@@ -1,0 +1,20 @@
+# Secrets
+**/.env
+
+# Runtime files
+logs/
+**/posted_ids.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
