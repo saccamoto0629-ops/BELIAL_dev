@@ -15,6 +15,12 @@ import feedparser
 import requests
 import schedule
 
+try:
+    from market_snapshot import get_market_snapshot_message
+except Exception as exc:  # optional dependency; do not crash the news bot
+    get_market_snapshot_message = None
+    print(f"[WARN] Market snapshot feature is unavailable: {exc}")
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
@@ -125,6 +131,11 @@ DEBUG_SELECTION = env_bool(
     ENV_VALUES.get("DEBUG_SELECTION", os.getenv("DEBUG_SELECTION")),
     default=False,
 )
+MARKET_SNAPSHOT_ENABLED = env_bool(
+    ENV_VALUES.get("MARKET_SNAPSHOT_ENABLED", os.getenv("MARKET_SNAPSHOT_ENABLED")),
+    default=True,
+)
+MARKET_SNAPSHOT_TIME = ENV_VALUES.get("MARKET_SNAPSHOT_TIME", "07:00").strip()
 
 GOOGLE_NEWS_RSS_URL = (
     f"https://news.google.com/rss/search?q={quote_plus(GOOGLE_NEWS_QUERY)}"
@@ -452,6 +463,24 @@ def send_dev_log(stats, status="OK", detail="", *, dry_run=DRY_RUN):
         print(f"[ERROR] Failed to post dev log: {exc}")
 
 
+def post_market_snapshot(*, dry_run=DRY_RUN):
+    if get_market_snapshot_message is None:
+        print("[WARN] Skipping market snapshot: feature unavailable.")
+        return
+
+    try:
+        message = get_market_snapshot_message()
+    except Exception as exc:
+        print(f"[ERROR] Failed to build market snapshot: {exc}")
+        return
+
+    try:
+        send_discord_webhook(NEWS_WEBHOOK_URL, {"content": message[:2000]}, dry_run=dry_run)
+        print("[OK] Posted market snapshot.")
+    except requests.RequestException as exc:
+        print(f"[ERROR] Failed to post market snapshot: {exc}")
+
+
 def fetch_and_post(*, dry_run=DRY_RUN):
     stats = {"fetch": 0, "post": 0, "skip": 0, "error": 0}
     details = []
@@ -593,6 +622,10 @@ def main(argv=None):
 
     fetch_and_post(dry_run=dry_run)
     schedule.every(FETCH_INTERVAL_MINUTES).minutes.do(fetch_and_post, dry_run=dry_run)
+
+    if MARKET_SNAPSHOT_ENABLED and get_market_snapshot_message is not None:
+        schedule.every().day.at(MARKET_SNAPSHOT_TIME).do(post_market_snapshot, dry_run=dry_run)
+        print(f"Market snapshot: daily at {MARKET_SNAPSHOT_TIME}")
 
     while not STOP_REQUESTED:
         schedule.run_pending()

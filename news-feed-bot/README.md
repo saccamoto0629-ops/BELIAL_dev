@@ -165,7 +165,46 @@ Tests use fixtures and fake sessions, so they do not require a real Discord Webh
 - importance scoreで重要記事が優先されること
 - `MAX_TOTAL_ARTICLES_PER_RUN` で全体投稿数が制限されること
 
-## 8. Security notes
+## 8. Market snapshot
+
+`market_snapshot.py` は、ニュースとは別に市場スナップショットをDiscordへ投稿するための機能です。
+
+```powershell
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\news-feed-bot
+python market_snapshot.py
+```
+
+コマンドラインで直接実行すると、Discordへは投稿せずスナップショットの内容をコンソールへ表示します。
+
+### Data sources
+
+| File | Source | Content |
+|---|---|---|
+| `market_data.py` | Yahoo Finance (`yfinance`) | VIX, S&P500, Nasdaq, USDJPY, Gold の直近終値・前日比 |
+| `fred_data.py` | FRED API | US10Y, US2Y, 10Y-2Y spread, Effective Fed Funds Rate |
+| `tradingview_data.py` | `tradingview_ta` | USDJPY, XAUUSD, SPX, VIX のRECOMMENDATION・RSI・MACD・EMA |
+| `market_snapshot.py` | 上記3つを統合 | Discord投稿用Markdownメッセージと `[Risk Label]` を生成 |
+
+各データ取得は個別に例外を処理するため、いずれかが失敗・タイムアウトしてもそのセクションだけ `unavailable` になり、bot全体は継続します。`FRED_API_KEY` が未設定の場合は `[Rates / FRED]` セクション全体がスキップされます。
+
+### Risk Label rules
+
+- VIX > 25、またはVIX前日比 +15%以上 → `Risk Off`
+- VIX < 18 かつ S&P500・Nasdaqがともにプラス → `Risk On`
+- US10Yが前日比 +0.05(pt)以上、かつS&P500かNasdaqのいずれかがマイナス → `Watch`
+- それ以外 → `Neutral`
+
+### Scheduling
+
+`news_feed_bot.py` から `market_snapshot.get_market_snapshot_message()` を呼び出し、`MARKET_SNAPSHOT_TIME`(デフォルト `07:00`)に毎日1回Discordへ投稿します。`MARKET_SNAPSHOT_ENABLED=false` にすると無効化できます。市場データ用のライブラリ(`yfinance` / `tradingview-ta`)が読み込めない環境でも、警告を出すだけでニュース配信自体は継続します。
+
+| Setting | Default | Description |
+|---|---:|---|
+| `FRED_API_KEY` | empty | FREDの金利・マクロ指標取得用APIキー。未設定なら該当セクションのみスキップ。 |
+| `MARKET_SNAPSHOT_ENABLED` | `true` | 市場スナップショットの定期投稿を有効にするか。 |
+| `MARKET_SNAPSHOT_TIME` | `07:00` | 市場スナップショットを投稿する時刻(ローカル時刻、`HH:MM`)。 |
+
+## 9. Security notes
 
 - `.env` をコミットしない
 - real webhook URL、API key、tokenをREADMEや`.env.example`に書かない

@@ -288,15 +288,16 @@ errors: 0
 
 ### 7.3 投稿件数制御
 
-v0.1 では、1回の実行につき最大投稿件数を設定可能にする。
+現行の `news-feed-bot` では、投稿件数制御を2段階で行う。
 
-初期値。
+| 設定 | 役割 |
+|---|---|
+| `MAX_ARTICLES_PER_RUN` | RSS feedごとの候補取得上限 |
+| `MAX_TOTAL_ARTICLES_PER_RUN` | 1回の実行全体の投稿上限 |
 
-```json
-{
-  "max_articles_per_run": 5
-}
-```
+つまり、各RSS feedから一定数まで候補を集めたあと、全候補を `importance_score(article)` で並べ、最終的に `MAX_TOTAL_ARTICLES_PER_RUN` 件まで投稿する。
+
+詳細な現行仕様は「24. 現行 news-feed-bot 仕様」を正とする。
 
 ---
 
@@ -304,15 +305,21 @@ v0.1 では、1回の実行につき最大投稿件数を設定可能にする�
 
 ### 8.1 config.json
 
-変更頻度の高い設定は `config.json` に分離する。
+`config.json` は将来候補である。
 
-候補。
+現行の `news-feed-bot` は、主に `.env` / 環境変数で設定を管理する。
+
+将来的にRSS feed一覧やスコア重み、投稿先チャンネルなどが増えた場合、変更頻度の高い設定を `config.json` に分離する案がある。
+
+将来候補の例。
 
 ```json
 {
   "max_articles_per_run": 5,
-  "fetch_interval_minutes": 15,
+  "max_total_articles_per_run": 5,
+  "fetch_interval_minutes": 60,
   "feeds": [
+    "google_news_reuters",
     "https://news.yahoo.co.jp/rss/categories/business.xml",
     "https://news.yahoo.co.jp/rss/categories/it.xml",
     "https://news.yahoo.co.jp/rss/categories/domestic.xml",
@@ -323,24 +330,40 @@ v0.1 では、1回の実行につき最大投稿件数を設定可能にする�
 
 ### 8.2 .env
 
-秘密情報は `.env` に置く。
+現行実装では、秘密情報と運用設定は `.env` または環境変数から読む。
+
+`.env` はGit管理しない。
+
+例。実値は書かない。
 
 ```env
 NEWS_WEBHOOK_URL=
 DEV_LOG_WEBHOOK_URL=
-OPENAI_API_KEY=
-OANDA_API_KEY=
+DRY_RUN=false
+DEBUG_SELECTION=false
+GOOGLE_NEWS_QUERY=
+MAX_ARTICLES_PER_RUN=5
+MAX_TOTAL_ARTICLES_PER_RUN=5
+FETCH_INTERVAL_MINUTES=60
 ```
 
 ### 8.3 .env.example
 
-`.env.example` にはダミー値のみ記載する。
+`.env.example` には安全なサンプル値のみ記載する。
+
+本物のWebhook URL、API key、tokenは書かない。
+
+現行の `.env.example` は、誤送信防止のため `DRY_RUN=true` を既定のサンプルにする。本番投稿する場合は `.env` 側で `NEWS_WEBHOOK_URL` を設定し、`DRY_RUN=false` に変更する。
 
 ```env
-NEWS_WEBHOOK_URL=https://discord.com/api/webhooks/xxxxx/yyyyy
-DEV_LOG_WEBHOOK_URL=https://discord.com/api/webhooks/xxxxx/yyyyy
-OPENAI_API_KEY=sk-xxxxx
-OANDA_API_KEY=xxxxx
+NEWS_WEBHOOK_URL=
+DEV_LOG_WEBHOOK_URL=
+DRY_RUN=true
+DEBUG_SELECTION=false
+GOOGLE_NEWS_QUERY=site:reuters.com (markets OR stocks OR bonds OR forex OR commodities OR oil OR gold OR "central bank" OR inflation OR "interest rates" OR earnings) when:1d
+MAX_ARTICLES_PER_RUN=5
+MAX_TOTAL_ARTICLES_PER_RUN=5
+FETCH_INTERVAL_MINUTES=60
 ```
 
 ---
@@ -656,34 +679,48 @@ BELIAL_dev/
 
 ## 19. Backlog
 
-### 19.1 最優先
+### 19.1 完了済み
 
-- `docs/spec.md` を作成する
-- `docs/backlog.md` を作成する
-- `.gitignore` に `.env` を追加する
-- `.env.example` を作成する
-- Webhook URL をソースコードから除去する
-- 漏洩済み Webhook を削除・再生成する
+現行 `news-feed-bot` で完了済みの項目。
 
-### 19.2 news_feed_bot 改善
-
-- RSS URL を config 化する
-- 最大投稿件数を config 化する
+- `.gitignore` に `.env` を含める
+- `.env.example` を用意する
+- Webhook URL のソースコード直書きを避ける
 - `NEWS_WEBHOOK_URL` と `DEV_LOG_WEBHOOK_URL` を分離する
-- Ctrl+C 時に安全終了する
-- fetch / post / skip / error 件数を dev-log に送る
-- 重複排除ファイル破損時に復旧する
-- README を追加する
-- 最低限のテストを追加する
+- `.env` / 環境変数から設定を読む
+- `DRY_RUN=true` / `--dry-run` を実装する
+- dry-runではDiscord送信も `posted_ids.json` 更新もしない
+- 金融・市場関連キーワードフィルタを追加する
+- `importance_score(article)` を追加する
+- `MAX_ARTICLES_PER_RUN` と `MAX_TOTAL_ARTICLES_PER_RUN` による2段階上限を追加する
+- Discord embed footer にscoreとhit keywordsを表示する
+- `DEBUG_SELECTION=true` による選別理由debugログを追加する
+- fetch / post / skip / error 件数をdev-logに送る
+- `posted_ids.json` による重複排除を行う
+- 重複排除ファイル破損時に退避して継続する
+- READMEを整備する
+- pytestで主要機能を検証する
 
-### 19.3 次段階
+### 19.2 news-feed-bot の未完了改善候補
 
-- 市場関連キーワードフィルタを追加する
-- ニュース重要度スコアを追加する
+- `MIN_IMPORTANCE_SCORE` を導入し、低スコア記事を足切りする
+- RSSソースを追加する
+- Google News queryを調整する
+- RSS feed一覧やスコア重みを将来的に `config.json` 化する
+- ソースごとの信頼度・優先度重みを導入する
+- Webikeの新車記事など、市場影響が薄い記事をより強く除外する
+- Discord投稿を「速報」「通常」「低優先度」に分ける
+
+### 19.3 次段階システム機能
+
 - `market_data.py` を作成する
 - `market_state.py` を作成する
 - AI 判定 JSON スキーマを固定する
+- AI要約を追加する
+- ブル/ベア判定を追加する
+- 市場インパクト判定を追加する
 - `#market-state` 投稿を実装する
+- systemd化またはLambda化を検討する
 
 ---
 
@@ -752,16 +789,16 @@ Webhook / API key / token は絶対にソースコードに直書きしない。
 
 ## 22. 次にやること
 
-次に実施する作業は以下。
+次に実施する候補は以下。
 
 ```text
-1. この仕様書を docs/spec.md として GitHub に配置する
-2. docs/backlog.md を作成する
-3. .env / .env.example / .gitignore を整備する
-4. news_feed_bot.py の Webhook 直書きを除去する
-5. dev-log 通知を追加する
-6. config.json 対応を追加する
-7. Codex / Claude Code に仕様書を読ませてから改修させる
+1. MIN_IMPORTANCE_SCORE 導入を検討する
+2. RSSソースを追加する
+3. Google News query を調整する
+4. systemd化またはLambda化を検討する
+5. market_data.py を作成する
+6. market_state.py を作成する
+7. AI要約・市場インパクト判定を検討する
 ```
 
 ---
@@ -769,16 +806,16 @@ Webhook / API key / token は絶対にソースコードに直書きしない。
 ## 23. Codex / Claude Code への作業指示テンプレート
 
 ```text
-このリポジトリでは docs/spec.md を正とします。
-実装前に必ず docs/spec.md と docs/backlog.md を確認してください。
+このリポジトリでは docs/berial_spec.md を正とします。
+実装前に必ず docs/berial_spec.md と関連ドキュメントを確認してください。
 勝手に仕様外の機能を追加しないでください。
 
 今回の作業範囲:
-- news_feed_bot.py の Webhook 直書きを廃止する
-- NEWS_WEBHOOK_URL / DEV_LOG_WEBHOOK_URL を .env から読む
-- .env.example を追加する
-- .gitignore に .env を追加する
-- fetch/post/skip/error 件数を #dev-log に投稿する
+- 24章の現行仕様を確認する
+- 変更対象ファイルを明示する
+- 既存の news-feed-bot 本番挙動を壊さない
+- 実Webhook URL、API key、token を書かない
+- dry-run、pytest、debugログ仕様を必要に応じて維持・更新する
 - 既存機能を壊さない
 
 作業後に以下を報告してください。
@@ -787,3 +824,326 @@ Webhook / API key / token は絶対にソースコードに直書きしない。
 - 動作確認方法
 - 残った課題
 ```
+
+---
+
+## 24. 現行 news-feed-bot 仕様
+
+この章は、現在実装済みの `news-feed-bot/news_feed_bot.py` の仕様を反映する。
+
+1〜23章には初期構想や将来構想も含まれる。現行の `news-feed-bot` の実装詳細については、この24章を正とする。
+
+将来構想と現行仕様が異なる場合は、以下のように扱う。
+
+- 現行挙動の確認・修正では24章を優先する
+- 将来拡張の検討では19章、20章、22章、24.14を参照する
+- 秘密情報の扱いは9章と24.12を優先する
+
+### 24.1 現在の役割
+
+`news-feed-bot` は、市場監視システム BELIAL におけるニュース収集・一次選別レイヤーである。
+
+現在の役割は以下に限定する。
+
+- Google News / Reuters と Yahoo!ニュース系RSSからニュースを取得する
+- 金融・市場関連キーワードで記事を一次選別する
+- 重要そうな市場ニュースをDiscordへ通知する
+- 既投稿記事や同一実行内の重複記事を除外する
+- 記事ごとにルールベースの `importance_score(article)` を計算し、優先順位を付ける
+- 実行結果を必要に応じてdev-logへ送る
+
+現時点では、以下は行わない。
+
+- AIによる記事分析
+- AIによるブル/ベア判定
+- 売買判断
+- 自動発注
+- 市場インパクトの最終判定
+
+つまり `news-feed-bot` は、BELIAL本体の判断層ではなく、その前段にある「ニュース収集・通知・一次フィルタ」の役割を持つ。
+
+### 24.2 RSS取得元
+
+現行実装では、主に以下のRSSを取得対象にする。
+
+| 種別 | 用途 |
+|---|---|
+| Google News / Reuters | Reuters由来の市場関連ニュース監視 |
+| Yahoo!ニュース / 経済 | 国内経済ニュース |
+| Yahoo!ニュース / IT | IT・テック関連ニュース |
+| Yahoo!ニュース / 国内 | 国内ニュースのうち市場影響があり得るもの |
+| Yahoo!ニュース / 国際 | 国際ニュースのうち市場影響があり得るもの |
+
+Google News queryは `GOOGLE_NEWS_QUERY` で変更可能である。
+
+### 24.3 記事選別フロー
+
+記事選別は以下の順番で行う。
+
+1. RSS取得
+2. `posted_ids.json` による既投稿記事の除外
+3. 同一実行内の重複記事の除外
+4. 金融・市場関連キーワードによるフィルタ
+5. RSS feedごとの候補上限 `MAX_ARTICLES_PER_RUN` の適用
+6. `importance_score(article)` によるスコアリング
+7. `importance_score` の降順に並べる
+8. scoreが同点の場合は `published_sort_key` により公開日時が新しい順に並べる
+9. 1回の実行全体の投稿上限 `MAX_TOTAL_ARTICLES_PER_RUN` を適用する
+10. Discordへ投稿する
+11. 本番実行時のみ `posted_ids.json` を更新する
+
+`MAX_ARTICLES_PER_RUN` は「feedごとの候補上限」であり、最終投稿数ではない。
+
+`MAX_TOTAL_ARTICLES_PER_RUN` は「1回の実行全体で実際に投稿する最大件数」である。
+
+たとえば、5つのRSS feedがあり `MAX_ARTICLES_PER_RUN=5` の場合、最大25件が候補になる。その後、score順に並べたうえで `MAX_TOTAL_ARTICLES_PER_RUN=5` なら最大5件だけが投稿される。
+
+### 24.4 金融・市場関連フィルタ
+
+金融・市場関連フィルタは、記事タイトルとsummaryを対象にする。
+
+判定時にはHTMLを除去し、キーワードに一致するかを確認する。
+
+対象例:
+
+- 株価
+- 日経平均
+- TOPIX
+- 株式市場
+- 為替
+- 円安
+- 円高
+- ドル円
+- 金利
+- 日銀
+- 日本銀行
+- FRB
+- 中央銀行
+- インフレ
+- 消費者物価
+- GDP
+- 原油
+- 金価格
+- 暗号資産
+- 仮想通貨
+- stocks
+- markets
+- bonds
+- forex
+- commodities
+- oil
+- gold
+- central bank
+- inflation
+- interest rates
+- earnings
+
+このフィルタは本番でも有効である。
+
+### 24.5 importance_score(article)
+
+`importance_score(article)` は、記事の重要度をルールベースで計算する関数である。
+
+対象:
+
+- title
+- summary
+
+判定前処理:
+
+- HTMLタグを除去する
+- HTML entityを復元する
+- 大文字小文字を無視する
+
+加点対象の例:
+
+| 種別 | 例 |
+|---|---|
+| 危機・速報 | breaking, urgent, emergency, crisis, shock, war, attack, sanctions, default, recession, 緊急, 速報, 危機, 戦争, 攻撃, 制裁, デフォルト, 景気後退 |
+| 中央銀行・金利 | FRB, Federal Reserve, BOJ, 日銀, 日本銀行, central bank, policy rate, interest rates, rate hike, rate cut, 金利, 政策金利, 利上げ, 利下げ, 中央銀行 |
+| 経済指標 | CPI, inflation, jobs report, unemployment, GDP, 消費者物価, インフレ, 雇用統計, 失業率 |
+| 為替 | forex, dollar, yen, USDJPY, ドル円, 円安, 円高, 為替 |
+| 商品 | oil, crude, gold, commodity, 原油, 金, 金価格, 商品先物 |
+| 株式・債券 | stocks, markets, bonds, yields, 株価, 日経平均, TOPIX, 株式市場, 債券, 利回り |
+| 決算 | earnings, guidance, profit warning, 決算, 業績, 増益, 減益, 下方修正 |
+| 暗号資産 | crypto, bitcoin, 暗号資産, 仮想通貨, ビットコイン |
+
+減点対象の例:
+
+| 種別 | 例 |
+|---|---|
+| 広告・PR | PR, sponsored, advertisement, promotion, キャンペーン, 広告 |
+| 個人向け投資記事 | 個人投資家, 投資術, ランキング, おすすめ, 初心者向け |
+| コラム・解説系 | 解説, コラム, opinion, column |
+
+現時点の `importance_score(article)` はルールベースであり、AI判定ではない。
+
+将来的には、AI要約や市場インパクト判定の前段スコアとして使うことができる。
+
+### 24.6 Discord投稿仕様
+
+ニュース投稿はDiscord Webhookを通じて行う。
+
+投稿payloadはDiscord embed形式である。
+
+主な内容:
+
+- title
+- URL
+- summary由来のdescription
+- source feed名
+- `Score: N`
+- hit keywords 最大5個
+- 実行時刻
+
+footerには、scoreとhit keywordsを表示する。
+
+例:
+
+```text
+Google News / Reuters • Score: 12 • 2026-07-04 14:30 • Hits: breaking, FRB, inflation
+```
+
+### 24.7 posted_ids.json と重複除外
+
+`posted_ids.json` は、既に投稿した記事IDを記録するruntime fileである。
+
+目的:
+
+- 同じ記事を繰り返し投稿しない
+- bot再起動後も既投稿記事を除外する
+
+同一実行内では、複数RSS feedに同じ記事IDが現れた場合もduplicateとして除外する。
+
+`posted_ids.json` が破損している場合は、破損ファイルを退避し、空のIDリストから継続する。
+
+### 24.8 Dry run仕様
+
+`DRY_RUN=true` または `--dry-run` の場合、botは安全な検証モードで動作する。
+
+dry-runでは以下を行わない。
+
+- Discord Webhookへの実送信
+- `posted_ids.json` の更新
+
+dry-runでは、送信予定payloadをコンソールに出力する。
+
+このため、dry-runを繰り返すと同じ記事が候補に見え続ける。これは正常挙動である。
+
+本番実行では、投稿後に `posted_ids.json` が更新されるため、次回以降は既投稿記事として除外される。
+
+### 24.9 DEBUG_SELECTION仕様
+
+`DEBUG_SELECTION=true` のときだけ、記事選別理由のdebugログを出す。
+
+通常運用では `false` を推奨する。調査時のみ `true` にする。
+
+feedごと、および全体で以下のカウントを出す。
+
+| 項目 | 意味 |
+|---|---|
+| `posted` | `posted_ids.json` に既に存在する |
+| `duplicate` | 同一実行内で既に候補化済み |
+| `non_finance` | finance filterに一致しない |
+| `low_score` | score閾値未満。現時点では閾値未実装のため通常0 |
+| `per_feed_limit` | feedごとの候補上限 `MAX_ARTICLES_PER_RUN` で落ちた |
+| `total_limit` | 全体投稿上限 `MAX_TOTAL_ARTICLES_PER_RUN` で落ちた |
+| `selected` | feedログではfeed内候補数、全体ログでは最終投稿対象数 |
+
+ログ例:
+
+```text
+[DEBUG] Google News / Reuters: posted=20 duplicate=1 non_finance=70 low_score=0 per_feed_limit=5 total_limit=0 selected=0
+[DEBUG] Yahoo!ニュース / 経済: posted=10 duplicate=0 non_finance=32 low_score=0 per_feed_limit=3 total_limit=0 selected=3
+[DEBUG] Selection stats: posted=28 duplicate=0 non_finance=269 low_score=0 per_feed_limit=0 total_limit=0 selected=3
+```
+
+`DEBUG_SELECTION=true` はログ量が増えるため、常時有効化は推奨しない。
+
+### 24.10 Dev log仕様
+
+`DEV_LOG_WEBHOOK_URL` が設定されている場合、実行サマリをdev-log用Webhookへ送る。
+
+サマリ項目:
+
+- fetch
+- post
+- skip
+- error
+- status
+- detail
+
+`DEV_LOG_WEBHOOK_URL` が未設定の場合、dev-log投稿はスキップされる。
+
+### 24.11 現在の運用上の観察
+
+dry-runでは `posted_ids.json` を更新しないため、候補が多く見えることがある。
+
+本番では `posted_ids.json` により既投稿記事が除外されるため、`MAX_TOTAL_ARTICLES_PER_RUN=5` でも候補が3件なら3件しか投稿されない。
+
+これは正常挙動である。
+
+重要なのは、`MAX_TOTAL_ARTICLES_PER_RUN` は「最大5件」であって「必ず5件」ではない、という点である。
+
+候補が少ない場合は、投稿数が5件未満になる。
+
+### 24.12 設定項目
+
+| 設定 | 既定値 | 説明 |
+|---|---:|---|
+| `NEWS_WEBHOOK_URL` | empty | ニュース投稿先Discord Webhook URL。本番投稿時に必要 |
+| `DEV_LOG_WEBHOOK_URL` | empty | 実行サマリ投稿先Discord Webhook URL。任意 |
+| `DRY_RUN` | `false` | `true` のときDiscord送信も `posted_ids.json` 更新もしない |
+| `DEBUG_SELECTION` | `false` | `true` のとき記事選別理由のdebugログを出す |
+| `GOOGLE_NEWS_QUERY` | market query | Google News RSS検索条件 |
+| `MAX_ARTICLES_PER_RUN` | `5` | RSS feedごとの候補上限 |
+| `MAX_TOTAL_ARTICLES_PER_RUN` | `5` | 1回の実行全体の投稿上限 |
+| `FETCH_INTERVAL_MINUTES` | `60` | RSS取得間隔 |
+
+`.env.example` には実値を記載しない。
+
+本物のWebhook URL、API key、tokenは `.env` または実行環境のSecret管理に置く。
+
+### 24.13 pytestによる検証範囲
+
+現行実装では、pytestにより主要機能を検証している。
+
+検証対象の例:
+
+- RSS取得結果からDiscord payloadを作れること
+- `posted_ids` に存在する記事を除外すること
+- `posted_ids` に存在しない記事だけ送信対象になること
+- 日本語金融キーワードで記事が選別されること
+- 金融キーワードを含まない一般記事が除外されること
+- `importance_score(article)` が重要語で加点されること
+- PR、ランキング、個人投資家などで減点されること
+- scoreが高い記事が低い記事より優先されること
+- score同点時に公開日時が新しい記事が優先されること
+- `MAX_TOTAL_ARTICLES_PER_RUN` により全体投稿数が制限されること
+- dry-runではDiscord送信しないこと
+- dry-runでは `posted_ids.json` が更新されないこと
+- `DEBUG_SELECTION=true` のときdebugログが出ること
+- `DEBUG_SELECTION=false` のときdebugログが出ないこと
+
+### 24.14 現在の課題・次の改善候補
+
+現在の課題:
+
+- 候補が少ない場合、投稿数が5件未満になる
+- Webikeの新車記事など、市場影響が薄い記事が混ざる可能性がある
+- 現在の `importance_score(article)` はルールベースであり、文脈理解は行わない
+- `low_score` はdebug項目として存在するが、現時点では最低score閾値が未実装のため通常0である
+
+改善候補:
+
+- `MIN_IMPORTANCE_SCORE` を導入し、低スコア記事を足切りする
+- Google News queryを調整して候補数を増やす
+- RSSソースを追加する
+- ソースごとの重み付けを導入する
+- hit keywordsをより説明的に整形する
+- AI要約を追加する
+- ブル/ベア判定を追加する
+- 市場インパクト判定を追加する
+- Discord投稿を「速報」「通常」「低優先度」に分ける
+
+将来的には、`news-feed-bot` が収集した記事をBELIALのAI分析層へ渡し、市場状態分類や戦略判断の材料にする。
