@@ -118,6 +118,7 @@ NEWS_WEBHOOK_URL = ENV_VALUES.get("NEWS_WEBHOOK_URL", "").strip()
 DEV_LOG_WEBHOOK_URL = ENV_VALUES.get("DEV_LOG_WEBHOOK_URL", "").strip()
 GOOGLE_NEWS_QUERY = ENV_VALUES.get("GOOGLE_NEWS_QUERY", DEFAULT_NEWS_QUERY).strip()
 MAX_ARTICLES_PER_RUN = int(ENV_VALUES.get("MAX_ARTICLES_PER_RUN", "5"))
+MAX_TOTAL_ARTICLES_PER_RUN = int(ENV_VALUES.get("MAX_TOTAL_ARTICLES_PER_RUN", "5"))
 FETCH_INTERVAL_MINUTES = int(ENV_VALUES.get("FETCH_INTERVAL_MINUTES", "60"))
 DRY_RUN = env_bool(ENV_VALUES.get("DRY_RUN", os.getenv("DRY_RUN")), default=False)
 
@@ -146,6 +147,80 @@ def article_id(article):
 def is_finance_related(article):
     text = strip_html(f"{article.get('title', '')} {article.get('summary', '')}").lower()
     return any(keyword.lower() in text for keyword in FINANCE_KEYWORDS)
+
+
+IMPORTANCE_KEYWORD_GROUPS = [
+    (6, [
+        "breaking", "urgent", "emergency", "crisis", "shock", "war", "attack",
+        "sanctions", "default", "recession", "緊急", "速報", "危機", "戦争",
+        "攻撃", "制裁", "デフォルト", "景気後退",
+    ]),
+    (5, [
+        "frb", "federal reserve", "boj", "日銀", "日本銀行", "central bank",
+        "policy rate", "interest rates", "rate hike", "rate cut", "金利",
+        "政策金利", "利上げ", "利下げ", "中央銀行",
+    ]),
+    (5, [
+        "cpi", "inflation", "jobs report", "unemployment", "gdp", "消費者物価",
+        "インフレ", "雇用統計", "失業率",
+    ]),
+    (4, [
+        "forex", "dollar", "yen", "usdjpy", "ドル円", "円安", "円高", "為替",
+    ]),
+    (4, [
+        "oil", "crude", "gold", "commodity", "原油", "金", "金価格", "商品先物",
+    ]),
+    (4, [
+        "stocks", "markets", "bonds", "yields", "株価", "日経平均", "topix",
+        "株式市場", "債券", "利回り",
+    ]),
+    (3, [
+        "earnings", "guidance", "profit warning", "決算", "業績", "増益",
+        "減益", "下方修正",
+    ]),
+    (2, [
+        "crypto", "bitcoin", "暗号資産", "仮想通貨", "ビットコイン",
+    ]),
+    (-4, [
+        "pr", "sponsored", "advertisement", "promotion", "キャンペーン", "広告",
+    ]),
+    (-3, [
+        "個人投資家", "投資術", "ランキング", "おすすめ", "初心者向け",
+    ]),
+    (-2, [
+        "解説", "コラム", "opinion", "column",
+    ]),
+]
+
+
+def keyword_matches(text, keyword):
+    keyword_text = keyword.lower()
+    if keyword_text == "pr":
+        return re.search(r"\bpr\b", text) is not None
+    return keyword_text in text
+
+
+def importance_details(article):
+    text = strip_html(f"{article.get('title', '')} {article.get('summary', '')}").lower()
+    score = 0
+    hits = []
+    seen = set()
+
+    for points, keywords in IMPORTANCE_KEYWORD_GROUPS:
+        for keyword in keywords:
+            if keyword_matches(text, keyword):
+                score += points
+                hit_key = keyword.lower()
+                if hit_key not in seen:
+                    hits.append(keyword)
+                    seen.add(hit_key)
+
+    return score, hits
+
+
+def importance_score(article):
+    score, _hits = importance_details(article)
+    return score
 
 
 def load_posted_ids(path=None):
@@ -186,16 +261,21 @@ def build_discord_message(article):
     """Build a Discord webhook payload for one RSS article."""
     summary = strip_html(article.get("summary", ""))
     description = summary[:300] + "..." if len(summary) > 300 else summary
+    score, hits = importance_details(article)
+    footer_text = (
+        f"{article.get('_feed_name', 'RSS')} • "
+        f"Score: {score} • "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    if hits:
+        footer_text += f" • Hits: {', '.join(hits[:5])}"
     embed = {
         "title": article.get("title", "No title")[:256],
         "url": article.get("link", ""),
         "description": description,
         "color": 0xE8312A,
         "footer": {
-            "text": (
-                f"{article.get('_feed_name', 'RSS')} • "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
+            "text": footer_text[:2048]
         },
     }
     return {"embeds": [embed]}
@@ -277,12 +357,22 @@ def select_new_articles(entries, posted_ids, *, max_articles=MAX_ARTICLES_PER_RU
     return selected, skipped
 
 
+def rank_articles(articles, *, max_articles=MAX_TOTAL_ARTICLES_PER_RUN):
+    ranked = sorted(
+        articles,
+        key=lambda article: (importance_score(article), published_sort_key(article)),
+        reverse=True,
+    )
+    return ranked[:max_articles]
+
+
 def build_messages_from_rss(feed_name, rss_content, posted_ids, *, max_articles=MAX_ARTICLES_PER_RUN):
     entries = parse_rss_entries(feed_name, rss_content)
     entries.sort(key=published_sort_key, reverse=True)
     selected, skipped = select_new_articles(entries, posted_ids, max_articles=max_articles)
-    messages = [build_discord_message(article) for article in selected]
-    return messages, selected, skipped
+    ranked = rank_articles(selected, max_articles=len(selected))
+    messages = [build_discord_message(article) for article in ranked]
+    return messages, ranked, skipped
 
 
 def send_dev_log(stats, status="OK", detail="", *, dry_run=DRY_RUN):
@@ -345,7 +435,9 @@ def fetch_and_post(*, dry_run=DRY_RUN):
                 details.append(f"Fetch failed: {feed_name} ({exc})")
                 print(f"[ERROR] Failed to fetch {feed_name}: {exc}")
 
-        selected.sort(key=published_sort_key, reverse=True)
+        ranked_selected = rank_articles(selected, max_articles=MAX_TOTAL_ARTICLES_PER_RUN)
+        stats["skip"] += len(selected) - len(ranked_selected)
+        selected = ranked_selected
 
         for index, article in enumerate(selected):
             if STOP_REQUESTED:
@@ -399,6 +491,8 @@ def validate_config(*, dry_run=DRY_RUN):
         errors.append("NEWS_WEBHOOK_URL is not set in .env")
     if MAX_ARTICLES_PER_RUN < 1:
         errors.append("MAX_ARTICLES_PER_RUN must be at least 1")
+    if MAX_TOTAL_ARTICLES_PER_RUN < 1:
+        errors.append("MAX_TOTAL_ARTICLES_PER_RUN must be at least 1")
     if FETCH_INTERVAL_MINUTES < 1:
         errors.append("FETCH_INTERVAL_MINUTES must be at least 1")
     if errors:
@@ -430,6 +524,7 @@ def main(argv=None):
     print("=== Discord Market News Feed Bot ===")
     print(f"Query: {GOOGLE_NEWS_QUERY}")
     print(f"RSS feeds: {len(RSS_FEEDS)}")
+    print(f"Max total articles: {MAX_TOTAL_ARTICLES_PER_RUN}")
     print(f"Interval: Every {FETCH_INTERVAL_MINUTES} minute(s)")
     print(f"Dry run: {dry_run}")
     print("Starting...\n")

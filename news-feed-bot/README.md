@@ -1,28 +1,23 @@
-# Discord Market News Feed Bot
+﻿# Discord Market News Feed Bot
 
-RSSから金融・市場関連ニュースを取得し、Discord Webhookへ投稿するPythonボットです。
+RSSから金融・市場関連ニュースを取得し、重要度スコア順に並べてDiscord Webhookへ投稿するPythonボットです。
 
-## Local setup
+The bot fetches finance/market-related RSS articles, ranks them by importance score, and posts the highest-priority articles to Discord.
+
+## 1. Local setup
 
 ```powershell
 cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-## Dry run
+## 2. Dry run
 
-実Webhookを使わずに確認する場合は、環境変数またはCLI引数でdry-runを使います。
-
-```powershell
-cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\news-feed-bot
-$env:DRY_RUN = "true"
-python .\news_feed_bot.py
-```
-
-または:
+実Webhookを使わずに確認する場合は、`--dry-run` を使います。
 
 ```powershell
-python .\news_feed_bot.py --dry-run
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
+python .\news-feed-bot\news_feed_bot.py --dry-run
 ```
 
 Dry-runでは以下を行いません。
@@ -32,47 +27,90 @@ Dry-runでは以下を行いません。
 
 送信予定のpayloadだけをコンソールへ出力します。
 
-## Production run
+## 3. Production run
 
-本番実行では、従来通り `.env` の `NEWS_WEBHOOK_URL` を使ってDiscordへ送信します。
-
-```powershell
-cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\news-feed-bot
-Copy-Item .env.example .env
-notepad .env
-python .\news_feed_bot.py
-```
-
-`.env` の例:
-
-```env
-NEWS_WEBHOOK_URL=https://discord.com/api/webhooks/...
-DRY_RUN=false
-```
-
-注意:
-
-- 本物のWebhook URLやAPIキーは、コード・README・テスト・`.env.example` へ書かないでください。
-- `.env` はGit管理対象外です。
-- `posted_ids.json` は投稿済み記事の重複投稿防止に使います。
-
-## Tests
+本番実行では `.env` の `NEWS_WEBHOOK_URL` を使ってDiscordへ送信します。
 
 ```powershell
 cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
-pytest news-feed-bot
+python .\news-feed-bot\news_feed_bot.py
 ```
 
-pytestでは以下を検証します。
+`.env.example` を `.env` にコピーし、少なくとも以下を設定してください。
 
-- RSS取得結果から投稿メッセージを作れること
-- `posted_ids` に存在する記事は投稿しないこと
-- `posted_ids` にない記事だけ送信対象になること
-- `DRY_RUN=true` / `--dry-run` 相当ではDiscord送信しないこと
-- dry-runでは `posted_ids.json` が変更されないこと
-- 実Webhookなしでも送信関数を差し替えて本番送信経路を検証できること
+```env
+NEWS_WEBHOOK_URL=<your Discord webhook URL>
+DRY_RUN=false
+MAX_ARTICLES_PER_RUN=5
+MAX_TOTAL_ARTICLES_PER_RUN=5
+```
 
-## Main settings
+本物の `.env`、Webhook URL、APIキー、tokenはGitにコミットしないでください。
+
+## 4. Article selection
+
+記事選択は以下の流れで行います。
+
+1. 設定されたRSS feedを取得する
+2. `posted_ids.json` に存在する記事を除外する
+3. 同一実行内で重複する記事IDを除外する
+4. 金融・市場関連キーワードに一致しない記事を除外する
+5. 各RSS feedから最大 `MAX_ARTICLES_PER_RUN` 件を候補にする
+6. 候補記事に `importance_score(article)` を付ける
+7. scoreが高い順に並べる
+8. scoreが同じ場合は公開日時が新しい順にする
+9. 全体で最大 `MAX_TOTAL_ARTICLES_PER_RUN` 件だけ投稿する
+
+### Finance filter
+
+記事タイトルとsummaryをHTML除去後にチェックし、金融・市場関連キーワードに一致しない記事は除外します。
+
+このfilterは本番でも有効です。
+
+### Per-feed candidate limit
+
+`MAX_ARTICLES_PER_RUN` は、RSS feedごとの候補記事数上限です。
+
+例: RSS feedが5個あり、`MAX_ARTICLES_PER_RUN=5` の場合、最大25件が候補になります。
+
+### Global post limit
+
+`MAX_TOTAL_ARTICLES_PER_RUN` は、1回の実行全体で実際に投稿する最大件数です。
+
+例: `MAX_TOTAL_ARTICLES_PER_RUN=5` の場合、候補が25件あっても投稿されるのは上位5件だけです。
+
+Discord embedのfooterには `Score: N` と、最大5個のhit keywordsが表示されます。
+
+## 5. Importance score overview
+
+`importance_score(article)` は、記事タイトルとsummaryをHTML除去したテキストをもとに計算します。
+
+### Positive signals
+
+主な加点対象:
+
+- breaking, urgent, emergency, crisis, shock, war, attack, sanctions, default, recession
+- 緊急, 速報, 危機, 戦争, 攻撃, 制裁, デフォルト, 景気後退
+- FRB, Federal Reserve, BOJ, central bank, policy rate, interest rates, rate hike, rate cut
+- 日銀, 日本銀行, 金利, 政策金利, 利上げ, 利下げ, 中央銀行
+- CPI, inflation, jobs report, unemployment, GDP
+- 消費者物価, インフレ, 雇用統計, 失業率, GDP
+- forex, dollar, yen, USDJPY, ドル円, 円安, 円高, 為替
+- oil, crude, gold, commodity, 原油, 金, 金価格, 商品先物
+- stocks, markets, bonds, yields, 株価, 日経平均, TOPIX, 株式市場, 債券, 利回り
+- earnings, guidance, profit warning, 決算, 業績, 増益, 減益, 下方修正
+- crypto, bitcoin, 暗号資産, 仮想通貨, ビットコイン
+
+### Negative signals
+
+主な減点対象:
+
+- PR, sponsored, advertisement, promotion
+- キャンペーン, 広告
+- 個人投資家, 投資術, ランキング, おすすめ, 初心者向け
+- 解説, コラム, opinion, column
+
+## 6. Settings
 
 | Setting | Default | Description |
 |---|---:|---|
@@ -80,5 +118,33 @@ pytestでは以下を検証します。
 | `DEV_LOG_WEBHOOK_URL` | empty | Optional webhook for run summaries. |
 | `DRY_RUN` | `false` | When `true`, prints only and does not send or update `posted_ids.json`. |
 | `GOOGLE_NEWS_QUERY` | market query | Google News search query. |
-| `MAX_ARTICLES_PER_RUN` | `5` | Max selected articles per RSS feed per run. |
+| `MAX_ARTICLES_PER_RUN` | `5` | Per-feed candidate limit before global scoring. |
+| `MAX_TOTAL_ARTICLES_PER_RUN` | `5` | Overall post limit for one run after scoring all candidates. |
 | `FETCH_INTERVAL_MINUTES` | `60` | RSS polling interval. |
+
+## 7. Tests
+
+```powershell
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
+python -m pytest news-feed-bot --basetemp=.tmp_pytest -p no:cacheprovider
+```
+
+Tests use fixtures and fake sessions, so they do not require a real Discord Webhook.
+
+テストでは主に以下を検証します。
+
+- RSS取得結果からDiscord payloadを作れること
+- `posted_ids` に存在する記事を投稿しないこと
+- `posted_ids` にない記事だけ送信対象になること
+- dry-runではDiscord送信しないこと
+- dry-runでは `posted_ids.json` を更新しないこと
+- importance scoreで重要記事が優先されること
+- `MAX_TOTAL_ARTICLES_PER_RUN` で全体投稿数が制限されること
+
+## 8. Security notes
+
+- `.env` をコミットしない
+- real webhook URL、API key、tokenをREADMEや`.env.example`に書かない
+- real secretsはEC2など実行環境の `.env` だけに置く
+- `posted_ids.json` は重複投稿防止用のruntime file
+- `posted_ids.json` はコミットしない

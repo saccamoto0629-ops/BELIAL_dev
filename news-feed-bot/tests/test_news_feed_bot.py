@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import json
+import time
 
 import pytest
 
@@ -127,6 +128,126 @@ def test_general_japanese_article_without_finance_keywords_is_excluded():
 
     assert selected == []
     assert skipped == 1
+
+
+def test_importance_score_adds_points_for_high_importance_keywords():
+    article = {
+        "id": "important-1",
+        "title": "Breaking FRB interest rates shock lifts stocks",
+        "summary": "Inflation and earnings remain in focus for markets.",
+    }
+
+    score = bot.importance_score(article)
+
+    assert score >= 20
+
+
+def test_importance_score_subtracts_points_for_low_value_keywords():
+    article = {
+        "id": "low-value-1",
+        "title": "Stocks ranking for individual investors PR",
+        "summary": "Sponsored column for beginners and promotion.",
+    }
+
+    score = bot.importance_score(article)
+
+    assert score < 0
+
+
+def test_discord_payload_includes_importance_score_and_hit_keywords():
+    article = {
+        "id": "payload-score-1",
+        "title": "Breaking central bank inflation news lifts stocks",
+        "summary": "<p>Markets watched interest rates.</p>",
+        "link": "https://example.com/scored",
+        "_feed_name": "Fixture",
+    }
+
+    payload = bot.build_discord_message(article)
+    footer = payload["embeds"][0]["footer"]["text"]
+
+    assert "Score:" in footer
+    assert "Hits:" in footer
+
+
+def test_rank_articles_puts_higher_score_before_lower_score():
+    high_score_article = {
+        "id": "high-score",
+        "title": "Breaking FRB inflation shock hits stocks and bonds",
+        "summary": "Central bank interest rates and earnings in focus.",
+        "published_parsed": time.strptime("Sat, 04 Jul 2026 01:00:00 GMT", "%a, %d %b %Y %H:%M:%S %Z"),
+    }
+    low_score_article = {
+        "id": "low-score",
+        "title": "Stocks edge higher",
+        "summary": "Markets update.",
+        "published_parsed": time.strptime("Sat, 04 Jul 2026 04:00:00 GMT", "%a, %d %b %Y %H:%M:%S %Z"),
+    }
+
+    ranked = bot.rank_articles([low_score_article, high_score_article], max_articles=2)
+
+    assert [article["id"] for article in ranked] == ["high-score", "low-score"]
+
+
+def test_rank_articles_limits_total_articles():
+    articles = [
+        {"id": "a1", "title": "Breaking FRB stocks", "summary": "markets"},
+        {"id": "a2", "title": "Inflation stocks", "summary": "markets"},
+        {"id": "a3", "title": "Stocks", "summary": "markets"},
+    ]
+
+    ranked = bot.rank_articles(articles, max_articles=2)
+
+    assert len(ranked) == 2
+    assert [article["id"] for article in ranked] == ["a1", "a2"]
+
+
+def test_rank_articles_uses_newer_published_date_when_scores_tie():
+    older = {
+        "id": "older",
+        "title": "Stocks rise",
+        "summary": "Markets update.",
+        "published_parsed": time.strptime("Sat, 04 Jul 2026 01:00:00 GMT", "%a, %d %b %Y %H:%M:%S %Z"),
+    }
+    newer = {
+        "id": "newer",
+        "title": "Stocks rise",
+        "summary": "Markets update.",
+        "published_parsed": time.strptime("Sat, 04 Jul 2026 04:00:00 GMT", "%a, %d %b %Y %H:%M:%S %Z"),
+    }
+
+    ranked = bot.rank_articles([older, newer], max_articles=2)
+
+    assert [article["id"] for article in ranked] == ["newer", "older"]
+
+
+def test_fetch_and_post_applies_max_total_articles_per_run(tmp_path, monkeypatch):
+    posted_ids_path = tmp_path / "posted_ids.json"
+    posted_ids_path.write_text("[]", encoding="utf-8")
+    entries = [
+        {"id": "high", "title": "Breaking FRB inflation stocks", "summary": "markets"},
+        {"id": "middle", "title": "Oil and gold markets", "summary": "commodities"},
+        {"id": "low", "title": "Stocks", "summary": "markets"},
+    ]
+    sent_articles = []
+
+    monkeypatch.setattr(bot, "POSTED_IDS_FILE", posted_ids_path)
+    monkeypatch.setattr(bot, "RSS_FEEDS", [("Fixture RSS", "https://example.invalid/rss")])
+    monkeypatch.setattr(bot, "MAX_ARTICLES_PER_RUN", 10)
+    monkeypatch.setattr(bot, "MAX_TOTAL_ARTICLES_PER_RUN", 2)
+    monkeypatch.setattr(bot, "fetch_feed", lambda feed_name, rss_url: entries)
+    monkeypatch.setattr(
+        bot,
+        "post_article",
+        lambda article, webhook_url=None, dry_run=False: sent_articles.append(bot.article_id(article)),
+    )
+    monkeypatch.setattr(bot, "send_dev_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot.time, "sleep", lambda seconds: None)
+
+    bot.fetch_and_post(dry_run=False)
+
+    assert sent_articles == ["high", "middle"]
+    assert json.loads(posted_ids_path.read_text(encoding="utf-8")) == ["high", "middle"]
 
 
 def test_dry_run_prints_without_sending_to_discord(capsys):
