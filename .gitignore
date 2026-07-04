@@ -4,10 +4,13 @@
 # Runtime files
 logs/
 **/posted_ids.json
+**/macd_alert_state.json
 
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+**/.pytest_cache/
 .venv/
 venv/
 
