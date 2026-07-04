@@ -81,6 +81,29 @@ MAX_TOTAL_ARTICLES_PER_RUN=5
 
 Discord embedのfooterには `Score: N` と、最大5個のhit keywordsが表示されます。
 
+### Selection debug logs
+
+`DEBUG_SELECTION=true` にすると、記事が選ばれなかった理由をfeedごと・全体で表示します。
+
+Example:
+
+```text
+[DEBUG] Google News / Reuters: posted=20 duplicate=1 non_finance=70 low_score=0 per_feed_limit=5 total_limit=0 selected=0
+[DEBUG] Selection stats: posted=80 duplicate=3 non_finance=210 low_score=0 per_feed_limit=5 total_limit=10 selected=5
+```
+
+Reasons:
+
+- `posted`: already exists in `posted_ids.json`
+- `duplicate`: already selected as a candidate in the same run
+- `non_finance`: did not match the finance filter
+- `low_score`: below score threshold, currently always `0` because no score threshold is implemented
+- `per_feed_limit`: dropped by `MAX_ARTICLES_PER_RUN`
+- `total_limit`: dropped by `MAX_TOTAL_ARTICLES_PER_RUN`
+- `selected`: feed candidate count in feed logs, final post target count in the overall log
+
+Default is `false`. Keeping this enabled in production can produce a lot of logs.
+
 ## 5. Importance score overview
 
 `importance_score(article)` は、記事タイトルとsummaryをHTML除去したテキストをもとに計算します。
@@ -117,6 +140,7 @@ Discord embedのfooterには `Score: N` と、最大5個のhit keywordsが表示
 | `NEWS_WEBHOOK_URL` | empty | Discord news webhook URL. Required for production posting. |
 | `DEV_LOG_WEBHOOK_URL` | empty | Optional webhook for run summaries. |
 | `DRY_RUN` | `false` | When `true`, prints only and does not send or update `posted_ids.json`. |
+| `DEBUG_SELECTION` | `false` | When `true`, prints selection reason counts for each feed and the whole run. |
 | `GOOGLE_NEWS_QUERY` | market query | Google News search query. |
 | `MAX_ARTICLES_PER_RUN` | `5` | Per-feed candidate limit before global scoring. |
 | `MAX_TOTAL_ARTICLES_PER_RUN` | `5` | Overall post limit for one run after scoring all candidates. |

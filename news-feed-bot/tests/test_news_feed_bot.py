@@ -221,6 +221,35 @@ def test_rank_articles_uses_newer_published_date_when_scores_tie():
     assert [article["id"] for article in ranked] == ["newer", "older"]
 
 
+def test_select_new_articles_returns_reason_counts():
+    entries = [
+        {"id": "posted", "title": "Stocks", "summary": "markets"},
+        {"id": "dup", "title": "Stocks", "summary": "markets"},
+        {"id": "dup", "title": "Stocks", "summary": "markets"},
+        {"id": "non-finance", "title": "Sports club wins", "summary": "final"},
+        {"id": "extra", "title": "Oil and gold markets", "summary": "commodities"},
+    ]
+
+    selected, skipped, reason_stats = bot.select_new_articles(
+        entries,
+        posted_ids=["posted"],
+        max_articles=1,
+        return_stats=True,
+    )
+
+    assert [article["id"] for article in selected] == ["dup"]
+    assert skipped == 4
+    assert reason_stats == {
+        "posted": 1,
+        "duplicate": 1,
+        "non_finance": 1,
+        "low_score": 0,
+        "per_feed_limit": 1,
+        "total_limit": 0,
+        "selected": 1,
+    }
+
+
 def test_fetch_and_post_applies_max_total_articles_per_run(tmp_path, monkeypatch):
     posted_ids_path = tmp_path / "posted_ids.json"
     posted_ids_path.write_text("[]", encoding="utf-8")
@@ -248,6 +277,55 @@ def test_fetch_and_post_applies_max_total_articles_per_run(tmp_path, monkeypatch
 
     assert sent_articles == ["high", "middle"]
     assert json.loads(posted_ids_path.read_text(encoding="utf-8")) == ["high", "middle"]
+
+
+def test_debug_selection_true_prints_reason_counts(tmp_path, monkeypatch, capsys):
+    posted_ids_path = tmp_path / "posted_ids.json"
+    posted_ids_path.write_text(json.dumps(["posted"]), encoding="utf-8")
+    entries = [
+        {"id": "posted", "title": "Stocks", "summary": "markets"},
+        {"id": "dup", "title": "Stocks", "summary": "markets"},
+        {"id": "dup", "title": "Stocks", "summary": "markets"},
+        {"id": "non-finance", "title": "Sports club wins", "summary": "final"},
+        {"id": "top", "title": "Breaking FRB inflation stocks", "summary": "markets"},
+        {"id": "extra", "title": "Oil and gold markets", "summary": "commodities"},
+    ]
+
+    monkeypatch.setattr(bot, "DEBUG_SELECTION", True)
+    monkeypatch.setattr(bot, "POSTED_IDS_FILE", posted_ids_path)
+    monkeypatch.setattr(bot, "RSS_FEEDS", [("Fixture RSS", "https://example.invalid/rss")])
+    monkeypatch.setattr(bot, "MAX_ARTICLES_PER_RUN", 2)
+    monkeypatch.setattr(bot, "MAX_TOTAL_ARTICLES_PER_RUN", 1)
+    monkeypatch.setattr(bot, "fetch_feed", lambda feed_name, rss_url: entries)
+    monkeypatch.setattr(bot, "post_article", lambda article, webhook_url=None, dry_run=False: None)
+    monkeypatch.setattr(bot, "send_dev_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot.time, "sleep", lambda seconds: None)
+
+    bot.fetch_and_post(dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "[DEBUG] Fixture RSS:" in output
+    assert "posted=1 duplicate=1 non_finance=1 low_score=0 per_feed_limit=1 total_limit=0 selected=2" in output
+    assert "[DEBUG] Selection stats:" in output
+    assert "posted=1 duplicate=1 non_finance=1 low_score=0 per_feed_limit=1 total_limit=1 selected=1" in output
+
+
+def test_debug_selection_false_suppresses_reason_counts(tmp_path, monkeypatch, capsys):
+    posted_ids_path = tmp_path / "posted_ids.json"
+    posted_ids_path.write_text("[]", encoding="utf-8")
+    entries = [{"id": "one", "title": "Stocks", "summary": "markets"}]
+
+    monkeypatch.setattr(bot, "DEBUG_SELECTION", False)
+    monkeypatch.setattr(bot, "POSTED_IDS_FILE", posted_ids_path)
+    monkeypatch.setattr(bot, "RSS_FEEDS", [("Fixture RSS", "https://example.invalid/rss")])
+    monkeypatch.setattr(bot, "fetch_feed", lambda feed_name, rss_url: entries)
+    monkeypatch.setattr(bot, "post_article", lambda article, webhook_url=None, dry_run=False: None)
+    monkeypatch.setattr(bot, "send_dev_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot.time, "sleep", lambda seconds: None)
+
+    bot.fetch_and_post(dry_run=True)
+
+    assert "[DEBUG]" not in capsys.readouterr().out
 
 
 def test_dry_run_prints_without_sending_to_discord(capsys):

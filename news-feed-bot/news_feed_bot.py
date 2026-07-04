@@ -121,6 +121,10 @@ MAX_ARTICLES_PER_RUN = int(ENV_VALUES.get("MAX_ARTICLES_PER_RUN", "5"))
 MAX_TOTAL_ARTICLES_PER_RUN = int(ENV_VALUES.get("MAX_TOTAL_ARTICLES_PER_RUN", "5"))
 FETCH_INTERVAL_MINUTES = int(ENV_VALUES.get("FETCH_INTERVAL_MINUTES", "60"))
 DRY_RUN = env_bool(ENV_VALUES.get("DRY_RUN", os.getenv("DRY_RUN")), default=False)
+DEBUG_SELECTION = env_bool(
+    ENV_VALUES.get("DEBUG_SELECTION", os.getenv("DEBUG_SELECTION")),
+    default=False,
+)
 
 GOOGLE_NEWS_RSS_URL = (
     f"https://news.google.com/rss/search?q={quote_plus(GOOGLE_NEWS_QUERY)}"
@@ -333,27 +337,74 @@ def published_sort_key(article):
     return time.mktime(published) if published else 0
 
 
-def select_new_articles(entries, posted_ids, *, max_articles=MAX_ARTICLES_PER_RUN):
+SELECTION_STAT_KEYS = [
+    "posted",
+    "duplicate",
+    "non_finance",
+    "low_score",
+    "per_feed_limit",
+    "total_limit",
+    "selected",
+]
+
+
+def empty_selection_stats():
+    return {key: 0 for key in SELECTION_STAT_KEYS}
+
+
+def add_selection_stats(total, partial):
+    for key in SELECTION_STAT_KEYS:
+        total[key] += partial.get(key, 0)
+
+
+def format_selection_stats(stats):
+    return " ".join(f"{key}={stats.get(key, 0)}" for key in SELECTION_STAT_KEYS)
+
+
+def debug_selection_log(message):
+    if DEBUG_SELECTION:
+        print(f"[DEBUG] {message}")
+
+
+def select_new_articles(
+    entries,
+    posted_ids,
+    *,
+    queued_ids=None,
+    max_articles=MAX_ARTICLES_PER_RUN,
+    return_stats=False,
+):
     posted_id_set = set(posted_ids)
-    queued_id_set = set()
+    queued_id_set = set(queued_ids or [])
     selected = []
     skipped = 0
+    reason_stats = empty_selection_stats()
 
     for entry in entries:
         entry_id = article_id(entry)
-        if not entry_id or entry_id in posted_id_set or entry_id in queued_id_set:
+        if not entry_id or entry_id in posted_id_set:
+            reason_stats["posted"] += 1
+            skipped += 1
+            continue
+        if entry_id in queued_id_set:
+            reason_stats["duplicate"] += 1
             skipped += 1
             continue
         if not is_finance_related(entry):
+            reason_stats["non_finance"] += 1
             skipped += 1
             continue
         if len(selected) >= max_articles:
+            reason_stats["per_feed_limit"] += 1
             skipped += 1
             continue
 
         selected.append(entry)
         queued_id_set.add(entry_id)
+        reason_stats["selected"] += 1
 
+    if return_stats:
+        return selected, skipped, reason_stats
     return selected, skipped
 
 
@@ -410,6 +461,7 @@ def fetch_and_post(*, dry_run=DRY_RUN):
         posted_ids = load_posted_ids()
         selected = []
         queued_ids = []
+        selection_stats = empty_selection_stats()
 
         for feed_name, rss_url in RSS_FEEDS:
             if STOP_REQUESTED:
@@ -421,23 +473,33 @@ def fetch_and_post(*, dry_run=DRY_RUN):
                 stats["fetch"] += len(feed_entries)
                 print(f"[OK] Fetched {len(feed_entries)} article(s): {feed_name}")
 
-                feed_selected, skipped = select_new_articles(
+                feed_selected, skipped, feed_selection_stats = select_new_articles(
                     feed_entries,
-                    [*posted_ids, *queued_ids],
+                    posted_ids,
+                    queued_ids=queued_ids,
                     max_articles=MAX_ARTICLES_PER_RUN,
+                    return_stats=True,
                 )
+                add_selection_stats(selection_stats, feed_selection_stats)
                 stats["skip"] += skipped
                 selected.extend(feed_selected)
                 queued_ids.extend(article_id(article) for article in feed_selected)
                 print(f"[INFO] Selected {len(feed_selected)} article(s): {feed_name}")
+                debug_selection_log(
+                    f"{feed_name}: {format_selection_stats(feed_selection_stats)}"
+                )
             except Exception as exc:
                 stats["error"] += 1
                 details.append(f"Fetch failed: {feed_name} ({exc})")
                 print(f"[ERROR] Failed to fetch {feed_name}: {exc}")
 
         ranked_selected = rank_articles(selected, max_articles=MAX_TOTAL_ARTICLES_PER_RUN)
-        stats["skip"] += len(selected) - len(ranked_selected)
+        total_limit_count = len(selected) - len(ranked_selected)
+        selection_stats["total_limit"] += total_limit_count
+        selection_stats["selected"] = len(ranked_selected)
+        stats["skip"] += total_limit_count
         selected = ranked_selected
+        debug_selection_log(f"Selection stats: {format_selection_stats(selection_stats)}")
 
         for index, article in enumerate(selected):
             if STOP_REQUESTED:
