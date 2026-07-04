@@ -47,13 +47,17 @@ def test_run_once_notifies_and_records_state_on_cross(monkeypatch):
 
     posted = []
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+    monkeypatch.setattr(bot, "save_state", lambda state: None)
 
     state = {}
     bot.run_once(state, dry_run=False)
 
     assert len(posted) == 1
-    assert posted[0]["title"] == "MACD Bullish Cross"
+    assert posted[0]["title"] == "Berial Market Watch: MACD Golden Cross"
+    assert "Signal" in [field["name"] for field in posted[0]["fields"]]
     assert bot.state_key() in state
+    assert state[bot.state_key()]["signal"] == "bullish"
+    assert state[bot.state_key()]["candle_time"] == close.index[-2].isoformat()
 
 
 def test_run_once_does_not_duplicate_notification_for_same_candle(monkeypatch):
@@ -64,12 +68,33 @@ def test_run_once_does_not_duplicate_notification_for_same_candle(monkeypatch):
 
     posted = []
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+    monkeypatch.setattr(bot, "save_state", lambda state: None)
 
     state = {}
     bot.run_once(state, dry_run=False)
     bot.run_once(state, dry_run=False)
 
     assert len(posted) == 1
+
+
+def test_run_once_does_not_duplicate_after_restart_style_state(monkeypatch):
+    values = [100.0] * 40 + [100.5, 100.5]
+    close = _make_close_series(values)
+
+    monkeypatch.setattr(bot, "fetch_candles", lambda: close)
+
+    posted = []
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+
+    state = {
+        bot.state_key(): {
+            "candle_time": close.index[-2].isoformat(),
+            "signal": "bullish",
+        }
+    }
+    bot.run_once(state, dry_run=False)
+
+    assert posted == []
 
 
 def test_run_once_skips_when_not_enough_candles(monkeypatch, caplog):
@@ -105,7 +130,7 @@ def test_validate_config_requires_webhook_unless_dry_run(monkeypatch):
 
 def test_validate_config_rejects_unsupported_symbol(monkeypatch):
     monkeypatch.setattr(bot, "DISCORD_WEBHOOK_URL", "https://discord.invalid/webhook")
-    monkeypatch.setattr(bot, "SYMBOL", "EUR_USD")
+    monkeypatch.setattr(bot, "SYMBOL", "")
 
     with pytest.raises(RuntimeError):
         bot.validate_config(dry_run=False)
@@ -113,9 +138,51 @@ def test_validate_config_rejects_unsupported_symbol(monkeypatch):
 
 def test_state_round_trips_through_disk(tmp_path, monkeypatch):
     state_path = tmp_path / "macd_alert_state.json"
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
     monkeypatch.setattr(bot, "STATE_FILE", state_path)
 
-    bot.save_state({"USD_JPY_M15": "2026-07-01T00:00:00+00:00"})
+    bot.save_state({"USD_JPY_M15": {"candle_time": "2026-07-01T00:00:00+00:00", "signal": "bullish"}})
     loaded = bot.load_state()
 
-    assert loaded == {"USD_JPY_M15": "2026-07-01T00:00:00+00:00"}
+    assert loaded == {"USD_JPY_M15": {"candle_time": "2026-07-01T00:00:00+00:00", "signal": "bullish"}}
+
+
+def test_load_config_reads_public_config_file(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[monitor]
+symbol = "USD_JPY"
+ticker = "JPY=X"
+timeframe = "M15"
+interval = "15m"
+period = "5d"
+
+[macd]
+macd_fast = 12
+macd_slow = 26
+macd_signal = 9
+
+[runtime]
+check_interval_seconds = 30
+
+[logging]
+log_level = "DEBUG"
+""",
+        encoding="utf-8",
+    )
+
+    config = bot.load_config(config_path)
+
+    assert config.symbol == "USD_JPY"
+    assert config.ticker == "JPY=X"
+    assert config.check_interval_seconds == 30
+    assert config.log_level == "DEBUG"
+
+
+def test_load_config_reports_invalid_toml(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[monitor\nsymbol = 'USD_JPY'", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Failed to parse config file"):
+        bot.load_config(config_path)

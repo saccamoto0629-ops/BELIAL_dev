@@ -197,292 +197,110 @@ pytestで以下を検証している。
 - COT Report
 
 FedWatch / Economic Calendar は外部取得元が不安定なため、今後も必須Providerではなく optional Provider として扱う。
+
 ---
 
-## 26. 現行 MACDクロス通知Bot 仕様 v1.2.1
+## 26. Berial v1.2.2 Market Watch / MACD Alert Bot
 
-この章は、`market-watch/` 配下に追加した MACDクロス通知Bot の現行仕様を反映する。
-
-v1.2.1 では、Berial はニュース監視・Market Snapshot に加えて、テクニカル指標の変化を監視する `market-watch` レイヤーを持つ。  
-現時点では、MACDクロスを検知してDiscordへ通知するのみであり、自動売買・自動発注・売買推奨は行わない。
+v1.2.2 は、`market-watch/macd_alert_bot.py` を継続運用しやすい監視モジュールとして整備するリリースである。v1.2系は MACD クロス通知Botの安定運用フェーズであり、市場判断ロジックは追加しない。
 
 ### 26.1 目的
 
-`market-watch` は、チャート特徴量監視の最初の実装である。
+- USD/JPY M15 の MACD(12,26,9) を監視する
+- 確定足ベースで bullish / bearish cross を検知する
+- Discord Webhookへ通知する
+- 再起動後も同じ足・同じsignalを重複通知しない
+- 運用ログと設定ファイルを整備する
 
-v1.2.1 の目的は以下。
+このBotは「シグナル検知・通知」までを担当する。売買判断、ブル/ベア判定、市場状態分類、エントリー判断は行わない。
 
-- USD/JPY の15分足を監視する
-- MACD(12,26,9) を計算する
-- 確定足ベースでMACDクロスを検知する
-- Bullish cross / Bearish cross をDiscordへ通知する
-- 同一足での重複通知を防止する
-- ニュース監視Botとは責務を分離する
-- 将来の市場状態分類・エントリーBot連携の前段にする
+### 26.2 追加・更新された機能
 
-### 26.2 ディレクトリ構成
-
-v1.2.1 時点の主要ファイルは以下。
-
-```text
-market-watch/
-├─ .env.example
-├─ README.md
-├─ macd_alert_bot.py
-└─ tests/
-   └─ test_macd_alert_bot.py
-```
-
-実行時には、以下のruntime fileが生成される場合がある。
-
-```text
-market-watch/macd_alert_state.json
-```
-
-`macd_alert_state.json` は重複通知防止用の状態ファイルであり、Git管理しない。
-
-### 26.3 news-feed-bot との責務分離
-
-`news-feed-bot` と `market-watch` は責務を分ける。
-
-| モジュール | 役割 |
+| 項目 | 内容 |
 |---|---|
-| `news-feed-bot` | RSSニュース監視、Market Snapshot投稿、ニュース重要度スコアリング |
-| `market-watch` | チャート特徴量監視、MACDクロス検知、テクニカルアラート通知 |
+| 設定外部化 | 公開可能な監視設定を `market-watch/config.toml` に分離 |
+| 秘匿情報管理 | `DISCORD_WEBHOOK_URL` などのsecretは `.env` に残す |
+| state管理 | `market-watch/state/macd_alert_state.json` に最後に通知した candle time と signal を保存 |
+| 通知改善 | symbol、timeframe、signal種別、golden/dead cross、価格、MACD、signal line、検知時刻、説明文を含める |
+| ログ強化 | `logs/macd_alert_bot.log` に起動、監視対象、取得結果、cross検知、Discord通知結果、例外を記録 |
+| エラー処理 | データ取得失敗やDiscord通知失敗はログに残し、継続運用できる形にする |
 
-v1.2.1 では、`market-watch/macd_alert_bot.py` は既存の `news-feed-bot/news_feed_bot.py` を変更せずに追加する。
+### 26.3 起動方式
 
-### 26.4 データ取得
+Linux運用パスは `/opt/berial` を想定する。
 
-v1.2.1 の初期実装では、ローソク足データ取得に `yfinance` を使用する。
+```bash
+cd /opt/berial
+python -m pip install -r requirements.txt
+cp market-watch/.env.example market-watch/.env
+python market-watch/macd_alert_bot.py --once --dry-run
+```
 
-初期監視対象:
+本番で継続監視する場合:
+
+```bash
+cd /opt/berial
+python market-watch/macd_alert_bot.py
+```
+
+`--dry-run` ではDiscord送信もstate更新も行わない。
+
+systemd化は v1.4 以降に回す。v1.2.2 ではPythonプロセスとして起動できる状態に留める。
+
+### 26.4 監視対象
+
+現行の既定値は以下。
 
 | 項目 | 値 |
 |---|---|
-| 通貨ペア | USD/JPY |
-| Symbol | `USDJPY=X` |
-| 時間足 | `15m` |
-| 監視間隔 | 60秒 |
+| symbol | `USD_JPY` |
+| ticker | `JPY=X` |
+| timeframe | `M15` |
+| interval | `15m` |
+| period | `5d` |
+| MACD | `12,26,9` |
+| check interval | `60s` |
 
-将来的には、OANDA API / MT5 / XM 連携への置き換えを検討する。  
-ただし、現時点では発注連携は行わない。
+設定は `market-watch/config.toml` で変更する。
 
-### 26.5 MACD設定
+### 26.5 state管理
 
-MACD設定は以下。
-
-| パラメータ | 値 |
-|---|---:|
-| Fast EMA | 12 |
-| Slow EMA | 26 |
-| Signal EMA | 9 |
-
-MACDラインは Fast EMA と Slow EMA の差分である。  
-Signalラインは MACDラインのEMAである。
-
-### 26.6 クロス判定
-
-クロス判定は、前回の確定足と今回の確定足のMACD / Signalの位置関係で行う。
-
-Bullish cross:
+重複通知防止のstateは以下に保存する。
 
 ```text
-prev_macd <= prev_signal
-and
-curr_macd > curr_signal
+market-watch/state/macd_alert_state.json
 ```
 
-Bearish cross:
+保存内容は `symbol + timeframe` 単位で、以下を含む。
 
-```text
-prev_macd >= prev_signal
-and
-curr_macd < curr_signal
-```
+- `candle_time`
+- `signal`
+- `price`
+- `macd`
+- `signal_line`
+- `notified_at`
 
-未確定足は判定対象にしない。  
-これにより、足確定前に一時的に発生して消える「幻のクロス」を通知しない。
+旧v1.2.1の `market-watch/macd_alert_state.json` が残っている場合も、初回読み込み時の互換性を持たせる。ただし新規保存先は `market-watch/state/` である。
 
-### 26.7 重複通知防止
+`state/`、`.env`、`__pycache__/`、`.pytest_cache/`、`logs/` はGit管理しない。
 
-同一足で同じクロスを複数回通知しないよう、状態ファイルを使用する。
+### 26.6 v1.3 / v1.4 以降
 
-```text
-market-watch/macd_alert_state.json
-```
+v1.3では、市場判断ロジックの追加を検討する。
 
-状態ファイルには、最後に通知した足の時刻やクロス種別を保存する。
+候補:
 
-dry-run時は、状態ファイルを更新しない。  
-これにより、検証実行を繰り返しても本番通知状態に影響しない。
+- Market Snapshotとの連携
+- Risk Labelとの連携
+- AI要約・市場インパクト判定
+- MACD以外の補助指標
 
-### 26.8 Discord通知仕様
+ただし v1.2.2 ではこれらを実装しない。
 
-MACDクロスを検知した場合、Discord Webhookへ通知する。
+v1.4以降で検討するもの:
 
-通知内容の例。
-
-```text
-Berial MACD Alert
-
-Symbol: USDJPY=X
-Timeframe: 15m
-Signal: Bullish Cross
-Candle Time: 2026-07-04 12:45 JST
-Close: 160.12
-MACD: 0.0123
-Signal: 0.0087
-```
-
-通知は市場状態の変化候補を知らせるものであり、売買推奨ではない。
-
-### 26.9 環境変数
-
-`market-watch/.env` に設定する。  
-`.env` はGit管理しない。
-
-```env
-DISCORD_WEBHOOK_URL=
-SYMBOL=USDJPY=X
-TIMEFRAME=15m
-MACD_FAST=12
-MACD_SLOW=26
-MACD_SIGNAL=9
-CHECK_INTERVAL_SECONDS=60
-```
-
-`.env.example` には本物のWebhook URLを書かない。
-
-本番用 `.env` はEC2上にのみ配置する。  
-Windowsローカル、GitHub、設計書には実値を書かない。
-
-### 26.10 実行方法
-
-単発dry-run:
-
-```bash
-cd /opt/berial
-python3 market-watch/macd_alert_bot.py --once --dry-run
-```
-
-単発本番実行:
-
-```bash
-cd /opt/berial
-python3 market-watch/macd_alert_bot.py --once
-```
-
-通常実行:
-
-```bash
-cd /opt/berial
-python3 market-watch/macd_alert_bot.py
-```
-
-nohupによる常駐実行:
-
-```bash
-cd /opt/berial
-nohup python3 market-watch/macd_alert_bot.py > logs/macd_alert_bot.log 2>&1 &
-```
-
-プロセス確認:
-
-```bash
-ps aux | grep macd_alert_bot
-```
-
-ログ確認:
-
-```bash
-tail -n 50 logs/macd_alert_bot.log
-```
-
-停止:
-
-```bash
-pkill -f macd_alert_bot.py
-```
-
-### 26.11 テスト
-
-pytestで `market-watch` のテストを実行する。
-
-```bash
-cd /opt/berial
-python3 -m pytest market-watch/tests -q
-```
-
-主な検証観点:
-
-- MACD計算が実行できること
-- Bullish crossを検知できること
-- Bearish crossを検知できること
-- クロスしていない場合は通知対象にならないこと
-- 同一足で重複通知しないこと
-- dry-run時にDiscord送信しないこと
-- dry-run時に状態ファイルを更新しないこと
-- `.env.example` と実装の設定項目が一致していること
-
-### 26.12 依存関係
-
-v1.2.1 で追加・利用する主な依存関係は以下。
-
-```text
-pandas
-yfinance
-requests
-pytest
-```
-
-EC2では、仮想環境を有効化した状態で以下を実行する。
-
-```bash
-cd /opt/berial
-python3 -m pip install -r requirements.txt
-```
-
-`ModuleNotFoundError: No module named 'pandas'` が出た場合は、仮想環境に依存関係が入っていない可能性が高い。
-
-### 26.13 運用状態
-
-v1.2.1 時点では、EC2上で以下の2プロセスを起動する運用とする。
-
-```text
-python3 market-watch/macd_alert_bot.py
-python3 news-feed-bot/news_feed_bot.py
-```
-
-`nohup` で起動した場合、TeraTermを閉じてもプロセスは継続する。
-
-確認例:
-
-```bash
-ps aux | grep -E 'macd_alert_bot|news_feed_bot'
-```
-
-### 26.14 現在の制約
-
-- `yfinance` のデータ取得に依存する
-- 15分足の取得可用性は外部サービス側に依存する
-- MACDクロス単体ではダマシが多い
-- クロス通知は売買判断ではない
-- 経済指標・ニュース・上位足トレンドはまだ統合していない
-- 複数通貨ペア監視は未対応
-- systemdによる常駐管理は未実装
-
-### 26.15 今後の拡張候補
-
-- OANDA APIによるローソク足取得
-- 複数通貨ペア監視
-- 複数時間足監視
-- 上位足トレンドフィルタ
-- RSI / ADX / 移動平均線との複合判定
-- Market Snapshotとの統合
-- ニュース重要度とテクニカルアラートの統合
-- `#market-alerts` チャンネルの新設
-- systemd化
-- Discord通知文のBerial人格化
-- エントリーBotの前段シグナルとして利用
-- クロス後の成績記録とバックテスト
+- systemd unit
+- restart policy
+- logrotate
+- production deploy手順
+---

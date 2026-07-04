@@ -4,7 +4,9 @@
 # Runtime files
 logs/
 **/posted_ids.json
-**/macd_alert_state.json
+market-watch/state/
+market-watch/macd_alert_state.json
+**/*.json.tmp
 
 # Python
 __pycache__/

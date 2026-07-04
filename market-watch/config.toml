@@ -1,0 +1,17 @@
+[monitor]
+symbol = "USD_JPY"
+ticker = "JPY=X"
+timeframe = "M15"
+interval = "15m"
+period = "5d"
+
+[macd]
+macd_fast = 12
+macd_slow = 26
+macd_signal = 9
+
+[runtime]
+check_interval_seconds = 60
+
+[logging]
+log_level = "INFO"

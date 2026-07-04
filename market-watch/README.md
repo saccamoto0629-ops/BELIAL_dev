@@ -1,12 +1,31 @@
-# MACD Cross Alert Bot (v1.2.1)
+# MACD Cross Alert Bot (v1.2.2)
 
 `market-watch/macd_alert_bot.py` monitors USD/JPY M15 candles and sends a Discord alert when MACD(12,26,9) makes a confirmed-candle bullish or bearish cross.
 
-The current data source is Yahoo Finance via `yfinance` (`JPY=X`). No broker account or market-data API key is required.
+v1.2.2 is an operations-hardening release. It does not add market-judgement logic. The bot only detects MACD crosses and notifies Discord.
 
-## Local setup on Linux
+## Files
 
-The production path is assumed to be `/opt/berial`.
+```text
+market-watch/
+├─ .env.example          # secret-only sample
+├─ config.toml           # public monitoring settings
+├─ README.md
+├─ macd_alert_bot.py
+└─ tests/
+   └─ test_macd_alert_bot.py
+```
+
+Runtime files are created outside Git:
+
+```text
+logs/macd_alert_bot.log
+market-watch/state/macd_alert_state.json
+```
+
+## Setup on Linux
+
+Production path is assumed to be `/opt/berial`.
 
 ```bash
 cd /opt/berial
@@ -14,19 +33,41 @@ python -m pip install -r requirements.txt
 cp market-watch/.env.example market-watch/.env
 ```
 
-Edit `market-watch/.env` and set a real Discord webhook only on the production host:
+Edit `market-watch/.env` and set:
 
 ```env
 DISCORD_WEBHOOK_URL=
-SYMBOL=USD_JPY
-TIMEFRAME=M15
-MACD_FAST=12
-MACD_SLOW=26
-MACD_SIGNAL=9
-CHECK_INTERVAL_SECONDS=60
 ```
 
-Do not commit `.env` or a real webhook URL.
+Do not commit `.env` or real webhook URLs.
+
+## Configuration
+
+Public monitoring settings live in `market-watch/config.toml`.
+
+```toml
+[monitor]
+symbol = "USD_JPY"
+ticker = "JPY=X"
+timeframe = "M15"
+interval = "15m"
+period = "5d"
+
+[macd]
+macd_fast = 12
+macd_slow = 26
+macd_signal = 9
+
+[runtime]
+check_interval_seconds = 60
+
+[logging]
+log_level = "INFO"
+```
+
+`.env` is reserved for secrets such as Discord webhook URLs and future API keys.
+
+For backward compatibility, old `.env` keys such as `SYMBOL`, `TIMEFRAME`, `MACD_FAST`, `MACD_SLOW`, `MACD_SIGNAL`, `CHECK_INTERVAL_SECONDS`, and `LOG_LEVEL` can still override config values, but new deployments should use `config.toml`.
 
 ## Run
 
@@ -51,33 +92,73 @@ cd /opt/berial
 python market-watch/macd_alert_bot.py
 ```
 
-`--dry-run` does not send to Discord and does not update `market-watch/macd_alert_state.json`.
+`--dry-run` does not send to Discord and does not update `market-watch/state/macd_alert_state.json`.
 
-## Cross detection logic
+## Cross detection
 
-1. Fetch recent USD/JPY M15 close prices from Yahoo Finance.
+1. Fetch recent close prices with `yfinance`.
 2. Calculate:
    - MACD line = EMA(12) - EMA(26)
    - Signal line = EMA(MACD, 9)
-3. Exclude the most recent bar because it may still be forming.
-4. Compare the two latest confirmed candles:
+3. Exclude the latest bar because it may still be forming.
+4. Compare confirmed candles:
    - previous confirmed candle: index `-3`
    - current confirmed candle: index `-2`
 5. Detect:
-   - bullish cross: previous `MACD - Signal <= 0`, current `MACD - Signal > 0`
-   - bearish cross: previous `MACD - Signal >= 0`, current `MACD - Signal < 0`
+   - golden cross / bullish: previous `MACD - Signal <= 0`, current `MACD - Signal > 0`
+   - dead cross / bearish: previous `MACD - Signal >= 0`, current `MACD - Signal < 0`
 
 ## Duplicate prevention
 
-The bot stores the notified candle timestamp in:
+State is saved in:
 
 ```text
-market-watch/macd_alert_state.json
+market-watch/state/macd_alert_state.json
 ```
 
-If the same `SYMBOL_TIMEFRAME` candle has already been notified, the bot skips sending again.
+The key is `symbol + timeframe`. The value stores:
 
-This file is runtime state and must not be committed.
+- last notified candle time
+- signal type
+- price
+- MACD value
+- signal-line value
+- notification time
+
+This prevents duplicate notifications for the same candle after a bot restart.
+
+## Discord alert content
+
+Alerts include:
+
+- symbol
+- timeframe
+- signal type and golden/dead cross label
+- confirmed candle time
+- current close price
+- MACD value
+- signal-line value
+- detection time
+- short explanation
+
+The tone is Berial-style market watch, but the content stays practical.
+
+## Logs
+
+Logs are written to:
+
+```text
+logs/macd_alert_bot.log
+```
+
+The log directory is created automatically. Logs include:
+
+- bot startup
+- monitored target and MACD settings
+- candle fetch success/failure
+- MACD cross detection
+- Discord notification success/failure
+- exceptions
 
 ## Tests
 
@@ -102,30 +183,20 @@ or:
 sudo rm -rf /opt/berial/.pytest_cache /opt/berial/news-feed-bot/.pytest_cache
 ```
 
-## Files
-
-```text
-market-watch/
-├─ .env.example
-├─ README.md
-├─ macd_alert_bot.py
-└─ tests/
-   └─ test_macd_alert_bot.py
-```
-
-## Git ignore / security notes
+## Security notes
 
 Do not commit:
 
 - `market-watch/.env`
 - real Discord webhook URLs
-- `market-watch/macd_alert_state.json`
+- `market-watch/state/`
+- `market-watch/macd_alert_state.json` from older versions
 - `__pycache__/`
 - `.pytest_cache/`
 - `logs/`
 
-The repository `.gitignore` excludes these runtime files.
+## Future
 
-## Future: OANDA data source
+v1.3 is reserved for market-judgement logic. v1.2.2 intentionally does not add judgement, scoring, or trade decisions.
 
-The current version uses Yahoo Finance. If more precise FX candles are needed later, replace `fetch_candles()` with an OANDA candle API implementation and enable the commented OANDA settings in `.env.example`.
+systemd service files and production daemonization are postponed to v1.4 or later.
