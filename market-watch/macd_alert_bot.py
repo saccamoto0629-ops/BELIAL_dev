@@ -77,14 +77,19 @@ def load_config(path=CONFIG_FILE):
 
         monitor = raw_config.get("monitor", {})
         macd = raw_config.get("macd", {})
-        runtime = raw_config.get("runtime", {})
+        runtime_config = raw_config.get("runtime", {})
         logging_config = raw_config.get("logging", {})
-        if not all(isinstance(section, dict) for section in (monitor, macd, runtime, logging_config)):
+        if not all(isinstance(section, dict) for section in (monitor, macd, runtime_config, logging_config)):
             raise RuntimeError(f"Invalid config file {path}: sections must be TOML tables")
 
         values.update({key: value for key, value in monitor.items() if key in values})
         values.update({key: value for key, value in macd.items() if key in values})
-        values.update({key: value for key, value in runtime.items() if key in values})
+        values["check_interval_seconds"] = int(
+            os.getenv(
+                "CHECK_INTERVAL_SECONDS",
+                runtime_config.get("check_interval_seconds", DEFAULT_CONFIG["check_interval_seconds"]),
+            )
+        )
         values.update({key: value for key, value in logging_config.items() if key in values})
 
     # Backward-compatible environment overrides for old .env files. Secrets
@@ -95,7 +100,7 @@ def load_config(path=CONFIG_FILE):
         "macd_fast": os.getenv("MACD_FAST") or ENV_VALUES.get("MACD_FAST"),
         "macd_slow": os.getenv("MACD_SLOW") or ENV_VALUES.get("MACD_SLOW"),
         "macd_signal": os.getenv("MACD_SIGNAL") or ENV_VALUES.get("MACD_SIGNAL"),
-        "check_interval_seconds": os.getenv("CHECK_INTERVAL_SECONDS") or ENV_VALUES.get("CHECK_INTERVAL_SECONDS"),
+        "check_interval_seconds": os.getenv("CHECK_INTERVAL_SECONDS"),
         "log_level": os.getenv("LOG_LEVEL") or ENV_VALUES.get("LOG_LEVEL"),
     }
     values.update({key: value for key, value in env_overrides.items() if value not in (None, "")})
