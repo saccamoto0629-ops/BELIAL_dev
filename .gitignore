@@ -1,18 +1,19 @@
 # Secrets
 **/.env
+.env
 
-# Runtime files
+# Runtime / cache
 logs/
 **/posted_ids.json
 market-watch/state/
 market-watch/macd_alert_state.json
 **/*.json.tmp
+.pytest_cache/
+**/.pytest_cache/
 
 # Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-**/.pytest_cache/
 .venv/
 venv/
 

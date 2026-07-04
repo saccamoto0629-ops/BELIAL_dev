@@ -11,6 +11,7 @@ from economic_calendar import EconomicEvent, get_economic_calendar
 from fedwatch import FedWatchSnapshot, get_fedwatch
 from fred_data import get_fred_data
 from market_data import get_market_data
+from market_bias import classify_market_bias, format_market_bias_section
 from tradingview_data import get_tradingview_data
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,8 @@ def build_market_snapshot_message(
     tv_data: dict,
     calendar_events: list[EconomicEvent] | None = None,
     fedwatch: FedWatchSnapshot | None = None,
+    *,
+    macd_signal: str | None = None,
 ) -> str:
     """Build the Discord message body (plain Markdown) from already-fetched data."""
     lines = ["\U0001f4ca Market Snapshot", ""]
@@ -286,6 +289,13 @@ def build_market_snapshot_message(
 
     lines.append("[Risk Label]")
     lines.append(compute_risk_label(market_data, fred_data))
+    lines.append("")
+
+    try:
+        bias = classify_market_bias(market_data, fred_data, tv_data, macd_signal=macd_signal)
+        lines.append(format_market_bias_section(bias))
+    except Exception as exc:
+        logger.warning("[market_snapshot] Market Bias failed: %s", exc)
 
     return "\n".join(lines)
 
