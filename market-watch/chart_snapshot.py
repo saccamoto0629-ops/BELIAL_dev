@@ -89,6 +89,9 @@ def build_indicator_snapshot(
     sma20 = _float_or_none(latest.get("sma20"))
     sma75 = _float_or_none(latest.get("sma75"))
     bb_position = _float_or_none(latest.get("bb_position"))
+    macd = _float_or_none(latest.get("macd"))
+    macd_signal = _float_or_none(latest.get("macd_signal"))
+    macd_hist = _float_or_none(latest.get("macd_hist"))
     timestamp = indicators.index[-1].isoformat()
     freshness, age_seconds = freshness_from_timestamp(timestamp, now_utc=now_utc)
     is_stale = freshness == "Stale"
@@ -107,6 +110,10 @@ def build_indicator_snapshot(
         bb_upper=_float_or_none(latest.get("bb_upper")),
         bb_width_pct=_float_or_none(latest.get("bb_width_pct")),
         bb_position=bb_position,
+        macd=macd,
+        macd_signal=macd_signal,
+        macd_hist=macd_hist,
+        macd_state=str(latest.get("macd_state") or "Neutral"),
         freshness=freshness,
         age_seconds=age_seconds,
         bias_weight=MARKET_CLOSED_BIAS_WEIGHT if is_market_closed else (0.0 if is_stale else 1.0),
@@ -148,6 +155,8 @@ def format_snapshot(snapshot: IndicatorSnapshot) -> str:
             f"BB: {_fmt(snapshot.bb_lower)} / {_fmt(snapshot.bb_middle)} / {_fmt(snapshot.bb_upper)}",
             f"BB Width: {_fmt(snapshot.bb_width_pct)}%",
             f"BB Position: {_fmt(snapshot.bb_position)}",
+            f"MACD: {_fmt(snapshot.macd, 5)} / Signal: {_fmt(snapshot.macd_signal, 5)} / Hist: {_fmt(snapshot.macd_hist, 5)}",
+            f"MACD State: {snapshot.macd_state}",
             f"Trend: {snapshot.trend}",
             f"State: {snapshot.state}",
         ]

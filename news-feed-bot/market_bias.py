@@ -154,9 +154,17 @@ def _score_chart_signals(chart_data, tv_data: dict | None) -> tuple[dict[str, fl
             scores["Bull"] += weight
         elif trend == "Bear":
             scores["Bear"] += weight
-        else:
-            continue
-        reasons.append(f"Chart {symbol} 1h trend is {trend} (weight {weight:.2f})")
+        if trend in {"Bull", "Bear"}:
+            reasons.append(f"Chart {symbol} 1h trend is {trend} (weight {weight:.2f})")
+
+        macd_state = _snapshot_get(snapshot, "macd_state")
+        macd_weight = 0.5 * weight
+        if macd_state == "Bullish":
+            scores["Bull"] += macd_weight
+            reasons.append(f"Chart {symbol} 1h MACD is Bullish (weight {macd_weight:.2f})")
+        elif macd_state == "Bearish":
+            scores["Bear"] += macd_weight
+            reasons.append(f"Chart {symbol} 1h MACD is Bearish (weight {macd_weight:.2f})")
 
         tv_recommendation = _recommendation(tv_data.get(symbol))
         if (

@@ -14,7 +14,8 @@ def calculate_indicators(frame: pd.DataFrame) -> pd.DataFrame:
 
     Expected input columns are at least ``close``. The returned frame includes:
     ``sma20``, ``sma75``, ``ema20``, ``bb_middle``, ``bb_upper``, ``bb_lower``,
-    ``bb_width_pct``, and ``bb_position``.
+    ``bb_width_pct``, ``bb_position``, ``macd``, ``macd_signal``,
+    ``macd_hist``, and ``macd_state``.
     """
     if "close" not in frame.columns:
         raise ValueError("frame must contain a 'close' column")
@@ -34,7 +35,63 @@ def calculate_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     band_range = result["bb_upper"] - result["bb_lower"]
     result["bb_width_pct"] = (band_range / result["bb_middle"]) * 100
     result["bb_position"] = (close - result["bb_lower"]) / band_range
+
+    macd, macd_signal, macd_hist = calculate_macd(close)
+    result["macd"] = macd
+    result["macd_signal"] = macd_signal
+    result["macd_hist"] = macd_hist
+    result["macd_state"] = [
+        classify_macd_state(macd_value, signal_value, hist_value)
+        for macd_value, signal_value, hist_value in zip(macd, macd_signal, macd_hist)
+    ]
     return result
+
+
+def calculate_macd(
+    close: pd.Series,
+    *,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Return MACD, signal, and histogram series.
+
+    MACD = EMA12 - EMA26 by default. The signal line is EMA9 of MACD, and the
+    histogram is MACD - signal.
+    """
+    close = close.astype(float)
+    macd = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    return macd, macd_signal, macd_hist
+
+
+def detect_macd_cross(prev_macd, prev_signal, curr_macd, curr_signal) -> str | None:
+    """Return bullish/bearish when MACD crosses the signal line."""
+    prev_diff = prev_macd - prev_signal
+    curr_diff = curr_macd - curr_signal
+    if prev_diff <= 0 and curr_diff > 0:
+        return "bullish"
+    if prev_diff >= 0 and curr_diff < 0:
+        return "bearish"
+    return None
+
+
+def classify_macd_state(macd: float | None, macd_signal: float | None, macd_hist: float | None) -> str:
+    if (
+        macd is None
+        or macd_signal is None
+        or macd_hist is None
+        or pd.isna(macd)
+        or pd.isna(macd_signal)
+        or pd.isna(macd_hist)
+    ):
+        return "Neutral"
+    if macd > macd_signal and macd_hist > 0:
+        return "Bullish"
+    if macd < macd_signal and macd_hist < 0:
+        return "Bearish"
+    return "Neutral"
 
 
 def classify_trend(close: float, sma20: float | None, sma75: float | None) -> str:

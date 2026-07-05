@@ -21,6 +21,33 @@ def test_calculate_indicators_adds_moving_averages_and_bollinger_bands():
     assert latest["bb_lower"] < latest["bb_middle"] < latest["bb_upper"]
     assert latest["bb_width_pct"] > 0
     assert latest["bb_position"] > 0
+    assert latest["macd"] == result["macd"].iloc[-1]
+    assert latest["macd_hist"] == latest["macd"] - latest["macd_signal"]
+    assert latest["macd_state"] in {"Bullish", "Bearish", "Neutral"}
+
+
+def test_calculate_macd_returns_macd_signal_and_histogram():
+    close = pd.Series([100 + i * 0.1 for i in range(60)])
+
+    macd, macd_signal, macd_hist = indicators.calculate_macd(close)
+
+    assert len(macd) == len(close)
+    assert len(macd_signal) == len(close)
+    assert len(macd_hist) == len(close)
+    assert macd_hist.iloc[-1] == macd.iloc[-1] - macd_signal.iloc[-1]
+
+
+def test_detect_macd_cross_rules():
+    assert indicators.detect_macd_cross(-0.1, 0.0, 0.1, 0.0) == "bullish"
+    assert indicators.detect_macd_cross(0.1, 0.0, -0.1, 0.0) == "bearish"
+    assert indicators.detect_macd_cross(0.2, 0.0, 0.1, 0.0) is None
+
+
+def test_classify_macd_state_rules():
+    assert indicators.classify_macd_state(1.0, 0.5, 0.5) == "Bullish"
+    assert indicators.classify_macd_state(0.5, 1.0, -0.5) == "Bearish"
+    assert indicators.classify_macd_state(1.0, 1.0, 0.0) == "Neutral"
+    assert indicators.classify_macd_state(None, 1.0, 0.0) == "Neutral"
 
 
 def test_classify_trend_rules():

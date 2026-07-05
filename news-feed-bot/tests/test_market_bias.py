@@ -167,7 +167,7 @@ def test_chart_stale_data_is_excluded_from_market_bias():
         None,
         {},
         chart_data=[
-            {"symbol": "SPX", "trend": "Bull", "freshness": "Stale", "bias_weight": 1.0},
+            {"symbol": "SPX", "trend": "Bull", "macd_state": "Bullish", "freshness": "Stale", "bias_weight": 1.0},
         ],
     )
 
@@ -181,7 +181,7 @@ def test_weekend_closed_chart_data_uses_reduced_bias_weight():
         None,
         {},
         chart_data=[
-            {"symbol": "SPX", "trend": "Bull", "freshness": "Weekend Closed", "bias_weight": 0.25},
+            {"symbol": "SPX", "trend": "Bull", "macd_state": "Neutral", "freshness": "Weekend Closed", "bias_weight": 0.25},
         ],
     )
 
@@ -195,8 +195,36 @@ def test_chart_tv_mixed_reason_is_added_on_conflict():
         None,
         {"SPX": {"recommendation": "SELL"}},
         chart_data=[
-            {"symbol": "SPX", "trend": "Bull", "freshness": "Fresh", "bias_weight": 1.0},
+            {"symbol": "SPX", "trend": "Bull", "macd_state": "Neutral", "freshness": "Fresh", "bias_weight": 1.0},
         ],
     )
 
     assert "Chart/TV mixed" in result["reasons"]
+
+
+def test_chart_macd_state_adds_lightweight_bull_score():
+    result = mb.classify_market_bias(
+        {"VIX": make_snapshot(17.0, 18.0)},
+        None,
+        {},
+        chart_data=[
+            {"symbol": "USDJPY", "trend": "Neutral", "macd_state": "Bullish", "freshness": "Fresh", "bias_weight": 1.0},
+        ],
+    )
+
+    assert result["scores"]["Bull"] == 1.5
+    assert "Chart USDJPY 1h MACD is Bullish (weight 0.50)" in result["reasons"]
+
+
+def test_chart_macd_state_adds_lightweight_bear_score_with_market_closed_weight():
+    result = mb.classify_market_bias(
+        {"VIX": make_snapshot(17.0, 18.0)},
+        None,
+        {},
+        chart_data=[
+            {"symbol": "USDJPY", "trend": "Neutral", "macd_state": "Bearish", "freshness": "Weekend Closed", "bias_weight": 0.25},
+        ],
+    )
+
+    assert result["scores"]["Bear"] == 0.125
+    assert "Chart USDJPY 1h MACD is Bearish (weight 0.12)" in result["reasons"]

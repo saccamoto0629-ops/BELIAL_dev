@@ -243,7 +243,7 @@ def format_chart_summary_section(chart_snapshots: list | None) -> str:
     for snapshot in chart_snapshots:
         lines.append(
             "- {symbol} 1h: Trend {trend} / State {state} / Freshness {freshness} "
-            "/ Bias Weight {bias_weight:.2f} / BB Position {bb_position}".format(
+            "/ Bias Weight {bias_weight:.2f} / BB Position {bb_position} / MACD State {macd_state}".format(
                 symbol=_snapshot_get(snapshot, "symbol", "UNKNOWN"),
                 trend=_snapshot_get(snapshot, "trend", "N/A"),
                 state=_snapshot_get(snapshot, "state", "N/A"),
@@ -254,6 +254,7 @@ def format_chart_summary_section(chart_snapshots: list | None) -> str:
                     if _snapshot_get(snapshot, "bb_position") is None
                     else f"{float(_snapshot_get(snapshot, 'bb_position')):.2f}"
                 ),
+                macd_state=_snapshot_get(snapshot, "macd_state", "N/A"),
             )
         )
     return "\n".join(lines)

@@ -18,6 +18,8 @@ from pathlib import Path
 import requests
 import yfinance as yf
 
+from indicators import calculate_macd, detect_macd_cross
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 CONFIG_FILE = BASE_DIR / "config.toml"
@@ -236,19 +238,12 @@ def fetch_candles():
 
 
 def compute_macd(close, *, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
-    macd_line = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    macd_line, signal_line, _hist = calculate_macd(close, fast=fast, slow=slow, signal=signal)
     return macd_line, signal_line
 
 
 def detect_cross(prev_macd, prev_signal, curr_macd, curr_signal):
-    prev_diff = prev_macd - prev_signal
-    curr_diff = curr_macd - curr_signal
-    if prev_diff <= 0 and curr_diff > 0:
-        return "bullish"
-    if prev_diff >= 0 and curr_diff < 0:
-        return "bearish"
-    return None
+    return detect_macd_cross(prev_macd, prev_signal, curr_macd, curr_signal)
 
 
 def post_discord_embed(embed, *, dry_run=False):

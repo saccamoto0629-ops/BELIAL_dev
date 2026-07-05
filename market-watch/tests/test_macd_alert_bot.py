@@ -36,6 +36,23 @@ def test_compute_macd_returns_macd_and_signal_lines():
     assert len(signal_line) == len(close)
 
 
+def test_compute_macd_uses_shared_indicator_function(monkeypatch):
+    close = _make_close_series([100 + i * 0.1 for i in range(60)])
+    calls = []
+
+    def fake_calculate_macd(close_series, *, fast=12, slow=26, signal=9):
+        calls.append((fast, slow, signal))
+        return close_series, close_series + 1, close_series + 2
+
+    monkeypatch.setattr(bot, "calculate_macd", fake_calculate_macd)
+
+    macd_line, signal_line = bot.compute_macd(close, fast=1, slow=2, signal=3)
+
+    assert calls == [(1, 2, 3)]
+    assert macd_line.equals(close)
+    assert signal_line.equals(close + 1)
+
+
 def test_run_once_notifies_and_records_state_on_cross(monkeypatch):
     # 40 flat bars (diff == 0) then one bar that pushes MACD above the signal
     # line, then one more (still-forming, excluded) bar. The cross lands

@@ -40,6 +40,10 @@ class IndicatorSnapshot:
     bb_upper: float | None
     bb_width_pct: float | None
     bb_position: float | None
+    macd: float | None
+    macd_signal: float | None
+    macd_hist: float | None
+    macd_state: str
     freshness: str
     age_seconds: int
     bias_weight: float

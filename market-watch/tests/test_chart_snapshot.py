@@ -43,6 +43,7 @@ def test_build_indicator_snapshot_and_format_message():
     assert "Bias Weight: 1.00" in message
     assert "SMA20:" in message
     assert "BB Width:" in message
+    assert "MACD State:" in message
     assert "Trend: Bull" in message
 
 
