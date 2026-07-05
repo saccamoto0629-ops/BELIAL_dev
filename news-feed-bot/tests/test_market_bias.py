@@ -159,3 +159,44 @@ def test_format_market_bias_section_does_not_expose_tv_buy_sell_words():
 
     assert "BUY" not in section
     assert "SELL" not in section
+
+
+def test_chart_stale_data_is_excluded_from_market_bias():
+    result = mb.classify_market_bias(
+        {},
+        None,
+        {},
+        chart_data=[
+            {"symbol": "SPX", "trend": "Bull", "freshness": "Stale", "bias_weight": 1.0},
+        ],
+    )
+
+    assert result["market_bias"] == "Neutral"
+    assert result["scores"] == {"Bull": 0, "Bear": 0}
+
+
+def test_weekend_closed_chart_data_uses_reduced_bias_weight():
+    result = mb.classify_market_bias(
+        {"VIX": make_snapshot(17.0, 18.0)},
+        None,
+        {},
+        chart_data=[
+            {"symbol": "SPX", "trend": "Bull", "freshness": "Weekend Closed", "bias_weight": 0.25},
+        ],
+    )
+
+    assert result["scores"]["Bull"] == 1.25
+    assert any("Chart SPX 1h trend is Bull" in reason for reason in result["reasons"])
+
+
+def test_chart_tv_mixed_reason_is_added_on_conflict():
+    result = mb.classify_market_bias(
+        {"VIX": make_snapshot(17.0, 18.0)},
+        None,
+        {"SPX": {"recommendation": "SELL"}},
+        chart_data=[
+            {"symbol": "SPX", "trend": "Bull", "freshness": "Fresh", "bias_weight": 1.0},
+        ],
+    )
+
+    assert "Chart/TV mixed" in result["reasons"]

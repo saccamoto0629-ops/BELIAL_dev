@@ -1,0 +1,234 @@
+"""Build and send Berial chart snapshots.
+
+This module is independent from news_feed_bot.py and is observation-only. It
+does not implement entries, exits, lot sizing, orders, or automated trading.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import UTC, datetime, timezone, timedelta
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+from chart_collector import (
+    DEFAULT_PERIOD,
+    chart_db_path,
+    collect_all,
+    load_candles,
+    load_chart_targets,
+    load_env_file,
+)
+from chart_models import ChartTarget, IndicatorSnapshot
+from indicators import calculate_indicators, classify_bb_state, classify_trend
+
+REQUEST_TIMEOUT_SECONDS = 20
+JST = timezone(timedelta(hours=9), name="JST")
+STALE_AFTER = timedelta(hours=24)
+MARKET_CLOSED_BIAS_WEIGHT = 0.25
+
+
+def _float_or_none(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def parse_timestamp_utc(timestamp: str) -> pd.Timestamp:
+    parsed = pd.Timestamp(timestamp)
+    if parsed.tzinfo is None:
+        return parsed.tz_localize(UTC)
+    return parsed.tz_convert(UTC)
+
+
+def is_market_closed_window(now_utc: datetime | pd.Timestamp | None = None) -> tuple[bool, str | None]:
+    now = pd.Timestamp(now_utc if now_utc is not None else datetime.now(UTC))
+    if now.tzinfo is None:
+        now = now.tz_localize(UTC)
+    else:
+        now = now.tz_convert(UTC)
+    now_jst = now.tz_convert(JST)
+    weekday = now_jst.weekday()
+    if weekday in {5, 6}:
+        return True, "Weekend Closed"
+    if weekday == 0 and now_jst.hour < 7:
+        return True, "Market Closed"
+    return False, None
+
+
+def freshness_from_timestamp(timestamp: str, *, now_utc: datetime | pd.Timestamp | None = None) -> tuple[str, int]:
+    now = pd.Timestamp(now_utc if now_utc is not None else datetime.now(UTC))
+    if now.tzinfo is None:
+        now = now.tz_localize(UTC)
+    else:
+        now = now.tz_convert(UTC)
+    age = max(timedelta(0), now.to_pydatetime() - parse_timestamp_utc(timestamp).to_pydatetime())
+    is_closed, closed_label = is_market_closed_window(now)
+    if is_closed:
+        freshness = closed_label or "Market Closed"
+    else:
+        freshness = "Stale" if age > STALE_AFTER else "Fresh"
+    return freshness, int(age.total_seconds())
+
+
+def build_indicator_snapshot(
+    target: ChartTarget,
+    candles: pd.DataFrame,
+    *,
+    now_utc: datetime | pd.Timestamp | None = None,
+) -> IndicatorSnapshot | None:
+    if candles.empty:
+        return None
+
+    indicators = calculate_indicators(candles)
+    latest = indicators.iloc[-1]
+    close = float(latest["close"])
+    sma20 = _float_or_none(latest.get("sma20"))
+    sma75 = _float_or_none(latest.get("sma75"))
+    bb_position = _float_or_none(latest.get("bb_position"))
+    timestamp = indicators.index[-1].isoformat()
+    freshness, age_seconds = freshness_from_timestamp(timestamp, now_utc=now_utc)
+    is_stale = freshness == "Stale"
+    is_market_closed = freshness in {"Weekend Closed", "Market Closed"}
+
+    return IndicatorSnapshot(
+        symbol=target.symbol,
+        timeframe=target.timeframe,
+        timestamp=timestamp,
+        close=close,
+        sma20=sma20,
+        sma75=sma75,
+        ema20=_float_or_none(latest.get("ema20")),
+        bb_lower=_float_or_none(latest.get("bb_lower")),
+        bb_middle=_float_or_none(latest.get("bb_middle")),
+        bb_upper=_float_or_none(latest.get("bb_upper")),
+        bb_width_pct=_float_or_none(latest.get("bb_width_pct")),
+        bb_position=bb_position,
+        freshness=freshness,
+        age_seconds=age_seconds,
+        bias_weight=MARKET_CLOSED_BIAS_WEIGHT if is_market_closed else (0.0 if is_stale else 1.0),
+        trend="Stale" if is_stale else classify_trend(close, sma20, sma75),
+        state="Stale" if is_stale else classify_bb_state(bb_position),
+    )
+
+
+def _fmt(value: float | None, digits: int = 2) -> str:
+    return "N/A" if value is None else f"{value:.{digits}f}"
+
+
+def format_timestamp_jst(timestamp: str) -> str:
+    return parse_timestamp_utc(timestamp).tz_convert(JST).strftime("%Y-%m-%d %H:%M JST")
+
+
+def format_age(age_seconds: int) -> str:
+    hours, remainder = divmod(max(age_seconds, 0), 3600)
+    minutes = remainder // 60
+    if hours >= 24:
+        days, day_hours = divmod(hours, 24)
+        return f"{days}d {day_hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def format_snapshot(snapshot: IndicatorSnapshot) -> str:
+    return "\n".join(
+        [
+            f"{snapshot.symbol} {snapshot.timeframe}",
+            f"Time: {format_timestamp_jst(snapshot.timestamp)}",
+            f"Freshness: {snapshot.freshness} ({format_age(snapshot.age_seconds)} old)",
+            f"Bias Weight: {_fmt(snapshot.bias_weight)}",
+            f"Close: {_fmt(snapshot.close)}",
+            f"SMA20: {_fmt(snapshot.sma20)}",
+            f"SMA75: {_fmt(snapshot.sma75)}",
+            f"EMA20: {_fmt(snapshot.ema20)}",
+            f"BB: {_fmt(snapshot.bb_lower)} / {_fmt(snapshot.bb_middle)} / {_fmt(snapshot.bb_upper)}",
+            f"BB Width: {_fmt(snapshot.bb_width_pct)}%",
+            f"BB Position: {_fmt(snapshot.bb_position)}",
+            f"Trend: {snapshot.trend}",
+            f"State: {snapshot.state}",
+        ]
+    )
+
+
+def build_chart_snapshot_message(snapshots: list[IndicatorSnapshot]) -> str:
+    if not snapshots:
+        return "📈 Chart Snapshot\n\n- unavailable"
+    sections = ["📈 Chart Snapshot"]
+    sections.extend(format_snapshot(snapshot) for snapshot in snapshots)
+    return "\n\n".join(sections)
+
+
+def post_discord_message(webhook_url: str, message: str, *, dry_run: bool = False, session=requests) -> None:
+    if dry_run:
+        print(f"[DRY_RUN] Would send Chart Snapshot:\n{message}")
+        return
+    response = session.post(
+        webhook_url,
+        json={"content": message[:2000]},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+
+def load_webhook_url(env_values: dict[str, str]) -> str:
+    return env_values.get("DISCORD_WEBHOOK_URL", "").strip()
+
+
+def collect_and_build_snapshots(
+    targets: list[ChartTarget],
+    db_path: Path,
+    *,
+    period: str = DEFAULT_PERIOD,
+    collect: bool = True,
+) -> list[IndicatorSnapshot]:
+    if collect:
+        collect_all(targets, db_path, period=period)
+
+    snapshots: list[IndicatorSnapshot] = []
+    for target in targets:
+        candles = load_candles(db_path, target.symbol, target.timeframe, limit=200)
+        snapshot = build_indicator_snapshot(target, candles)
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Send Berial chart snapshot to Discord.")
+    parser.add_argument("--once", action="store_true", help="Collect charts, send one snapshot, and exit.")
+    parser.add_argument("--dry-run", action="store_true", help="Print payload instead of sending to Discord.")
+    parser.add_argument(
+        "--skip-fetch",
+        action="store_true",
+        help="Use existing SQLite candles without fetching from Yahoo Finance.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    args = parse_args(argv)
+    env_values = load_env_file()
+    dry_run = args.dry_run or env_values.get("DRY_RUN", "").lower() in {"1", "true", "yes", "on"}
+    webhook_url = load_webhook_url(env_values)
+    if not dry_run and not webhook_url:
+        raise RuntimeError("DISCORD_WEBHOOK_URL is not set in market-watch/.env")
+
+    targets = load_chart_targets(env_values)
+    db_path = chart_db_path(env_values)
+    period = env_values.get("CHART_HISTORY_PERIOD", DEFAULT_PERIOD)
+    snapshots = collect_and_build_snapshots(targets, db_path, period=period, collect=not args.skip_fetch)
+    message = build_chart_snapshot_message(snapshots)
+    post_discord_message(webhook_url, message, dry_run=dry_run)
+
+    if not args.once:
+        print("[INFO] Chart snapshot sent once. Add scheduling later if continuous mode is needed.")
+
+
+if __name__ == "__main__":
+    main()

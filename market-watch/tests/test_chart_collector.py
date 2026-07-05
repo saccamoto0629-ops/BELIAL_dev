@@ -1,0 +1,116 @@
+import pathlib
+import sqlite3
+import sys
+
+import pandas as pd
+
+BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BOT_DIR))
+
+import chart_collector as collector  # noqa: E402
+from chart_models import ChartTarget  # noqa: E402
+
+
+def test_load_chart_targets_reads_env_values():
+    targets = collector.load_chart_targets(
+        {
+            "CHART_SYMBOLS": "USDJPY,SPX",
+            "CHART_TIMEFRAMES": "15m,1h",
+            "CHART_TICKER_USDJPY": "JPY=X",
+            "CHART_TICKER_SPX": "^GSPC",
+        }
+    )
+
+    assert targets == [
+        ChartTarget("USDJPY", "JPY=X", "15m"),
+        ChartTarget("USDJPY", "JPY=X", "1h"),
+        ChartTarget("SPX", "^GSPC", "15m"),
+        ChartTarget("SPX", "^GSPC", "1h"),
+    ]
+
+
+def test_save_and_load_candles_roundtrip(tmp_path):
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+    frame = pd.DataFrame(
+        {
+            "open": [1.0, 2.0],
+            "high": [1.5, 2.5],
+            "low": [0.5, 1.5],
+            "close": [1.2, 2.2],
+            "volume": [100, 200],
+        },
+        index=pd.to_datetime(["2026-07-05T00:00:00Z", "2026-07-05T00:15:00Z"]),
+    )
+    db_path = tmp_path / "chart.sqlite3"
+
+    count = collector.save_candles(db_path, collector.candles_from_frame(target, frame))
+    loaded = collector.load_candles(db_path, "USDJPY", "15m")
+
+    assert count == 2
+    assert len(loaded) == 2
+    assert loaded.iloc[-1]["close"] == 2.2
+
+    with sqlite3.connect(db_path) as connection:
+        row_count = connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+    assert row_count == 2
+
+
+def test_candles_from_frame_stores_timezone_aware_timestamps_as_utc_z():
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+    frame = pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [1.5],
+            "low": [0.5],
+            "close": [1.2],
+            "volume": [100],
+        },
+        index=pd.to_datetime(["2026-07-04T05:45:00+09:00"]),
+    )
+
+    candles = collector.candles_from_frame(target, frame)
+
+    assert candles[0].timestamp == "2026-07-03T20:45:00Z"
+
+
+def test_load_candles_returns_utc_index(tmp_path):
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+    frame = pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [1.5],
+            "low": [0.5],
+            "close": [1.2],
+            "volume": [100],
+        },
+        index=pd.to_datetime(["2026-07-04T05:45:00+09:00"]),
+    )
+    db_path = tmp_path / "chart.sqlite3"
+
+    collector.save_candles(db_path, collector.candles_from_frame(target, frame))
+    loaded = collector.load_candles(db_path, "USDJPY", "15m")
+
+    assert loaded.index[0].isoformat() == "2026-07-03T20:45:00+00:00"
+
+
+def test_migration_note_documents_old_timestamp_policy():
+    assert "deleting market-watch/data/chart_data.sqlite3" in collector.MIGRATION_NOTE
+    assert "to_utc_iso_z" in collector.MIGRATION_NOTE
+
+
+def test_collect_target_fetches_and_saves_with_mock(monkeypatch, tmp_path):
+    target = ChartTarget("VIX", "^VIX", "1h")
+    frame = pd.DataFrame(
+        {
+            "open": [10.0],
+            "high": [11.0],
+            "low": [9.0],
+            "close": [10.5],
+            "volume": [0],
+        },
+        index=pd.to_datetime(["2026-07-05T01:00:00Z"]),
+    )
+
+    monkeypatch.setattr(collector, "fetch_ohlcv", lambda target, *, period=collector.DEFAULT_PERIOD: frame)
+
+    assert collector.collect_target(target, tmp_path / "chart.sqlite3") == 1

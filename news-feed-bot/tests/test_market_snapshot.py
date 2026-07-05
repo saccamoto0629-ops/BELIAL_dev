@@ -155,6 +155,17 @@ def test_build_market_snapshot_message_includes_all_sections():
         tv_data,
         calendar_events,
         fedwatch,
+        chart_snapshots=[
+            {
+                "symbol": "SPX",
+                "timeframe": "1h",
+                "trend": "Bull",
+                "state": "Inside band",
+                "freshness": "Fresh",
+                "bias_weight": 1.0,
+                "bb_position": 0.67,
+            }
+        ],
     )
 
     assert "[VIX]" in message
@@ -172,6 +183,8 @@ def test_build_market_snapshot_message_includes_all_sections():
     assert "- PCE: 124.10 as of 2026-06-01" in message
     assert "- Unemployment: 4.10% as of 2026-06-01" in message
     assert "- USDJPY: BUY / RSI 61.2 / ADX 24.0 / STOCH 70.0/65.0" in message
+    assert "[Chart Snapshot Summary]" in message
+    assert "- SPX 1h: Trend Bull / State Inside band / Freshness Fresh / Bias Weight 1.00 / BB Position 0.67" in message
     assert "📅 Today's Events" in message
     assert "🇺🇸 CPI ★★★" in message
     assert "21:30" in message
@@ -190,10 +203,15 @@ def test_build_market_snapshot_message_shows_unavailable_without_fred():
     assert "[Rates / FRED]\n- unavailable" in message
 
 
+def test_format_chart_summary_section_reports_unavailable_when_missing():
+    assert snap.format_chart_summary_section([]) == "[Chart Snapshot Summary]\n- unavailable"
+
+
 def test_get_market_snapshot_message_uses_all_three_sources(monkeypatch):
     monkeypatch.setattr(snap, "get_market_data", lambda **kwargs: {"VIX": make_snapshot(18.2, 17.4)})
     monkeypatch.setattr(snap, "get_fred_data", lambda api_key, **kwargs: None)
     monkeypatch.setattr(snap, "get_tradingview_data", lambda **kwargs: {})
+    monkeypatch.setattr(snap, "get_chart_snapshot_summaries", lambda: [])
     monkeypatch.setattr(snap, "get_economic_calendar", lambda: [])
     monkeypatch.setattr(snap, "get_fedwatch", lambda: None)
 
@@ -212,6 +230,9 @@ def test_fetch_snapshot_sources_runs_providers_and_keeps_partial_failures():
 
     def tradingview_provider():
         return {"USDJPY": {"recommendation": "BUY", "rsi": 61.2}}
+
+    def chart_provider():
+        return [{"symbol": "USDJPY", "trend": "Bull", "freshness": "Fresh", "bias_weight": 1.0, "bb_position": 0.5}]
 
     def calendar_provider():
         return [
@@ -240,6 +261,7 @@ def test_fetch_snapshot_sources_runs_providers_and_keeps_partial_failures():
             "market": market_provider,
             "fred": fred_provider,
             "tradingview": tradingview_provider,
+            "chart": chart_provider,
             "calendar": calendar_provider,
             "fedwatch": fedwatch_provider,
         }
@@ -248,6 +270,7 @@ def test_fetch_snapshot_sources_runs_providers_and_keeps_partial_failures():
     assert sources["market"]["VIX"]["latest"] == 18.2
     assert sources["fred"] is None
     assert sources["tradingview"]["USDJPY"]["recommendation"] == "BUY"
+    assert sources["chart"][0]["symbol"] == "USDJPY"
     assert sources["calendar"][0]["event"] == "CPI"
     assert sources["fedwatch"]["hold_probability"] == 78.0
 
@@ -265,6 +288,7 @@ def test_optional_calendar_and_fedwatch_are_disabled_by_default(monkeypatch):
     monkeypatch.setattr(snap, "get_market_data", lambda **kwargs: {})
     monkeypatch.setattr(snap, "get_fred_data", lambda api_key, **kwargs: None)
     monkeypatch.setattr(snap, "get_tradingview_data", lambda **kwargs: {})
+    monkeypatch.setattr(snap, "get_chart_snapshot_summaries", lambda: [])
 
     def calendar_provider(**kwargs):
         calls["calendar"] += 1
@@ -292,6 +316,7 @@ def test_optional_calendar_and_fedwatch_run_only_when_enabled(monkeypatch):
     monkeypatch.setattr(snap, "get_market_data", lambda **kwargs: {})
     monkeypatch.setattr(snap, "get_fred_data", lambda api_key, **kwargs: None)
     monkeypatch.setattr(snap, "get_tradingview_data", lambda **kwargs: {})
+    monkeypatch.setattr(snap, "get_chart_snapshot_summaries", lambda: [])
 
     def calendar_provider(**kwargs):
         calls["calendar"] += 1

@@ -16,7 +16,7 @@ BEARISH_RECOMMENDATIONS = {"SELL", "STRONG_SELL"}
 class MarketBiasResult(TypedDict):
     market_bias: MarketBiasLabel
     confidence: float
-    scores: dict[str, int]
+    scores: dict[str, float]
     reasons: list[str]
     warnings: list[str]
     note: str
@@ -63,7 +63,7 @@ def _score_core_signals(
     market_data: dict | None,
     fred_data: dict | None,
     tv_data: dict | None,
-) -> tuple[dict[str, int], list[str]]:
+) -> tuple[dict[str, float], list[str]]:
     market_data = market_data or {}
     fred_data = fred_data or {}
     tv_data = tv_data or {}
@@ -130,7 +130,48 @@ def _score_core_signals(
     return scores, reasons
 
 
-def _macd_adjustment(macd_signal: str | None) -> tuple[dict[str, int], list[str]]:
+def _snapshot_get(snapshot, key, default=None):
+    if isinstance(snapshot, dict):
+        return snapshot.get(key, default)
+    return getattr(snapshot, key, default)
+
+
+def _score_chart_signals(chart_data, tv_data: dict | None) -> tuple[dict[str, float], list[str]]:
+    scores = {"Bull": 0.0, "Bear": 0.0}
+    reasons: list[str] = []
+    tv_data = tv_data or {}
+    mixed = False
+
+    for snapshot in chart_data or []:
+        if _snapshot_get(snapshot, "freshness") == "Stale":
+            continue
+        trend = _snapshot_get(snapshot, "trend")
+        symbol = _snapshot_get(snapshot, "symbol")
+        weight = float(_snapshot_get(snapshot, "bias_weight", 1.0) or 0.0)
+        if weight <= 0:
+            continue
+        if trend == "Bull":
+            scores["Bull"] += weight
+        elif trend == "Bear":
+            scores["Bear"] += weight
+        else:
+            continue
+        reasons.append(f"Chart {symbol} 1h trend is {trend} (weight {weight:.2f})")
+
+        tv_recommendation = _recommendation(tv_data.get(symbol))
+        if (
+            trend == "Bull" and tv_recommendation in BEARISH_RECOMMENDATIONS
+        ) or (
+            trend == "Bear" and tv_recommendation in BULLISH_RECOMMENDATIONS
+        ):
+            mixed = True
+
+    if mixed:
+        reasons.append("Chart/TV mixed")
+    return scores, reasons
+
+
+def _macd_adjustment(macd_signal: str | None) -> tuple[dict[str, float], list[str]]:
     if not macd_signal:
         return {"Bull": 0, "Bear": 0}, []
 
@@ -142,7 +183,7 @@ def _macd_adjustment(macd_signal: str | None) -> tuple[dict[str, int], list[str]
     return {"Bull": 0, "Bear": 0}, []
 
 
-def _choose_bias(scores: dict[str, int], evidence_count: int) -> tuple[MarketBiasLabel, float]:
+def _choose_bias(scores: dict[str, float], evidence_count: int) -> tuple[MarketBiasLabel, float]:
     if evidence_count < 2:
         return "Neutral", 0.0
 
@@ -155,7 +196,7 @@ def _choose_bias(scores: dict[str, int], evidence_count: int) -> tuple[MarketBia
     return label, confidence
 
 
-def _build_warnings(core_scores: dict[str, int], macd_signal: str | None) -> list[str]:
+def _build_warnings(core_scores: dict[str, float], macd_signal: str | None) -> list[str]:
     if not macd_signal:
         return []
 
@@ -174,6 +215,7 @@ def classify_market_bias(
     tv_data: dict | None = None,
     *,
     macd_signal: str | None = None,
+    chart_data=None,
 ) -> MarketBiasResult:
     """Classify market bias as Bull, Bear, or Neutral.
 
@@ -182,11 +224,13 @@ def classify_market_bias(
     missing or mixed.
     """
     core_scores, reasons = _score_core_signals(market_data, fred_data, tv_data)
+    chart_scores, chart_reasons = _score_chart_signals(chart_data, tv_data)
     macd_scores, macd_reasons = _macd_adjustment(macd_signal)
     scores = {
-        "Bull": core_scores["Bull"] + macd_scores["Bull"],
-        "Bear": core_scores["Bear"] + macd_scores["Bear"],
+        "Bull": core_scores["Bull"] + chart_scores["Bull"] + macd_scores["Bull"],
+        "Bear": core_scores["Bear"] + chart_scores["Bear"] + macd_scores["Bear"],
     }
+    reasons = [*reasons, *chart_reasons]
     evidence_count = len(reasons)
     bias, confidence = _choose_bias(scores, evidence_count)
     warnings = _build_warnings(core_scores, macd_signal)

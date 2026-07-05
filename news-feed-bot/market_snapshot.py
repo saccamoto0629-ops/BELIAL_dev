@@ -3,6 +3,7 @@
 import concurrent.futures
 import logging
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, TypedDict, cast
@@ -17,7 +18,21 @@ from tradingview_data import get_tradingview_data
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
+MARKET_WATCH_DIR = BASE_DIR.parent / "market-watch"
 ENV_FILE = BASE_DIR / ".env"
+
+if MARKET_WATCH_DIR.exists() and str(MARKET_WATCH_DIR) not in sys.path:
+    sys.path.insert(0, str(MARKET_WATCH_DIR))
+
+try:
+    from chart_collector import chart_db_path, load_chart_targets, load_env_file as load_chart_env_file
+    from chart_snapshot import collect_and_build_snapshots
+except Exception as exc:  # optional chart layer; keep Market Snapshot alive
+    chart_db_path = None
+    load_chart_targets = None
+    load_chart_env_file = None
+    collect_and_build_snapshots = None
+    logger.debug("[market_snapshot] Chart Snapshot summary unavailable: %s", exc)
 
 VIX_RISK_OFF_LEVEL = 25
 VVIX_RISK_OFF_LEVEL = 100
@@ -36,6 +51,7 @@ class SnapshotSources(TypedDict):
     market: dict
     fred: dict | None
     tradingview: dict
+    chart: list
     calendar: list[EconomicEvent]
     fedwatch: FedWatchSnapshot | None
 
@@ -192,6 +208,57 @@ def format_fedwatch_section(snapshot: FedWatchSnapshot | None) -> str:
     return "\n".join(lines)
 
 
+def get_chart_snapshot_summaries() -> list:
+    """Return 1h chart snapshots for Market Snapshot summary only.
+
+    Detailed Chart Snapshot Discord notifications remain owned by
+    market-watch/chart_snapshot.py and are not sent from here.
+    """
+    if not all([chart_db_path, load_chart_targets, load_chart_env_file, collect_and_build_snapshots]):
+        return []
+    env_values = load_chart_env_file()
+    targets = [target for target in load_chart_targets(env_values) if target.timeframe == "1h"]
+    if not targets:
+        return []
+    return collect_and_build_snapshots(
+        targets,
+        chart_db_path(env_values),
+        period=env_values.get("CHART_HISTORY_PERIOD", "60d"),
+        collect=True,
+    )
+
+
+def _snapshot_get(snapshot, key, default=None):
+    if isinstance(snapshot, dict):
+        return snapshot.get(key, default)
+    return getattr(snapshot, key, default)
+
+
+def format_chart_summary_section(chart_snapshots: list | None) -> str:
+    lines = ["[Chart Snapshot Summary]"]
+    if not chart_snapshots:
+        lines.append("- unavailable")
+        return "\n".join(lines)
+
+    for snapshot in chart_snapshots:
+        lines.append(
+            "- {symbol} 1h: Trend {trend} / State {state} / Freshness {freshness} "
+            "/ Bias Weight {bias_weight:.2f} / BB Position {bb_position}".format(
+                symbol=_snapshot_get(snapshot, "symbol", "UNKNOWN"),
+                trend=_snapshot_get(snapshot, "trend", "N/A"),
+                state=_snapshot_get(snapshot, "state", "N/A"),
+                freshness=_snapshot_get(snapshot, "freshness", "N/A"),
+                bias_weight=float(_snapshot_get(snapshot, "bias_weight", 0.0) or 0.0),
+                bb_position=(
+                    "N/A"
+                    if _snapshot_get(snapshot, "bb_position") is None
+                    else f"{float(_snapshot_get(snapshot, 'bb_position')):.2f}"
+                ),
+            )
+        )
+    return "\n".join(lines)
+
+
 def _is_up(snapshot: dict | None) -> bool:
     return bool(snapshot and snapshot.get("pct_change", 0) > 0)
 
@@ -241,6 +308,7 @@ def build_market_snapshot_message(
     fedwatch: FedWatchSnapshot | None = None,
     *,
     macd_signal: str | None = None,
+    chart_snapshots: list | None = None,
 ) -> str:
     """Build the Discord message body (plain Markdown) from already-fetched data."""
     lines = ["\U0001f4ca Market Snapshot", ""]
@@ -281,6 +349,9 @@ def build_market_snapshot_message(
     lines.append(format_technical_line("VIX", tv_data.get("VIX")))
     lines.append("")
 
+    lines.append(format_chart_summary_section(chart_snapshots))
+    lines.append("")
+
     lines.append(format_calendar_section(calendar_events))
     lines.append("")
 
@@ -292,7 +363,13 @@ def build_market_snapshot_message(
     lines.append("")
 
     try:
-        bias = classify_market_bias(market_data, fred_data, tv_data, macd_signal=macd_signal)
+        bias = classify_market_bias(
+            market_data,
+            fred_data,
+            tv_data,
+            macd_signal=macd_signal,
+            chart_data=chart_snapshots,
+        )
         lines.append(format_market_bias_section(bias))
     except Exception as exc:
         logger.warning("[market_snapshot] Market Bias failed: %s", exc)
@@ -311,6 +388,7 @@ def fetch_snapshot_sources(
             "market": lambda: get_market_data(timeout=5),
             "fred": lambda: get_fred_data(FRED_API_KEY, timeout=5),
             "tradingview": lambda: get_tradingview_data(timeout=5),
+            "chart": get_chart_snapshot_summaries,
         }
         if ENABLE_ECONOMIC_CALENDAR:
             providers["calendar"] = lambda: get_economic_calendar(timeout=FAST_PROVIDER_TIMEOUT_SECONDS)
@@ -324,6 +402,7 @@ def fetch_snapshot_sources(
         "market": {},
         "fred": None,
         "tradingview": {},
+        "chart": [],
         "calendar": [],
         "fedwatch": None,
     }
@@ -344,6 +423,8 @@ def fetch_snapshot_sources(
                     defaults["fred"] = result if isinstance(result, dict) else None
                 elif name == "tradingview":
                     defaults["tradingview"] = result if isinstance(result, dict) else {}
+                elif name == "chart":
+                    defaults["chart"] = result if isinstance(result, list) else []
                 elif name == "calendar":
                     defaults["calendar"] = result if isinstance(result, list) else []
                 elif name == "fedwatch":
@@ -371,6 +452,7 @@ def get_market_snapshot_message() -> str:
         sources["tradingview"],
         sources["calendar"],
         sources["fedwatch"],
+        chart_snapshots=sources["chart"],
     )
 
 

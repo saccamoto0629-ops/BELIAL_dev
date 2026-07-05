@@ -1,0 +1,230 @@
+"""Fetch OHLCV chart data and persist it to SQLite.
+
+The collector is observation-only. It never places orders or performs trading
+actions.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from datetime import UTC
+from pathlib import Path
+
+import pandas as pd
+import yfinance as yf
+
+from chart_models import Candle, ChartTarget
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+DEFAULT_DB_PATH = BASE_DIR / "data" / "chart_data.sqlite3"
+
+DEFAULT_SYMBOL_TICKERS = {
+    "USDJPY": "JPY=X",
+    "XAUUSD": "GC=F",
+    "SPX": "^GSPC",
+    "VIX": "^VIX",
+}
+DEFAULT_SYMBOLS = tuple(DEFAULT_SYMBOL_TICKERS)
+DEFAULT_TIMEFRAMES = ("15m", "1h", "4h")
+DEFAULT_PERIOD = "60d"
+
+MIGRATION_NOTE = (
+    "Chart candle timestamps are stored as UTC ISO strings ending in 'Z'. "
+    "If an older SQLite database contains timezone-offset or naive timestamps, "
+    "rebuild it by deleting market-watch/data/chart_data.sqlite3 and running "
+    "chart_snapshot.py without --skip-fetch, or migrate rows by parsing each "
+    "timestamp and rewriting it through to_utc_iso_z()."
+)
+
+
+def load_env_file(path: Path = ENV_FILE) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    with path.open("r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def _env_value(values: dict[str, str], name: str, default: str = "") -> str:
+    return (os.getenv(name) or values.get(name) or default).strip()
+
+
+def parse_csv(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def load_chart_targets(env_values: dict[str, str] | None = None) -> list[ChartTarget]:
+    values = env_values if env_values is not None else load_env_file()
+    symbols = parse_csv(_env_value(values, "CHART_SYMBOLS", ",".join(DEFAULT_SYMBOLS)))
+    timeframes = parse_csv(_env_value(values, "CHART_TIMEFRAMES", ",".join(DEFAULT_TIMEFRAMES)))
+
+    targets: list[ChartTarget] = []
+    for symbol in symbols:
+        ticker = _env_value(values, f"CHART_TICKER_{symbol.upper()}", DEFAULT_SYMBOL_TICKERS.get(symbol.upper(), symbol))
+        for timeframe in timeframes:
+            targets.append(ChartTarget(symbol=symbol.upper(), ticker=ticker, timeframe=timeframe))
+    return targets
+
+
+def chart_db_path(env_values: dict[str, str] | None = None) -> Path:
+    values = env_values if env_values is not None else load_env_file()
+    raw_path = _env_value(values, "CHART_DB_PATH", str(DEFAULT_DB_PATH))
+    path = Path(raw_path)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def init_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candles (
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                PRIMARY KEY (symbol, timeframe, timestamp)
+            )
+            """
+        )
+
+
+def to_utc_iso_z(timestamp) -> str:
+    """Return a UTC ISO-8601 timestamp like ``2026-07-03T20:45:00Z``.
+
+    Timezone-aware source timestamps are converted to UTC before saving. Naive
+    timestamps are treated as UTC because yfinance normally returns exchange
+    timestamps with timezone information, and guessing a local timezone would
+    create mixed historical data.
+    """
+    parsed = pd.Timestamp(timestamp)
+    if parsed.tzinfo is None:
+        parsed = parsed.tz_localize(UTC)
+    else:
+        parsed = parsed.tz_convert(UTC)
+    parsed = parsed.replace(microsecond=0, nanosecond=0)
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _normalize_history(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    frame = history.rename(columns=str.lower)
+    frame = frame[[column for column in ["open", "high", "low", "close", "volume"] if column in frame.columns]]
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    if "volume" not in frame.columns:
+        frame["volume"] = 0.0
+    return frame
+
+
+def _resample_4h(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    return (
+        frame.resample("4h")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna(subset=["open", "high", "low", "close"])
+    )
+
+
+def fetch_ohlcv(target: ChartTarget, *, period: str = DEFAULT_PERIOD) -> pd.DataFrame:
+    """Fetch OHLCV from Yahoo Finance via yfinance for one target."""
+    interval = "1h" if target.timeframe == "4h" else target.timeframe
+    history = yf.Ticker(target.ticker).history(period=period, interval=interval)
+    frame = _normalize_history(history)
+    if target.timeframe == "4h":
+        frame = _resample_4h(frame)
+    return frame
+
+
+def candles_from_frame(target: ChartTarget, frame: pd.DataFrame) -> list[Candle]:
+    candles: list[Candle] = []
+    for timestamp, row in frame.iterrows():
+        candles.append(
+            Candle(
+                symbol=target.symbol,
+                timeframe=target.timeframe,
+                timestamp=to_utc_iso_z(timestamp),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row.get("volume", 0.0)),
+            )
+        )
+    return candles
+
+
+def save_candles(db_path: Path, candles: list[Candle]) -> int:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO candles
+            (symbol, timeframe, timestamp, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    candle.symbol,
+                    candle.timeframe,
+                    candle.timestamp,
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                    candle.volume,
+                )
+                for candle in candles
+            ],
+        )
+    return len(candles)
+
+
+def load_candles(db_path: Path, symbol: str, timeframe: str, *, limit: int = 200) -> pd.DataFrame:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT timestamp, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (symbol.upper(), timeframe, limit),
+        ).fetchall()
+
+    rows.reverse()
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    return frame.set_index("timestamp")
+
+
+def collect_target(target: ChartTarget, db_path: Path, *, period: str = DEFAULT_PERIOD) -> int:
+    frame = fetch_ohlcv(target, period=period)
+    return save_candles(db_path, candles_from_frame(target, frame))
+
+
+def collect_all(targets: list[ChartTarget], db_path: Path, *, period: str = DEFAULT_PERIOD) -> dict[str, int]:
+    return {
+        f"{target.symbol}_{target.timeframe}": collect_target(target, db_path, period=period)
+        for target in targets
+    }
