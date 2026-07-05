@@ -6,7 +6,7 @@
 
 ### 25.1 システム概要
 
-現行の Berial は、以下の2つの監視レイヤーを持つ。
+現行の Berial は、以下の3つの監視レイヤーを持つ。
 
 - RSSニュース監視
   - Google News / Reuters と Yahoo!ニュース系RSSを取得する
@@ -15,8 +15,12 @@
   - Yahoo Finance / FRED / TradingView TA から市場データを取得する
   - FREDのマクロ指標、TradingViewのテクニカル指標、Yahoo Financeの市場価格をまとめる
   - 簡易 `Risk Label` を算出し、Discord投稿本文として整形する
+- Market Watch
+  - `market-watch/` 配下でローソク足を取得し、SMA / EMA / Bollinger Bands / MACDを計算する
+  - Chart Snapshotを生成し、Market Snapshotの `Chart Snapshot Summary` と Market Bias に連携する
+  - MACDクロス発生時は `macd_alert_bot.py` がイベント通知する
 
-現時点では、AI分析・売買判断・自動発注は行わない。Market Snapshot は、BELIALの将来のAI判断層へ渡す前段の「市場状態の可視化」機能である。
+現時点では、AI分析・売買判断・自動発注は行わない。Market Snapshot と Market Watch は、BELIALの将来のAI判断層へ渡す前段の「市場状態の可視化」機能である。
 
 ### 25.2 ディレクトリ構成
 
@@ -25,7 +29,8 @@
 ```text
 news-feed-bot/
 ├─ news_feed_bot.py          # RSSニュース監視、Discord投稿、定期実行
-├─ market_snapshot.py        # Market Snapshot本文生成、Provider統合、Risk Label
+├─ market_snapshot.py        # Market Snapshot本文生成、Provider統合、Risk Label、Chart Summary統合
+├─ market_bias.py            # Bull / Bear / Neutral のMarket Bias Engine
 ├─ market_data.py            # Yahoo Finance / yfinance Provider
 ├─ fred_data.py              # FRED API Provider
 ├─ tradingview_data.py       # TradingView TA Provider
@@ -33,6 +38,8 @@ news-feed-bot/
 ├─ fedwatch.py               # FedWatch Provider枠
 └─ tests/                    # pytest
 ```
+
+`market-watch/` 配下の構成は第26章に記載する。
 
 ### 25.3 データ取得Provider
 
@@ -43,6 +50,7 @@ news-feed-bot/
 | TradingView | `tradingview_data.py` | テクニカル指標を取得 | 個別シンボルを `None` |
 | Economic Calendar | `economic_calendar.py` | 経済イベント取得のProvider枠 | `[]`、本文は unavailable |
 | FedWatch | `fedwatch.py` | 金利確率取得のProvider枠 | `None`、本文は unavailable |
+| Chart Snapshot | `../market-watch/chart_snapshot.py` | ローソク足由来のTrend / BB / MACD状態を取得 | セクションは unavailable、またはBiasから除外 |
 
 #### Yahoo Finance
 
@@ -120,9 +128,13 @@ FREDは公式APIであり、現行Market Snapshotでは信頼Providerとして�
 - `FX / Commodity`
 - `Rates / FRED`
 - `Technical / TradingView`
+- `Chart Snapshot Summary`
 - `Today's Events`
 - `FedWatch`
 - `Risk Label`
+- `Market Bias`
+
+`Chart Snapshot Summary` は `market-watch/chart_snapshot.py` 由来の1h代表値を表示する。表示項目は `Trend`、`State`、`Freshness`、`Bias Weight`、`BB Position`、`MACD State` である。
 
 `news_feed_bot.py` からは `MARKET_SNAPSHOT_ENABLED=true` のとき、`MARKET_SNAPSHOT_TIME` に `market_snapshot.get_market_snapshot_message()` を呼び出してDiscordへ投稿する。
 
@@ -177,11 +189,13 @@ pytestで以下を検証している。
 - FRED Provider
 - TradingView Provider
 - Risk Label
+- Chart Snapshot Summary連携
+- Market Bias本文生成
 - Economic Calendar Providerの正常系・異常系
 - FedWatch Providerの正常系・異常系
 - optional Providerが既定falseで呼ばれないこと
 
-現時点でpytestは55件以上が通過している。外部APIアクセスはテストではMock化し、実Webhookや本物のAPIキーは使わない。
+外部APIアクセスはテストではMock化し、実Webhookや本物のAPIキーは使わない。
 
 ### 25.8 今後の拡張予定
 
@@ -199,56 +213,209 @@ FedWatch / Economic Calendar は外部取得元が不安定なため、今後も
 
 ---
 
-## 26. Berial v1.2.2 Market Watch / MACD Alert Bot
+## 26. Berial v1.3 Market Watch Engine
 
-v1.2.2 は、`market-watch/macd_alert_bot.py` を継続運用しやすい監視モジュールとして整備するリリースである。v1.2系は MACD クロス通知Botの安定運用フェーズであり、市場判断ロジックは追加しない。
+v1.3 では、`market-watch/` を単なるMACDクロス通知Botではなく、チャート取得・指標計算・状態表示・イベント通知を担当する Market Watch Engine として拡張した。
+
+Market Watch Engine は、ローソク足を取得し、SQLiteへ保存し、SMA / EMA / Bollinger Bands / MACDを計算する。計算結果は `Chart Snapshot` として単独表示できるほか、`news-feed-bot/market_snapshot.py` の `Chart Snapshot Summary` と `news-feed-bot/market_bias.py` の判定材料として利用する。
+
+現時点では、売買判断、自動発注、エントリー推奨、ロット計算は行わない。
 
 ### 26.1 目的
 
-- USD/JPY M15 の MACD(12,26,9) を監視する
-- 確定足ベースで bullish / bearish cross を検知する
-- Discord Webhookへ通知する
-- 再起動後も同じ足・同じsignalを重複通知しない
-- 運用ログと設定ファイルを整備する
+- 複数シンボル・複数時間足のローソク足を取得する
+- 取得データをSQLiteへ保存する
+- timestampはUTCで保存し、Discord表示時のみJSTへ変換する
+- SMA20 / SMA75 / EMA20 / Bollinger Bands / MACDを共通関数で計算する
+- Chart Snapshotとして現在のチャート状態を表示する
+- Market Snapshotへ1h代表値の要約を渡す
+- Market BiasへTrend / BB / MACD状態を渡す
+- MACDクロスは `macd_alert_bot.py` でイベント通知として扱う
+- ニュース監視Botとは責務を分離する
 
-このBotは「シグナル検知・通知」までを担当する。売買判断、ブル/ベア判定、市場状態分類、エントリー判断は行わない。
+### 26.2 ディレクトリ構成
 
-### 26.2 追加・更新された機能
+```text
+market-watch/
+├─ .env.example
+├─ config.toml
+├─ chart_collector.py        # ローソク足取得、SQLite保存、UTC正規化
+├─ chart_models.py           # ChartTarget / Candle / IndicatorSnapshot
+├─ indicators.py             # SMA / EMA / BB / MACD / クロス判定 / 状態分類
+├─ chart_snapshot.py         # Chart Snapshot生成、Discord投稿、Summary生成
+├─ macd_alert_bot.py         # MACDクロスのイベント通知Bot
+├─ data/
+│  └─ chart_data.sqlite3     # runtime DB。Git管理しない
+├─ state/
+│  └─ macd_alert_state.json  # MACDクロス通知の重複防止state。Git管理しない
+└─ tests/
+   ├─ test_chart_collector.py
+   ├─ test_chart_snapshot.py
+   ├─ test_indicators.py
+   └─ test_macd_alert_bot.py
+```
 
-| 項目 | 内容 |
+`data/`、`state/`、`.env`、`__pycache__/`、`.pytest_cache/`、`logs/` はGit管理しない。
+
+### 26.3 処理パイプライン
+
+```text
+chart_collector.py
+  ↓
+SQLite chart_data.sqlite3 (timestampはUTC保存)
+  ↓
+indicators.py
+  ├─ SMA / EMA
+  ├─ Bollinger Bands
+  └─ MACD
+  ↓
+chart_snapshot.py
+  ├─ Chart Snapshot詳細表示
+  └─ Market Snapshot向けSummary
+  ↓
+market_snapshot.py / market_bias.py
+```
+
+MACDクロス通知は、上記のSnapshot系とは役割を分ける。
+
+```text
+indicators.py
+  ↓
+macd_alert_bot.py
+  ↓
+Discord Event Alert
+```
+
+`chart_snapshot.py` は「状態表示」、`macd_alert_bot.py` は「イベント通知」である。状態表示とイベント通知を混ぜないことで、Snapshot本文の肥大化や二重通知を避ける。
+
+### 26.4 監視対象と時間足
+
+現行のChart Snapshot対象は以下。
+
+| Symbol | 用途 |
 |---|---|
-| 設定外部化 | 公開可能な監視設定を `market-watch/config.toml` に分離 |
-| 秘匿情報管理 | `DISCORD_WEBHOOK_URL` などのsecretは `.env` に残す |
-| state管理 | `market-watch/state/macd_alert_state.json` に最後に通知した candle time と signal を保存 |
-| 通知改善 | symbol、timeframe、signal種別、golden/dead cross、価格、MACD、signal line、検知時刻、説明文を含める |
-| ログ強化 | `logs/macd_alert_bot.log` に起動、監視対象、取得結果、cross検知、Discord通知結果、例外を記録 |
-| エラー処理 | データ取得失敗やDiscord通知失敗はログに残し、継続運用できる形にする |
+| `USDJPY` | 為替、ドル円 |
+| `XAUUSD` | Gold |
+| `SPX` | S&P500 |
+| `VIX` | Volatility |
 
-### 26.3 起動方式
+現行の時間足は以下。
 
-Linux運用パスは `/opt/berial` を想定する。
+- `15m`
+- `1h`
+- `4h`
 
-```bash
-cd /opt/berial
-python -m pip install -r requirements.txt
-cp market-watch/.env.example market-watch/.env
-python market-watch/macd_alert_bot.py --once --dry-run
+Market Snapshotに統合する `Chart Snapshot Summary` では、本文を短く保つため、各Symbolの `1h` を代表値として表示する。
+
+### 26.5 SQLite保存と時刻仕様
+
+ローソク足は `market-watch/data/chart_data.sqlite3` へ保存する。保存時のtimestampはUTCへ正規化する。
+
+```text
+2026-07-03T20:45:00Z
 ```
 
-本番で継続監視する場合:
+Discord表示時のみJSTへ変換する。
 
-```bash
-cd /opt/berial
-python market-watch/macd_alert_bot.py
+```text
+2026-07-04 05:45 JST
 ```
 
-`--dry-run` ではDiscord送信もstate更新も行わない。
+内部保存をUTCへ統一する理由は、USDJPY / SPX / VIX / XAUUSD のように市場・取得元ごとにタイムゾーンが異なるデータを同一基準で比較するためである。
 
-systemd化は v1.4 以降に回す。v1.2.2 ではPythonプロセスとして起動できる状態に留める。
+### 26.6 指標仕様
 
-### 26.4 監視対象
+`indicators.py` はチャート指標の共通ライブラリである。`chart_snapshot.py` と `macd_alert_bot.py` は、可能な限りここにある共通関数を利用する。
 
-現行の既定値は以下。
+計算対象:
+
+| 指標 | 内容 |
+|---|---|
+| `sma20` | Closeの20本単純移動平均 |
+| `sma75` | Closeの75本単純移動平均 |
+| `ema20` | Closeの20本指数移動平均 |
+| `bb_middle` | SMA20 |
+| `bb_upper` | SMA20 + 2σ |
+| `bb_lower` | SMA20 - 2σ |
+| `bb_width_pct` | `(bb_upper - bb_lower) / bb_middle * 100` |
+| `bb_position` | CloseがBB内のどこにいるか。0.0=下限、0.5=中央、1.0=上限 |
+| `macd` | EMA12 - EMA26 |
+| `macd_signal` | MACDのEMA9 |
+| `macd_hist` | `macd - macd_signal` |
+| `macd_state` | `Bullish` / `Bearish` / `Neutral` |
+
+MACD State:
+
+| State | 条件 |
+|---|---|
+| `Bullish` | `macd > macd_signal` かつ `macd_hist > 0` |
+| `Bearish` | `macd < macd_signal` かつ `macd_hist < 0` |
+| `Neutral` | 上記以外、または値欠損 |
+
+Trend:
+
+| Trend | 条件 |
+|---|---|
+| `Bull` | `close > sma20 > sma75` |
+| `Bear` | `close < sma20 < sma75` |
+| `Neutral` | 上記以外 |
+| `Stale` | データ鮮度がStaleの場合 |
+
+Bollinger Band State:
+
+| State | 条件 |
+|---|---|
+| `Upper breakout` | `bb_position > 1.0` |
+| `Near upper band` | `0.8 <= bb_position <= 1.0` |
+| `Inside band` | `0.2 <= bb_position < 0.8` |
+| `Near lower band` | `0.0 <= bb_position < 0.2` |
+| `Lower breakout` | `bb_position < 0.0` |
+| `Unavailable` | 値欠損 |
+
+### 26.7 Freshness / Bias Weight
+
+Chart Snapshotは、最新ローソク足のtimestampと現在時刻を比較して鮮度を判定する。
+
+| Freshness | 意味 | Bias Weight |
+|---|---|---:|
+| `Fresh` | 通常の新鮮なデータ | `1.0` |
+| `Weekend Closed` | 土日など市場休場により更新が止まっている | `0.25` |
+| `Market Closed` | 市場再開前など、休場時間帯 | `0.25` |
+| `Stale` | 平常時に24時間超古いデータ | `0.0` |
+
+`Stale` はMarket Bias計算から除外する。`Weekend Closed` / `Market Closed` は、休場中の最終有効値として表示は維持しつつ、Market Biasへの影響を弱める。
+
+### 26.8 Chart Snapshot表示
+
+`chart_snapshot.py --once --dry-run` は、Discordへ送信せずにChart Snapshot本文を標準出力する。
+
+表示例:
+
+```text
+📈 Chart Snapshot
+
+USDJPY 1h
+Time: 2026-07-04 05:00 JST
+Freshness: Weekend Closed (1d 9h old)
+Bias Weight: 0.25
+Close: 161.34
+SMA20: 161.18
+SMA75: 161.85
+EMA20: 161.25
+BB: 160.87 / 161.18 / 161.49
+BB Width: 0.38%
+BB Position: 0.76
+MACD: -0.00872 / Signal: -0.06150 / Hist: 0.05278
+MACD State: Bullish
+Trend: Neutral
+State: Inside band
+```
+
+### 26.9 MACD Alert Bot
+
+`macd_alert_bot.py` は、MACDクロスが発生したときだけDiscordへイベント通知する常駐Botである。
+
+初期監視対象:
 
 | 項目 | 値 |
 |---|---|
@@ -260,17 +427,31 @@ systemd化は v1.4 以降に回す。v1.2.2 ではPythonプロセスとして起
 | MACD | `12,26,9` |
 | check interval | `60s` |
 
-設定は `market-watch/config.toml` で変更する。
+クロス判定は、未確定足を除外し、前回の確定足と今回の確定足で行う。
 
-### 26.5 state管理
+Bullish cross:
 
-重複通知防止のstateは以下に保存する。
+```text
+prev_macd <= prev_signal
+and
+curr_macd > curr_signal
+```
+
+Bearish cross:
+
+```text
+prev_macd >= prev_signal
+and
+curr_macd < curr_signal
+```
+
+同一足・同一signalの重複通知を防ぐため、stateを以下に保存する。
 
 ```text
 market-watch/state/macd_alert_state.json
 ```
 
-保存内容は `symbol + timeframe` 単位で、以下を含む。
+保存内容:
 
 - `candle_time`
 - `signal`
@@ -279,48 +460,91 @@ market-watch/state/macd_alert_state.json
 - `signal_line`
 - `notified_at`
 
-旧v1.2.1の `market-watch/macd_alert_state.json` が残っている場合も、初回読み込み時の互換性を持たせる。ただし新規保存先は `market-watch/state/` である。
+旧v1.2系の `market-watch/macd_alert_state.json` が残っている場合は初回読み込み互換を持たせる。ただし新規保存先は `market-watch/state/` である。
 
-`state/`、`.env`、`__pycache__/`、`.pytest_cache/`、`logs/` はGit管理しない。
+### 26.10 起動方式 / 本番運用
 
-### 26.6 v1.3 / v1.4 以降
+Linux運用パスは `/opt/berial` を想定する。
 
-v1.3では、市場判断ロジックの追加を検討する。
+初期確認:
 
-候補:
+```bash
+cd /opt/berial
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python market-watch/chart_snapshot.py --once --dry-run
+python market-watch/macd_alert_bot.py --once --dry-run
+python news-feed-bot/market_snapshot.py
+```
 
-- Market Snapshotとの連携
-- Risk Labelとの連携
-- AI要約・市場インパクト判定
-- MACD以外の補助指標
+常駐対象:
 
-ただし v1.2.2 ではこれらを実装しない。
+```text
+news-feed-bot/news_feed_bot.py
+market-watch/macd_alert_bot.py
+```
 
-v1.4以降で検討するもの:
+定期実行対象:
 
-- systemd unit
-- restart policy
-- logrotate
-- production deploy手順
+```text
+market-watch/chart_snapshot.py --once
+news-feed-bot/market_snapshot.py
+```
+
+`macd_alert_bot.py` は systemd で常駐させる。手動起動プロセスとsystemd起動プロセスが二重起動しないよう、`ps -aux | grep .py` で確認する。
+
+systemd例:
+
+```ini
+[Unit]
+Description=Berial MACD Alert Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/berial/market-watch
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/berial/.venv/bin/python /opt/berial/market-watch/macd_alert_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+確認コマンド:
+
+```bash
+systemctl status berial-macd-alert --no-pager
+journalctl -u berial-macd-alert -f
+ps -aux | grep .py
+```
+
+`--dry-run` ではDiscord送信もstate更新も行わない。
 
 ---
 
-## 27. Berial v1.3.0 Market Bias Engine
+## 27. Berial v1.3 Market Bias Engine
 
-v1.3.0 は、Berial が既に取得している市場データ(Yahoo Finance / FRED / TradingView / MACD Alert Bot)をもとに、**Bull / Bear / Neutral の3分類だけ**を返す初期ロジックを追加するリリースである。
+v1.3 は、Berial が取得している市場データ(Yahoo Finance / FRED / TradingView / Chart Snapshot)をもとに、**Bull / Bear / Neutral の3分類だけ**を返す初期ロジックを追加するリリースである。
 
 ### 27.1 目的
 
 - 既存Providerが取得済みのデータから、市場の大まかな方向感をルールベースで判定する
+- Chart Snapshot由来のTrend / BB / MACD状態をBias計算へ反映する
 - 判定結果、confidence、scores、reasons、warnings、note をDiscordへ出せる形にする
 - 「観測結果の可視化」を一段進めるものであり、売買判断や自動発注を行う機能ではない
 
 ### 27.2 Market Bias Engine の位置づけ
 
-第25章で述べた通り、現行のBerialはRSSニュース監視とMarket Snapshotを持つ。v1.3.0で追加する `news-feed-bot/market_bias.py` は、Market Snapshot が集約したデータを読むだけの補助レイヤーである。
+`news-feed-bot/market_bias.py` は、Market Snapshotが集約したデータを読む補助レイヤーである。
 
 ```text
 Market Snapshot(市場データの可視化)
+        ├─ TradingView Summary
+        ├─ Chart Snapshot Summary
         └─ Market Bias Engine(Bull / Bear / Neutral の3分類)
 ```
 
@@ -335,7 +559,19 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 | `market_data` | `market_data.get_market_data()` (Yahoo Finance) | 任意(欠損可) |
 | `fred_data` | `fred_data.get_fred_data()` (FRED) | 任意(`None`可) |
 | `tv_data` | `tradingview_data.get_tradingview_data()` (TradingView TA) | 任意(欠損可) |
-| `macd_signal` | `market-watch/macd_alert_bot.py` が検知した直近MACDクロス方向(`"bullish"` / `"bearish"` / `None`) | 任意、v1.3.0では呼び出し側が明示的に渡す場合のみ使用 |
+| `chart_data` | `market-watch/chart_snapshot.py` の `IndicatorSnapshot` summary | 任意(欠損可) |
+| `macd_signal` | `macd_alert_bot.py` が検知した直近MACDクロス方向 | 任意。現在は主入力ではなく、イベント通知用の補助扱い |
+
+`chart_data` は以下の値を含む。
+
+- `symbol`
+- `timeframe`
+- `trend`
+- `state`
+- `freshness`
+- `bias_weight`
+- `bb_position`
+- `macd_state`
 
 すべての入力は欠損・部分欠損があっても例外を投げず、判定可能な範囲で分類を行う。
 
@@ -343,17 +579,16 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 
 ```python
 {
-    "market_bias": "Bear",
-    "confidence": 0.67,
-    "scores": {"Bull": 1, "Bear": 5},
+    "market_bias": "Bull",
+    "confidence": 0.40,
+    "scores": {"Bull": 3.5, "Bear": 1.5},
     "reasons": [
-        "VIX is above 25",
-        "S&P500 is falling",
-        "Nasdaq is falling",
+        "VIX is below 18",
+        "S&P500 is rising",
+        "SPX technical recommendation is positive",
+        "Chart USDJPY 1h MACD is Bullish (weight 0.12)",
     ],
-    "warnings": [
-        "M15 MACD bullish cross conflicts with broader Bear conditions",
-    ],
+    "warnings": [],
     "note": "Observation only. No trade recommendation.",
 }
 ```
@@ -362,7 +597,7 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 
 #### market_bias
 
-返却値は `Bull` / `Bear` / `Neutral` のいずれかのみとする。`Risk Off`、`USD Strength`、`Gold Strength` などの細かい市場状態ラベルは v1.3.0 のスコープ外であり、将来検討に回す。
+返却値は `Bull` / `Bear` / `Neutral` のいずれかのみとする。`Risk Off`、`USD Strength`、`Gold Strength` などの細かい市場状態ラベルは現行スコープ外であり、将来検討に回す。
 
 - 入力データが不足している場合 → `Neutral`
 - Bull / Bear のスコア差が小さい場合 → `Neutral`
@@ -371,19 +606,34 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 
 #### confidence
 
-`confidence` は 0.0～1.0 の範囲に収める。入力不足の場合は `0.0` とし、スコア差が大きいほど高くなる。
+`confidence` は 0.0～1.0 の範囲に収める。入力不足の場合は `0.0` とし、スコア差と評価できた材料数をもとに算出する。
 
 #### scores
 
-`scores` は `{"Bull": int, "Bear": int}` のdictで返す。Market Snapshot由来のVIX、VVIX、株価指数、米金利、Dollar Index、TradingView technical recommendationなどをルールベースで加点する。
+`scores` は `{"Bull": float, "Bear": float}` のdictで返す。Market Snapshot由来のVIX、VVIX、株価指数、米金利、Dollar Index、TradingView technical recommendation、Chart Snapshot由来のTrend / MACD Stateなどをルールベースで加点する。
+
+Chart Snapshotは `bias_weight` を掛けて反映する。
+
+- `Fresh`: 原則 `1.0`
+- `Weekend Closed` / `Market Closed`: 原則 `0.25`
+- `Stale`: `0.0`、Bias計算から除外
+
+MACD StateはTrendより軽い補助指標として扱う。例: `0.5 * bias_weight`。
 
 #### reasons
 
 `reasons` は判定に使った根拠のlistで返す。Discord表示では長くなりすぎないよう最大数を制限する。
 
+Chart Snapshot由来の例:
+
+```text
+Chart XAUUSD 1h trend is Bull (weight 0.25)
+Chart USDJPY 1h MACD is Bullish (weight 0.12)
+```
+
 #### warnings
 
-M15 MACDの直近クロス方向と、より広いMarket Snapshot由来の方向感が矛盾する場合に `warnings` へ入れる。MACD Alert は短期補助シグナルであり、全体判断を支配しすぎないように扱う。
+TradingView recommendation と Chart Snapshot のTrend / MACD Stateが大きく矛盾する場合、必要に応じて `warnings` へ入れる。短期のMACDや1hの状態は補助シグナルであり、全体判断を支配しすぎないように扱う。
 
 #### note
 
@@ -404,19 +654,27 @@ TradingView由来の `BUY` / `SELL` は内部データとして扱うことは�
 
 ### 27.7 Market Snapshotとの連携
 
-`market_snapshot.build_market_snapshot_message()` は、末尾に `## Market Bias` セクションを追加する。生成時の例外は吸収し、Market Snapshot全体の投稿が壊れないようにする。
+`market_snapshot.build_market_snapshot_message()` は、本文内に `[Chart Snapshot Summary]` と `## Market Bias` セクションを追加する。生成時の例外は吸収し、Market Snapshot全体の投稿が壊れないようにする。
 
-`macd_signal` は `build_market_snapshot_message()` の任意キーワード引数として渡せるが、v1.3.0時点では `market-watch/macd_alert_bot.py` のstateを自動的に読み取る連携は行わない。呼び出し側が明示的に渡さない限り `None` として扱われる。
+`Chart Snapshot Summary` では、各Symbolの1hを代表値として以下を表示する。
+
+```text
+- USDJPY 1h: Trend Neutral / State Inside band / Freshness Weekend Closed / Bias Weight 0.25 / BB Position 0.76 / MACD State Bullish
+```
+
+Market BiasはこのSummary由来の `chart_data` を受け取り、TrendとMACD Stateをスコアへ反映する。
 
 ### 27.8 v1.3.1以降の検討
 
 - `Risk Off` / `USD Strength` / `Gold Strength` など、より細かい市場状態分類
 - Market Bias判定履歴の保存と状態遷移の追跡
 - 判定ロジックのバックテスト・閾値チューニング
-- `market-watch/macd_alert_bot.py` のstateを読み取る自動連携
-- 複数時間足(M15以外)や他通貨ペアへの対応
+- Chart Snapshotの定期投稿頻度調整
+- ATR / 出来高 / Fear & Greed / COT Report などの補助指標追加
+- デモ口座でのPaper Signal記録
+- Pepperoniによる将来のエントリー執行レイヤー
 
-これらは v1.3.1 以降の検討事項であり、v1.3.0では実装しない。
+これらは v1.3.1 以降の検討事項であり、現行v1.3では実装しない。
 
 ---
 
@@ -516,14 +774,4 @@ Pepperoni 自身は炎のエフェクトを出さないが、このペンだけ�
 
 ### 28.8 実装上の注意
 
-Pepperoni は将来的な自動発注レイヤーを象徴するキャラクターである。ただし、現行の v1.3.0 では自動売買・自動発注・エントリー推奨は実装しない。
-
-実装に進む場合は、以下を別途定義する。
-
-- 対象ブローカー / API
-- デモ口座での検証手順
-- ロット計算
-- 損切り / 利確 / Exit との責務分離
-- 注文失敗時のリトライ方針
-- 監査ログ
-- 緊急停止条件
+Pepperoni は将来的な自動発注レイヤーを象徴するキャラクターである。ただし、現行の v1.3 では自動売買・自動発注・エントリー推奨は実装しない。
