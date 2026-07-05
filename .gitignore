@@ -1,3 +1,5 @@
+*.zip
+
 # Secrets
 **/.env
 .env
@@ -8,6 +10,7 @@ logs/
 market-watch/state/
 market-watch/macd_alert_state.json
 market-watch/data/
+paper-signal/data/
 **/*.json.tmp
 .pytest_cache/
 **/.pytest_cache/
