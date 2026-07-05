@@ -142,7 +142,7 @@ def load_env_file(path=ENV_FILE):
 ENV_VALUES = load_env_file()
 CONFIG = load_config()
 
-DISCORD_WEBHOOK_URL = ENV_VALUES.get("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_URL = ENV_VALUES.get("BOT_ALERTS_WEBHOOK_URL", ENV_VALUES.get("DISCORD_WEBHOOK_URL", "")).strip()
 SYMBOL = CONFIG.symbol
 TICKER = CONFIG.ticker
 TIMEFRAME = CONFIG.timeframe

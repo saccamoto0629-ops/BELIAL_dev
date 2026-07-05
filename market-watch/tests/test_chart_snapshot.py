@@ -57,6 +57,15 @@ def test_post_discord_message_dry_run_does_not_call_session(capsys):
     assert "Would send Chart Snapshot" in capsys.readouterr().out
 
 
+def test_load_webhook_url_uses_chart_snapshot_webhook():
+    assert snapshot.load_webhook_url(
+        {
+            "CHART_SNAPSHOT_WEBHOOK_URL": "https://discord.invalid/chart-snapshot",
+            "DISCORD_WEBHOOK_URL": "https://discord.invalid/legacy",
+        }
+    ) == "https://discord.invalid/chart-snapshot"
+
+
 def test_format_timestamp_jst_converts_utc_z_to_jst():
     assert snapshot.format_timestamp_jst("2026-07-03T20:45:00Z") == "2026-07-04 05:45 JST"
 
@@ -117,7 +126,11 @@ def test_main_once_dry_run_uses_existing_sqlite_without_fetch(monkeypatch, tmp_p
     target = ChartTarget("USDJPY", "JPY=X", "15m")
     calls = []
 
-    monkeypatch.setattr(snapshot, "load_env_file", lambda: {"DRY_RUN": "true", "CHART_DB_PATH": str(tmp_path / "chart.sqlite3")})
+    monkeypatch.setattr(snapshot, "load_env_file", lambda: {
+        "DRY_RUN": "true",
+        "CHART_DB_PATH": str(tmp_path / "chart.sqlite3"),
+        "CHART_SNAPSHOT_WEBHOOK_URL": "https://discord.invalid/chart-snapshot",
+    })
     monkeypatch.setattr(snapshot, "load_chart_targets", lambda env_values: [target])
     monkeypatch.setattr(snapshot, "chart_db_path", lambda env_values: tmp_path / "chart.sqlite3")
     monkeypatch.setattr(snapshot, "load_candles", lambda db_path, symbol, timeframe, limit=200: make_candles())
@@ -126,5 +139,6 @@ def test_main_once_dry_run_uses_existing_sqlite_without_fetch(monkeypatch, tmp_p
     snapshot.main(["--once", "--dry-run", "--skip-fetch"])
 
     assert calls
+    assert calls[0][0] == "https://discord.invalid/chart-snapshot"
     assert calls[0][1] is True
     assert "Chart Snapshot" in calls[0][2]

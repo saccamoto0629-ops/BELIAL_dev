@@ -36,10 +36,17 @@ cp market-watch/.env.example market-watch/.env
 Edit `market-watch/.env` and set:
 
 ```env
-DISCORD_WEBHOOK_URL=
+CHART_SNAPSHOT_WEBHOOK_URL=
+BOT_ALERTS_WEBHOOK_URL=
 ```
 
 Do not commit `.env` or real webhook URLs.
+
+Webhook roles:
+
+- `CHART_SNAPSHOT_WEBHOOK_URL`: posts scheduled Chart Snapshot reports to the dedicated `chart-snapshot` channel.
+- `BOT_ALERTS_WEBHOOK_URL`: posts event alerts such as MA touches, MACD crosses, and sharp moves to `bot-alerts`.
+- `DISCORD_WEBHOOK_URL`: legacy fallback for older MACD alert deployments. New deployments should prefer `BOT_ALERTS_WEBHOOK_URL`.
 
 ## Configuration
 

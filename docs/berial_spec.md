@@ -288,6 +288,15 @@ Discord Event Alert
 
 `chart_snapshot.py` は「状態表示」、`macd_alert_bot.py` は「イベント通知」である。状態表示とイベント通知を混ぜないことで、Snapshot本文の肥大化や二重通知を避ける。
 
+Discord投稿先も役割ごとに分離する。
+
+| 変数 | 投稿先 | 役割 |
+|---|---|---|
+| `CHART_SNAPSHOT_WEBHOOK_URL` | `chart-snapshot` | 定時のチャート状態レポート。`chart_snapshot.py` が使用する |
+| `BOT_ALERTS_WEBHOOK_URL` | `bot-alerts` | MAタッチ、MACDクロス、急変などのイベント通知。`macd_alert_bot.py` が使用する |
+
+旧設定との互換性のため、イベント通知側は `BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り旧 `DISCORD_WEBHOOK_URL` をfallbackとして扱う。新規運用では `CHART_SNAPSHOT_WEBHOOK_URL` と `BOT_ALERTS_WEBHOOK_URL` を明示する。
+
 ### 26.4 監視対象と時間足
 
 現行のChart Snapshot対象は以下。

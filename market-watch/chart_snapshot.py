@@ -184,7 +184,7 @@ def post_discord_message(webhook_url: str, message: str, *, dry_run: bool = Fals
 
 
 def load_webhook_url(env_values: dict[str, str]) -> str:
-    return env_values.get("DISCORD_WEBHOOK_URL", "").strip()
+    return env_values.get("CHART_SNAPSHOT_WEBHOOK_URL", "").strip()
 
 
 def collect_and_build_snapshots(
@@ -226,7 +226,7 @@ def main(argv=None):
     dry_run = args.dry_run or env_values.get("DRY_RUN", "").lower() in {"1", "true", "yes", "on"}
     webhook_url = load_webhook_url(env_values)
     if not dry_run and not webhook_url:
-        raise RuntimeError("DISCORD_WEBHOOK_URL is not set in market-watch/.env")
+        raise RuntimeError("CHART_SNAPSHOT_WEBHOOK_URL is not set in market-watch/.env")
 
     targets = load_chart_targets(env_values)
     db_path = chart_db_path(env_values)
