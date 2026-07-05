@@ -597,6 +597,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Print Discord payloads without sending webhooks or updating posted_ids.json.",
     )
+    parser.add_argument(
+        "--send-market-snapshot-now",
+        action="store_true",
+        help="Send one Market Snapshot immediately and exit without running the news feed loop.",
+    )
     return parser.parse_args(argv)
 
 
@@ -605,7 +610,15 @@ def is_dry_run_requested(argv=None):
 
 
 def main(argv=None):
-    dry_run = is_dry_run_requested(argv)
+    args = parse_args(argv)
+    dry_run = DRY_RUN or args.dry_run
+
+    if args.send_market_snapshot_now:
+        validate_config(dry_run=dry_run)
+        print("=== Discord Market Snapshot Manual Send ===")
+        print(f"Dry run: {dry_run}")
+        post_market_snapshot(dry_run=dry_run)
+        return
 
     signal.signal(signal.SIGINT, request_shutdown)
     if hasattr(signal, "SIGTERM"):

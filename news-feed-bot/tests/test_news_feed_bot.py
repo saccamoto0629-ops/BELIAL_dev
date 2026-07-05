@@ -409,7 +409,30 @@ def test_cli_dry_run_argument_matches_dry_run_mode():
     assert args.dry_run is True
 
 
+def test_cli_send_market_snapshot_now_argument():
+    args = bot.parse_args(["--send-market-snapshot-now"])
+
+    assert args.send_market_snapshot_now is True
+
+
 def test_dry_run_request_helper_honors_cli_argument(monkeypatch):
     monkeypatch.setattr(bot, "DRY_RUN", False)
 
     assert bot.is_dry_run_requested(["--dry-run"]) is True
+
+
+def test_send_market_snapshot_now_exits_without_news_loop(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(bot, "DRY_RUN", False)
+    monkeypatch.setattr(bot, "validate_config", lambda *, dry_run=False: calls.append(("validate", dry_run)))
+    monkeypatch.setattr(bot, "post_market_snapshot", lambda *, dry_run=False: calls.append(("snapshot", dry_run)))
+    monkeypatch.setattr(
+        bot,
+        "fetch_and_post",
+        lambda *, dry_run=False: (_ for _ in ()).throw(AssertionError("news loop should not run")),
+    )
+
+    bot.main(["--send-market-snapshot-now", "--dry-run"])
+
+    assert calls == [("validate", True), ("snapshot", True)]
