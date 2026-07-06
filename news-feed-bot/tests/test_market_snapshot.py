@@ -165,6 +165,8 @@ def test_build_market_snapshot_message_includes_all_sections():
                 "bias_weight": 1.0,
                 "bb_position": 0.67,
                 "macd_state": "Bullish",
+                "rsi14": 58.4,
+                "rsi_state": "Neutral",
             }
         ],
     )
@@ -185,7 +187,7 @@ def test_build_market_snapshot_message_includes_all_sections():
     assert "- Unemployment: 4.10% as of 2026-06-01" in message
     assert "- USDJPY: BUY / RSI 61.2 / ADX 24.0 / STOCH 70.0/65.0" in message
     assert "[Chart Snapshot Summary]" in message
-    assert "- SPX 1h: Trend Bull / State Inside band / Freshness Fresh / Bias Weight 1.00 / BB Position 0.67 / MACD State Bullish" in message
+    assert "- SPX 1h: Trend Bull / State Inside band / Freshness Fresh / Bias Weight 1.00 / BB Position 0.67 / MACD State Bullish / RSI14 58.40 / RSI State Neutral" in message
     assert "📅 Today's Events" in message
     assert "🇺🇸 CPI ★★★" in message
     assert "21:30" in message
