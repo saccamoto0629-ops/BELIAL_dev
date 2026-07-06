@@ -92,6 +92,7 @@ def build_indicator_snapshot(
     macd = _float_or_none(latest.get("macd"))
     macd_signal = _float_or_none(latest.get("macd_signal"))
     macd_hist = _float_or_none(latest.get("macd_hist"))
+    rsi14 = _float_or_none(latest.get("rsi14"))
     timestamp = indicators.index[-1].isoformat()
     freshness, age_seconds = freshness_from_timestamp(timestamp, now_utc=now_utc)
     is_stale = freshness == "Stale"
@@ -114,6 +115,8 @@ def build_indicator_snapshot(
         macd_signal=macd_signal,
         macd_hist=macd_hist,
         macd_state=str(latest.get("macd_state") or "Neutral"),
+        rsi14=rsi14,
+        rsi_state=str(latest.get("rsi_state") or "Unavailable"),
         freshness=freshness,
         age_seconds=age_seconds,
         bias_weight=MARKET_CLOSED_BIAS_WEIGHT if is_market_closed else (0.0 if is_stale else 1.0),
@@ -157,6 +160,8 @@ def format_snapshot(snapshot: IndicatorSnapshot) -> str:
             f"BB Position: {_fmt(snapshot.bb_position)}",
             f"MACD: {_fmt(snapshot.macd, 5)} / Signal: {_fmt(snapshot.macd_signal, 5)} / Hist: {_fmt(snapshot.macd_hist, 5)}",
             f"MACD State: {snapshot.macd_state}",
+            f"RSI14: {_fmt(snapshot.rsi14)}",
+            f"RSI State: {snapshot.rsi_state}",
             f"Trend: {snapshot.trend}",
             f"State: {snapshot.state}",
         ]
