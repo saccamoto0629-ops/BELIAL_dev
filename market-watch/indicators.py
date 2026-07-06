@@ -10,12 +10,12 @@ import pandas as pd
 
 
 def calculate_indicators(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of *frame* with moving averages and Bollinger Bands.
+    """Return a copy of *frame* with moving averages and technical indicators.
 
     Expected input columns are at least ``close``. The returned frame includes:
     ``sma20``, ``sma75``, ``ema20``, ``bb_middle``, ``bb_upper``, ``bb_lower``,
     ``bb_width_pct``, ``bb_position``, ``macd``, ``macd_signal``,
-    ``macd_hist``, and ``macd_state``.
+    ``macd_hist``, ``macd_state``, ``rsi14``, and ``rsi_state``.
     """
     if "close" not in frame.columns:
         raise ValueError("frame must contain a 'close' column")
@@ -44,6 +44,9 @@ def calculate_indicators(frame: pd.DataFrame) -> pd.DataFrame:
         classify_macd_state(macd_value, signal_value, hist_value)
         for macd_value, signal_value, hist_value in zip(macd, macd_signal, macd_hist)
     ]
+
+    result["rsi14"] = calculate_rsi(close)
+    result["rsi_state"] = [classify_rsi_state(value) for value in result["rsi14"]]
     return result
 
 
@@ -64,6 +67,27 @@ def calculate_macd(
     macd_signal = macd.ewm(span=signal, adjust=False).mean()
     macd_hist = macd - macd_signal
     return macd, macd_signal, macd_hist
+
+
+def calculate_rsi(close: pd.Series, *, period: int = 14) -> pd.Series:
+    """Return Wilder-style RSI for *close*.
+
+    The default period is 14. Values before enough candles are available remain
+    ``NaN`` so callers can classify them as unavailable.
+    """
+    close = close.astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
+    return rsi
 
 
 def detect_macd_cross(prev_macd, prev_signal, curr_macd, curr_signal) -> str | None:
@@ -91,6 +115,16 @@ def classify_macd_state(macd: float | None, macd_signal: float | None, macd_hist
         return "Bullish"
     if macd < macd_signal and macd_hist < 0:
         return "Bearish"
+    return "Neutral"
+
+
+def classify_rsi_state(rsi: float | None) -> str:
+    if rsi is None or pd.isna(rsi):
+        return "Unavailable"
+    if rsi >= 70:
+        return "Overbought"
+    if rsi <= 30:
+        return "Oversold"
     return "Neutral"
 
 
