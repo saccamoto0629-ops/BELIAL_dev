@@ -10,6 +10,11 @@ macd_fast = 12
 macd_slow = 26
 macd_signal = 9
 
+[ma_alert]
+enabled = true
+threshold_pct = 0.05
+ma_names = ["sma20", "sma75", "ema20"]
+
 [runtime]
 check_interval_seconds = 60
 

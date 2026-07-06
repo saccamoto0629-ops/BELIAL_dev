@@ -487,7 +487,63 @@ market-watch/state/macd_alert_state.json
 
 旧v1.2系の `market-watch/macd_alert_state.json` が残っている場合は初回読み込み互換を持たせる。ただし新規保存先は `market-watch/state/` である。
 
-### 26.10 起動方式 / 本番運用
+### 26.10 MA Alert Bot
+
+`ma_alert_bot.py` は、USDJPY M15の確定足で終値が監視対象の移動平均線に接近したときだけDiscordへイベント通知するBotである。これはChart Snapshotではなくイベント通知であり、売買判断、エントリー推奨、ロット計算、自動発注は行わない。
+
+初期監視対象:
+
+| 項目 | 値 |
+|---|---|
+| symbol | `USD_JPY` |
+| ticker | `JPY=X` |
+| timeframe | `M15` |
+| interval | `15m` |
+| period | `5d` |
+| MA | `sma20` / `sma75` / `ema20` |
+| threshold_pct | `0.05` |
+
+判定は確定足の `close` を基準に行う。Yahoo Financeの最新足は未確定の可能性があるため、最新足 `-1` は使わず、直近の確定足 `-2` を使う。
+
+```text
+distance_pct = abs(close - ma) / ma * 100
+distance_pct <= threshold_pct
+```
+
+`side` は `close >= ma` のとき `above`、`close < ma` のとき `below` とする。
+
+同一足・同一MAの重複通知を避けるため、stateを以下へ保存する。
+
+```text
+market-watch/state/ma_alert_state.json
+```
+
+state keyは `symbol`、`timeframe`、`ma_name`、`candle_time` を区別できる形式とし、保存内容には `candle_time`、`ma_name`、`close`、`ma_value`、`distance_pct`、`side`、`notified_at` を含める。
+
+通知先は `BOT_ALERTS_WEBHOOK_URL` を使う。既存互換として、未設定の場合のみ `DISCORD_WEBHOOK_URL` へfallbackしてよい。Embed titleは `Berial Market Watch: MA Touch` とし、注意文として `This is a watch alert only, not a trade decision.` を含める。
+
+設定は `market-watch/config.toml` の `[ma_alert]` に置く。
+
+```toml
+[ma_alert]
+enabled = true
+threshold_pct = 0.05
+ma_names = ["sma20", "sma75", "ema20"]
+```
+
+ログは `logs/ma_alert_bot.log` に `RotatingFileHandler` で出力する。
+
+起動例:
+
+```bash
+python market-watch/ma_alert_bot.py --once --dry-run
+python market-watch/ma_alert_bot.py --once
+python market-watch/ma_alert_bot.py
+```
+
+`--dry-run` ではDiscord送信もstate更新も行わない。
+
+### 26.11 起動方式 / 本番運用
 
 Linux運用パスは `/opt/berial` を想定する。
 
@@ -499,6 +555,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python market-watch/chart_snapshot.py --once --dry-run
 python market-watch/macd_alert_bot.py --once --dry-run
+python market-watch/ma_alert_bot.py --once --dry-run
 python news-feed-bot/market_snapshot.py
 ```
 
@@ -507,6 +564,7 @@ python news-feed-bot/market_snapshot.py
 ```text
 news-feed-bot/news_feed_bot.py
 market-watch/macd_alert_bot.py
+market-watch/ma_alert_bot.py
 ```
 
 定期実行対象:

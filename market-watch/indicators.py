@@ -134,6 +134,23 @@ def detect_macd_cross(prev_macd, prev_signal, curr_macd, curr_signal) -> str | N
     return None
 
 
+def detect_ma_touch(close_price, ma_value, *, threshold_pct: float):
+    """Return MA touch details when close is within threshold_pct of ma_value."""
+    if close_price is None or ma_value is None or pd.isna(close_price) or pd.isna(ma_value):
+        return None
+    close = float(close_price)
+    ma = float(ma_value)
+    if ma == 0:
+        return None
+    distance_pct = abs(close - ma) / abs(ma) * 100
+    if distance_pct > threshold_pct:
+        return None
+    return {
+        "distance_pct": distance_pct,
+        "side": "above" if close >= ma else "below",
+    }
+
+
 def classify_macd_state(macd: float | None, macd_signal: float | None, macd_hist: float | None) -> str:
     if (
         macd is None
