@@ -24,6 +24,8 @@ def test_calculate_indicators_adds_moving_averages_and_bollinger_bands():
     assert latest["macd"] == result["macd"].iloc[-1]
     assert latest["macd_hist"] == latest["macd"] - latest["macd_signal"]
     assert latest["macd_state"] in {"Bullish", "Bearish", "Neutral"}
+    assert latest["rsi14"] == 100.0
+    assert latest["rsi_state"] == "Overbought"
 
 
 def test_calculate_macd_returns_macd_signal_and_histogram():
@@ -37,6 +39,34 @@ def test_calculate_macd_returns_macd_signal_and_histogram():
     assert macd_hist.iloc[-1] == macd.iloc[-1] - macd_signal.iloc[-1]
 
 
+def test_calculate_rsi_returns_wilder_rsi():
+    close = pd.Series([
+        44.34,
+        44.09,
+        44.15,
+        43.61,
+        44.33,
+        44.83,
+        45.10,
+        45.42,
+        45.84,
+        46.08,
+        45.89,
+        46.03,
+        45.61,
+        46.28,
+        46.28,
+        46.00,
+        46.03,
+    ])
+
+    rsi = indicators.calculate_rsi(close)
+
+    assert len(rsi) == len(close)
+    assert pd.isna(rsi.iloc[13])
+    assert 50 < rsi.iloc[-1] < 80
+
+
 def test_detect_macd_cross_rules():
     assert indicators.detect_macd_cross(-0.1, 0.0, 0.1, 0.0) == "bullish"
     assert indicators.detect_macd_cross(0.1, 0.0, -0.1, 0.0) == "bearish"
@@ -48,6 +78,13 @@ def test_classify_macd_state_rules():
     assert indicators.classify_macd_state(0.5, 1.0, -0.5) == "Bearish"
     assert indicators.classify_macd_state(1.0, 1.0, 0.0) == "Neutral"
     assert indicators.classify_macd_state(None, 1.0, 0.0) == "Neutral"
+
+
+def test_classify_rsi_state_rules():
+    assert indicators.classify_rsi_state(71.0) == "Overbought"
+    assert indicators.classify_rsi_state(29.0) == "Oversold"
+    assert indicators.classify_rsi_state(50.0) == "Neutral"
+    assert indicators.classify_rsi_state(None) == "Unavailable"
 
 
 def test_classify_trend_rules():
