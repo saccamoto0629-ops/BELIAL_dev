@@ -44,6 +44,8 @@ class IndicatorSnapshot:
     macd_signal: float | None
     macd_hist: float | None
     macd_state: str
+    rsi14: float | None
+    rsi_state: str
     freshness: str
     age_seconds: int
     bias_weight: float
