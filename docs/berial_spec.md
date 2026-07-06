@@ -16,7 +16,7 @@
   - FREDのマクロ指標、TradingViewのテクニカル指標、Yahoo Financeの市場価格をまとめる
   - 簡易 `Risk Label` を算出し、Discord投稿本文として整形する
 - Market Watch
-  - `market-watch/` 配下でローソク足を取得し、SMA / EMA / Bollinger Bands / MACDを計算する
+  - `market-watch/` 配下でローソク足を取得し、SMA / EMA / Bollinger Bands / MACD / RSI14を計算する
   - Chart Snapshotを生成し、Market Snapshotの `Chart Snapshot Summary` と Market Bias に連携する
   - MACDクロス発生時は `macd_alert_bot.py` がイベント通知する
 
@@ -50,7 +50,7 @@ news-feed-bot/
 | TradingView | `tradingview_data.py` | テクニカル指標を取得 | 個別シンボルを `None` |
 | Economic Calendar | `economic_calendar.py` | 経済イベント取得のProvider枠 | `[]`、本文は unavailable |
 | FedWatch | `fedwatch.py` | 金利確率取得のProvider枠 | `None`、本文は unavailable |
-| Chart Snapshot | `../market-watch/chart_snapshot.py` | ローソク足由来のTrend / BB / MACD状態を取得 | セクションは unavailable、またはBiasから除外 |
+| Chart Snapshot | `../market-watch/chart_snapshot.py` | ローソク足由来のTrend / BB / MACD / RSI状態を取得 | セクションは unavailable、またはBiasから除外 |
 
 #### Yahoo Finance
 
@@ -134,7 +134,7 @@ FREDは公式APIであり、現行Market Snapshotでは信頼Providerとして�
 - `Risk Label`
 - `Market Bias`
 
-`Chart Snapshot Summary` は `market-watch/chart_snapshot.py` 由来の1h代表値を表示する。表示項目は `Trend`、`State`、`Freshness`、`Bias Weight`、`BB Position`、`MACD State` である。
+`Chart Snapshot Summary` は `market-watch/chart_snapshot.py` 由来の1h代表値を表示する。表示項目は `Trend`、`State`、`Freshness`、`Bias Weight`、`BB Position`、`MACD State`、`RSI14`、`RSI State` である。
 
 `news_feed_bot.py` からは `MARKET_SNAPSHOT_ENABLED=true` のとき、`MARKET_SNAPSHOT_TIME` に `market_snapshot.get_market_snapshot_message()` を呼び出してDiscordへ投稿する。
 
@@ -217,7 +217,7 @@ FedWatch / Economic Calendar は外部取得元が不安定なため、今後も
 
 v1.3 では、`market-watch/` を単なるMACDクロス通知Botではなく、チャート取得・指標計算・状態表示・イベント通知を担当する Market Watch Engine として拡張した。
 
-Market Watch Engine は、ローソク足を取得し、SQLiteへ保存し、SMA / EMA / Bollinger Bands / MACDを計算する。計算結果は `Chart Snapshot` として単独表示できるほか、`news-feed-bot/market_snapshot.py` の `Chart Snapshot Summary` と `news-feed-bot/market_bias.py` の判定材料として利用する。
+Market Watch Engine は、ローソク足を取得し、SQLiteへ保存し、SMA / EMA / Bollinger Bands / MACD / RSI14を計算する。計算結果は `Chart Snapshot` として単独表示できるほか、`news-feed-bot/market_snapshot.py` の `Chart Snapshot Summary` と `news-feed-bot/market_bias.py` の判定材料として利用する。RSI14は現時点では表示・観測専用であり、Market Biasのスコアには入れない。
 
 現時点では、売買判断、自動発注、エントリー推奨、ロット計算は行わない。
 
@@ -226,10 +226,10 @@ Market Watch Engine は、ローソク足を取得し、SQLiteへ保存し、SMA
 - 複数シンボル・複数時間足のローソク足を取得する
 - 取得データをSQLiteへ保存する
 - timestampはUTCで保存し、Discord表示時のみJSTへ変換する
-- SMA20 / SMA75 / EMA20 / Bollinger Bands / MACDを共通関数で計算する
+- SMA20 / SMA75 / EMA20 / Bollinger Bands / MACD / RSI14を共通関数で計算する
 - Chart Snapshotとして現在のチャート状態を表示する
 - Market Snapshotへ1h代表値の要約を渡す
-- Market BiasへTrend / BB / MACD状態を渡す
+- Market BiasへTrend / BB / MACD状態を渡す。RSI14 / RSI StateはSummary表示用の観測値として保持し、Biasスコアには反映しない
 - MACDクロスは `macd_alert_bot.py` でイベント通知として扱う
 - ニュース監視Botとは責務を分離する
 
@@ -241,7 +241,7 @@ market-watch/
 ├─ config.toml
 ├─ chart_collector.py        # ローソク足取得、SQLite保存、UTC正規化
 ├─ chart_models.py           # ChartTarget / Candle / IndicatorSnapshot
-├─ indicators.py             # SMA / EMA / BB / MACD / クロス判定 / 状態分類
+├─ indicators.py             # SMA / EMA / BB / MACD / RSI / クロス判定 / 状態分類
 ├─ chart_snapshot.py         # Chart Snapshot生成、Discord投稿、Summary生成
 ├─ macd_alert_bot.py         # MACDクロスのイベント通知Bot
 ├─ data/
@@ -267,7 +267,8 @@ SQLite chart_data.sqlite3 (timestampはUTC保存)
 indicators.py
   ├─ SMA / EMA
   ├─ Bollinger Bands
-  └─ MACD
+  ├─ MACD
+  └─ RSI14
   ↓
 chart_snapshot.py
   ├─ Chart Snapshot詳細表示
@@ -352,6 +353,8 @@ Discord表示時のみJSTへ変換する。
 | `macd_signal` | MACDのEMA9 |
 | `macd_hist` | `macd - macd_signal` |
 | `macd_state` | `Bullish` / `Bearish` / `Neutral` |
+| `rsi14` | Wilder-style RSI, period=14 |
+| `rsi_state` | `Overbought` / `Oversold` / `Neutral` / `Unavailable` |
 
 MACD State:
 
@@ -360,6 +363,17 @@ MACD State:
 | `Bullish` | `macd > macd_signal` かつ `macd_hist > 0` |
 | `Bearish` | `macd < macd_signal` かつ `macd_hist < 0` |
 | `Neutral` | 上記以外、または値欠損 |
+
+RSI State:
+
+| State | Condition |
+|---|---|
+| `Overbought` | `rsi14 >= 70` |
+| `Oversold` | `rsi14 <= 30` |
+| `Neutral` | `30 < rsi14 < 70` |
+| `Unavailable` | `rsi14` is `None` / `NaN`, or candles are insufficient |
+
+RSI14 / RSI State are observation-only values. They are displayed in Chart Snapshot and Chart Snapshot Summary, but are not used for Market Bias score, Paper Signal candidate rules, entries, exits, lot sizing, or order handling.
 
 Trend:
 
@@ -416,6 +430,8 @@ BB Width: 0.38%
 BB Position: 0.76
 MACD: -0.00872 / Signal: -0.06150 / Hist: 0.05278
 MACD State: Bullish
+RSI14: 58.40
+RSI State: Neutral
 Trend: Neutral
 State: Inside band
 ```
@@ -543,6 +559,7 @@ v1.3 は、Berial が取得している市場データ(Yahoo Finance / FRED / Tr
 
 - 既存Providerが取得済みのデータから、市場の大まかな方向感をルールベースで判定する
 - Chart Snapshot由来のTrend / BB / MACD状態をBias計算へ反映する
+- Chart Snapshot由来のRSI14 / RSI Stateは表示・観測専用であり、Bias計算へは反映しない
 - 判定結果、confidence、scores、reasons、warnings、note をDiscordへ出せる形にする
 - 「観測結果の可視化」を一段進めるものであり、売買判断や自動発注を行う機能ではない
 
@@ -581,6 +598,10 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 - `bias_weight`
 - `bb_position`
 - `macd_state`
+- `rsi14`
+- `rsi_state`
+
+`rsi14` / `rsi_state` are accepted as observation fields only. They may appear in summaries and downstream records, but Market Bias scoring ignores them in the current version.
 
 すべての入力は欠損・部分欠損があっても例外を投げず、判定可能な範囲で分類を行う。
 
@@ -619,7 +640,7 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 
 #### scores
 
-`scores` は `{"Bull": float, "Bear": float}` のdictで返す。Market Snapshot由来のVIX、VVIX、株価指数、米金利、Dollar Index、TradingView technical recommendation、Chart Snapshot由来のTrend / MACD Stateなどをルールベースで加点する。
+`scores` は `{"Bull": float, "Bear": float}` のdictで返す。Market Snapshot由来のVIX、VVIX、株価指数、米金利、Dollar Index、TradingView technical recommendation、Chart Snapshot由来のTrend / MACD Stateなどをルールベースで加点する。RSI14 / RSI Stateは現行版ではスコア入力にしない。
 
 Chart Snapshotは `bias_weight` を掛けて反映する。
 
@@ -668,10 +689,10 @@ TradingView由来の `BUY` / `SELL` は内部データとして扱うことは�
 `Chart Snapshot Summary` では、各Symbolの1hを代表値として以下を表示する。
 
 ```text
-- USDJPY 1h: Trend Neutral / State Inside band / Freshness Weekend Closed / Bias Weight 0.25 / BB Position 0.76 / MACD State Bullish
+- USDJPY 1h: Trend Neutral / State Inside band / Freshness Weekend Closed / Bias Weight 0.25 / BB Position 0.76 / MACD State Bullish / RSI14 58.40 / RSI State Neutral
 ```
 
-Market BiasはこのSummary由来の `chart_data` を受け取り、TrendとMACD Stateをスコアへ反映する。
+Market BiasはこのSummary由来の `chart_data` を受け取り、TrendとMACD Stateをスコアへ反映する。RSI14 / RSI Stateは表示・観測専用であり、Market Biasスコアには反映しない。
 
 ### 27.8 v1.3.1以降の検討
 
@@ -815,7 +836,9 @@ Paper Signal は、Market Bias が示す「市場の大まかな方向」と、C
 | 入力 | 由来 | 説明 |
 |---|---|---|
 | `market_bias` / `confidence` | `news-feed-bot/market_bias.classify_market_bias()` | `Bull` / `Bear` / `Neutral` と 0.0〜1.0 の confidence |
-| Chart Snapshot(1h) | `fetch_snapshot_sources()["chart"]`(内部で `market-watch/chart_snapshot.py` を呼ぶ) | symbol / timeframe / trend / state / freshness / bias_weight / macd_state |
+| Chart Snapshot(1h) | `fetch_snapshot_sources()["chart"]`(内部で `market-watch/chart_snapshot.py` を呼ぶ) | symbol / timeframe / trend / state / freshness / bias_weight / macd_state / rsi14 / rsi_state |
+
+Paper Signal v1.4.0では、`rsi14` / `rsi_state` は記録・観測用の補助フィールドであり、候補生成ルールには使わない。
 
 ### 29.4 出力データ(Paper Signal)
 
