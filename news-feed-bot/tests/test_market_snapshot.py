@@ -3,8 +3,11 @@ import sys
 
 BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BOT_DIR))
+MARKET_WATCH_DIR = BOT_DIR.parent / "market-watch"
+sys.path.insert(0, str(MARKET_WATCH_DIR))
 
 import market_snapshot as snap  # noqa: E402
+from chart_models import IndicatorSnapshot  # noqa: E402
 
 
 def make_snapshot(latest, previous):
@@ -208,6 +211,84 @@ def test_build_market_snapshot_message_shows_unavailable_without_fred():
 
 def test_format_chart_summary_section_reports_unavailable_when_missing():
     assert snap.format_chart_summary_section([]) == "[Chart Snapshot Summary]\n- unavailable"
+
+
+def test_format_chart_summary_section_includes_rsi_from_dict_snapshot():
+    section = snap.format_chart_summary_section(
+        [
+            {
+                "symbol": "USDJPY",
+                "trend": "Bull",
+                "state": "Inside band",
+                "freshness": "Fresh",
+                "bias_weight": 1.0,
+                "bb_position": 0.42,
+                "macd_state": "Bullish",
+                "rsi14": 71.25,
+                "rsi_state": "Overbought",
+            }
+        ]
+    )
+
+    assert (
+        "- USDJPY 1h: Trend Bull / State Inside band / Freshness Fresh / Bias Weight 1.00 "
+        "/ BB Position 0.42 / MACD State Bullish / RSI14 71.25 / RSI State Overbought"
+    ) in section
+
+
+def test_format_chart_summary_section_formats_missing_rsi_as_na():
+    section = snap.format_chart_summary_section(
+        [
+            {
+                "symbol": "USDJPY",
+                "trend": "Neutral",
+                "state": "Unavailable",
+                "freshness": "Fresh",
+                "bias_weight": 1.0,
+                "bb_position": None,
+                "macd_state": "Neutral",
+                "rsi14": None,
+                "rsi_state": "Unavailable",
+            }
+        ]
+    )
+
+    assert "RSI14 N/A / RSI State Unavailable" in section
+
+
+def test_format_chart_summary_section_includes_rsi_from_indicator_snapshot():
+    indicator = IndicatorSnapshot(
+        symbol="SPX",
+        timeframe="1h",
+        timestamp="2026-07-06T00:00:00Z",
+        close=5500.0,
+        sma20=5480.0,
+        sma75=5400.0,
+        ema20=5475.0,
+        bb_lower=5400.0,
+        bb_middle=5480.0,
+        bb_upper=5560.0,
+        bb_width_pct=2.9,
+        bb_position=0.63,
+        macd=1.2,
+        macd_signal=1.0,
+        macd_hist=0.2,
+        macd_state="Bullish",
+        rsi14=58.4,
+        rsi_state="Neutral",
+        freshness="Fresh",
+        age_seconds=120,
+        bias_weight=1.0,
+        trend="Bull",
+        state="Inside band",
+    )
+
+    section = snap.format_chart_summary_section([indicator])
+
+    assert (
+        "- SPX 1h: Trend Bull / State Inside band / Freshness Fresh / Bias Weight 1.00 "
+        "/ BB Position 0.63 / MACD State Bullish / RSI14 58.40 / RSI State Neutral"
+    ) in section
 
 
 def test_get_market_snapshot_message_uses_all_three_sources(monkeypatch):

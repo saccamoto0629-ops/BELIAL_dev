@@ -2,6 +2,7 @@ import pathlib
 import sys
 
 import pandas as pd
+import pytest
 
 BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BOT_DIR))
@@ -64,7 +65,62 @@ def test_calculate_rsi_returns_wilder_rsi():
 
     assert len(rsi) == len(close)
     assert pd.isna(rsi.iloc[13])
-    assert 50 < rsi.iloc[-1] < 80
+    assert rsi.iloc[14] == pytest.approx(70.464135)
+    assert rsi.iloc[-1] == pytest.approx(66.480942)
+
+
+def test_calculate_rsi_keeps_series_length_and_waits_for_period():
+    close = pd.Series([100.0 + i for i in range(14)])
+
+    rsi = indicators.calculate_rsi(close)
+
+    assert len(rsi) == len(close)
+    assert rsi.isna().all()
+
+
+def test_calculate_rsi_returns_100_for_rising_only_series():
+    close = pd.Series([100.0 + i for i in range(20)])
+
+    rsi = indicators.calculate_rsi(close)
+
+    assert rsi.iloc[:14].isna().all()
+    assert rsi.iloc[14] == 100.0
+    assert rsi.iloc[-1] == 100.0
+
+
+def test_calculate_rsi_returns_zero_for_falling_only_series():
+    close = pd.Series([100.0 - i for i in range(20)])
+
+    rsi = indicators.calculate_rsi(close)
+
+    assert rsi.iloc[:14].isna().all()
+    assert rsi.iloc[14] == pytest.approx(0.0)
+    assert rsi.iloc[-1] == pytest.approx(0.0)
+
+
+def test_calculate_rsi_returns_50_for_flat_series():
+    close = pd.Series([100.0 for _ in range(20)])
+
+    rsi = indicators.calculate_rsi(close)
+
+    assert rsi.iloc[:14].isna().all()
+    assert rsi.iloc[14] == 50.0
+    assert rsi.iloc[-1] == 50.0
+
+
+def test_calculate_rsi_handles_nan_by_waiting_for_a_new_seed_window():
+    close = pd.Series(
+        [100.0 + i for i in range(10)]
+        + [float("nan")]
+        + [110.0 + i for i in range(16)]
+    )
+
+    rsi = indicators.calculate_rsi(close)
+
+    assert len(rsi) == len(close)
+    assert pd.isna(rsi.iloc[10])
+    assert pd.isna(rsi.iloc[24])
+    assert rsi.iloc[-1] == 100.0
 
 
 def test_detect_macd_cross_rules():
@@ -81,10 +137,13 @@ def test_classify_macd_state_rules():
 
 
 def test_classify_rsi_state_rules():
-    assert indicators.classify_rsi_state(71.0) == "Overbought"
-    assert indicators.classify_rsi_state(29.0) == "Oversold"
+    assert indicators.classify_rsi_state(70.0) == "Overbought"
+    assert indicators.classify_rsi_state(69.9) == "Neutral"
+    assert indicators.classify_rsi_state(30.0) == "Oversold"
+    assert indicators.classify_rsi_state(30.1) == "Neutral"
     assert indicators.classify_rsi_state(50.0) == "Neutral"
     assert indicators.classify_rsi_state(None) == "Unavailable"
+    assert indicators.classify_rsi_state(float("nan")) == "Unavailable"
 
 
 def test_classify_trend_rules():

@@ -75,18 +75,51 @@ def calculate_rsi(close: pd.Series, *, period: int = 14) -> pd.Series:
     The default period is 14. Values before enough candles are available remain
     ``NaN`` so callers can classify them as unavailable.
     """
+    if period <= 0:
+        raise ValueError("period must be positive")
+
     close = close.astype(float)
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
+    rsi = pd.Series(float("nan"), index=close.index, dtype="float64")
+    window_gains: list[float] = []
+    window_losses: list[float] = []
+    avg_gain: float | None = None
+    avg_loss: float | None = None
 
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
+    for position in range(1, len(close)):
+        current_gain = gain.iloc[position]
+        current_loss = loss.iloc[position]
+
+        if pd.isna(current_gain) or pd.isna(current_loss):
+            window_gains.clear()
+            window_losses.clear()
+            avg_gain = None
+            avg_loss = None
+            continue
+
+        if avg_gain is None or avg_loss is None:
+            window_gains.append(float(current_gain))
+            window_losses.append(float(current_loss))
+            if len(window_gains) < period:
+                continue
+
+            avg_gain = sum(window_gains[-period:]) / period
+            avg_loss = sum(window_losses[-period:]) / period
+        else:
+            avg_gain = ((avg_gain * (period - 1)) + float(current_gain)) / period
+            avg_loss = ((avg_loss * (period - 1)) + float(current_loss)) / period
+
+        if avg_loss == 0 and avg_gain > 0:
+            rsi.iloc[position] = 100.0
+        elif avg_loss == 0 and avg_gain == 0:
+            rsi.iloc[position] = 50.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi.iloc[position] = 100 - (100 / (1 + rs))
+
     return rsi
 
 

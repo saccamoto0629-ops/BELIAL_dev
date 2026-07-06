@@ -23,6 +23,19 @@ def make_candles():
     )
 
 
+def make_short_candles():
+    return pd.DataFrame(
+        {
+            "open": [float(i) for i in range(1, 10)],
+            "high": [float(i) + 0.5 for i in range(1, 10)],
+            "low": [float(i) - 0.5 for i in range(1, 10)],
+            "close": [float(i) for i in range(1, 10)],
+            "volume": [100.0 for _ in range(9)],
+        },
+        index=pd.date_range("2026-07-05", periods=9, freq="15min", tz="UTC"),
+    )
+
+
 def test_build_indicator_snapshot_and_format_message():
     target = ChartTarget("USDJPY", "JPY=X", "15m")
 
@@ -49,6 +62,24 @@ def test_build_indicator_snapshot_and_format_message():
     assert "RSI14: 100.00" in message
     assert "RSI State: Overbought" in message
     assert "Trend: Bull" in message
+
+
+def test_build_indicator_snapshot_reports_unavailable_rsi_when_data_is_short():
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+
+    indicator = snapshot.build_indicator_snapshot(
+        target,
+        make_short_candles(),
+        now_utc=pd.Timestamp("2026-07-05T02:00:00Z"),
+    )
+
+    assert indicator is not None
+    assert indicator.rsi14 is None
+    assert indicator.rsi_state == "Unavailable"
+
+    formatted = snapshot.format_snapshot(indicator)
+    assert "RSI14: N/A" in formatted
+    assert "RSI State: Unavailable" in formatted
 
 
 def test_post_discord_message_dry_run_does_not_call_session(capsys):
