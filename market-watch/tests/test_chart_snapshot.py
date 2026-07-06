@@ -36,6 +36,8 @@ def test_build_indicator_snapshot_and_format_message():
     assert indicator is not None
     assert indicator.symbol == "USDJPY"
     assert indicator.trend == "Bull"
+    assert indicator.rsi14 == 100.0
+    assert indicator.rsi_state == "Overbought"
     assert "📈 Chart Snapshot" in message
     assert "USDJPY 15m" in message
     assert "Time: 2026-07-06 04:45 JST" in message
@@ -44,6 +46,8 @@ def test_build_indicator_snapshot_and_format_message():
     assert "SMA20:" in message
     assert "BB Width:" in message
     assert "MACD State:" in message
+    assert "RSI14: 100.00" in message
+    assert "RSI State: Overbought" in message
     assert "Trend: Bull" in message
 
 
