@@ -234,6 +234,11 @@ def _snapshot_get(snapshot, key, default=None):
     return getattr(snapshot, key, default)
 
 
+def _format_optional_float(snapshot, key: str, decimals: int = 2) -> str:
+    value = _snapshot_get(snapshot, key)
+    return "N/A" if value is None else f"{float(value):.{decimals}f}"
+
+
 def format_chart_summary_section(chart_snapshots: list | None) -> str:
     lines = ["[Chart Snapshot Summary]"]
     if not chart_snapshots:
@@ -243,18 +248,17 @@ def format_chart_summary_section(chart_snapshots: list | None) -> str:
     for snapshot in chart_snapshots:
         lines.append(
             "- {symbol} 1h: Trend {trend} / State {state} / Freshness {freshness} "
-            "/ Bias Weight {bias_weight:.2f} / BB Position {bb_position} / MACD State {macd_state}".format(
+            "/ Bias Weight {bias_weight:.2f} / BB Position {bb_position} / MACD State {macd_state} "
+            "/ RSI14 {rsi14} / RSI State {rsi_state}".format(
                 symbol=_snapshot_get(snapshot, "symbol", "UNKNOWN"),
                 trend=_snapshot_get(snapshot, "trend", "N/A"),
                 state=_snapshot_get(snapshot, "state", "N/A"),
                 freshness=_snapshot_get(snapshot, "freshness", "N/A"),
                 bias_weight=float(_snapshot_get(snapshot, "bias_weight", 0.0) or 0.0),
-                bb_position=(
-                    "N/A"
-                    if _snapshot_get(snapshot, "bb_position") is None
-                    else f"{float(_snapshot_get(snapshot, 'bb_position')):.2f}"
-                ),
+                bb_position=_format_optional_float(snapshot, "bb_position"),
                 macd_state=_snapshot_get(snapshot, "macd_state", "N/A"),
+                rsi14=_format_optional_float(snapshot, "rsi14"),
+                rsi_state=_snapshot_get(snapshot, "rsi_state", "N/A"),
             )
         )
     return "\n".join(lines)
