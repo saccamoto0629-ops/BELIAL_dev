@@ -1,0 +1,65 @@
+name: Feature Request
+description: 新機能、改善、追加したい通知/分析の提案
+title: "[Feature]: "
+labels: ["type: feature"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目的
+      description: 何をできるようにしたいか。なぜ必要か。
+      placeholder: 例）アラート発生時のチャートスナップショットをDiscordに添付したい
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 背景/現状の困りごと
+      placeholder: 現在の運用、手作業、見落とし、判断が遅れる場面など
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: スコープ
+      description: 今回やること/やらないことを分ける。
+      placeholder: |
+        やる:
+        - 
+        やらない:
+        - 
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 完了条件
+      description: Closeしてよい状態。
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 領域
+      options:
+        - News Bot
+        - Alert
+        - Chart Snapshot
+        - Strategy / Backtest
+        - Database
+        - Discord
+        - Infra / Deploy
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: 補足
+      placeholder: 関連Issue、参考URL、実装メモなど
+    validations:
+      required: false
