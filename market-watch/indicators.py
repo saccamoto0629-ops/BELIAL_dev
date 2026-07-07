@@ -9,6 +9,35 @@ from __future__ import annotations
 import pandas as pd
 
 
+def calculate_bollinger_bands(
+    close: pd.Series,
+    *,
+    window: int = 20,
+    std_multiplier: float = 2.0,
+) -> pd.DataFrame:
+    """Return Bollinger Bands and decimal bandwidth for *close*."""
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if std_multiplier <= 0:
+        raise ValueError("std_multiplier must be positive")
+
+    close = close.astype(float)
+    middle = close.rolling(window=window, min_periods=window).mean()
+    std = close.rolling(window=window, min_periods=window).std()
+    upper = middle + (std * std_multiplier)
+    lower = middle - (std * std_multiplier)
+    bandwidth = (upper - lower) / middle
+    return pd.DataFrame(
+        {
+            "bb_middle": middle,
+            "bb_upper": upper,
+            "bb_lower": lower,
+            "bb_bandwidth": bandwidth,
+        },
+        index=close.index,
+    )
+
+
 def calculate_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of *frame* with moving averages and technical indicators.
 
@@ -27,10 +56,11 @@ def calculate_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     result["sma75"] = close.rolling(window=75, min_periods=75).mean()
     result["ema20"] = close.ewm(span=20, adjust=False, min_periods=20).mean()
 
-    result["bb_middle"] = result["sma20"]
-    bb_std = close.rolling(window=20, min_periods=20).std()
-    result["bb_upper"] = result["bb_middle"] + (bb_std * 2)
-    result["bb_lower"] = result["bb_middle"] - (bb_std * 2)
+    bands = calculate_bollinger_bands(close)
+    result["bb_middle"] = bands["bb_middle"]
+    result["bb_upper"] = bands["bb_upper"]
+    result["bb_lower"] = bands["bb_lower"]
+    result["bb_bandwidth"] = bands["bb_bandwidth"]
 
     band_range = result["bb_upper"] - result["bb_lower"]
     result["bb_width_pct"] = (band_range / result["bb_middle"]) * 100
@@ -149,6 +179,128 @@ def detect_ma_touch(close_price, ma_value, *, threshold_pct: float):
         "distance_pct": distance_pct,
         "side": "above" if close >= ma else "below",
     }
+
+
+def is_bollinger_squeeze(
+    bandwidth: pd.Series,
+    position: int,
+    *,
+    lookback: int = 120,
+    percentile: float = 0.10,
+) -> bool:
+    """Return True when bandwidth is in the lower percentile of its lookback."""
+    if lookback <= 0:
+        raise ValueError("lookback must be positive")
+    if not 0 <= percentile <= 1:
+        raise ValueError("percentile must be between 0 and 1")
+
+    current = bandwidth.iloc[position]
+    if pd.isna(current):
+        return False
+    window = bandwidth.iloc[: position + 1].dropna().tail(lookback)
+    if len(window) < lookback:
+        return False
+    return float(current) <= float(window.quantile(percentile))
+
+
+def detect_bollinger_signals(
+    candles: pd.DataFrame,
+    *,
+    current_position: int = -1,
+    window: int = 20,
+    std_multiplier: float = 2.0,
+    squeeze_lookback: int = 120,
+    squeeze_percentile: float = 0.10,
+    expansion_ratio: float = 1.30,
+) -> list[dict]:
+    """Return Bollinger observation signals for one already-confirmed candle."""
+    required = {"high", "low", "close"}
+    if not required.issubset(candles.columns):
+        missing = ", ".join(sorted(required - set(candles.columns)))
+        raise ValueError(f"candles must contain columns: {missing}")
+    if expansion_ratio <= 0:
+        raise ValueError("expansion_ratio must be positive")
+
+    bands = calculate_bollinger_bands(
+        candles["close"],
+        window=window,
+        std_multiplier=std_multiplier,
+    )
+    frame = candles.copy()
+    frame[["bb_middle", "bb_upper", "bb_lower", "bb_bandwidth"]] = bands
+    current_idx = len(frame) + current_position if current_position < 0 else current_position
+    row = frame.iloc[current_position]
+
+    values = {
+        "close": row["close"],
+        "high": row["high"],
+        "low": row["low"],
+        "middle": row["bb_middle"],
+        "upper": row["bb_upper"],
+        "lower": row["bb_lower"],
+        "bandwidth": row["bb_bandwidth"],
+    }
+    if any(pd.isna(value) for value in values.values()):
+        return []
+
+    close = float(values["close"])
+    high = float(values["high"])
+    low = float(values["low"])
+    upper = float(values["upper"])
+    lower = float(values["lower"])
+    bandwidth = float(values["bandwidth"])
+
+    events: list[dict] = []
+
+    def append(signal_type: str, note: str) -> None:
+        events.append(
+            {
+                "signal_type": signal_type,
+                "close": close,
+                "upper": upper,
+                "middle": float(values["middle"]),
+                "lower": lower,
+                "bandwidth": bandwidth,
+                "note": note,
+            }
+        )
+
+    if close >= upper:
+        append("upper_break", "終値が+2σ外側。過熱/ブレイク候補。")
+    if close <= lower:
+        append("lower_break", "終値が-2σ外側。過熱/ブレイク候補。")
+    if high >= upper:
+        append("upper_touch", "高値が+2σに到達。市場状態の監視対象。")
+    if low <= lower:
+        append("lower_touch", "安値が-2σに到達。市場状態の監視対象。")
+
+    current_squeeze = is_bollinger_squeeze(
+        frame["bb_bandwidth"],
+        current_idx,
+        lookback=squeeze_lookback,
+        percentile=squeeze_percentile,
+    )
+    if current_squeeze:
+        append("squeeze", "バンド幅が過去レンジの下位圏。低ボラティリティ状態。")
+
+    if current_idx > 0:
+        previous_bandwidth = frame["bb_bandwidth"].iloc[current_idx - 1]
+        previous_squeeze = is_bollinger_squeeze(
+            frame["bb_bandwidth"],
+            current_idx - 1,
+            lookback=squeeze_lookback,
+            percentile=squeeze_percentile,
+        )
+        if (
+            previous_squeeze
+            and not current_squeeze
+            and not pd.isna(previous_bandwidth)
+            and float(previous_bandwidth) > 0
+            and bandwidth >= float(previous_bandwidth) * expansion_ratio
+        ):
+            append("expansion_start", "スクイーズを抜けてバンド幅が拡大開始。")
+
+    return events
 
 
 def classify_macd_state(macd: float | None, macd_signal: float | None, macd_hist: float | None) -> str:

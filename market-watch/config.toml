@@ -15,6 +15,22 @@ enabled = true
 threshold_pct = 0.05
 ma_names = ["sma20", "sma75", "ema20"]
 
+[bollinger]
+enabled = true
+window = 20
+std_multiplier = 2.0
+squeeze_lookback = 120
+squeeze_percentile = 0.10
+expansion_ratio = 1.30
+
+[bollinger.notify]
+upper_break = true
+lower_break = true
+expansion_start = true
+upper_touch = false
+lower_touch = false
+squeeze = false
+
 [runtime]
 check_interval_seconds = 60
 

@@ -1,6 +1,7 @@
 # MACD Cross Alert Bot (v1.2.2)
 
 `market-watch/macd_alert_bot.py` monitors USD/JPY M15 candles and sends a Discord alert when MACD(12,26,9) makes a confirmed-candle bullish or bearish cross.
+`market-watch/bollinger_alert_bot.py` monitors confirmed candles for Bollinger Bands market-state signals and sends observation-only Discord alerts.
 
 v1.2.2 is an operations-hardening release. It does not add market-judgement logic. The bot only detects MACD crosses and notifies Discord.
 
@@ -20,7 +21,9 @@ Runtime files are created outside Git:
 
 ```text
 logs/macd_alert_bot.log
+logs/bollinger_alert_bot.log
 market-watch/state/macd_alert_state.json
+market-watch/state/bollinger_alert_state.json
 ```
 
 ## Setup on Linux
@@ -65,6 +68,22 @@ macd_fast = 12
 macd_slow = 26
 macd_signal = 9
 
+[bollinger]
+enabled = true
+window = 20
+std_multiplier = 2.0
+squeeze_lookback = 120
+squeeze_percentile = 0.10
+expansion_ratio = 1.30
+
+[bollinger.notify]
+upper_break = true
+lower_break = true
+expansion_start = true
+upper_touch = false
+lower_touch = false
+squeeze = false
+
 [runtime]
 check_interval_seconds = 60
 
@@ -83,6 +102,7 @@ One dry-run check:
 ```bash
 cd /opt/berial
 python market-watch/macd_alert_bot.py --once --dry-run
+python market-watch/bollinger_alert_bot.py --once --dry-run
 ```
 
 One real check:
@@ -90,6 +110,7 @@ One real check:
 ```bash
 cd /opt/berial
 python market-watch/macd_alert_bot.py --once
+python market-watch/bollinger_alert_bot.py --once
 ```
 
 Continuous loop:
@@ -97,9 +118,11 @@ Continuous loop:
 ```bash
 cd /opt/berial
 python market-watch/macd_alert_bot.py
+python market-watch/bollinger_alert_bot.py
 ```
 
 `--dry-run` does not send to Discord and does not update `market-watch/state/macd_alert_state.json`.
+For Bollinger alerts, `--dry-run` also leaves `market-watch/state/bollinger_alert_state.json` unchanged.
 
 ## Cross detection
 
@@ -134,6 +157,39 @@ The key is `symbol + timeframe`. The value stores:
 
 This prevents duplicate notifications for the same candle after a bot restart.
 
+For Bollinger alerts, state is saved in:
+
+```text
+market-watch/state/bollinger_alert_state.json
+```
+
+The dedupe key is `symbol + timeframe + signal_type + candle_time`, so the same confirmed candle cannot notify the same Bollinger signal twice.
+
+## Bollinger alert detection
+
+`bollinger_alert_bot.py` excludes the latest bar because it may still be forming, then evaluates the confirmed candle at index `-2`.
+
+It calculates:
+
+- `middle = SMA20(close)`
+- `upper = middle + 2σ`
+- `lower = middle - 2σ`
+- `bandwidth = (upper - lower) / middle`
+
+Enabled by default:
+
+- `upper_break`: close is at or above upper band
+- `lower_break`: close is at or below lower band
+- `expansion_start`: previous confirmed candle was squeeze, current candle exits squeeze, and bandwidth is at least `1.30x` the previous bandwidth
+
+Disabled by default:
+
+- `upper_touch`: high is at or above upper band
+- `lower_touch`: low is at or below lower band
+- `squeeze`: bandwidth is at or below the lower 10% of the past 120 candles
+
+These are market-state alerts only. They are not entry, exit, order, lot-size, stop-loss, or take-profit instructions.
+
 ## Discord alert content
 
 Alerts include:
@@ -141,8 +197,10 @@ Alerts include:
 - symbol
 - timeframe
 - signal type and golden/dead cross label
+- Bollinger signal type when emitted by `bollinger_alert_bot.py`
 - confirmed candle time
 - current close price
+- Bollinger upper, middle, lower, and bandwidth
 - MACD value
 - signal-line value
 - detection time

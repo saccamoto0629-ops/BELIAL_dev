@@ -10,6 +10,18 @@ sys.path.insert(0, str(BOT_DIR))
 import indicators  # noqa: E402
 
 
+def _make_ohlc(values):
+    index = pd.date_range("2026-07-01", periods=len(values), freq="15min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "high": [float(value) + 0.01 for value in values],
+            "low": [float(value) - 0.01 for value in values],
+            "close": [float(value) for value in values],
+        },
+        index=index,
+    )
+
+
 def test_calculate_indicators_adds_moving_averages_and_bollinger_bands():
     frame = pd.DataFrame({"close": [float(i) for i in range(1, 81)]})
 
@@ -20,6 +32,7 @@ def test_calculate_indicators_adds_moving_averages_and_bollinger_bands():
     assert latest["sma75"] == sum(range(6, 81)) / 75
     assert latest["ema20"] > 0
     assert latest["bb_lower"] < latest["bb_middle"] < latest["bb_upper"]
+    assert latest["bb_bandwidth"] == pytest.approx(latest["bb_width_pct"] / 100)
     assert latest["bb_width_pct"] > 0
     assert latest["bb_position"] > 0
     assert latest["macd"] == result["macd"].iloc[-1]
@@ -27,6 +40,20 @@ def test_calculate_indicators_adds_moving_averages_and_bollinger_bands():
     assert latest["macd_state"] in {"Bullish", "Bearish", "Neutral"}
     assert latest["rsi14"] == 100.0
     assert latest["rsi_state"] == "Overbought"
+
+
+def test_calculate_bollinger_bands_uses_window_and_std_multiplier():
+    close = pd.Series([100.0] * 19 + [110.0])
+
+    bands = indicators.calculate_bollinger_bands(close, window=20, std_multiplier=2.0)
+
+    latest = bands.iloc[-1]
+    expected_middle = close.mean()
+    expected_std = close.std()
+    assert latest["bb_middle"] == pytest.approx(expected_middle)
+    assert latest["bb_upper"] == pytest.approx(expected_middle + expected_std * 2.0)
+    assert latest["bb_lower"] == pytest.approx(expected_middle - expected_std * 2.0)
+    assert latest["bb_bandwidth"] == pytest.approx((latest["bb_upper"] - latest["bb_lower"]) / expected_middle)
 
 
 def test_calculate_macd_returns_macd_signal_and_histogram():
@@ -127,6 +154,43 @@ def test_detect_macd_cross_rules():
     assert indicators.detect_macd_cross(-0.1, 0.0, 0.1, 0.0) == "bullish"
     assert indicators.detect_macd_cross(0.1, 0.0, -0.1, 0.0) == "bearish"
     assert indicators.detect_macd_cross(0.2, 0.0, 0.1, 0.0) is None
+
+
+def test_detect_bollinger_signals_upper_and_lower_breaks():
+    upper = _make_ohlc([100.0] * 20 + [110.0, 100.0])
+    lower = _make_ohlc([100.0] * 20 + [90.0, 100.0])
+
+    upper_signals = indicators.detect_bollinger_signals(upper, current_position=-2, squeeze_lookback=3)
+    lower_signals = indicators.detect_bollinger_signals(lower, current_position=-2, squeeze_lookback=3)
+
+    assert {signal["signal_type"] for signal in upper_signals} >= {"upper_break", "upper_touch"}
+    assert {signal["signal_type"] for signal in lower_signals} >= {"lower_break", "lower_touch"}
+    assert upper_signals[0]["note"] == "終値が+2σ外側。過熱/ブレイク候補。"
+    assert lower_signals[0]["note"] == "終値が-2σ外側。過熱/ブレイク候補。"
+
+
+def test_detect_bollinger_signals_squeeze_and_expansion_start():
+    squeeze_candles = _make_ohlc([100.0, 102.0, 100.0, 102.0, 100.0, 100.1, 100.0])
+    squeeze_signals = indicators.detect_bollinger_signals(
+        squeeze_candles,
+        current_position=-2,
+        window=2,
+        squeeze_lookback=3,
+        squeeze_percentile=0.10,
+    )
+
+    expansion_candles = _make_ohlc([100.0, 102.0, 100.0, 102.0, 100.0, 100.1, 100.0, 101.0, 101.1])
+    expansion_signals = indicators.detect_bollinger_signals(
+        expansion_candles,
+        current_position=-2,
+        window=2,
+        squeeze_lookback=3,
+        squeeze_percentile=0.10,
+        expansion_ratio=1.30,
+    )
+
+    assert "squeeze" in {signal["signal_type"] for signal in squeeze_signals}
+    assert "expansion_start" in {signal["signal_type"] for signal in expansion_signals}
 
 
 def test_classify_macd_state_rules():

@@ -19,6 +19,7 @@
   - `market-watch/` 配下でローソク足を取得し、SMA / EMA / Bollinger Bands / MACD / RSI14を計算する
   - Chart Snapshotを生成し、Market Snapshotの `Chart Snapshot Summary` と Market Bias に連携する
   - MACDクロス発生時は `macd_alert_bot.py` がイベント通知する
+  - Bollinger Bands の break / squeeze / expansion_start は `bollinger_alert_bot.py` がイベント通知する
 
 現時点では、AI分析・売買判断・自動発注は行わない。Market Snapshot と Market Watch は、BELIALの将来のAI判断層へ渡す前段の「市場状態の可視化」機能である。
 
@@ -231,6 +232,7 @@ Market Watch Engine は、ローソク足を取得し、SQLiteへ保存し、SMA
 - Market Snapshotへ1h代表値の要約を渡す
 - Market BiasへTrend / BB / MACD状態を渡す。RSI14 / RSI StateはSummary表示用の観測値として保持し、Biasスコアには反映しない
 - MACDクロスは `macd_alert_bot.py` でイベント通知として扱う
+- Bollinger Bands Alert は `bollinger_alert_bot.py` で市場状態監視のイベント通知として扱う
 - ニュース監視Botとは責務を分離する
 
 ### 26.2 ディレクトリ構成
@@ -244,15 +246,18 @@ market-watch/
 ├─ indicators.py             # SMA / EMA / BB / MACD / RSI / クロス判定 / 状態分類
 ├─ chart_snapshot.py         # Chart Snapshot生成、Discord投稿、Summary生成
 ├─ macd_alert_bot.py         # MACDクロスのイベント通知Bot
+├─ bollinger_alert_bot.py    # Bollinger Bandsの市場状態イベント通知Bot
 ├─ data/
 │  └─ chart_data.sqlite3     # runtime DB。Git管理しない
 ├─ state/
-│  └─ macd_alert_state.json  # MACDクロス通知の重複防止state。Git管理しない
+│  ├─ macd_alert_state.json  # MACDクロス通知の重複防止state。Git管理しない
+│  └─ bollinger_alert_state.json  # Bollinger通知の重複防止state。Git管理しない
 └─ tests/
    ├─ test_chart_collector.py
    ├─ test_chart_snapshot.py
    ├─ test_indicators.py
-   └─ test_macd_alert_bot.py
+   ├─ test_macd_alert_bot.py
+   └─ test_bollinger_alert_bot.py
 ```
 
 `data/`、`state/`、`.env`、`__pycache__/`、`.pytest_cache/`、`logs/` はGit管理しない。
@@ -287,14 +292,24 @@ macd_alert_bot.py
 Discord Event Alert
 ```
 
-`chart_snapshot.py` は「状態表示」、`macd_alert_bot.py` は「イベント通知」である。状態表示とイベント通知を混ぜないことで、Snapshot本文の肥大化や二重通知を避ける。
+Bollinger Bands Alert は同じイベント通知層に属する。
+
+```text
+indicators.py
+  →
+bollinger_alert_bot.py
+  →
+Discord Event Alert
+```
+
+`chart_snapshot.py` は「状態表示」、`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` は「イベント通知」である。状態表示とイベント通知を混ぜないことで、Snapshot本文の肥大化や二重通知を避ける。
 
 Discord投稿先も役割ごとに分離する。
 
 | 変数 | 投稿先 | 役割 |
 |---|---|---|
 | `CHART_SNAPSHOT_WEBHOOK_URL` | `chart-snapshot` | 定時のチャート状態レポート。`chart_snapshot.py` が使用する |
-| `BOT_ALERTS_WEBHOOK_URL` | `bot-alerts` | MAタッチ、MACDクロス、急変などのイベント通知。`macd_alert_bot.py` が使用する |
+| `BOT_ALERTS_WEBHOOK_URL` | `bot-alerts` | MAタッチ、MACDクロス、Bollinger Bands Alert、急変などのイベント通知。`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` が使用する |
 
 旧設定との互換性のため、イベント通知側は `BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り旧 `DISCORD_WEBHOOK_URL` をfallbackとして扱う。新規運用では `CHART_SNAPSHOT_WEBHOOK_URL` と `BOT_ALERTS_WEBHOOK_URL` を明示する。
 
@@ -335,7 +350,7 @@ Discord表示時のみJSTへ変換する。
 
 ### 26.6 指標仕様
 
-`indicators.py` はチャート指標の共通ライブラリである。`chart_snapshot.py` と `macd_alert_bot.py` は、可能な限りここにある共通関数を利用する。
+`indicators.py` はチャート指標の共通ライブラリである。`chart_snapshot.py`、`macd_alert_bot.py`、`ma_alert_bot.py`、`bollinger_alert_bot.py` は、可能な限りここにある共通関数を利用する。
 
 計算対象:
 
@@ -347,6 +362,7 @@ Discord表示時のみJSTへ変換する。
 | `bb_middle` | SMA20 |
 | `bb_upper` | SMA20 + 2σ |
 | `bb_lower` | SMA20 - 2σ |
+| `bb_bandwidth` | `(bb_upper - bb_lower) / bb_middle` |
 | `bb_width_pct` | `(bb_upper - bb_lower) / bb_middle * 100` |
 | `bb_position` | CloseがBB内のどこにいるか。0.0=下限、0.5=中央、1.0=上限 |
 | `macd` | EMA12 - EMA26 |
@@ -543,7 +559,132 @@ python market-watch/ma_alert_bot.py
 
 `--dry-run` ではDiscord送信もstate更新も行わない。
 
-### 26.11 起動方式 / 本番運用
+### 26.11 Bollinger Bands Alert Bot
+
+`bollinger_alert_bot.py` は、BELIAL の `market-watch` における市場状態監視アラートである。Bollinger Bands の ±2σ 到達、ボラティリティ圧縮、圧縮解除を検知し、既存のイベント通知導線へ通知する。
+
+この機能の目的は、価格やボラティリティの状態変化を「何が起きたか」として記録・通知することである。売買判断、エントリー指示、Exit指示、損切り判断、利確判断、売買推奨文言の生成は行わない。Alert 層は事実検知だけを担当し、その情報をどう解釈するかは Strategy / Method 側の責務とする。
+
+責務分離:
+
+| Layer | Responsibility | Example |
+|---|---|---|
+| Alert | 事実を検知して通知する | 終値が +2σ を突破した、squeeze から expansion_start に移行した |
+| Strategy / Method | Alert の情報を文脈に応じて解釈する | トレンド相場では順張り候補、レンジ相場では過熱警戒、他指標と組み合わせた条件判定 |
+| Execution | 実際の注文、Exit、損切り、利確を担当する | Bollinger Alert では扱わない |
+
+計算仕様:
+
+| Item | Value |
+|---|---|
+| `window` | `20` |
+| `std_multiplier` | `2.0` |
+| `middle` | close の20期間移動平均 |
+| `upper` | `middle + 2σ` |
+| `lower` | `middle - 2σ` |
+| `bandwidth` | `(upper - lower) / middle` |
+
+シグナル仕様:
+
+| signal_type | Condition | Meaning | Default notify | Note |
+|---|---|---|---|---|
+| `upper_break` | `close >= upper` | 終値が +2σ 外側 | ON | 過熱またはブレイク候補の観測 |
+| `lower_break` | `close <= lower` | 終値が -2σ 外側 | ON | 過熱またはブレイク候補の観測 |
+| `upper_touch` | `high >= upper` | 高値が +2σ に接触 | OFF | 通知頻度が高くなりやすいため初期OFF |
+| `lower_touch` | `low <= lower` | 安値が -2σ に接触 | OFF | 通知頻度が高くなりやすいため初期OFF |
+| `squeeze` | `bandwidth` が過去120本の下位10%以下 | ボラティリティ圧縮 | OFF | 状態継続中に通知が増えやすいため初期OFF |
+| `expansion_start` | 直前足が squeeze、現在足で squeeze を抜ける、かつ `bandwidth` が直前足比 `1.3x` 以上 | ボラティリティ拡張開始候補 | ON | レンジ圧縮後の変化検知 |
+
+通知仕様:
+
+```text
+[BOLLINGER] USD_JPY M15 upper_break
+close=161.234 upper=161.180 middle=160.820 lower=160.459
+bandwidth=0.45%
+note=終値が+2σ外側。過熱/ブレイク候補。エントリー判断は手法側で確認。
+```
+
+通知には `symbol`、`timeframe`、`signal_type`、`timestamp`、`close`、`upper`、`middle`、`lower`、`bandwidth`、`note` を含める。
+
+Webhook仕様:
+
+- Bollinger Alert は既存のイベント通知導線に乗せる。
+- `BOT_ALERTS_WEBHOOK_URL` を優先する。
+- 未設定時のみ legacy `DISCORD_WEBHOOK_URL` へ fallback してよい。
+- `CHART_SNAPSHOT_WEBHOOK_URL` は定時レポート専用であり、Bollinger Alert では使わない。
+
+State / Dedupe 方針:
+
+- Yahoo Finance の最新足は未確定の可能性があるため、判定は確定足 `-2` ベースで行う。
+- 同一足・同一銘柄・同一時間足・同一シグナルの重複通知を防ぐ。
+- state ファイルは `market-watch/state/bollinger_alert_state.json` を使う。
+- dedupe の概念は `bollinger:{symbol}:{timeframe}:{signal_type}:{timestamp}` である。
+- 実装上の state key は `symbol + timeframe + signal_type + candle_time` を識別できる形式とする。
+- `--dry-run` では Discord 送信も state 更新も行わない。
+
+設定は `market-watch/config.toml` の `[bollinger]` と `[bollinger.notify]` に置く。
+
+```toml
+[bollinger]
+enabled = true
+window = 20
+std_multiplier = 2.0
+squeeze_lookback = 120
+squeeze_percentile = 0.10
+expansion_ratio = 1.30
+
+[bollinger.notify]
+upper_break = true
+lower_break = true
+expansion_start = true
+upper_touch = false
+lower_touch = false
+squeeze = false
+```
+
+初期ON:
+
+- `upper_break`
+- `lower_break`
+- `expansion_start`
+
+初期OFF:
+
+- `upper_touch`
+- `lower_touch`
+- `squeeze`
+
+非スコープ:
+
+- 自動エントリー
+- 自動Exit
+- 損切り判断
+- 利確判断
+- 売買推奨文言の通知
+- バックテスト最適化
+- Strategy / Method の実装
+
+手動確認:
+
+```powershell
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
+C:\Users\kinniki\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe market-watch\bollinger_alert_bot.py --once --dry-run
+```
+
+実運用確認は `.env` に `BOT_ALERTS_WEBHOOK_URL` を設定したうえで行う。
+
+```powershell
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
+C:\Users\kinniki\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe market-watch\bollinger_alert_bot.py --once
+```
+
+継続監視:
+
+```powershell
+C:\Users\kinniki\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe market-watch\bollinger_alert_bot.py
+```
+
+### 26.12 起動方式 / 本番運用
 
 Linux運用パスは `/opt/berial` を想定する。
 
@@ -556,6 +697,7 @@ python -m pip install -r requirements.txt
 python market-watch/chart_snapshot.py --once --dry-run
 python market-watch/macd_alert_bot.py --once --dry-run
 python market-watch/ma_alert_bot.py --once --dry-run
+python market-watch/bollinger_alert_bot.py --once --dry-run
 python news-feed-bot/market_snapshot.py
 ```
 
@@ -565,6 +707,7 @@ python news-feed-bot/market_snapshot.py
 news-feed-bot/news_feed_bot.py
 market-watch/macd_alert_bot.py
 market-watch/ma_alert_bot.py
+market-watch/bollinger_alert_bot.py
 ```
 
 定期実行対象:
