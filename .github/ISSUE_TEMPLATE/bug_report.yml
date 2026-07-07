@@ -1,0 +1,63 @@
+name: Bug Report
+デscription: 動作不良、例外、想定外挙動の報告
+タイトル: "[Bug]: "
+labels: ["type: bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要
+      description: 何が起きたかを一言で。
+      placeholder: 例）ニュースBOTが同一URLを重複投稿する
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する動作
+      placeholder: 本来どう動いてほしいか
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の動作
+      placeholder: 実際に起きたこと、ログ、スクショ、Discord投稿内容など
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 再現手順
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: false
+  - type: dropdown
+    id: impact
+    attributes:
+      label: 影響度
+      options:
+        - Critical - 売買判断や通知停止に直結
+        - High - 主要機能が使えない
+        - Medium - 回避策はあるが運用に支障
+        - Low - 軽微な表示/整理
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログ/証跡
+      description: 例外ログ、投稿URL、対象ファイル、発生時刻など。
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: 補足
+      placeholder: 原因仮説、関連Issue、修正案など
+    validations:
+      required: false
