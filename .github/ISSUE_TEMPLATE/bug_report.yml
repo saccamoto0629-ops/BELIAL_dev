@@ -1,6 +1,6 @@
 name: Bug Report
-デscription: 動作不良、例外、想定外挙動の報告
-タイトル: "[Bug]: "
+description: 動作不良、例外、想定外挙動の報告
+title: "[Bug]: "
 labels: ["type: bug"]
 body:
   - type: textarea
