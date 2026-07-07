@@ -1,0 +1,65 @@
+name: Strategy / Backtest
+description: 手法、エントリー/Exit、バックテスト、相場地合い検証
+title: "[Strategy]: "
+labels: ["type: strategy"]
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: 仮説
+      description: どんな相場で、何が効くと思っているか。
+      placeholder: 例）ドル円レンジでは長期MAタッチ後の逆張りが有効ではないか
+    validations:
+      required: true
+  - type: textarea
+    id: market
+    attributes:
+      label: 対象市場/地合い
+      placeholder: |
+        対象: USD/JPY / Gold / CFD など
+        地合い: Bull / Bear / Box / Event-driven など
+        時間足: 
+    validations:
+      required: true
+  - type: textarea
+    id: entry
+    attributes:
+      label: Entry条件
+      placeholder: 具体的な条件。曖昧なら「未定」と書いて後で詰める。
+    validations:
+      required: false
+  - type: textarea
+    id: exit
+    attributes:
+      label: Exit / 損切り条件
+      placeholder: 利確、損切り、時間撤退、指標前撤退など
+    validations:
+      required: false
+  - type: textarea
+    id: backtest
+    attributes:
+      label: バックテスト条件
+      placeholder: |
+        期間:
+        データソース:
+        手数料/スプレッド:
+        除外条件:
+    validations:
+      required: false
+  - type: textarea
+    id: result
+    attributes:
+      label: 結果/メモ
+      placeholder: 勝率、PF、DD、最大連敗、気づきなど
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 完了条件
+      placeholder: |
+        - [ ] ルールを文章化した
+        - [ ] バックテスト結果を記録した
+        - [ ] 採用/保留/棄却を決めた
+    validations:
+      required: true
