@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: BELIAL project notes
+    url: https://github.com/saccamoto0629-ops/BELIAL_dev
+    about: 設計メモや作業ログは必要に応じてIssue化してください。
