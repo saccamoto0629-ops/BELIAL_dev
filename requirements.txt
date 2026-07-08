@@ -6,3 +6,5 @@ yfinance
 pandas
 tradingview-ta
 python-dotenv
+boto3
+matplotlib

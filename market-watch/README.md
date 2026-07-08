@@ -41,6 +41,11 @@ Edit `market-watch/.env` and set:
 ```env
 CHART_SNAPSHOT_WEBHOOK_URL=
 BOT_ALERTS_WEBHOOK_URL=
+AWS_REGION=ap-northeast-1
+CHART_S3_BUCKET=belial-chart-snapshots
+CHART_S3_PREFIX=charts
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
 ```
 
 Do not commit `.env` or real webhook URLs.
@@ -91,7 +96,7 @@ check_interval_seconds = 60
 log_level = "INFO"
 ```
 
-`.env` is reserved for secrets such as Discord webhook URLs and future API keys.
+`.env` is reserved for secrets such as Discord webhook URLs and future API keys. Chart images are uploaded to private S3 keys and then downloaded for Discord attachment. Do not depend on public S3 URLs.
 
 For backward compatibility, old `.env` keys such as `SYMBOL`, `TIMEFRAME`, `MACD_FAST`, `MACD_SLOW`, `MACD_SIGNAL`, `CHECK_INTERVAL_SECONDS`, and `LOG_LEVEL` can still override config values, but new deployments should use `config.toml`.
 
@@ -205,6 +210,7 @@ Alerts include:
 - signal-line value
 - detection time
 - short explanation
+- attached chart image when a linked `chart_snapshots.image_s3_key` is available
 
 The tone is Berial-style market watch, but the content stays practical.
 

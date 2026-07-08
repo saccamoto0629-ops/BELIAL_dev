@@ -21,6 +21,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from chart_alert_context import prepare_alert_image
 from indicators import detect_bollinger_signals
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -289,17 +290,27 @@ def fetch_candles():
     return frame
 
 
-def post_discord_embed(embed, *, dry_run=False):
+def post_discord_embed(embed, *, dry_run=False, image_bytes=None, image_filename=None):
     if dry_run:
         logger.info("[DRY_RUN] Would post to Discord: %s", json.dumps(embed, ensure_ascii=False))
+        if image_filename:
+            logger.info("[DRY_RUN] Would attach chart image: %s", image_filename)
         return
 
     try:
-        response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"embeds": [embed]},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        if image_bytes and image_filename:
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                data={"payload_json": json.dumps({"embeds": [embed]}, ensure_ascii=False)},
+                files={"files[0]": (image_filename, image_bytes, "image/png")},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        else:
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"embeds": [embed]},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         response.raise_for_status()
         logger.info("Discord notification sent: title=%s", embed.get("title"))
     except requests.RequestException:
@@ -337,8 +348,26 @@ def build_bollinger_embed(event):
     }
 
 
-def notify_bollinger(event, *, dry_run=False):
-    post_discord_embed(build_bollinger_embed(event), dry_run=dry_run)
+def notify_bollinger(event, *, dry_run=False, candles=None):
+    image_bytes = None
+    image_filename = None
+    try:
+        _snapshot_id, image_bytes, image_filename = prepare_alert_image(
+            alert_type=f"bollinger_{event['signal_type']}",
+            symbol=event["symbol"],
+            timeframe=event["timeframe"],
+            candle_time=event["candle_time"],
+            candles=candles if candles is not None else pd.Series([event["close"]]),
+            metadata=event,
+            dry_run=dry_run,
+        )
+    except ModuleNotFoundError as exc:
+        logger.warning("Chart image attachment skipped because dependency is missing: %s", exc)
+    embed = build_bollinger_embed(event)
+    if image_bytes and image_filename:
+        post_discord_embed(embed, dry_run=dry_run, image_bytes=image_bytes, image_filename=image_filename)
+    else:
+        post_discord_embed(embed, dry_run=dry_run)
     logger.info(
         "Bollinger notified: symbol=%s timeframe=%s signal=%s candle=%s close=%.3f bandwidth=%.5f",
         event["symbol"],
@@ -408,7 +437,7 @@ def run_once(state, *, dry_run=False):
             continue
 
         event = build_bollinger_event(signal, candle_time)
-        notify_bollinger(event, dry_run=dry_run)
+        notify_bollinger(event, dry_run=dry_run, candles=candles)
         if not dry_run:
             state[key] = {
                 "candle_time": candle_time,

@@ -114,3 +114,52 @@ def test_collect_target_fetches_and_saves_with_mock(monkeypatch, tmp_path):
     monkeypatch.setattr(collector, "fetch_ohlcv", lambda target, *, period=collector.DEFAULT_PERIOD: frame)
 
     assert collector.collect_target(target, tmp_path / "chart.sqlite3") == 1
+
+
+def test_chart_snapshot_schema_keeps_image_url_and_adds_image_s3_key(tmp_path):
+    db_path = tmp_path / "chart.sqlite3"
+
+    collector.init_db(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(chart_snapshots)").fetchall()}
+    assert "image_url" in columns
+    assert "image_s3_key" in columns
+
+
+def test_alerts_reference_chart_snapshots_by_snapshot_id(tmp_path):
+    db_path = tmp_path / "chart.sqlite3"
+
+    snapshot_id = collector.insert_chart_snapshot(
+        db_path,
+        symbol="USDJPY",
+        timeframe="15m",
+        captured_at="2026-07-08T00:00:00Z",
+        candle_time="2026-07-08T00:00:00Z",
+        image_s3_key="charts/USDJPY/15m/2026/07/08/snapshot.png",
+        ohlcv_json="[]",
+        indicators_json="{}",
+    )
+    alert_id = collector.insert_alert(
+        db_path,
+        alert_type="ma_touch",
+        symbol="USDJPY",
+        timeframe="15m",
+        occurred_at="2026-07-08T00:01:00Z",
+        candle_time="2026-07-08T00:00:00Z",
+        snapshot_id=snapshot_id,
+        metadata_json="{}",
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT alerts.id, alerts.snapshot_id, chart_snapshots.image_s3_key
+            FROM alerts
+            JOIN chart_snapshots ON alerts.snapshot_id = chart_snapshots.id
+            WHERE alerts.id = ?
+            """,
+            (alert_id,),
+        ).fetchone()
+
+    assert row == (alert_id, snapshot_id, "charts/USDJPY/15m/2026/07/08/snapshot.png")
