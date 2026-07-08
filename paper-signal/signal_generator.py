@@ -5,7 +5,7 @@ other broker integration) and NEVER implements entries, exits, lot sizing,
 leverage, stop-loss, or take-profit. Every generated record is stored with
 ``status = "paper_only"`` and is for observation only.
 
-See docs/berial_spec.md chapter 29 for the full v1.4.0 Paper Signal spec.
+See docs/architecture/berial_spec.md chapter 29 for the full v1.4.0 Paper Signal spec.
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ def build_candidates(
 ) -> list[dict]:
     """Return paper-signal candidates from Market Bias + 1h Chart Snapshot data.
 
-    Rules (docs/berial_spec.md chapter 29):
+    Rules (docs/architecture/berial_spec.md chapter 29):
       - market_bias must be Bull or Bear (Neutral never produces a candidate)
       - confidence must be >= confidence_threshold
       - Bull requires macd_state == Bullish, freshness == Fresh, bias_weight > 0 -> side=long
