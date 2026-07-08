@@ -53,6 +53,7 @@ def test_prepare_alert_image_dry_run_has_no_side_effects(monkeypatch, tmp_path):
 def test_prepare_alert_image_uploads_presigns_and_links_db(monkeypatch, tmp_path):
     db_path = tmp_path / "chart.sqlite3"
     uploaded = {}
+    render_call = {}
 
     class FakeS3Client:
         def upload_file(self, local_path, bucket, key, ExtraArgs=None):
@@ -73,8 +74,16 @@ def test_prepare_alert_image_uploads_presigns_and_links_db(monkeypatch, tmp_path
     })
     monkeypatch.setattr(context, "create_s3_client", lambda config: FakeS3Client())
 
+    def fake_render_chart_snapshot(candles, output_path, **kwargs):
+        render_call["event_type"] = kwargs["event_type"]
+        render_call["metadata"] = kwargs["metadata"]
+        pathlib.Path(output_path).write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        return pathlib.Path(output_path)
+
+    monkeypatch.setattr(context, "render_chart_snapshot", fake_render_chart_snapshot)
+
     snapshot_id, presigned_url = context.prepare_alert_image(
-        alert_type="ma_touch",
+        alert_type="bollinger_upper_break",
         symbol="USDJPY",
         timeframe="1h",
         candle_time="2026-07-08T00:00:00Z",
@@ -88,10 +97,17 @@ def test_prepare_alert_image_uploads_presigns_and_links_db(monkeypatch, tmp_path
             },
             index=pd.date_range("2026-07-08", periods=3, freq="1h", tz="UTC"),
         ),
-        metadata={"detected_at": "2026-07-08T00:01:00Z"},
+        metadata={
+            "detected_at": "2026-07-08T00:01:00Z",
+            "upper": 102.2,
+            "middle": 101.2,
+            "lower": 100.2,
+        },
     )
 
     assert snapshot_id
+    assert render_call["event_type"] == "bollinger_upper_break"
+    assert render_call["metadata"]["upper"] == 102.2
     assert uploaded["bucket"] == "belial-chart-snapshots"
     assert uploaded["key"].startswith("charts/USDJPY/1h/")
     assert uploaded["key"].endswith(".png")

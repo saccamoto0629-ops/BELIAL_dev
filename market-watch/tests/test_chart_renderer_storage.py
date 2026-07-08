@@ -12,15 +12,16 @@ import chart_renderer  # noqa: E402
 
 
 def make_candles():
+    close = [1.0 + (index * 0.01) + (0.04 if index == 24 else 0.0) for index in range(25)]
     return pd.DataFrame(
         {
-            "open": [1.0, 2.0, 1.5, 2.5],
-            "high": [1.5, 2.3, 1.8, 2.8],
-            "low": [0.8, 1.7, 1.2, 2.1],
-            "close": [1.2, 1.9, 1.7, 2.6],
-            "volume": [100.0, 120.0, 90.0, 130.0],
+            "open": [value - 0.003 for value in close],
+            "high": [value + 0.02 for value in close],
+            "low": [value - 0.02 for value in close],
+            "close": close,
+            "volume": [100.0 + index for index in range(25)],
         },
-        index=pd.date_range("2026-07-05", periods=4, freq="15min", tz="UTC"),
+        index=pd.date_range("2026-07-05", periods=25, freq="15min", tz="UTC"),
     )
 
 
@@ -35,6 +36,42 @@ def test_render_chart_snapshot_creates_local_png(tmp_path):
 
     assert rendered == output_path
     assert output_path.read_bytes().startswith(b"\x89PNG")
+
+
+def test_render_chart_snapshot_accepts_bollinger_event_context(tmp_path):
+    output_path = tmp_path / "snapshot.png"
+    candles = make_candles()
+
+    rendered = chart_renderer.render_chart_snapshot(
+        candles,
+        output_path,
+        title="USDJPY 15m bollinger_upper_break",
+        event_type="bollinger_upper_break",
+        metadata={
+            "upper": float(candles["close"].iloc[-1] + 0.01),
+            "middle": float(candles["close"].iloc[-1]),
+            "lower": float(candles["close"].iloc[-1] - 0.01),
+        },
+    )
+
+    assert rendered == output_path
+    assert output_path.read_bytes().startswith(b"\x89PNG")
+
+
+def test_visible_body_bounds_keeps_tiny_open_close_visible():
+    body_low, body_high = chart_renderer._visible_body_bounds(100.0, 100.000001, 0.02)
+
+    assert body_high - body_low == pytest.approx(0.02)
+    assert body_low < 100.0
+    assert body_high > 100.000001
+
+
+def test_bollinger_event_context_selects_bands_and_highlight():
+    context = chart_renderer.RenderContext(event_type="bollinger_lower_break", metadata={})
+
+    assert chart_renderer._show_bollinger(context) is True
+    assert chart_renderer._highlight_bollinger_band(context) == "lower"
+    assert chart_renderer._calculate_bollinger_bands(make_candles()["close"])["upper"].notna().any()
 
 
 def test_render_chart_snapshot_requires_real_ohlc(tmp_path):
