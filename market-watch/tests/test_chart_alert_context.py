@@ -10,6 +10,46 @@ sys.path.insert(0, str(BOT_DIR))
 import chart_alert_context as context  # noqa: E402
 
 
+def test_prepare_alert_image_dry_run_has_no_side_effects(monkeypatch, tmp_path):
+    db_path = tmp_path / "chart.sqlite3"
+
+    class FailingS3Client:
+        def upload_file(self, *args, **kwargs):
+            raise AssertionError("S3 upload must not be called in dry-run")
+
+        def generate_presigned_url(self, *args, **kwargs):
+            raise AssertionError("presigned URL must not be generated in dry-run")
+
+    monkeypatch.setattr(context, "load_env_file", lambda: {
+        "CHART_DB_PATH": str(db_path),
+        "S3_BUCKET_NAME": "belial-chart-snapshots",
+        "S3_CHART_PREFIX": "charts",
+    })
+    monkeypatch.setattr(context, "create_s3_client", lambda config: FailingS3Client())
+
+    snapshot_id, presigned_url = context.prepare_alert_image(
+        alert_type="ma_touch",
+        symbol="USDJPY",
+        timeframe="1h",
+        candle_time="2026-07-08T00:00:00Z",
+        candles=pd.DataFrame(
+            {
+                "open": [99.5, 100.5],
+                "high": [100.5, 101.5],
+                "low": [99.0, 100.0],
+                "close": [100.0, 101.0],
+            },
+            index=pd.date_range("2026-07-08", periods=2, freq="1h", tz="UTC"),
+        ),
+        metadata={"detected_at": "2026-07-08T00:01:00Z"},
+        dry_run=True,
+    )
+
+    assert snapshot_id is None
+    assert presigned_url is None
+    assert not db_path.exists()
+
+
 def test_prepare_alert_image_uploads_presigns_and_links_db(monkeypatch, tmp_path):
     db_path = tmp_path / "chart.sqlite3"
     uploaded = {}
