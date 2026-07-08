@@ -158,4 +158,4 @@ python signal_generator.py --once
 `--once` を付けない場合は `PAPER_SIGNAL_CHECK_INTERVAL_SECONDS`(既定900秒)ごとにループする常駐プロセスとして動作する。
 ## Paper Signal systemd timer案
 
-Paper Signal の将来の systemd timer 案は [Roadmap](roadmap.md) に置く。
+Paper Signal の将来の systemd timer 案は [Roadmap](../product/roadmap.md) に置く。

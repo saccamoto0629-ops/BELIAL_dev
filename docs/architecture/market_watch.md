@@ -333,7 +333,7 @@ ma_names = ["sma20", "sma75", "ema20"]
 
 ログは `logs/ma_alert_bot.log` に `RotatingFileHandler` で出力する。
 
-起動例と dry-run の確認方法は [Operations](operations.md) に置く。
+起動例と dry-run の確認方法は [Operations](../operations/operations.md) に置く。
 
 ## Bollinger Bands Alert Bot
 
@@ -440,4 +440,4 @@ squeeze = false
 - バックテスト最適化
 - Strategy / Method の実装
 
-手動確認、実運用確認、継続監視のコマンドは [Operations](operations.md) に置く。
+手動確認、実運用確認、継続監視のコマンドは [Operations](../operations/operations.md) に置く。

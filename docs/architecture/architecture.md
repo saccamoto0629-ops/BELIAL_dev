@@ -55,4 +55,4 @@ Alert は売買判断をしない。Strategy / Method は複数の観測情報�
 - [Market Watch](market_watch.md)
 - [Market Bias](market_bias.md)
 - [Paper Signal](paper_signal.md)
-- [Operations](operations.md)
+- [Operations](../operations/operations.md)
