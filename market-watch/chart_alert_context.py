@@ -39,7 +39,7 @@ def prepare_alert_image(
     symbol: str,
     timeframe: str,
     candle_time: str,
-    candles: pd.DataFrame | pd.Series,
+    candles: pd.DataFrame,
     metadata: dict,
     dry_run: bool = False,
 ) -> tuple[str | None, str | None]:
@@ -54,7 +54,9 @@ def prepare_alert_image(
     env_values = load_env_file()
     db_path = chart_db_path(env_values)
     snapshot_at = datetime.now(UTC)
-    frame = candles.to_frame(name="close") if isinstance(candles, pd.Series) else candles.copy()
+    if not isinstance(candles, pd.DataFrame):
+        raise TypeError("alert chart images require an OHLC DataFrame")
+    frame = candles.copy()
     config = load_s3_config(env_values)
     client = create_s3_client(config)
     snapshot_id = metadata.get("snapshot_id") or str(uuid.uuid4())

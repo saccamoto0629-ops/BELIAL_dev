@@ -3,11 +3,30 @@ import sqlite3
 import sys
 
 import pandas as pd
+import pytest
 
 BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BOT_DIR))
 
 import chart_alert_context as context  # noqa: E402
+
+
+def test_prepare_alert_image_rejects_close_only_series(monkeypatch, tmp_path):
+    monkeypatch.setattr(context, "load_env_file", lambda: {
+        "CHART_DB_PATH": str(tmp_path / "chart.sqlite3"),
+        "S3_BUCKET_NAME": "belial-chart-snapshots",
+        "S3_CHART_PREFIX": "charts",
+    })
+
+    with pytest.raises(TypeError, match="OHLC DataFrame"):
+        context.prepare_alert_image(
+            alert_type="ma_touch",
+            symbol="USDJPY",
+            timeframe="1h",
+            candle_time="2026-07-08T00:00:00Z",
+            candles=pd.Series([100.0], index=pd.date_range("2026-07-08", periods=1, freq="1h", tz="UTC")),
+            metadata={"detected_at": "2026-07-08T00:01:00Z"},
+        )
 
 
 def test_prepare_alert_image_dry_run_has_no_side_effects(monkeypatch, tmp_path):
