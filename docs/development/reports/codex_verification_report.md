@@ -60,4 +60,3 @@ Result:
 ## Issues remaining
 
 No remaining blocking issues were found in the requested verification scope.
-
