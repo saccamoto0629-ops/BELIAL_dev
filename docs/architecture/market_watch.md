@@ -66,6 +66,39 @@ chart_snapshot.py
 market_snapshot.py / market_bias.py
 ```
 
+## Chart Snapshot画像生成
+
+Chart Snapshot画像は、定時Snapshotとイベント通知で同じ描画関数を使う。
+
+```text
+chart_snapshot.py
+  -> render_chart_snapshot()
+  -> S3 upload
+  -> Discord chart-snapshot channel
+
+macd_alert_bot.py / ma_alert_bot.py / bollinger_alert_bot.py
+  -> chart_alert_context.prepare_alert_image()
+  -> render_chart_snapshot()
+  -> S3 upload
+  -> presigned URL
+  -> Discord embed.image.url
+```
+
+`render_chart_snapshot()` は `market-watch/chart_renderer.py` の共通描画関数である。入力は `open` / `high` / `low` / `close` を持つOHLC DataFrameを必須とし、close-only Seriesやclose-only DataFrameを正常扱いするfallbackは持たない。これはローソク足が横線化したり、OHLC欠損に気づかないまま通知画像を生成したりすることを防ぐためである。
+
+アラート画像生成入口の `prepare_alert_image()` もOHLC DataFrameを必須とする。アラート判定ロジックは引き続き `close` を主に使うが、画像生成には同じDataFrameの `open` / `high` / `low` / `close` を渡す。テストやモックもこの契約に合わせ、`open = close`、`high = close + 0.01`、`low = close - 0.01` のような最小OHLCを明示的に渡す。
+
+描画内容は通知種別に応じて変わる。
+
+| 通知種別 | 画像に表示する主な要素 |
+|---|---|
+| 定時Chart Snapshot | ローソク足、SMA20、SMA75、EMA20、MACD |
+| MA Alert | ローソク足、SMA20 / SMA75 / EMA20 |
+| MACD Alert | ローソク足、MACD、Signal、Histogram |
+| Bollinger Alert | ローソク足、Bollinger upper / middle / lower。`upper_break` / `lower_break` では突破対象ラインを強調する |
+
+ローソク足はOpen/Closeからbodyを描画する。bodyが極端に小さい場合も、画面上で確認できる最小表示サイズを持たせる。ただし、欠損したOHLCをcloseから暗黙補完して正常扱いすることはしない。
+
 MACDクロス通知は、上記のSnapshot系とは役割を分ける。
 
 ```text
@@ -109,6 +142,19 @@ Chart Snapshot画像は private S3 bucket に保存し、`chart_snapshots.s3_buc
 | `XAUUSD` | Gold |
 | `SPX` | S&P500. Chart data may use `ES` / `ES=F` as an index futures proxy with `SPX` / `^GSPC` fallback. |
 | `VIX` | Volatility |
+
+`SPX` は論理Symbolとして残し、表示名とチャート取得用Symbolを分離する。SQLite、Discord本文、S3 keyでは `SPX` を保存・表示の基準にする。一方、ローソク足取得では `CHART_SYMBOL_SPX` / `CHART_TICKER_SPX` を使い、現物指数の休場・時間外欠損を避けるため、既定では E-mini S&P 500 Futures をプロキシにできる。
+
+```env
+CHART_DISPLAY_NAME_SPX="S&P 500"
+CHART_SYMBOL_SPX=ES
+CHART_TICKER_SPX=ES=F
+CHART_FALLBACK_CHART_SYMBOL_SPX=SPX
+CHART_FALLBACK_TICKER_SPX=^GSPC
+CHART_ASSET_TYPE_SPX=index_futures_proxy
+```
+
+Micro E-mini を使う場合は `CHART_SYMBOL_SPX=MES` / `CHART_TICKER_SPX=MES=F` に切り替える。取得プロキシが空データを返す場合は fallback の `SPX` / `^GSPC` を使う。これはS&P500の地合い監視を目的とした観測用プロキシであり、売買判断や発注対象を意味しない。
 
 現行の時間足は以下。
 
