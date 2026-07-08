@@ -2,6 +2,7 @@ import pathlib
 import sys
 
 import pandas as pd
+import pytest
 
 BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BOT_DIR))
@@ -34,6 +35,20 @@ def test_render_chart_snapshot_creates_local_png(tmp_path):
 
     assert rendered == output_path
     assert output_path.read_bytes().startswith(b"\x89PNG")
+
+
+def test_render_chart_snapshot_requires_real_ohlc(tmp_path):
+    close_only = pd.DataFrame(
+        {"close": [1.0, 2.0, 3.0]},
+        index=pd.date_range("2026-07-05", periods=3, freq="15min", tz="UTC"),
+    )
+
+    with pytest.raises(ValueError, match="OHLC"):
+        chart_renderer.render_chart_snapshot(
+            close_only,
+            tmp_path / "snapshot.png",
+            title="USDJPY 15m Chart Snapshot",
+        )
 
 
 def test_build_chart_s3_key_uses_required_layout():

@@ -160,6 +160,33 @@ def test_post_discord_embed_sets_presigned_image_url(monkeypatch):
     assert posted["json"]["embeds"][0]["image"]["url"].startswith("https://presigned.invalid/")
 
 
+def test_notify_cross_passes_ohlc_to_chart_image(monkeypatch):
+    candles = pd.DataFrame(
+        {
+            "open": [99.5, 100.5],
+            "high": [100.5, 101.5],
+            "low": [99.0, 100.0],
+            "close": [100.0, 101.0],
+            "volume": [100.0, 120.0],
+        },
+        index=pd.date_range("2026-07-08", periods=2, freq="15min", tz="UTC"),
+    )
+    captured = {}
+
+    def fake_prepare_alert_image(**kwargs):
+        captured["columns"] = list(kwargs["candles"].columns)
+        return "snapshot-1", "https://presigned.invalid/chart.png"
+
+    posted = []
+    monkeypatch.setattr(bot, "prepare_alert_image", fake_prepare_alert_image)
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append((embed, image_url)))
+
+    bot.notify_cross("bullish", candles.index[-1], 101.0, 0.1, 0.05, candles=candles)
+
+    assert captured["columns"][:4] == ["open", "high", "low", "close"]
+    assert posted[0][1] == "https://presigned.invalid/chart.png"
+
+
 def test_validate_config_requires_webhook_unless_dry_run(monkeypatch):
     monkeypatch.setattr(bot, "DISCORD_WEBHOOK_URL", "")
 

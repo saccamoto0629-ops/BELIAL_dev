@@ -258,7 +258,11 @@ def fetch_candles():
         interval=INTERVAL,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    frame = pd.DataFrame({"close": history["Close"].dropna()})
+    frame = history.rename(columns=str.lower)
+    columns = [column for column in ["open", "high", "low", "close", "volume"] if column in frame.columns]
+    frame = frame[columns].dropna(subset=["open", "high", "low", "close"])
+    if "volume" not in frame.columns:
+        frame["volume"] = 0.0
     logger.info("Fetched candles: symbol=%s timeframe=%s rows=%s", SYMBOL, TIMEFRAME, len(frame))
     return frame
 

@@ -227,16 +227,20 @@ def state_key():
 
 
 def fetch_candles():
-    """Return the recent Close-price series for the configured symbol/timeframe."""
+    """Return recent OHLCV candles for the configured symbol/timeframe."""
     ticker = yf.Ticker(TICKER)
     history = ticker.history(
         period=HISTORY_PERIOD,
         interval=INTERVAL,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    close = history["Close"].dropna()
-    logger.info("Fetched candles: symbol=%s timeframe=%s rows=%s", SYMBOL, TIMEFRAME, len(close))
-    return close
+    frame = history.rename(columns=str.lower)
+    columns = [column for column in ["open", "high", "low", "close", "volume"] if column in frame.columns]
+    frame = frame[columns].dropna(subset=["open", "high", "low", "close"])
+    if "volume" not in frame.columns:
+        frame["volume"] = 0.0
+    logger.info("Fetched candles: symbol=%s timeframe=%s rows=%s", SYMBOL, TIMEFRAME, len(frame))
+    return frame
 
 
 def compute_macd(close, *, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
@@ -335,10 +339,11 @@ def notify_error(exc, *, dry_run=False):
 
 def run_once(state, *, dry_run=False):
     try:
-        close = fetch_candles()
+        candles = fetch_candles()
     except Exception as exc:
         logger.error("Failed to fetch candles: %s", exc)
         return
+    close = candles["close"] if isinstance(candles, pd.DataFrame) else candles
     min_bars = MACD_SLOW + MACD_SIGNAL + 2
     if len(close) < min_bars:
         logger.warning("Not enough candles yet: got %s, need %s", len(close), min_bars)
@@ -376,7 +381,7 @@ def run_once(state, *, dry_run=False):
         logger.info("Cross already notified for this candle (%s, %s); skipping.", candle_key, cross)
         return
 
-    notify_cross(cross, candle_time, close_price, curr_macd, curr_signal, dry_run=dry_run, candles=close)
+    notify_cross(cross, candle_time, close_price, curr_macd, curr_signal, dry_run=dry_run, candles=candles)
     state[state_key()] = {
         "candle_time": candle_key,
         "signal": cross,

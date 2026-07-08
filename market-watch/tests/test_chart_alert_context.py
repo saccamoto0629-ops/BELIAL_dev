@@ -39,7 +39,13 @@ def test_prepare_alert_image_uploads_presigns_and_links_db(monkeypatch, tmp_path
         timeframe="1h",
         candle_time="2026-07-08T00:00:00Z",
         candles=pd.DataFrame(
-            {"close": [100.0, 101.0, 102.0]},
+            {
+                "open": [99.5, 100.5, 101.5],
+                "high": [100.5, 101.5, 102.5],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.0, 101.0, 102.0],
+                "volume": [100.0, 120.0, 110.0],
+            },
             index=pd.date_range("2026-07-08", periods=3, freq="1h", tz="UTC"),
         ),
         metadata={"detected_at": "2026-07-08T00:01:00Z"},

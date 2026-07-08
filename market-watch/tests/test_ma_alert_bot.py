@@ -112,6 +112,34 @@ def test_run_once_uses_confirmed_candle_not_latest_candle(monkeypatch):
     assert saved == []
 
 
+def test_notify_touch_passes_ohlc_to_chart_image(monkeypatch):
+    candles = pd.DataFrame(
+        {
+            "open": [99.5, 100.5],
+            "high": [100.5, 101.5],
+            "low": [99.0, 100.0],
+            "close": [100.0, 101.0],
+            "volume": [100.0, 120.0],
+        },
+        index=pd.date_range("2026-07-08", periods=2, freq="15min", tz="UTC"),
+    )
+    event = bot.build_touch_event("sma20", candles.index[-1].isoformat(), 101.0, 101.0, {"distance_pct": 0.0, "side": "above"})
+    captured = {}
+    posted = []
+
+    def fake_prepare_alert_image(**kwargs):
+        captured["columns"] = list(kwargs["candles"].columns)
+        return "snapshot-1", "https://presigned.invalid/chart.png"
+
+    monkeypatch.setattr(bot, "prepare_alert_image", fake_prepare_alert_image)
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append((embed, image_url)))
+
+    bot.notify_touch(event, candles=candles)
+
+    assert captured["columns"][:4] == ["open", "high", "low", "close"]
+    assert posted[0][1] == "https://presigned.invalid/chart.png"
+
+
 def test_load_config_reads_ma_alert_section(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(

@@ -131,6 +131,38 @@ def test_run_once_honors_default_touch_notify_off(monkeypatch):
     assert saved == []
 
 
+def test_notify_bollinger_passes_ohlc_to_chart_image(monkeypatch):
+    candles = _make_candles([100.0, 101.0, 102.0])
+    candles["open"] = [99.5, 100.5, 101.5]
+    candles["volume"] = [100.0, 120.0, 110.0]
+    event = bot.build_bollinger_event(
+        {
+            "signal_type": "upper_break",
+            "close": 102.0,
+            "upper": 101.5,
+            "middle": 100.0,
+            "lower": 98.5,
+            "bandwidth": 0.03,
+            "note": "test",
+        },
+        candles.index[-1].isoformat(),
+    )
+    captured = {}
+    posted = []
+
+    def fake_prepare_alert_image(**kwargs):
+        captured["columns"] = list(kwargs["candles"].columns)
+        return "snapshot-1", "https://presigned.invalid/chart.png"
+
+    monkeypatch.setattr(bot, "prepare_alert_image", fake_prepare_alert_image)
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append((embed, image_url)))
+
+    bot.notify_bollinger(event, candles=candles)
+
+    assert {"open", "high", "low", "close"}.issubset(captured["columns"])
+    assert posted[0][1] == "https://presigned.invalid/chart.png"
+
+
 def test_load_config_reads_bollinger_section(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
