@@ -76,7 +76,7 @@ def test_run_once_notifies_and_records_state_on_cross(monkeypatch):
     monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
 
     posted = []
-    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append(embed))
     monkeypatch.setattr(bot, "save_state", lambda state: None)
 
     state = {}
@@ -97,7 +97,7 @@ def test_run_once_does_not_duplicate_notification_for_same_candle(monkeypatch):
     monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
 
     posted = []
-    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append(embed))
     monkeypatch.setattr(bot, "save_state", lambda state: None)
 
     state = {}
@@ -114,7 +114,7 @@ def test_run_once_does_not_duplicate_after_restart_style_state(monkeypatch):
     monkeypatch.setattr(bot, "fetch_candles", lambda: close)
 
     posted = []
-    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append(embed))
 
     state = {
         bot.state_key(): {
@@ -132,7 +132,7 @@ def test_run_once_skips_when_not_enough_candles(monkeypatch, caplog):
     monkeypatch.setattr(bot, "fetch_candles", lambda: close)
 
     posted = []
-    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
+    monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append(embed))
 
     bot.run_once({}, dry_run=False)
 
