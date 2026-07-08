@@ -1,0 +1,66 @@
+name: Research / Design
+description: 調査、設計、技術選定、方針決め
+title: "[Design]: "
+labels: ["type: design"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: 決めたいこと
+      description: このIssueで答えを出したい問い。
+      placeholder: 例）チャートスナップショットはDBに保存するかS3に保存するか
+    validations:
+      required: true
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      placeholder: なぜ今これを決める必要があるか、既に分かっている制約など
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: 選択肢
+      placeholder: |
+        A案:
+        - メリット:
+        - デメリット:
+
+        B案:
+        - メリット:
+        - デメリット:
+    validations:
+      required: false
+  - type: textarea
+    id: decision
+    attributes:
+      label: 暫定結論/決定事項
+      placeholder: 調査後に更新。まだなら未定でOK。
+    validations:
+      required: false
+  - type: textarea
+    id: tasks
+    attributes:
+      label: 次アクション
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: 領域
+      options:
+        - Architecture
+        - Database
+        - Storage
+        - News Source
+        - Alert Logic
+        - Backtest
+        - Deployment
+        - Cost
+        - Other
+    validations:
+      required: true
