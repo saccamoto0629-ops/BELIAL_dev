@@ -116,15 +116,14 @@ def test_collect_target_fetches_and_saves_with_mock(monkeypatch, tmp_path):
     assert collector.collect_target(target, tmp_path / "chart.sqlite3") == 1
 
 
-def test_chart_snapshot_schema_keeps_image_url_and_adds_image_s3_key(tmp_path):
+def test_chart_snapshot_schema_persists_private_s3_metadata(tmp_path):
     db_path = tmp_path / "chart.sqlite3"
 
     collector.init_db(db_path)
 
     with sqlite3.connect(db_path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(chart_snapshots)").fetchall()}
-    assert "image_url" in columns
-    assert "image_s3_key" in columns
+    assert {"snapshot_at", "s3_bucket", "s3_key"}.issubset(columns)
 
 
 def test_alerts_reference_chart_snapshots_by_snapshot_id(tmp_path):
@@ -134,9 +133,11 @@ def test_alerts_reference_chart_snapshots_by_snapshot_id(tmp_path):
         db_path,
         symbol="USDJPY",
         timeframe="15m",
+        snapshot_at="2026-07-08T00:00:00Z",
+        s3_bucket="belial-chart-snapshots",
+        s3_key="charts/USDJPY/15m/2026/07/08/snapshot.png",
         captured_at="2026-07-08T00:00:00Z",
         candle_time="2026-07-08T00:00:00Z",
-        image_s3_key="charts/USDJPY/15m/2026/07/08/snapshot.png",
         ohlcv_json="[]",
         indicators_json="{}",
     )
@@ -150,16 +151,26 @@ def test_alerts_reference_chart_snapshots_by_snapshot_id(tmp_path):
         snapshot_id=snapshot_id,
         metadata_json="{}",
     )
+    collector.link_alert_chart_snapshot(db_path, alert_id=alert_id, chart_snapshot_id=snapshot_id)
 
     with sqlite3.connect(db_path) as connection:
         row = connection.execute(
             """
-            SELECT alerts.id, alerts.snapshot_id, chart_snapshots.image_s3_key
+            SELECT alerts.id, alerts.snapshot_id, chart_snapshots.s3_key
             FROM alerts
             JOIN chart_snapshots ON alerts.snapshot_id = chart_snapshots.id
             WHERE alerts.id = ?
             """,
             (alert_id,),
         ).fetchone()
+        link_row = connection.execute(
+            """
+            SELECT alert_id, chart_snapshot_id
+            FROM alert_chart_snapshots
+            WHERE alert_id = ? AND chart_snapshot_id = ?
+            """,
+            (alert_id, snapshot_id),
+        ).fetchone()
 
     assert row == (alert_id, snapshot_id, "charts/USDJPY/15m/2026/07/08/snapshot.png")
+    assert link_row == (alert_id, snapshot_id)

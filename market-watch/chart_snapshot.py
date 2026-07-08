@@ -24,11 +24,10 @@ from chart_collector import (
     load_candles,
     load_chart_targets,
     load_env_file,
-    update_chart_snapshot_image_s3_key,
 )
 from chart_models import ChartTarget, IndicatorSnapshot
 from chart_renderer import render_chart_snapshot
-from chart_storage import build_s3_key, create_s3_client, load_s3_config, upload_chart_image
+from chart_image_uploader import create_s3_client, generate_presigned_chart_url, load_s3_config, upload_chart_image
 from indicators import calculate_indicators, classify_bb_state, classify_trend
 
 REQUEST_TIMEOUT_SECONDS = 20
@@ -193,28 +192,17 @@ def post_discord_message(
     message: str,
     *,
     dry_run: bool = False,
-    attachments: list[tuple[str, bytes]] | None = None,
+    image_urls: list[str] | None = None,
     session=requests,
 ) -> None:
     if dry_run:
         print(f"[DRY_RUN] Would send Chart Snapshot:\n{message}")
-        if attachments:
-            print(f"[DRY_RUN] Would attach {len(attachments)} chart image(s)")
+        if image_urls:
+            print(f"[DRY_RUN] Would include {len(image_urls)} presigned chart image URL(s)")
         return
     payload = {"content": message[:2000]}
-    if attachments:
-        files = [
-            (f"files[{index}]", (filename, content, "image/png"))
-            for index, (filename, content) in enumerate(attachments)
-        ]
-        response = session.post(
-            webhook_url,
-            data={"payload_json": json.dumps(payload, ensure_ascii=False)},
-            files=files,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        return
+    if image_urls:
+        payload["embeds"] = [{"image": {"url": url}} for url in image_urls[:10]]
     response = session.post(
         webhook_url,
         json=payload,
@@ -252,44 +240,46 @@ def persist_snapshot_images(
     env_values: dict[str, str],
     *,
     dry_run: bool = False,
-) -> list[tuple[str, bytes]]:
+) -> list[str]:
     if dry_run or not snapshots:
         return []
 
     config = load_s3_config(env_values)
     client = create_s3_client(config)
-    attachments: list[tuple[str, bytes]] = []
+    image_urls: list[str] = []
     image_dir = BASE_DIR / "data" / "chart_images"
-    captured_at = datetime.now(UTC)
+    snapshot_at = datetime.now(UTC)
 
     for snapshot in snapshots:
         candles = load_candles(db_path, snapshot.symbol, snapshot.timeframe, limit=200)
-        snapshot_id = insert_chart_snapshot(
-            db_path,
-            symbol=snapshot.symbol,
-            timeframe=snapshot.timeframe,
-            captured_at=captured_at.isoformat(),
-            candle_time=snapshot.timestamp,
-            ohlcv_json=candles.tail(120).reset_index().to_json(orient="records", date_format="iso"),
-            indicators_json=json.dumps(snapshot.__dict__, ensure_ascii=False, default=_json_default),
-        )
-        local_path = image_dir / f"{snapshot_id}.png"
+        local_path = image_dir / f"{snapshot.symbol}_{snapshot.timeframe}_{snapshot_at:%Y%m%d%H%M%S}.png"
         render_chart_snapshot(
             candles,
             local_path,
             title=f"{snapshot.symbol} {snapshot.timeframe} Chart Snapshot",
         )
-        s3_key = build_s3_key(
+        s3_key = upload_chart_image(
+            local_path,
             symbol=snapshot.symbol,
             timeframe=snapshot.timeframe,
-            snapshot_id=snapshot_id,
-            captured_at=captured_at,
-            prefix=config["prefix"],
+            snapshot_at=snapshot_at,
+            config=config,
+            s3_client=client,
         )
-        upload_chart_image(local_path, bucket=config["bucket"], s3_key=s3_key, s3_client=client)
-        update_chart_snapshot_image_s3_key(db_path, snapshot_id, s3_key)
-        attachments.append((local_path.name, local_path.read_bytes()))
-    return attachments
+        snapshot_id = insert_chart_snapshot(
+            db_path,
+            symbol=snapshot.symbol,
+            timeframe=snapshot.timeframe,
+            snapshot_at=snapshot_at.isoformat(),
+            s3_bucket=config["bucket"],
+            s3_key=s3_key,
+            captured_at=snapshot_at.isoformat(),
+            candle_time=snapshot.timestamp,
+            ohlcv_json=candles.tail(120).reset_index().to_json(orient="records", date_format="iso"),
+            indicators_json=json.dumps(snapshot.__dict__, ensure_ascii=False, default=_json_default),
+        )
+        image_urls.append(generate_presigned_chart_url(s3_key, config=config, s3_client=client))
+    return image_urls
 
 
 def parse_args(argv=None):
@@ -322,8 +312,8 @@ def main(argv=None):
     else:
         snapshots = collect_and_build_snapshots(targets, db_path, period=period, collect=not args.skip_fetch)
     message = build_chart_snapshot_message(snapshots)
-    attachments = persist_snapshot_images(snapshots, db_path, env_values, dry_run=dry_run)
-    post_discord_message(webhook_url, message, dry_run=dry_run, attachments=attachments)
+    image_urls = persist_snapshot_images(snapshots, db_path, env_values, dry_run=dry_run)
+    post_discord_message(webhook_url, message, dry_run=dry_run, image_urls=image_urls)
 
     if not args.once:
         print("[INFO] Chart snapshot sent once. Add scheduling later if continuous mode is needed.")

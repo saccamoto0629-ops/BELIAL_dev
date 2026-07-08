@@ -15,12 +15,10 @@ def _prepare_frame(candles: pd.DataFrame) -> pd.DataFrame:
     frame = candles.copy()
     if frame.empty:
         raise ValueError("candles must not be empty")
-    if "close" not in frame.columns:
-        raise ValueError("candles must contain a close column")
-
-    for column in ("open", "high", "low"):
-        if column not in frame.columns:
-            frame[column] = frame["close"]
+    required = {"open", "high", "low", "close"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"candles must contain OHLC columns; missing: {', '.join(sorted(missing))}")
     if "volume" not in frame.columns:
         frame["volume"] = 0.0
     return frame[["open", "high", "low", "close", "volume"]].tail(120)

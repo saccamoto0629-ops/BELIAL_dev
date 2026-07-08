@@ -95,7 +95,7 @@ Discord投稿先も役割ごとに分離する。
 | `CHART_SNAPSHOT_WEBHOOK_URL` | `chart-snapshot` | 定時のチャート状態レポート。`chart_snapshot.py` が使用する |
 | `BOT_ALERTS_WEBHOOK_URL` | `bot-alerts` | MAタッチ、MACDクロス、Bollinger Bands Alert、急変などのイベント通知。`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` が使用する |
 
-Chart Snapshot画像は `chart_snapshots.image_s3_key` に private S3 key として保存する。S3 bucket は public access block 済みの前提であり、Discord通知では公開URLを本文に載せず、S3から画像を取得して添付する。
+Chart Snapshot画像は private S3 bucket に保存し、`chart_snapshots.s3_bucket` / `chart_snapshots.s3_key` に永続メタデータを保存する。S3 bucket は public access block 済みの前提であり、Discord通知ではS3直URLを本文に載せず、短時間だけ有効な presigned URL を `embed.image.url` に設定する。presigned URL は期限切れするためDBへ保存しない。
 
 旧設定との互換性のため、イベント通知側は `BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り旧 `DISCORD_WEBHOOK_URL` をfallbackとして扱う。新規運用では `CHART_SNAPSHOT_WEBHOOK_URL` と `BOT_ALERTS_WEBHOOK_URL` を明示する。
 
@@ -122,9 +122,9 @@ Market Snapshotに統合する `Chart Snapshot Summary` では、本文を短く
 
 ローソク足は `market-watch/data/chart_data.sqlite3` へ保存する。保存時のtimestampはUTCへ正規化する。
 
-`chart_snapshots` は `id` / `symbol` / `timeframe` / `captured_at` / `candle_time` / `image_url` / `image_s3_key` / `ohlcv_json` / `indicators_json` を保持する。`image_url` は既存互換として残し、S3保存では `image_s3_key` を使う。
+`chart_snapshots` は `id` / `symbol` / `timeframe` / `snapshot_at` / `s3_bucket` / `s3_key` / `created_at` を保持する。互換用の `image_url` / `image_s3_key` が存在するDBでも、S3保存では `s3_bucket` / `s3_key` を正とする。
 
-`alerts` は `snapshot_id` で `chart_snapshots.id` を参照する。`occurred_at` / `captured_at` / `candle_time` は補助情報として保持し、主関連を時刻JOINにしない。
+`alerts` は `snapshot_id` と `alert_chart_snapshots.alert_id` / `chart_snapshot_id` で `chart_snapshots.id` を参照する。`occurred_at` / `snapshot_at` / `candle_time` は補助情報として保持し、主関連を時刻JOINにしない。
 
 ```text
 2026-07-03T20:45:00Z

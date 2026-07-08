@@ -227,16 +227,20 @@ def state_key():
 
 
 def fetch_candles():
-    """Return the recent Close-price series for the configured symbol/timeframe."""
+    """Return recent OHLCV candles for the configured symbol/timeframe."""
     ticker = yf.Ticker(TICKER)
     history = ticker.history(
         period=HISTORY_PERIOD,
         interval=INTERVAL,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    close = history["Close"].dropna()
-    logger.info("Fetched candles: symbol=%s timeframe=%s rows=%s", SYMBOL, TIMEFRAME, len(close))
-    return close
+    frame = history.rename(columns=str.lower)
+    columns = [column for column in ["open", "high", "low", "close", "volume"] if column in frame.columns]
+    frame = frame[columns].dropna(subset=["open", "high", "low", "close"])
+    if "volume" not in frame.columns:
+        frame["volume"] = 0.0
+    logger.info("Fetched candles: symbol=%s timeframe=%s rows=%s", SYMBOL, TIMEFRAME, len(frame))
+    return frame
 
 
 def compute_macd(close, *, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
@@ -248,27 +252,20 @@ def detect_cross(prev_macd, prev_signal, curr_macd, curr_signal):
     return detect_macd_cross(prev_macd, prev_signal, curr_macd, curr_signal)
 
 
-def post_discord_embed(embed, *, dry_run=False, image_bytes=None, image_filename=None):
+def post_discord_embed(embed, *, dry_run=False, image_url=None):
+    if image_url:
+        embed = dict(embed)
+        embed["image"] = {"url": image_url}
     if dry_run:
         logger.info("[DRY_RUN] Would post to Discord: %s", json.dumps(embed, ensure_ascii=False))
-        if image_filename:
-            logger.info("[DRY_RUN] Would attach chart image: %s", image_filename)
         return
 
     try:
-        if image_bytes and image_filename:
-            response = requests.post(
-                DISCORD_WEBHOOK_URL,
-                data={"payload_json": json.dumps({"embeds": [embed]}, ensure_ascii=False)},
-                files={"files[0]": (image_filename, image_bytes, "image/png")},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-        else:
-            response = requests.post(
-                DISCORD_WEBHOOK_URL,
-                json={"embeds": [embed]},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
         response.raise_for_status()
         logger.info("Discord notification sent: title=%s", embed.get("title"))
     except requests.RequestException:
@@ -299,10 +296,9 @@ def notify_cross(cross, candle_time, close_price, macd_value, signal_value, *, d
         ],
         "timestamp": detected_at,
     }
-    image_bytes = None
-    image_filename = None
+    image_url = None
     try:
-        _snapshot_id, image_bytes, image_filename = prepare_alert_image(
+        _snapshot_id, image_url = prepare_alert_image(
             alert_type=f"macd_{cross}",
             symbol=SYMBOL,
             timeframe=TIMEFRAME,
@@ -318,9 +314,9 @@ def notify_cross(cross, candle_time, close_price, macd_value, signal_value, *, d
             dry_run=dry_run,
         )
     except ModuleNotFoundError as exc:
-        logger.warning("Chart image attachment skipped because dependency is missing: %s", exc)
-    if image_bytes and image_filename:
-        post_discord_embed(embed, dry_run=dry_run, image_bytes=image_bytes, image_filename=image_filename)
+        logger.warning("Chart image presigned URL skipped because dependency is missing: %s", exc)
+    if image_url:
+        post_discord_embed(embed, dry_run=dry_run, image_url=image_url)
     else:
         post_discord_embed(embed, dry_run=dry_run)
     logger.info("%s MACD %s for %s %s at %s", cross, signal_name, SYMBOL, TIMEFRAME, candle_time)
@@ -343,10 +339,11 @@ def notify_error(exc, *, dry_run=False):
 
 def run_once(state, *, dry_run=False):
     try:
-        close = fetch_candles()
+        candles = fetch_candles()
     except Exception as exc:
         logger.error("Failed to fetch candles: %s", exc)
         return
+    close = candles["close"] if isinstance(candles, pd.DataFrame) else candles
     min_bars = MACD_SLOW + MACD_SIGNAL + 2
     if len(close) < min_bars:
         logger.warning("Not enough candles yet: got %s, need %s", len(close), min_bars)
@@ -384,7 +381,7 @@ def run_once(state, *, dry_run=False):
         logger.info("Cross already notified for this candle (%s, %s); skipping.", candle_key, cross)
         return
 
-    notify_cross(cross, candle_time, close_price, curr_macd, curr_signal, dry_run=dry_run, candles=close)
+    notify_cross(cross, candle_time, close_price, curr_macd, curr_signal, dry_run=dry_run, candles=candles)
     state[state_key()] = {
         "candle_time": candle_key,
         "signal": cross,
