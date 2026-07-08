@@ -21,11 +21,40 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 DEFAULT_DB_PATH = BASE_DIR / "data" / "chart_data.sqlite3"
 
-DEFAULT_SYMBOL_TICKERS = {
+DEFAULT_PROVIDER_TICKERS = {
     "USDJPY": "JPY=X",
     "XAUUSD": "GC=F",
     "SPX": "^GSPC",
+    "ES": "ES=F",
+    "MES": "MES=F",
     "VIX": "^VIX",
+}
+DEFAULT_SYMBOL_TICKERS = {
+    "USDJPY": "JPY=X",
+    "XAUUSD": "GC=F",
+    "SPX": "ES=F",
+    "VIX": "^VIX",
+}
+DEFAULT_DISPLAY_NAMES = {
+    "USDJPY": "USD/JPY",
+    "XAUUSD": "Gold",
+    "SPX": "S&P 500",
+    "VIX": "Volatility",
+}
+DEFAULT_CHART_SYMBOLS = {
+    "USDJPY": "USDJPY",
+    "XAUUSD": "XAUUSD",
+    "SPX": "ES",
+    "VIX": "VIX",
+}
+DEFAULT_FALLBACK_CHART_SYMBOLS = {
+    "SPX": "SPX",
+}
+DEFAULT_ASSET_TYPES = {
+    "USDJPY": "fx",
+    "XAUUSD": "commodity_futures_proxy",
+    "SPX": "index_futures_proxy",
+    "VIX": "volatility_index",
 }
 DEFAULT_SYMBOLS = tuple(DEFAULT_SYMBOL_TICKERS)
 DEFAULT_TIMEFRAMES = ("15m", "1h", "4h")
@@ -63,6 +92,11 @@ def parse_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def _provider_ticker(chart_symbol: str) -> str:
+    normalized = chart_symbol.upper()
+    return DEFAULT_PROVIDER_TICKERS.get(normalized, chart_symbol)
+
+
 def load_chart_targets(env_values: dict[str, str] | None = None) -> list[ChartTarget]:
     values = env_values if env_values is not None else load_env_file()
     symbols = parse_csv(_env_value(values, "CHART_SYMBOLS", ",".join(DEFAULT_SYMBOLS)))
@@ -70,9 +104,36 @@ def load_chart_targets(env_values: dict[str, str] | None = None) -> list[ChartTa
 
     targets: list[ChartTarget] = []
     for symbol in symbols:
-        ticker = _env_value(values, f"CHART_TICKER_{symbol.upper()}", DEFAULT_SYMBOL_TICKERS.get(symbol.upper(), symbol))
+        logical_symbol = symbol.upper()
+        display_name = _env_value(values, f"CHART_DISPLAY_NAME_{logical_symbol}", DEFAULT_DISPLAY_NAMES.get(logical_symbol, logical_symbol))
+        chart_symbol = _env_value(values, f"CHART_SYMBOL_{logical_symbol}", DEFAULT_CHART_SYMBOLS.get(logical_symbol, logical_symbol))
+        fallback_chart_symbol = _env_value(
+            values,
+            f"CHART_FALLBACK_CHART_SYMBOL_{logical_symbol}",
+            DEFAULT_FALLBACK_CHART_SYMBOLS.get(logical_symbol, ""),
+        )
+        asset_type = _env_value(values, f"CHART_ASSET_TYPE_{logical_symbol}", DEFAULT_ASSET_TYPES.get(logical_symbol, ""))
+        ticker = _env_value(values, f"CHART_TICKER_{logical_symbol}", _provider_ticker(chart_symbol))
+        fallback_ticker = ""
+        if fallback_chart_symbol:
+            fallback_ticker = _env_value(
+                values,
+                f"CHART_FALLBACK_TICKER_{logical_symbol}",
+                _provider_ticker(fallback_chart_symbol),
+            )
         for timeframe in timeframes:
-            targets.append(ChartTarget(symbol=symbol.upper(), ticker=ticker, timeframe=timeframe))
+            targets.append(
+                ChartTarget(
+                    symbol=logical_symbol,
+                    ticker=ticker,
+                    timeframe=timeframe,
+                    display_name=display_name,
+                    chart_symbol=chart_symbol.upper(),
+                    fallback_chart_symbol=fallback_chart_symbol.upper(),
+                    fallback_ticker=fallback_ticker,
+                    asset_type=asset_type,
+                )
+            )
     return targets
 
 
@@ -204,6 +265,9 @@ def fetch_ohlcv(target: ChartTarget, *, period: str = DEFAULT_PERIOD) -> pd.Data
     interval = "1h" if target.timeframe == "4h" else target.timeframe
     history = yf.Ticker(target.ticker).history(period=period, interval=interval)
     frame = _normalize_history(history)
+    if frame.empty and target.fallback_ticker and target.fallback_ticker != target.ticker:
+        history = yf.Ticker(target.fallback_ticker).history(period=period, interval=interval)
+        frame = _normalize_history(history)
     if target.timeframe == "4h":
         frame = _resample_4h(frame)
     return frame

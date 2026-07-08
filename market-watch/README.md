@@ -98,6 +98,8 @@ log_level = "INFO"
 
 `.env` is reserved for secrets such as Discord webhook URLs and future API keys. Chart images are uploaded to private S3 keys and exposed to Discord only through short-lived presigned URLs. Do not store presigned URLs or depend on public S3 URLs.
 
+Chart Snapshot symbols keep display/storage names separate from fetch symbols. For S&P 500 monitoring, `SPX` remains the logical symbol in SQLite, Discord text, and S3 keys, while `CHART_SYMBOL_SPX=ES` / `CHART_TICKER_SPX=ES=F` fetches E-mini S&P 500 futures candles for denser off-hours charts. `CHART_FALLBACK_CHART_SYMBOL_SPX=SPX` / `CHART_FALLBACK_TICKER_SPX=^GSPC` keeps the old index source as fallback when the futures proxy returns no candles. Use `MES` / `MES=F` instead if the Micro E-mini feed is preferred.
+
 For backward compatibility, old `.env` keys such as `SYMBOL`, `TIMEFRAME`, `MACD_FAST`, `MACD_SLOW`, `MACD_SIGNAL`, `CHECK_INTERVAL_SECONDS`, and `LOG_LEVEL` can still override config values, but new deployments should use `config.toml`.
 
 ## Run

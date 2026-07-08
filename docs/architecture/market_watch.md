@@ -107,7 +107,7 @@ Chart Snapshot画像は private S3 bucket に保存し、`chart_snapshots.s3_buc
 |---|---|
 | `USDJPY` | 為替、ドル円 |
 | `XAUUSD` | Gold |
-| `SPX` | S&P500 |
+| `SPX` | S&P500. Chart data may use `ES` / `ES=F` as an index futures proxy with `SPX` / `^GSPC` fallback. |
 | `VIX` | Volatility |
 
 現行の時間足は以下。
