@@ -27,6 +27,19 @@ def _make_close_series(values):
     return pd.Series(values, index=index)
 
 
+def _make_candles(values):
+    index = pd.date_range("2026-07-01", periods=len(values), freq="15min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "open": [float(value) for value in values],
+            "high": [float(value) + 0.01 for value in values],
+            "low": [float(value) - 0.01 for value in values],
+            "close": [float(value) for value in values],
+        },
+        index=index,
+    )
+
+
 def test_compute_macd_returns_macd_and_signal_lines():
     close = _make_close_series([100 + i * 0.1 for i in range(60)])
 
@@ -58,9 +71,9 @@ def test_run_once_notifies_and_records_state_on_cross(monkeypatch):
     # line, then one more (still-forming, excluded) bar. The cross lands
     # exactly on the "confirmed" candle at index -2.
     values = [100.0] * 40 + [100.5, 100.5]
-    close = _make_close_series(values)
+    candles = _make_candles(values)
 
-    monkeypatch.setattr(bot, "fetch_candles", lambda: close)
+    monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
 
     posted = []
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))
@@ -74,14 +87,14 @@ def test_run_once_notifies_and_records_state_on_cross(monkeypatch):
     assert "Signal" in [field["name"] for field in posted[0]["fields"]]
     assert bot.state_key() in state
     assert state[bot.state_key()]["signal"] == "bullish"
-    assert state[bot.state_key()]["candle_time"] == close.index[-2].isoformat()
+    assert state[bot.state_key()]["candle_time"] == candles.index[-2].isoformat()
 
 
 def test_run_once_does_not_duplicate_notification_for_same_candle(monkeypatch):
     values = [100.0] * 40 + [100.5, 100.5]
-    close = _make_close_series(values)
+    candles = _make_candles(values)
 
-    monkeypatch.setattr(bot, "fetch_candles", lambda: close)
+    monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
 
     posted = []
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False: posted.append(embed))

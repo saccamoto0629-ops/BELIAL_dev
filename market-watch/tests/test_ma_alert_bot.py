@@ -11,7 +11,15 @@ import ma_alert_bot as bot  # noqa: E402
 
 def _make_candles(values):
     index = pd.date_range("2026-07-01", periods=len(values), freq="15min", tz="UTC")
-    return pd.DataFrame({"close": values}, index=index)
+    return pd.DataFrame(
+        {
+            "open": [float(value) for value in values],
+            "high": [float(value) + 0.01 for value in values],
+            "low": [float(value) - 0.01 for value in values],
+            "close": [float(value) for value in values],
+        },
+        index=index,
+    )
 
 
 def _patch_common(monkeypatch, candles, posted, saved):
