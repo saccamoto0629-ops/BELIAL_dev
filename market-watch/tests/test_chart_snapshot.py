@@ -169,7 +169,11 @@ def test_main_once_dry_run_uses_existing_sqlite_without_fetch(monkeypatch, tmp_p
     monkeypatch.setattr(snapshot, "load_chart_targets", lambda env_values: [target])
     monkeypatch.setattr(snapshot, "chart_db_path", lambda env_values: tmp_path / "chart.sqlite3")
     monkeypatch.setattr(snapshot, "load_candles", lambda db_path, symbol, timeframe, limit=200: make_candles())
-    monkeypatch.setattr(snapshot, "post_discord_message", lambda webhook_url, message, dry_run=False: calls.append((webhook_url, dry_run, message)))
+    monkeypatch.setattr(
+        snapshot,
+        "post_discord_message",
+        lambda webhook_url, message, dry_run=False, attachments=None: calls.append((webhook_url, dry_run, message, attachments)),
+    )
 
     snapshot.main(["--once", "--dry-run", "--skip-fetch"])
 
@@ -177,3 +181,73 @@ def test_main_once_dry_run_uses_existing_sqlite_without_fetch(monkeypatch, tmp_p
     assert calls[0][0] == "https://discord.invalid/chart-snapshot"
     assert calls[0][1] is True
     assert "Chart Snapshot" in calls[0][2]
+    assert calls[0][3] == []
+
+
+def test_main_dry_run_skip_fetch_does_not_create_missing_sqlite(monkeypatch, tmp_path):
+    db_path = tmp_path / "missing.sqlite3"
+    calls = []
+
+    monkeypatch.setattr(snapshot, "load_env_file", lambda: {
+        "DRY_RUN": "true",
+        "CHART_DB_PATH": str(db_path),
+        "CHART_SNAPSHOT_WEBHOOK_URL": "https://discord.invalid/chart-snapshot",
+    })
+    monkeypatch.setattr(snapshot, "load_chart_targets", lambda env_values: [ChartTarget("USDJPY", "JPY=X", "15m")])
+    monkeypatch.setattr(snapshot, "chart_db_path", lambda env_values: db_path)
+    monkeypatch.setattr(
+        snapshot,
+        "post_discord_message",
+        lambda webhook_url, message, dry_run=False, attachments=None: calls.append((dry_run, message, attachments)),
+    )
+
+    snapshot.main(["--once", "--dry-run", "--skip-fetch"])
+
+    assert not db_path.exists()
+    assert calls == [(True, "📈 Chart Snapshot\n\n- unavailable", [])]
+
+
+def test_persist_snapshot_images_uploads_and_saves_s3_key(monkeypatch, tmp_path):
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+    db_path = tmp_path / "chart.sqlite3"
+    candles = make_candles()
+
+    import chart_collector as collector
+
+    collector.save_candles(db_path, collector.candles_from_frame(target, candles))
+    indicator = snapshot.build_indicator_snapshot(
+        target,
+        candles,
+        now_utc=pd.Timestamp("2026-07-06T01:45:00Z"),
+    )
+    uploaded = {}
+
+    class FakeS3Client:
+        def upload_file(self, local_path, bucket, key, ExtraArgs=None):
+            uploaded["bucket"] = bucket
+            uploaded["key"] = key
+            uploaded["content"] = pathlib.Path(local_path).read_bytes()
+            uploaded["extra_args"] = ExtraArgs
+
+    monkeypatch.setattr(snapshot, "create_s3_client", lambda config: FakeS3Client())
+
+    attachments = snapshot.persist_snapshot_images(
+        [indicator],
+        db_path,
+        {
+            "AWS_REGION": "ap-northeast-1",
+            "CHART_S3_BUCKET": "belial-chart-snapshots",
+            "CHART_S3_PREFIX": "charts",
+        },
+    )
+
+    assert uploaded["bucket"] == "belial-chart-snapshots"
+    assert uploaded["key"].startswith("charts/USDJPY/15m/")
+    assert uploaded["key"].endswith(".png")
+    assert uploaded["content"].startswith(b"\x89PNG")
+    assert uploaded["extra_args"] == {"ContentType": "image/png"}
+    assert attachments[0][1].startswith(b"\x89PNG")
+
+    with collector.sqlite3.connect(db_path) as connection:
+        row = connection.execute("SELECT image_s3_key FROM chart_snapshots").fetchone()
+    assert row[0] == uploaded["key"]

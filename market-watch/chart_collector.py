@@ -7,6 +7,7 @@ actions.
 from __future__ import annotations
 
 import os
+import uuid
 import sqlite3
 from datetime import UTC
 from pathlib import Path
@@ -100,6 +101,45 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chart_snapshots (
+                id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                candle_time TEXT NOT NULL,
+                image_url TEXT,
+                image_s3_key TEXT,
+                ohlcv_json TEXT,
+                indicators_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+                id TEXT PRIMARY KEY,
+                alert_type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                candle_time TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (snapshot_id) REFERENCES chart_snapshots(id)
+            )
+            """
+        )
+        _ensure_column(connection, "chart_snapshots", "image_s3_key", "TEXT")
+
+
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def to_utc_iso_z(timestamp) -> str:
@@ -216,6 +256,101 @@ def load_candles(db_path: Path, symbol: str, timeframe: str, *, limit: int = 200
     frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     return frame.set_index("timestamp")
+
+
+def insert_chart_snapshot(
+    db_path: Path,
+    *,
+    symbol: str,
+    timeframe: str,
+    captured_at: str,
+    candle_time: str,
+    image_url: str | None = None,
+    image_s3_key: str | None = None,
+    ohlcv_json: str | None = None,
+    indicators_json: str | None = None,
+    snapshot_id: str | None = None,
+) -> str:
+    init_db(db_path)
+    row_id = snapshot_id or str(uuid.uuid4())
+    now = to_utc_iso_z(pd.Timestamp.now(tz=UTC))
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO chart_snapshots
+            (id, symbol, timeframe, captured_at, candle_time, image_url, image_s3_key, ohlcv_json, indicators_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_id,
+                symbol.upper(),
+                timeframe,
+                captured_at,
+                candle_time,
+                image_url,
+                image_s3_key,
+                ohlcv_json,
+                indicators_json,
+                now,
+            ),
+        )
+    return row_id
+
+
+def update_chart_snapshot_image_s3_key(db_path: Path, snapshot_id: str, image_s3_key: str) -> None:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE chart_snapshots SET image_s3_key = ? WHERE id = ?",
+            (image_s3_key, snapshot_id),
+        )
+
+
+def get_chart_snapshot_image_s3_key(db_path: Path, snapshot_id: str) -> str | None:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT image_s3_key FROM chart_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+    return None if row is None else row[0]
+
+
+def insert_alert(
+    db_path: Path,
+    *,
+    alert_type: str,
+    symbol: str,
+    timeframe: str,
+    occurred_at: str,
+    candle_time: str,
+    snapshot_id: str,
+    metadata_json: str | None = None,
+    alert_id: str | None = None,
+) -> str:
+    init_db(db_path)
+    row_id = alert_id or str(uuid.uuid4())
+    now = to_utc_iso_z(pd.Timestamp.now(tz=UTC))
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO alerts
+            (id, alert_type, symbol, timeframe, occurred_at, candle_time, snapshot_id, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_id,
+                alert_type,
+                symbol.upper(),
+                timeframe,
+                occurred_at,
+                candle_time,
+                snapshot_id,
+                metadata_json,
+                now,
+            ),
+        )
+    return row_id
 
 
 def collect_target(target: ChartTarget, db_path: Path, *, period: str = DEFAULT_PERIOD) -> int:

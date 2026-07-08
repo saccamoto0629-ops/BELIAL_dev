@@ -16,8 +16,10 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
+import pandas as pd
 import yfinance as yf
 
+from chart_alert_context import prepare_alert_image
 from indicators import calculate_macd, detect_macd_cross
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -246,17 +248,27 @@ def detect_cross(prev_macd, prev_signal, curr_macd, curr_signal):
     return detect_macd_cross(prev_macd, prev_signal, curr_macd, curr_signal)
 
 
-def post_discord_embed(embed, *, dry_run=False):
+def post_discord_embed(embed, *, dry_run=False, image_bytes=None, image_filename=None):
     if dry_run:
         logger.info("[DRY_RUN] Would post to Discord: %s", json.dumps(embed, ensure_ascii=False))
+        if image_filename:
+            logger.info("[DRY_RUN] Would attach chart image: %s", image_filename)
         return
 
     try:
-        response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"embeds": [embed]},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        if image_bytes and image_filename:
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                data={"payload_json": json.dumps({"embeds": [embed]}, ensure_ascii=False)},
+                files={"files[0]": (image_filename, image_bytes, "image/png")},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        else:
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"embeds": [embed]},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         response.raise_for_status()
         logger.info("Discord notification sent: title=%s", embed.get("title"))
     except requests.RequestException:
@@ -264,7 +276,7 @@ def post_discord_embed(embed, *, dry_run=False):
         raise
 
 
-def notify_cross(cross, candle_time, close_price, macd_value, signal_value, *, dry_run=False):
+def notify_cross(cross, candle_time, close_price, macd_value, signal_value, *, dry_run=False, candles=None):
     is_bullish = cross == "bullish"
     signal_name = "golden cross" if is_bullish else "dead cross"
     detected_at = datetime.now(timezone.utc).isoformat()
@@ -287,7 +299,30 @@ def notify_cross(cross, candle_time, close_price, macd_value, signal_value, *, d
         ],
         "timestamp": detected_at,
     }
-    post_discord_embed(embed, dry_run=dry_run)
+    image_bytes = None
+    image_filename = None
+    try:
+        _snapshot_id, image_bytes, image_filename = prepare_alert_image(
+            alert_type=f"macd_{cross}",
+            symbol=SYMBOL,
+            timeframe=TIMEFRAME,
+            candle_time=str(candle_time),
+            candles=candles if candles is not None else pd.Series([close_price]),
+            metadata={
+                "cross": cross,
+                "close": float(close_price),
+                "macd": float(macd_value),
+                "signal_line": float(signal_value),
+                "detected_at": detected_at,
+            },
+            dry_run=dry_run,
+        )
+    except ModuleNotFoundError as exc:
+        logger.warning("Chart image attachment skipped because dependency is missing: %s", exc)
+    if image_bytes and image_filename:
+        post_discord_embed(embed, dry_run=dry_run, image_bytes=image_bytes, image_filename=image_filename)
+    else:
+        post_discord_embed(embed, dry_run=dry_run)
     logger.info("%s MACD %s for %s %s at %s", cross, signal_name, SYMBOL, TIMEFRAME, candle_time)
 
 
@@ -349,7 +384,7 @@ def run_once(state, *, dry_run=False):
         logger.info("Cross already notified for this candle (%s, %s); skipping.", candle_key, cross)
         return
 
-    notify_cross(cross, candle_time, close_price, curr_macd, curr_signal, dry_run=dry_run)
+    notify_cross(cross, candle_time, close_price, curr_macd, curr_signal, dry_run=dry_run, candles=close)
     state[state_key()] = {
         "candle_time": candle_key,
         "signal": cross,
