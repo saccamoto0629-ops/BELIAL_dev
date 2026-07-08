@@ -44,7 +44,7 @@ def _event_name(context: RenderContext) -> str:
 
 
 def _show_bollinger(context: RenderContext) -> bool:
-    return _event_name(context).startswith("bollinger_")
+    return True
 
 
 def _highlight_bollinger_band(context: RenderContext) -> str | None:
@@ -148,6 +148,33 @@ def _calculate_bollinger_bands(close: pd.Series) -> pd.DataFrame:
     )
 
 
+def _bollinger_band_styles(context: RenderContext) -> dict[str, dict[str, Any]]:
+    highlight = _highlight_bollinger_band(context)
+    return {
+        "upper": {
+            "color": "#d2a8ff",
+            "label": "BB Upper",
+            "linewidth": 2.2 if highlight == "upper" else 1.25,
+            "linestyle": "-" if highlight == "upper" else "--",
+            "highlight": highlight == "upper",
+        },
+        "middle": {
+            "color": "#8b949e",
+            "label": "BB Middle",
+            "linewidth": 1.55 if highlight == "middle" else 1.0,
+            "linestyle": "-" if highlight == "middle" else ":",
+            "highlight": highlight == "middle",
+        },
+        "lower": {
+            "color": "#7ee787",
+            "label": "BB Lower",
+            "linewidth": 2.2 if highlight == "lower" else 1.25,
+            "linestyle": "-" if highlight == "lower" else "--",
+            "highlight": highlight == "lower",
+        },
+    }
+
+
 def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, context: RenderContext) -> None:
     import matplotlib
 
@@ -212,27 +239,22 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
     price_ax.plot(x_values, ema20, color="#e67e22", linewidth=1.0, label="EMA20")
     if _show_bollinger(context):
         bands = _calculate_bollinger_bands(close)
-        highlight = _highlight_bollinger_band(context)
-        band_styles = {
-            "upper": ("#d2a8ff", "BB Upper"),
-            "middle": ("#8b949e", "BB Middle"),
-            "lower": ("#7ee787", "BB Lower"),
-        }
-        for band_name, (color, label) in band_styles.items():
-            linewidth = 2.2 if band_name == highlight else 1.35
+        band_styles = _bollinger_band_styles(context)
+        for band_name, style in band_styles.items():
             price_ax.plot(
                 x_values,
                 bands[band_name],
-                color=color,
-                linewidth=linewidth,
-                linestyle="-" if band_name == highlight else "--",
-                label=label,
+                color=style["color"],
+                linewidth=style["linewidth"],
+                linestyle=style["linestyle"],
+                label=style["label"],
             )
         metadata = context.metadata or {}
+        highlight = _highlight_bollinger_band(context)
         if highlight and metadata.get(highlight) is not None:
             price_ax.axhline(
                 float(metadata[highlight]),
-                color=band_styles[highlight][0],
+                color=band_styles[highlight]["color"],
                 linewidth=1.0,
                 linestyle=":",
             )
@@ -314,10 +336,8 @@ def _render_with_pillow(frame: pd.DataFrame, output_path: Path, title: str, cont
 
     if _show_bollinger(context):
         bands = _calculate_bollinger_bands(close)
-        highlight = _highlight_bollinger_band(context)
-        draw_series(bands["upper"], "#d2a8ff", width=3 if highlight == "upper" else 2)
-        draw_series(bands["middle"], "#8b949e", width=2)
-        draw_series(bands["lower"], "#7ee787", width=3 if highlight == "lower" else 2)
+        for band_name, style in _bollinger_band_styles(context).items():
+            draw_series(bands[band_name], style["color"], width=3 if style["highlight"] else 2)
 
     image.save(output_path, format="PNG")
 

@@ -117,6 +117,30 @@ def test_bollinger_event_context_selects_bands_and_highlight():
     assert chart_renderer._calculate_bollinger_bands(make_candles()["close"])["upper"].notna().any()
 
 
+def test_scheduled_chart_snapshot_plots_bollinger_bands_and_moving_averages(tmp_path, monkeypatch):
+    plt = pytest.importorskip("matplotlib.pyplot")
+
+    plotted_labels = []
+    original_plot = plt.Axes.plot
+
+    def spy_plot(self, *args, **kwargs):
+        label = kwargs.get("label")
+        if label:
+            plotted_labels.append(label)
+        return original_plot(self, *args, **kwargs)
+
+    monkeypatch.setattr(plt.Axes, "plot", spy_plot)
+
+    chart_renderer.render_chart_snapshot(
+        make_candles(),
+        tmp_path / "snapshot.png",
+        title="USDJPY 15m Chart Snapshot",
+    )
+
+    assert {"SMA20", "SMA75", "EMA20"}.issubset(plotted_labels)
+    assert {"BB Upper", "BB Middle", "BB Lower"}.issubset(plotted_labels)
+
+
 def test_render_chart_snapshot_draws_candlestick_wicks_and_bodies_from_ohlc(tmp_path, monkeypatch):
     plt = pytest.importorskip("matplotlib.pyplot")
 

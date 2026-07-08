@@ -92,8 +92,8 @@ macd_alert_bot.py / ma_alert_bot.py / bollinger_alert_bot.py
 
 | 通知種別 | 画像に表示する主な要素 |
 |---|---|
-| 定時Chart Snapshot | ローソク足、SMA20、SMA75、EMA20、MACD |
-| MA Alert | ローソク足、SMA20 / SMA75 / EMA20 |
+| 定時Chart Snapshot | ローソク足、SMA20、SMA75、EMA20、Bollinger upper / middle / lower、MACD |
+| MA Alert | ローソク足、SMA20 / SMA75 / EMA20、Bollinger upper / middle / lower |
 | MACD Alert | ローソク足、MACD、Signal、Histogram |
 | Bollinger Alert | ローソク足、Bollinger upper / middle / lower。`upper_break` / `lower_break` では突破対象ラインを強調する |
 
