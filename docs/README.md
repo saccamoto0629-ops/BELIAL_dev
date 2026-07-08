@@ -1,0 +1,22 @@
+# BELIAL Docs
+
+BELIAL のドキュメントは、目的別に以下のディレクトリへ分ける。
+
+## Structure
+
+```text
+docs/
+├── product/       # 何を作るか、目的、世界観
+├── architecture/  # どう作るか、責務分離、DB、各モジュール
+├── operations/    # どう動かすか、環境変数、デプロイ、障害対応
+├── development/   # どう開発するか、Issue、PR、コミット、タグ
+└── archive/       # 過去レビュー、旧仕様、検証メモ
+```
+
+## Guidelines
+
+- 現行仕様は `architecture/` に置く。
+- 開発ルールは `development/` に置く。
+- 検証レポートは `development/reports/` に置く。
+- 旧仕様やレビュー途中の資料は `archive/` に退避する。
+- `docs/` 直下には原則として、この `README.md` だけを置く。
