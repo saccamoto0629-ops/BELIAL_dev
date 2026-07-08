@@ -12,6 +12,15 @@ class ChartTarget:
     symbol: str
     ticker: str
     timeframe: str
+    display_name: str = ""
+    chart_symbol: str = ""
+    fallback_chart_symbol: str = ""
+    fallback_ticker: str = ""
+    asset_type: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.display_name or self.symbol
 
 
 @dataclass(frozen=True)
@@ -51,3 +60,10 @@ class IndicatorSnapshot:
     bias_weight: float
     trend: str
     state: str
+    display_name: str = ""
+    chart_symbol: str = ""
+    asset_type: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.display_name or self.symbol

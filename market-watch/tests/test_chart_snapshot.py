@@ -37,7 +37,7 @@ def make_short_candles():
 
 
 def test_build_indicator_snapshot_and_format_message():
-    target = ChartTarget("USDJPY", "JPY=X", "15m")
+    target = ChartTarget("USDJPY", "JPY=X", "15m", "USD/JPY", "USDJPY", "", "", "fx")
 
     indicator = snapshot.build_indicator_snapshot(
         target,
@@ -48,11 +48,15 @@ def test_build_indicator_snapshot_and_format_message():
 
     assert indicator is not None
     assert indicator.symbol == "USDJPY"
+    assert indicator.display_name == "USD/JPY"
+    assert indicator.chart_symbol == "USDJPY"
     assert indicator.trend == "Bull"
     assert indicator.rsi14 == 100.0
     assert indicator.rsi_state == "Overbought"
     assert "📈 Chart Snapshot" in message
     assert "USDJPY 15m" in message
+    assert "Display: USD/JPY" in message
+    assert "Chart Symbol: USDJPY" in message
     assert "Time: 2026-07-06 04:45 JST" in message
     assert "Freshness: Fresh (6h 0m old)" in message
     assert "Bias Weight: 1.00" in message
@@ -80,6 +84,22 @@ def test_build_indicator_snapshot_reports_unavailable_rsi_when_data_is_short():
     formatted = snapshot.format_snapshot(indicator)
     assert "RSI14: N/A" in formatted
     assert "RSI State: Unavailable" in formatted
+
+
+def test_format_snapshot_uses_spx_display_and_proxy_symbol():
+    target = ChartTarget("SPX", "ES=F", "15m", "S&P 500", "ES", "SPX", "^GSPC", "index_futures_proxy")
+
+    indicator = snapshot.build_indicator_snapshot(
+        target,
+        make_candles(),
+        now_utc=pd.Timestamp("2026-07-06T01:45:00Z"),
+    )
+
+    assert indicator is not None
+    formatted = snapshot.format_snapshot(indicator)
+    assert "SPX 15m" in formatted
+    assert "Display: S&P 500" in formatted
+    assert "Chart Symbol: ES" in formatted
 
 
 def test_post_discord_message_dry_run_does_not_call_session(capsys):

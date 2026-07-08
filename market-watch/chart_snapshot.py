@@ -127,6 +127,9 @@ def build_indicator_snapshot(
         bias_weight=MARKET_CLOSED_BIAS_WEIGHT if is_market_closed else (0.0 if is_stale else 1.0),
         trend="Stale" if is_stale else classify_trend(close, sma20, sma75),
         state="Stale" if is_stale else classify_bb_state(bb_position),
+        display_name=target.display_name,
+        chart_symbol=target.chart_symbol,
+        asset_type=target.asset_type,
     )
 
 
@@ -153,6 +156,8 @@ def format_snapshot(snapshot: IndicatorSnapshot) -> str:
     return "\n".join(
         [
             f"{snapshot.symbol} {snapshot.timeframe}",
+            f"Display: {snapshot.label}",
+            f"Chart Symbol: {snapshot.chart_symbol or snapshot.symbol}",
             f"Time: {format_timestamp_jst(snapshot.timestamp)}",
             f"Freshness: {snapshot.freshness} ({format_age(snapshot.age_seconds)} old)",
             f"Bias Weight: {_fmt(snapshot.bias_weight)}",
@@ -256,7 +261,7 @@ def persist_snapshot_images(
         render_chart_snapshot(
             candles,
             local_path,
-            title=f"{snapshot.symbol} {snapshot.timeframe} Chart Snapshot",
+            title=f"{snapshot.label} {snapshot.timeframe} Chart Snapshot",
         )
         s3_key = upload_chart_image(
             local_path,

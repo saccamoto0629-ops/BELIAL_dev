@@ -22,10 +22,33 @@ def test_load_chart_targets_reads_env_values():
     )
 
     assert targets == [
-        ChartTarget("USDJPY", "JPY=X", "15m"),
-        ChartTarget("USDJPY", "JPY=X", "1h"),
-        ChartTarget("SPX", "^GSPC", "15m"),
-        ChartTarget("SPX", "^GSPC", "1h"),
+        ChartTarget("USDJPY", "JPY=X", "15m", "USD/JPY", "USDJPY", "", "", "fx"),
+        ChartTarget("USDJPY", "JPY=X", "1h", "USD/JPY", "USDJPY", "", "", "fx"),
+        ChartTarget("SPX", "^GSPC", "15m", "S&P 500", "ES", "SPX", "^GSPC", "index_futures_proxy"),
+        ChartTarget("SPX", "^GSPC", "1h", "S&P 500", "ES", "SPX", "^GSPC", "index_futures_proxy"),
+    ]
+
+
+def test_load_chart_targets_defaults_spx_to_es_proxy_with_spx_fallback():
+    targets = collector.load_chart_targets({"CHART_SYMBOLS": "SPX", "CHART_TIMEFRAMES": "15m"})
+
+    assert targets == [
+        ChartTarget("SPX", "ES=F", "15m", "S&P 500", "ES", "SPX", "^GSPC", "index_futures_proxy")
+    ]
+
+
+def test_load_chart_targets_supports_mes_proxy_override():
+    targets = collector.load_chart_targets(
+        {
+            "CHART_SYMBOLS": "SPX",
+            "CHART_TIMEFRAMES": "1h",
+            "CHART_SYMBOL_SPX": "MES",
+            "CHART_TICKER_SPX": "MES=F",
+        }
+    )
+
+    assert targets == [
+        ChartTarget("SPX", "MES=F", "1h", "S&P 500", "MES", "SPX", "^GSPC", "index_futures_proxy")
     ]
 
 
@@ -114,6 +137,40 @@ def test_collect_target_fetches_and_saves_with_mock(monkeypatch, tmp_path):
     monkeypatch.setattr(collector, "fetch_ohlcv", lambda target, *, period=collector.DEFAULT_PERIOD: frame)
 
     assert collector.collect_target(target, tmp_path / "chart.sqlite3") == 1
+
+
+def test_fetch_ohlcv_falls_back_when_proxy_returns_empty(monkeypatch):
+    calls = []
+    fallback_history = pd.DataFrame(
+        {
+            "Open": [5000.0],
+            "High": [5010.0],
+            "Low": [4990.0],
+            "Close": [5005.0],
+            "Volume": [100],
+        },
+        index=pd.to_datetime(["2026-07-08T00:00:00Z"]),
+    )
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def history(self, period, interval):
+            calls.append((self.ticker, period, interval))
+            if self.ticker == "ES=F":
+                return pd.DataFrame()
+            return fallback_history
+
+    monkeypatch.setattr(collector.yf, "Ticker", FakeTicker)
+
+    frame = collector.fetch_ohlcv(
+        ChartTarget("SPX", "ES=F", "15m", "S&P 500", "ES", "SPX", "^GSPC", "index_futures_proxy"),
+        period="5d",
+    )
+
+    assert calls == [("ES=F", "5d", "15m"), ("^GSPC", "5d", "15m")]
+    assert frame.iloc[0]["close"] == 5005.0
 
 
 def test_chart_snapshot_schema_persists_private_s3_metadata(tmp_path):
