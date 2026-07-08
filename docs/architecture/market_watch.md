@@ -17,6 +17,7 @@ Market Watch Engine は、ローソク足を取得し、SQLiteへ保存し、SMA
 - Market BiasへTrend / BB / MACD状態を渡す。RSI14 / RSI StateはSummary表示用の観測値として保持し、Biasスコアには反映しない
 - MACDクロスは `macd_alert_bot.py` でイベント通知として扱う
 - Bollinger Bands Alert は `bollinger_alert_bot.py` で市場状態監視のイベント通知として扱う
+- RSI14 Alert は `rsi_alert_bot.py` で過熱/冷却圏への突入・離脱を観測イベントとして扱う
 - ニュース監視Botとは責務を分離する
 
 ## ディレクトリ構成
@@ -31,11 +32,13 @@ market-watch/
 ├─ chart_snapshot.py         # Chart Snapshot生成、Discord投稿、Summary生成
 ├─ macd_alert_bot.py         # MACDクロスのイベント通知Bot
 ├─ bollinger_alert_bot.py    # Bollinger Bandsの市場状態イベント通知Bot
+├─ rsi_alert_bot.py          # RSI14の過熱/冷却圏イベント通知Bot
 ├─ data/
 │  └─ chart_data.sqlite3     # runtime DB。Git管理しない
 ├─ state/
 │  ├─ macd_alert_state.json  # MACDクロス通知の重複防止state。Git管理しない
-│  └─ bollinger_alert_state.json  # Bollinger通知の重複防止state。Git管理しない
+│  ├─ bollinger_alert_state.json  # Bollinger通知の重複防止state。Git管理しない
+│  └─ rsi_alert_state.json   # RSI通知の重複防止state。Git管理しない
 └─ tests/
    ├─ test_chart_collector.py
    ├─ test_chart_snapshot.py
@@ -82,6 +85,9 @@ macd_alert_bot.py / ma_alert_bot.py / bollinger_alert_bot.py
   -> S3 upload
   -> presigned URL
   -> Discord embed.image.url
+
+rsi_alert_bot.py
+  -> Discord embed
 ```
 
 `render_chart_snapshot()` は `market-watch/chart_renderer.py` の共通描画関数である。入力は `open` / `high` / `low` / `close` を持つOHLC DataFrameを必須とし、close-only Seriesやclose-only DataFrameを正常扱いするfallbackは持たない。これはローソク足が横線化したり、OHLC欠損に気づかないまま通知画像を生成したりすることを防ぐためである。
@@ -96,6 +102,7 @@ macd_alert_bot.py / ma_alert_bot.py / bollinger_alert_bot.py
 | MA Alert | ローソク足、SMA20 / SMA75 / EMA20、Bollinger upper / middle / lower |
 | MACD Alert | ローソク足、MACD、Signal、Histogram |
 | Bollinger Alert | ローソク足、Bollinger upper / middle / lower。`upper_break` / `lower_break` では突破対象ラインを強調する |
+| RSI Alert | RSI14数値とイベント種別。RSIサブパネルは当面追加しない |
 
 ローソク足はOpen/Closeからbodyを描画する。bodyが極端に小さい場合も、画面上で確認できる最小表示サイズを持たせる。ただし、欠損したOHLCをcloseから暗黙補完して正常扱いすることはしない。
 
@@ -119,14 +126,16 @@ bollinger_alert_bot.py
 Discord Event Alert
 ```
 
-`chart_snapshot.py` は「状態表示」、`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` は「イベント通知」である。状態表示とイベント通知を混ぜないことで、Snapshot本文の肥大化や二重通知を避ける。
+RSI14 Alert もイベント通知層に属する。`rsi_alert_bot.py` は `indicators.py` の `rsi14` を使い、70以上への突入、70未満への復帰、30以下への突入、30超への復帰だけを通知する。通知は観測情報であり、エントリー、Exit、損切り、利確、ロット計算、Broker API連携は扱わない。
+
+`chart_snapshot.py` は「状態表示」、`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` は「イベント通知」である。状態表示とイベント通知を混ぜないことで、Snapshot本文の肥大化や二重通知を避ける。
 
 Discord投稿先も役割ごとに分離する。
 
 | 変数 | 投稿先 | 役割 |
 |---|---|---|
 | `CHART_SNAPSHOT_WEBHOOK_URL` | `chart-snapshot` | 定時のチャート状態レポート。`chart_snapshot.py` が使用する |
-| `BOT_ALERTS_WEBHOOK_URL` | `bot-alerts` | MAタッチ、MACDクロス、Bollinger Bands Alert、急変などのイベント通知。`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` が使用する |
+| `BOT_ALERTS_WEBHOOK_URL` | `bot-alerts` | MAタッチ、MACDクロス、Bollinger Bands Alert、RSI14 Alert、急変などのイベント通知。`macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` が使用する |
 
 Chart Snapshot画像は private S3 bucket に保存し、`chart_snapshots.s3_bucket` / `chart_snapshots.s3_key` に永続メタデータを保存する。S3 bucket は public access block 済みの前提であり、Discord通知ではS3直URLを本文に載せず、短時間だけ有効な presigned URL を `embed.image.url` に設定する。presigned URL は期限切れするためDBへ保存しない。
 

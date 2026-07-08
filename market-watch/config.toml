@@ -31,6 +31,11 @@ upper_touch = false
 lower_touch = false
 squeeze = false
 
+[rsi_alert]
+enabled = true
+overbought_threshold = 70.0
+oversold_threshold = 30.0
+
 [runtime]
 check_interval_seconds = 60
 

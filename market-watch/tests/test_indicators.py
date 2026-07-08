@@ -210,6 +210,15 @@ def test_classify_rsi_state_rules():
     assert indicators.classify_rsi_state(float("nan")) == "Unavailable"
 
 
+def test_detect_rsi_zone_event_rules():
+    assert indicators.detect_rsi_zone_event(69.9, 70.0) == "overbought_enter"
+    assert indicators.detect_rsi_zone_event(70.0, 69.9) == "overbought_exit"
+    assert indicators.detect_rsi_zone_event(30.1, 30.0) == "oversold_enter"
+    assert indicators.detect_rsi_zone_event(30.0, 30.1) == "oversold_exit"
+    assert indicators.detect_rsi_zone_event(50.0, 55.0) is None
+    assert indicators.detect_rsi_zone_event(float("nan"), 72.0) is None
+
+
 def test_classify_trend_rules():
     assert indicators.classify_trend(105.0, 100.0, 90.0) == "Bull"
     assert indicators.classify_trend(85.0, 90.0, 100.0) == "Bear"

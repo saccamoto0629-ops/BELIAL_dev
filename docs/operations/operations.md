@@ -63,6 +63,7 @@ python market-watch/chart_snapshot.py --once --dry-run
 python market-watch/macd_alert_bot.py --once --dry-run
 python market-watch/ma_alert_bot.py --once --dry-run
 python market-watch/bollinger_alert_bot.py --once --dry-run
+python market-watch/rsi_alert_bot.py --once --dry-run
 python news-feed-bot/market_snapshot.py
 ```
 
@@ -73,6 +74,7 @@ news-feed-bot/news_feed_bot.py
 market-watch/macd_alert_bot.py
 market-watch/ma_alert_bot.py
 market-watch/bollinger_alert_bot.py
+market-watch/rsi_alert_bot.py
 ```
 
 定期実行対象:
@@ -88,6 +90,7 @@ Market Watch 手動確認:
 python market-watch/macd_alert_bot.py --once --dry-run
 python market-watch/ma_alert_bot.py --once --dry-run
 python market-watch/bollinger_alert_bot.py --once --dry-run
+python market-watch/rsi_alert_bot.py --once --dry-run
 python market-watch/bollinger_alert_bot.py --once
 python market-watch/bollinger_alert_bot.py
 ```

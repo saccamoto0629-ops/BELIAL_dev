@@ -2,6 +2,7 @@
 
 `market-watch/macd_alert_bot.py` monitors USD/JPY M15 candles and sends a Discord alert when MACD(12,26,9) makes a confirmed-candle bullish or bearish cross.
 `market-watch/bollinger_alert_bot.py` monitors confirmed candles for Bollinger Bands market-state signals and sends observation-only Discord alerts.
+`market-watch/rsi_alert_bot.py` monitors confirmed candles for RSI14 overbought/oversold threshold transitions and sends observation-only Discord alerts.
 
 v1.2.2 is an operations-hardening release. It does not add market-judgement logic. The bot only detects MACD crosses and notifies Discord.
 
@@ -22,8 +23,10 @@ Runtime files are created outside Git:
 ```text
 logs/macd_alert_bot.log
 logs/bollinger_alert_bot.log
+logs/rsi_alert_bot.log
 market-watch/state/macd_alert_state.json
 market-watch/state/bollinger_alert_state.json
+market-watch/state/rsi_alert_state.json
 ```
 
 ## Setup on Linux
@@ -89,6 +92,11 @@ upper_touch = false
 lower_touch = false
 squeeze = false
 
+[rsi_alert]
+enabled = true
+overbought_threshold = 70.0
+oversold_threshold = 30.0
+
 [runtime]
 check_interval_seconds = 60
 
@@ -110,6 +118,7 @@ One dry-run check:
 cd /opt/berial
 python market-watch/macd_alert_bot.py --once --dry-run
 python market-watch/bollinger_alert_bot.py --once --dry-run
+python market-watch/rsi_alert_bot.py --once --dry-run
 ```
 
 One real check:
@@ -118,6 +127,7 @@ One real check:
 cd /opt/berial
 python market-watch/macd_alert_bot.py --once
 python market-watch/bollinger_alert_bot.py --once
+python market-watch/rsi_alert_bot.py --once
 ```
 
 Continuous loop:
@@ -126,10 +136,12 @@ Continuous loop:
 cd /opt/berial
 python market-watch/macd_alert_bot.py
 python market-watch/bollinger_alert_bot.py
+python market-watch/rsi_alert_bot.py
 ```
 
 `--dry-run` does not send to Discord and does not update `market-watch/state/macd_alert_state.json`.
 For Bollinger alerts, `--dry-run` also leaves `market-watch/state/bollinger_alert_state.json` unchanged.
+For RSI alerts, `--dry-run` also leaves `market-watch/state/rsi_alert_state.json` unchanged.
 
 ## Cross detection
 
@@ -172,6 +184,14 @@ market-watch/state/bollinger_alert_state.json
 
 The dedupe key is `symbol + timeframe + signal_type + candle_time`, so the same confirmed candle cannot notify the same Bollinger signal twice.
 
+For RSI alerts, state is saved in:
+
+```text
+market-watch/state/rsi_alert_state.json
+```
+
+The key is `symbol + timeframe`. The value stores the latest recorded confirmed candle, RSI14 state, and last notified event. This prevents duplicate notifications for the same confirmed candle and keeps repeated candles in the same RSI zone quiet.
+
 ## Bollinger alert detection
 
 `bollinger_alert_bot.py` excludes the latest bar because it may still be forming, then evaluates the confirmed candle at index `-2`.
@@ -197,6 +217,19 @@ Disabled by default:
 
 These are market-state alerts only. They are not entry, exit, order, lot-size, stop-loss, or take-profit instructions.
 
+## RSI alert detection
+
+`rsi_alert_bot.py` excludes the latest bar because it may still be forming, then compares the previous confirmed candle at index `-3` with the current confirmed candle at index `-2`.
+
+It uses the `rsi14` value from `indicators.calculate_indicators()` and detects:
+
+- `overbought_enter`: RSI14 moves from below 70 to 70 or above
+- `overbought_exit`: RSI14 moves from 70 or above to below 70
+- `oversold_enter`: RSI14 moves from above 30 to 30 or below
+- `oversold_exit`: RSI14 moves from 30 or below to above 30
+
+These are observation alerts only. They are not entry, exit, order, lot-size, stop-loss, or take-profit instructions.
+
 ## Discord alert content
 
 Alerts include:
@@ -205,9 +238,11 @@ Alerts include:
 - timeframe
 - signal type and golden/dead cross label
 - Bollinger signal type when emitted by `bollinger_alert_bot.py`
+- RSI event type when emitted by `rsi_alert_bot.py`
 - confirmed candle time
 - current close price
 - Bollinger upper, middle, lower, and bandwidth
+- RSI14 value and state
 - MACD value
 - signal-line value
 - detection time

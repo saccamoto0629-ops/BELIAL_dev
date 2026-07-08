@@ -330,6 +330,42 @@ def classify_rsi_state(rsi: float | None) -> str:
     return "Neutral"
 
 
+def detect_rsi_zone_event(
+    previous_rsi: float | None,
+    current_rsi: float | None,
+    *,
+    overbought_threshold: float = 70.0,
+    oversold_threshold: float = 30.0,
+) -> str | None:
+    """Return an RSI zone transition event, or ``None`` when unchanged.
+
+    This is observation-only. It detects threshold entry/exit facts and does
+    not imply entry, exit, order, or position-size decisions.
+    """
+    if overbought_threshold <= oversold_threshold:
+        raise ValueError("overbought_threshold must be greater than oversold_threshold")
+    if (
+        previous_rsi is None
+        or current_rsi is None
+        or pd.isna(previous_rsi)
+        or pd.isna(current_rsi)
+    ):
+        return None
+
+    previous = float(previous_rsi)
+    current = float(current_rsi)
+
+    if previous < overbought_threshold <= current:
+        return "overbought_enter"
+    if previous >= overbought_threshold and current < overbought_threshold:
+        return "overbought_exit"
+    if previous > oversold_threshold >= current:
+        return "oversold_enter"
+    if previous <= oversold_threshold and current > oversold_threshold:
+        return "oversold_exit"
+    return None
+
+
 def classify_trend(close: float, sma20: float | None, sma75: float | None) -> str:
     if sma20 is None or sma75 is None or pd.isna(sma20) or pd.isna(sma75):
         return "Neutral"
