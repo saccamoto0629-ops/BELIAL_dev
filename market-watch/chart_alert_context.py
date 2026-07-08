@@ -75,6 +75,7 @@ def prepare_alert_image(
             title=f"{symbol} {timeframe} {alert_type}",
             event_type=alert_type,
             metadata=metadata,
+            source="alert",
         )
         upload_chart_image(
             local_path,

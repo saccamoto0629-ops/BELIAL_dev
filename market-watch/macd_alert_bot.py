@@ -297,24 +297,27 @@ def notify_cross(cross, candle_time, close_price, macd_value, signal_value, *, d
         "timestamp": detected_at,
     }
     image_url = None
-    try:
-        _snapshot_id, image_url = prepare_alert_image(
-            alert_type=f"macd_{cross}",
-            symbol=SYMBOL,
-            timeframe=TIMEFRAME,
-            candle_time=str(candle_time),
-            candles=candles if candles is not None else pd.Series([close_price]),
-            metadata={
-                "cross": cross,
-                "close": float(close_price),
-                "macd": float(macd_value),
-                "signal_line": float(signal_value),
-                "detected_at": detected_at,
-            },
-            dry_run=dry_run,
-        )
-    except ModuleNotFoundError as exc:
-        logger.warning("Chart image presigned URL skipped because dependency is missing: %s", exc)
+    if candles is None:
+        logger.warning("Chart image skipped because OHLC candles were not provided for MACD alert.")
+    else:
+        try:
+            _snapshot_id, image_url = prepare_alert_image(
+                alert_type=f"macd_{cross}",
+                symbol=SYMBOL,
+                timeframe=TIMEFRAME,
+                candle_time=str(candle_time),
+                candles=candles,
+                metadata={
+                    "cross": cross,
+                    "close": float(close_price),
+                    "macd": float(macd_value),
+                    "signal_line": float(signal_value),
+                    "detected_at": detected_at,
+                },
+                dry_run=dry_run,
+            )
+        except ModuleNotFoundError as exc:
+            logger.warning("Chart image presigned URL skipped because dependency is missing: %s", exc)
     if image_url:
         post_discord_embed(embed, dry_run=dry_run, image_url=image_url)
     else:

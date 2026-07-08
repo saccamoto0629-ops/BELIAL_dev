@@ -7,16 +7,36 @@ alerts, never trading instructions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOG_FILE = LOGS_DIR / "chart_renderer.log"
 
 
 @dataclass(frozen=True)
 class RenderContext:
     event_type: str | None = None
     metadata: dict[str, Any] | None = None
+    source: str = "scheduled"
+
+
+def _logger() -> logging.Logger:
+    logger = logging.getLogger("chart_renderer")
+    if logger.handlers:
+        return logger
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.propagate = True
+    return logger
 
 
 def _event_name(context: RenderContext) -> str:
@@ -82,6 +102,37 @@ def _prepare_frame(candles: pd.DataFrame) -> pd.DataFrame:
     return frame.tail(120)
 
 
+def _log_render_input(frame: pd.DataFrame, title: str, context: RenderContext) -> None:
+    body_sizes = (frame["open"] - frame["close"]).abs()
+    all_open_equals_close = bool((body_sizes == 0).all())
+    logger = _logger()
+    logger.info(
+        "Chart render input: source=%s event_type=%s title=%r rows=%s columns=%s all_open_equals_close=%s body_min=%.8f body_median=%.8f body_max=%.8f",
+        context.source,
+        context.event_type,
+        title,
+        len(frame),
+        list(frame.columns),
+        all_open_equals_close,
+        float(body_sizes.min()),
+        float(body_sizes.median()),
+        float(body_sizes.max()),
+    )
+    if all_open_equals_close:
+        logger.warning(
+            "Chart render input has open == close for every candle: source=%s event_type=%s title=%r",
+            context.source,
+            context.event_type,
+            title,
+        )
+    logger.info(
+        "Chart render OHLC tail(10): source=%s event_type=%s\n%s",
+        context.source,
+        context.event_type,
+        frame[["open", "high", "low", "close"]].tail(10).to_string(),
+    )
+
+
 def _calculate_bollinger_bands(close: pd.Series) -> pd.DataFrame:
     middle = close.rolling(window=20, min_periods=20).mean()
     std = close.rolling(window=20, min_periods=20).std()
@@ -101,6 +152,13 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
     matplotlib.use("Agg")
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
+
+    _logger().info(
+        "Chart render backend=matplotlib candlestick=manual_vlines_rectangles no_hlines_scatter_for_price source=%s event_type=%s title=%r",
+        context.source,
+        context.event_type,
+        title,
+    )
 
     x_values = mdates.date2num(pd.to_datetime(frame.index).to_pydatetime())
     if len(x_values) > 1:
@@ -199,6 +257,13 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
 def _render_with_pillow(frame: pd.DataFrame, output_path: Path, title: str, context: RenderContext) -> None:
     from PIL import Image, ImageDraw
 
+    _logger().info(
+        "Chart render backend=pillow candlestick=manual_lines_rectangles no_hlines_scatter_for_price source=%s event_type=%s title=%r",
+        context.source,
+        context.event_type,
+        title,
+    )
+
     image = Image.new("RGB", (1200, 700), "#101418")
     draw = ImageDraw.Draw(image)
     draw.text((24, 18), title, fill="#f0f6fc")
@@ -263,6 +328,7 @@ def render_chart_snapshot(
     dry_run: bool = False,
     event_type: str | None = None,
     metadata: dict[str, Any] | None = None,
+    source: str = "scheduled",
 ) -> Path:
     """Render candles and indicators to a PNG and return the output path."""
     output_path = Path(output_path)
@@ -270,7 +336,8 @@ def render_chart_snapshot(
         return output_path
 
     frame = _prepare_frame(candles)
-    context = RenderContext(event_type=event_type, metadata=metadata)
+    context = RenderContext(event_type=event_type, metadata=metadata, source=source)
+    _log_render_input(frame, title, context)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         _render_with_matplotlib(frame, output_path, title, context)

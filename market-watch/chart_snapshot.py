@@ -262,6 +262,7 @@ def persist_snapshot_images(
             candles,
             local_path,
             title=f"{snapshot.label} {snapshot.timeframe} Chart Snapshot",
+            source="scheduled",
         )
         s3_key = upload_chart_image(
             local_path,

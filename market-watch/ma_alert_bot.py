@@ -317,18 +317,21 @@ def build_touch_embed(event):
 
 def notify_touch(event, *, dry_run=False, candles=None):
     image_url = None
-    try:
-        _snapshot_id, image_url = prepare_alert_image(
-            alert_type="ma_touch",
-            symbol=event["symbol"],
-            timeframe=event["timeframe"],
-            candle_time=event["candle_time"],
-            candles=candles if candles is not None else pd.Series([event["close"]]),
-            metadata=event,
-            dry_run=dry_run,
-        )
-    except ModuleNotFoundError as exc:
-        logger.warning("Chart image presigned URL skipped because dependency is missing: %s", exc)
+    if candles is None:
+        logger.warning("Chart image skipped because OHLC candles were not provided for MA alert.")
+    else:
+        try:
+            _snapshot_id, image_url = prepare_alert_image(
+                alert_type="ma_touch",
+                symbol=event["symbol"],
+                timeframe=event["timeframe"],
+                candle_time=event["candle_time"],
+                candles=candles,
+                metadata=event,
+                dry_run=dry_run,
+            )
+        except ModuleNotFoundError as exc:
+            logger.warning("Chart image presigned URL skipped because dependency is missing: %s", exc)
     embed = build_touch_embed(event)
     if image_url:
         post_discord_embed(embed, dry_run=dry_run, image_url=image_url)
