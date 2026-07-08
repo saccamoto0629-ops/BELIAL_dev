@@ -1,4 +1,3 @@
-import io
 import pathlib
 import sys
 
@@ -7,8 +6,8 @@ import pandas as pd
 BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BOT_DIR))
 
+import chart_image_uploader  # noqa: E402
 import chart_renderer  # noqa: E402
-import chart_storage  # noqa: E402
 
 
 def make_candles():
@@ -37,46 +36,51 @@ def test_render_chart_snapshot_creates_local_png(tmp_path):
     assert output_path.read_bytes().startswith(b"\x89PNG")
 
 
-def test_build_s3_key_uses_required_layout():
-    key = chart_storage.build_s3_key(
-        symbol="usdjpy",
-        timeframe="15m",
-        snapshot_id="snapshot-123",
-        captured_at=pd.Timestamp("2026-07-08T01:02:03Z").to_pydatetime(),
+def test_build_chart_s3_key_uses_required_layout():
+    key = chart_image_uploader.build_chart_s3_key(
+        "usdjpy",
+        "15m",
+        pd.Timestamp("2026-07-08T01:02:03Z").to_pydatetime(),
         prefix="charts",
+        object_id="snapshot-123",
     )
 
     assert key == "charts/USDJPY/15m/2026/07/08/snapshot-123.png"
 
 
-def test_upload_and_download_use_private_s3_key_without_url(tmp_path):
+def test_upload_and_presign_use_private_s3_key_without_direct_url(tmp_path):
     local_path = tmp_path / "snapshot.png"
     local_path.write_bytes(b"png-bytes")
     calls = {}
-
-    class Body:
-        def read(self):
-            return b"downloaded-png"
 
     class FakeS3Client:
         def upload_file(self, local_path_arg, bucket, key, ExtraArgs=None):
             calls["upload"] = (local_path_arg, bucket, key, ExtraArgs)
 
-        def get_object(self, Bucket, Key):
-            calls["download"] = (Bucket, Key)
-            return {"Body": Body()}
+        def generate_presigned_url(self, operation, Params, ExpiresIn):
+            calls["presign"] = (operation, Params, ExpiresIn)
+            return f"https://presigned.invalid/{Params['Key']}?expires={ExpiresIn}"
 
     client = FakeS3Client()
+    config = {
+        "region": "ap-northeast-1",
+        "bucket": "belial-chart-snapshots",
+        "prefix": "charts",
+    }
 
-    s3_key = chart_storage.upload_chart_image(
+    s3_key = chart_image_uploader.upload_chart_image(
         local_path,
-        bucket="belial-chart-snapshots",
-        s3_key="charts/USDJPY/15m/2026/07/08/snapshot.png",
+        "USDJPY",
+        "15m",
+        pd.Timestamp("2026-07-08T01:02:03Z").to_pydatetime(),
+        config=config,
         s3_client=client,
+        s3_key="charts/USDJPY/15m/2026/07/08/snapshot.png",
     )
-    data = chart_storage.download_chart_image(
-        bucket="belial-chart-snapshots",
-        s3_key=s3_key,
+    presigned_url = chart_image_uploader.generate_presigned_chart_url(
+        s3_key,
+        expires_in=900,
+        config=config,
         s3_client=client,
     )
 
@@ -86,5 +90,9 @@ def test_upload_and_download_use_private_s3_key_without_url(tmp_path):
         s3_key,
         {"ContentType": "image/png"},
     )
-    assert calls["download"] == ("belial-chart-snapshots", s3_key)
-    assert data == b"downloaded-png"
+    assert calls["presign"] == (
+        "get_object",
+        {"Bucket": "belial-chart-snapshots", "Key": s3_key},
+        900,
+    )
+    assert presigned_url == f"https://presigned.invalid/{s3_key}?expires=900"

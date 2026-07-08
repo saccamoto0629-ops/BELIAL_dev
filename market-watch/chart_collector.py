@@ -107,8 +107,11 @@ def init_db(db_path: Path) -> None:
                 id TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
-                captured_at TEXT NOT NULL,
-                candle_time TEXT NOT NULL,
+                snapshot_at TEXT NOT NULL,
+                s3_bucket TEXT NOT NULL,
+                s3_key TEXT NOT NULL,
+                captured_at TEXT,
+                candle_time TEXT,
                 image_url TEXT,
                 image_s3_key TEXT,
                 ohlcv_json TEXT,
@@ -126,13 +129,28 @@ def init_db(db_path: Path) -> None:
                 timeframe TEXT NOT NULL,
                 occurred_at TEXT NOT NULL,
                 candle_time TEXT NOT NULL,
-                snapshot_id TEXT NOT NULL,
+                snapshot_id TEXT,
                 metadata_json TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (snapshot_id) REFERENCES chart_snapshots(id)
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_chart_snapshots (
+                alert_id TEXT NOT NULL,
+                chart_snapshot_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (alert_id, chart_snapshot_id),
+                FOREIGN KEY (alert_id) REFERENCES alerts(id),
+                FOREIGN KEY (chart_snapshot_id) REFERENCES chart_snapshots(id)
+            )
+            """
+        )
+        _ensure_column(connection, "chart_snapshots", "snapshot_at", "TEXT")
+        _ensure_column(connection, "chart_snapshots", "s3_bucket", "TEXT")
+        _ensure_column(connection, "chart_snapshots", "s3_key", "TEXT")
         _ensure_column(connection, "chart_snapshots", "image_s3_key", "TEXT")
 
 
@@ -263,8 +281,11 @@ def insert_chart_snapshot(
     *,
     symbol: str,
     timeframe: str,
-    captured_at: str,
-    candle_time: str,
+    snapshot_at: str,
+    s3_bucket: str,
+    s3_key: str,
+    captured_at: str | None = None,
+    candle_time: str | None = None,
     image_url: str | None = None,
     image_s3_key: str | None = None,
     ohlcv_json: str | None = None,
@@ -278,17 +299,20 @@ def insert_chart_snapshot(
         connection.execute(
             """
             INSERT OR REPLACE INTO chart_snapshots
-            (id, symbol, timeframe, captured_at, candle_time, image_url, image_s3_key, ohlcv_json, indicators_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, symbol, timeframe, snapshot_at, s3_bucket, s3_key, captured_at, candle_time, image_url, image_s3_key, ohlcv_json, indicators_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row_id,
                 symbol.upper(),
                 timeframe,
+                snapshot_at,
+                s3_bucket,
+                s3_key,
                 captured_at,
                 candle_time,
                 image_url,
-                image_s3_key,
+                image_s3_key or s3_key,
                 ohlcv_json,
                 indicators_json,
                 now,
@@ -303,6 +327,19 @@ def update_chart_snapshot_image_s3_key(db_path: Path, snapshot_id: str, image_s3
         connection.execute(
             "UPDATE chart_snapshots SET image_s3_key = ? WHERE id = ?",
             (image_s3_key, snapshot_id),
+        )
+
+
+def update_chart_snapshot_s3_metadata(db_path: Path, snapshot_id: str, *, s3_bucket: str, s3_key: str) -> None:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE chart_snapshots
+            SET s3_bucket = ?, s3_key = ?, image_s3_key = ?
+            WHERE id = ?
+            """,
+            (s3_bucket, s3_key, s3_key, snapshot_id),
         )
 
 
@@ -351,6 +388,20 @@ def insert_alert(
             ),
         )
     return row_id
+
+
+def link_alert_chart_snapshot(db_path: Path, *, alert_id: str, chart_snapshot_id: str) -> None:
+    init_db(db_path)
+    now = to_utc_iso_z(pd.Timestamp.now(tz=UTC))
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO alert_chart_snapshots
+            (alert_id, chart_snapshot_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (alert_id, chart_snapshot_id, now),
+        )
 
 
 def collect_target(target: ChartTarget, db_path: Path, *, period: str = DEFAULT_PERIOD) -> int:

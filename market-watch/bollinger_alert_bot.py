@@ -290,27 +290,20 @@ def fetch_candles():
     return frame
 
 
-def post_discord_embed(embed, *, dry_run=False, image_bytes=None, image_filename=None):
+def post_discord_embed(embed, *, dry_run=False, image_url=None):
+    if image_url:
+        embed = dict(embed)
+        embed["image"] = {"url": image_url}
     if dry_run:
         logger.info("[DRY_RUN] Would post to Discord: %s", json.dumps(embed, ensure_ascii=False))
-        if image_filename:
-            logger.info("[DRY_RUN] Would attach chart image: %s", image_filename)
         return
 
     try:
-        if image_bytes and image_filename:
-            response = requests.post(
-                DISCORD_WEBHOOK_URL,
-                data={"payload_json": json.dumps({"embeds": [embed]}, ensure_ascii=False)},
-                files={"files[0]": (image_filename, image_bytes, "image/png")},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-        else:
-            response = requests.post(
-                DISCORD_WEBHOOK_URL,
-                json={"embeds": [embed]},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
         response.raise_for_status()
         logger.info("Discord notification sent: title=%s", embed.get("title"))
     except requests.RequestException:
@@ -349,10 +342,9 @@ def build_bollinger_embed(event):
 
 
 def notify_bollinger(event, *, dry_run=False, candles=None):
-    image_bytes = None
-    image_filename = None
+    image_url = None
     try:
-        _snapshot_id, image_bytes, image_filename = prepare_alert_image(
+        _snapshot_id, image_url = prepare_alert_image(
             alert_type=f"bollinger_{event['signal_type']}",
             symbol=event["symbol"],
             timeframe=event["timeframe"],
@@ -362,10 +354,10 @@ def notify_bollinger(event, *, dry_run=False, candles=None):
             dry_run=dry_run,
         )
     except ModuleNotFoundError as exc:
-        logger.warning("Chart image attachment skipped because dependency is missing: %s", exc)
+        logger.warning("Chart image presigned URL skipped because dependency is missing: %s", exc)
     embed = build_bollinger_embed(event)
-    if image_bytes and image_filename:
-        post_discord_embed(embed, dry_run=dry_run, image_bytes=image_bytes, image_filename=image_filename)
+    if image_url:
+        post_discord_embed(embed, dry_run=dry_run, image_url=image_url)
     else:
         post_discord_embed(embed, dry_run=dry_run)
     logger.info(

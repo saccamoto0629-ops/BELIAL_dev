@@ -136,6 +136,30 @@ def test_dry_run_does_not_call_discord_http(monkeypatch):
     bot.post_discord_embed({"title": "test"}, dry_run=True)
 
 
+def test_post_discord_embed_sets_presigned_image_url(monkeypatch):
+    posted = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, *, json=None, timeout=None):
+        posted["url"] = url
+        posted["json"] = json
+        posted["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(bot, "DISCORD_WEBHOOK_URL", "https://discord.invalid/webhook")
+    monkeypatch.setattr(bot.requests, "post", fake_post)
+
+    bot.post_discord_embed(
+        {"title": "test"},
+        image_url="https://presigned.invalid/charts/USDJPY/1h/snapshot.png?X-Amz-Signature=test",
+    )
+
+    assert posted["json"]["embeds"][0]["image"]["url"].startswith("https://presigned.invalid/")
+
+
 def test_validate_config_requires_webhook_unless_dry_run(monkeypatch):
     monkeypatch.setattr(bot, "DISCORD_WEBHOOK_URL", "")
 

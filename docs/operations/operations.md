@@ -17,9 +17,9 @@
 | `MAX_TOTAL_ARTICLES_PER_RUN` | `5` | 1回の実行全体の投稿上限 |
 | `FETCH_INTERVAL_MINUTES` | `60` | RSS取得間隔 |
 | `FRED_API_KEY` | empty | FRED API用キー。未設定ならFREDセクションをスキップ |
-| `AWS_REGION` | `ap-northeast-1` | Chart Snapshot画像保存先S3 region |
-| `CHART_S3_BUCKET` | `belial-chart-snapshots` | Chart Snapshot画像保存先S3 bucket |
-| `CHART_S3_PREFIX` | `charts` | S3 key prefix |
+| `AWS_DEFAULT_REGION` | `ap-northeast-1` | Chart Snapshot画像保存先S3 region |
+| `S3_BUCKET_NAME` | `belial-chart-snapshots` | Chart Snapshot画像保存先S3 bucket |
+| `S3_CHART_PREFIX` | `charts` | S3 key prefix |
 | `MARKET_SNAPSHOT_ENABLED` | `true` | Market Snapshot定期投稿を有効化 |
 | `MARKET_SNAPSHOT_TIME` | `07:00` | Market Snapshot投稿時刻 |
 | `ENABLE_FEDWATCH` | `false` | FedWatch optional Providerを有効化 |

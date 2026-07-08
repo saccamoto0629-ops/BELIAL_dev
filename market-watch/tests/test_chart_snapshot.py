@@ -172,7 +172,7 @@ def test_main_once_dry_run_uses_existing_sqlite_without_fetch(monkeypatch, tmp_p
     monkeypatch.setattr(
         snapshot,
         "post_discord_message",
-        lambda webhook_url, message, dry_run=False, attachments=None: calls.append((webhook_url, dry_run, message, attachments)),
+        lambda webhook_url, message, dry_run=False, image_urls=None: calls.append((webhook_url, dry_run, message, image_urls)),
     )
 
     snapshot.main(["--once", "--dry-run", "--skip-fetch"])
@@ -198,7 +198,7 @@ def test_main_dry_run_skip_fetch_does_not_create_missing_sqlite(monkeypatch, tmp
     monkeypatch.setattr(
         snapshot,
         "post_discord_message",
-        lambda webhook_url, message, dry_run=False, attachments=None: calls.append((dry_run, message, attachments)),
+        lambda webhook_url, message, dry_run=False, image_urls=None: calls.append((dry_run, message, image_urls)),
     )
 
     snapshot.main(["--once", "--dry-run", "--skip-fetch"])
@@ -229,15 +229,19 @@ def test_persist_snapshot_images_uploads_and_saves_s3_key(monkeypatch, tmp_path)
             uploaded["content"] = pathlib.Path(local_path).read_bytes()
             uploaded["extra_args"] = ExtraArgs
 
+        def generate_presigned_url(self, operation, Params, ExpiresIn):
+            uploaded["presign"] = (operation, Params, ExpiresIn)
+            return f"https://presigned.invalid/{Params['Key']}?signature=short-lived"
+
     monkeypatch.setattr(snapshot, "create_s3_client", lambda config: FakeS3Client())
 
-    attachments = snapshot.persist_snapshot_images(
+    image_urls = snapshot.persist_snapshot_images(
         [indicator],
         db_path,
         {
-            "AWS_REGION": "ap-northeast-1",
-            "CHART_S3_BUCKET": "belial-chart-snapshots",
-            "CHART_S3_PREFIX": "charts",
+            "AWS_DEFAULT_REGION": "ap-northeast-1",
+            "S3_BUCKET_NAME": "belial-chart-snapshots",
+            "S3_CHART_PREFIX": "charts",
         },
     )
 
@@ -246,8 +250,19 @@ def test_persist_snapshot_images_uploads_and_saves_s3_key(monkeypatch, tmp_path)
     assert uploaded["key"].endswith(".png")
     assert uploaded["content"].startswith(b"\x89PNG")
     assert uploaded["extra_args"] == {"ContentType": "image/png"}
-    assert attachments[0][1].startswith(b"\x89PNG")
+    assert uploaded["presign"] == (
+        "get_object",
+        {"Bucket": "belial-chart-snapshots", "Key": uploaded["key"]},
+        3600,
+    )
+    assert image_urls == [f"https://presigned.invalid/{uploaded['key']}?signature=short-lived"]
 
     with collector.sqlite3.connect(db_path) as connection:
-        row = connection.execute("SELECT image_s3_key FROM chart_snapshots").fetchone()
-    assert row[0] == uploaded["key"]
+        row = connection.execute("SELECT s3_bucket, s3_key FROM chart_snapshots").fetchone()
+        serialized = "\n".join(
+            str(value)
+            for value in connection.execute("SELECT * FROM chart_snapshots").fetchone()
+            if value is not None
+        )
+    assert row == ("belial-chart-snapshots", uploaded["key"])
+    assert "presigned.invalid" not in serialized

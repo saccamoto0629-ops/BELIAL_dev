@@ -41,9 +41,9 @@ Edit `market-watch/.env` and set:
 ```env
 CHART_SNAPSHOT_WEBHOOK_URL=
 BOT_ALERTS_WEBHOOK_URL=
-AWS_REGION=ap-northeast-1
-CHART_S3_BUCKET=belial-chart-snapshots
-CHART_S3_PREFIX=charts
+AWS_DEFAULT_REGION=ap-northeast-1
+S3_BUCKET_NAME=belial-chart-snapshots
+S3_CHART_PREFIX=charts
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 ```
@@ -96,7 +96,7 @@ check_interval_seconds = 60
 log_level = "INFO"
 ```
 
-`.env` is reserved for secrets such as Discord webhook URLs and future API keys. Chart images are uploaded to private S3 keys and then downloaded for Discord attachment. Do not depend on public S3 URLs.
+`.env` is reserved for secrets such as Discord webhook URLs and future API keys. Chart images are uploaded to private S3 keys and exposed to Discord only through short-lived presigned URLs. Do not store presigned URLs or depend on public S3 URLs.
 
 For backward compatibility, old `.env` keys such as `SYMBOL`, `TIMEFRAME`, `MACD_FAST`, `MACD_SLOW`, `MACD_SIGNAL`, `CHECK_INTERVAL_SECONDS`, and `LOG_LEVEL` can still override config values, but new deployments should use `config.toml`.
 
@@ -210,7 +210,7 @@ Alerts include:
 - signal-line value
 - detection time
 - short explanation
-- attached chart image when a linked `chart_snapshots.image_s3_key` is available
+- chart image in `embed.image.url` through a short-lived presigned URL when a linked `chart_snapshots.s3_key` is available
 
 The tone is Berial-style market watch, but the content stays practical.
 
@@ -239,6 +239,13 @@ Recommended command:
 cd /opt/berial
 python -m pytest market-watch/tests -q --basetemp .tmp_pytest_market_watch -p no:cacheprovider
 ```
+
+Manual confirmation for chart images:
+
+- Run `python market-watch/chart_snapshot.py --once --dry-run --skip-fetch` first and confirm no S3 upload, DB write, or Discord send is attempted.
+- In a configured environment, run one non-dry-run alert or snapshot check and confirm `chart_snapshots.s3_bucket` / `chart_snapshots.s3_key` are saved while no presigned URL is stored in SQLite.
+- Open the generated presigned URL before expiry and confirm the PNG renders; Discord should display the same URL through `embed.image.url`.
+- Keep the S3 bucket private. Do not switch to public S3 URLs.
 
 The explicit `--basetemp` and `-p no:cacheprovider` options avoid problems on hosts where an old `.pytest_cache/` or default temp directory is owned by another user.
 
