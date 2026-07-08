@@ -22,6 +22,7 @@ import requests
 import yfinance as yf
 
 from chart_alert_context import prepare_alert_image
+from chart_renderer import render_chart_snapshot
 from indicators import calculate_indicators, detect_ma_touch
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -321,6 +322,11 @@ def notify_touch(event, *, dry_run=False, candles=None):
         logger.warning("Chart image skipped because OHLC candles were not provided for MA alert.")
     else:
         try:
+            logger.info(
+                "MA alert image route: notify_touch -> %s.%s -> chart_renderer.render_chart_snapshot source=alert alert_type=ma_touch",
+                prepare_alert_image.__module__,
+                prepare_alert_image.__name__,
+            )
             _snapshot_id, image_url = prepare_alert_image(
                 alert_type="ma_touch",
                 symbol=event["symbol"],
@@ -361,6 +367,39 @@ def build_touch_event(ma_name, candle_time, close_price, ma_value, touch):
         "notified_at": datetime.now(timezone.utc).isoformat(),
         "detected_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def debug_render_ma_touch_image(output_path, *, candles=None):
+    candles = fetch_candles() if candles is None else candles
+    if not isinstance(candles, pd.DataFrame):
+        raise TypeError("debug ma_touch render requires an OHLC DataFrame")
+    indicators = build_indicators(candles)
+    if len(indicators) < 3:
+        raise RuntimeError("not enough candles to render ma_touch debug image")
+
+    confirmed_idx = -2
+    row = indicators.iloc[confirmed_idx]
+    candle_time = indicators.index[confirmed_idx].isoformat()
+    close_price = row["close"]
+    ma_name = MA_NAMES[0]
+    ma_value = row[ma_name]
+    touch = detect_ma_touch(close_price, ma_value, threshold_pct=THRESHOLD_PCT) or {
+        "distance_pct": abs(close_price - ma_value) / ma_value * 100 if ma_value else 0.0,
+        "side": "above" if close_price >= ma_value else "below",
+    }
+    event = build_touch_event(ma_name, candle_time, close_price, ma_value, touch)
+    logger.info(
+        "MA debug render route: debug_render_ma_touch_image -> chart_renderer.render_chart_snapshot source=alert-debug alert_type=ma_touch output=%s",
+        output_path,
+    )
+    return render_chart_snapshot(
+        candles,
+        Path(output_path),
+        title=f"{event['symbol']} {event['timeframe']} ma_touch",
+        event_type="ma_touch",
+        metadata=event,
+        source="alert-debug",
+    )
 
 
 def run_once(state, *, dry_run=False):
@@ -426,6 +465,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Run a single check and exit instead of looping forever.",
     )
+    parser.add_argument(
+        "--debug-render",
+        metavar="PNG_PATH",
+        help="Render one local ma_touch chart image with the alert renderer and exit without S3, DB, or Discord.",
+    )
     return parser.parse_args(argv)
 
 
@@ -445,6 +489,12 @@ def main(argv=None):
         CHECK_INTERVAL_SECONDS,
         args.dry_run,
     )
+
+    if args.debug_render:
+        rendered = debug_render_ma_touch_image(args.debug_render)
+        logger.info("MA debug render written: %s", rendered)
+        print(f"[DEBUG_RENDER] {rendered}")
+        return
 
     state = load_state()
 

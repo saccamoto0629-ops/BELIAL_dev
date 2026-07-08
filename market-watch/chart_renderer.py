@@ -58,7 +58,7 @@ def _highlight_bollinger_band(context: RenderContext) -> str | None:
     return None
 
 
-def _min_body_height(frame: pd.DataFrame, price_range: float) -> float:
+def _min_body_height(frame: pd.DataFrame, price_range: float, *, source: str = "scheduled") -> float:
     """Return the minimum candle-body height that keeps bodies visible.
 
     Scaled off the *typical* per-candle body size (median), not the full
@@ -71,6 +71,8 @@ def _min_body_height(frame: pd.DataFrame, price_range: float) -> float:
     body_sizes = (frame["open"] - frame["close"]).abs()
     positive_bodies = body_sizes[body_sizes > 0]
     typical_body = float(positive_bodies.median()) if not positive_bodies.empty else 0.0
+    if source.startswith("alert"):
+        return max(typical_body * 2.0, price_range * 0.006, 0.0002)
     return max(typical_body * 0.25, price_range * 0.0006, 0.00002)
 
 
@@ -169,7 +171,7 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
         candle_step = 0.02
     candle_width = min(max(0.68 * candle_step, 0.003), candle_step * 0.9)
     price_range = max(float(frame["high"].max() - frame["low"].min()), 0.00001)
-    min_body_height = _min_body_height(frame, price_range)
+    min_body_height = _min_body_height(frame, price_range, source=context.source)
 
     fig, (price_ax, macd_ax) = plt.subplots(
         2,
@@ -277,7 +279,7 @@ def _render_with_pillow(frame: pd.DataFrame, output_path: Path, title: str, cont
     price_range = max(max_price - min_price, 0.00001)
     step = (plot_right - plot_left) / max(len(frame), 1)
     pixels_per_price = (plot_bottom - plot_top) / price_range
-    min_body_pixels = max(_min_body_height(frame, price_range) * pixels_per_price, 2)
+    min_body_pixels = max(_min_body_height(frame, price_range, source=context.source) * pixels_per_price, 2)
 
     def y_for(price: float) -> float:
         return plot_bottom - ((price - min_price) / price_range) * (plot_bottom - plot_top)

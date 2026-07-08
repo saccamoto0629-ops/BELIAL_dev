@@ -148,6 +148,27 @@ def test_notify_touch_passes_ohlc_to_chart_image(monkeypatch):
     assert posted[0][1] == "https://presigned.invalid/chart.png"
 
 
+def test_debug_render_ma_touch_uses_alert_renderer(monkeypatch, tmp_path):
+    candles = _make_candles([100.0] * 80)
+    captured = {}
+
+    def fake_render_chart_snapshot(candles_arg, output_path, **kwargs):
+        captured["columns"] = list(candles_arg.columns)
+        captured["source"] = kwargs["source"]
+        captured["event_type"] = kwargs["event_type"]
+        pathlib.Path(output_path).write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        return pathlib.Path(output_path)
+
+    monkeypatch.setattr(bot, "render_chart_snapshot", fake_render_chart_snapshot)
+
+    rendered = bot.debug_render_ma_touch_image(tmp_path / "ma_touch.png", candles=candles)
+
+    assert rendered == tmp_path / "ma_touch.png"
+    assert captured["columns"][:4] == ["open", "high", "low", "close"]
+    assert captured["source"] == "alert-debug"
+    assert captured["event_type"] == "ma_touch"
+
+
 def test_load_config_reads_ma_alert_section(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
