@@ -66,12 +66,98 @@ def test_visible_body_bounds_keeps_tiny_open_close_visible():
     assert body_high > 100.000001
 
 
+def test_min_body_height_ignores_a_single_outlier_candle():
+    # A window of many quiet, small-bodied candles plus one large news-spike
+    # candle. Alert-triggered renders (e.g. an MA touch firing right after
+    # price reverts to the mean following a spike) hit this shape often. The
+    # floor must be sized off the *typical* candle body, not the spike's
+    # window-wide high/low span, or every quiet candle gets force-floored to
+    # the exact same height and the whole run reads as one flat bar instead
+    # of distinct candles.
+    # Varying-but-tiny quiet bodies (~0.0005-0.005), like a real ranging
+    # market, plus one dominant news-spike candle that sets the window's
+    # high/low span.
+    quiet_body_sizes = [0.0005 + 0.0045 * ((index * 37) % 11) / 10 for index in range(40)]
+    quiet_open = [1.0000 + 0.0001 * index for index in range(40)]
+    quiet_close = [o + size for o, size in zip(quiet_open, quiet_body_sizes)]
+    opens = quiet_open[:10] + [1.0000] + quiet_open[10:]
+    closes = quiet_close[:10] + [2.0000] + quiet_close[10:]
+    candles = pd.DataFrame(
+        {
+            "open": opens,
+            "high": [max(o, c) + 0.0001 for o, c in zip(opens, closes)],
+            "low": [min(o, c) - 0.0001 for o, c in zip(opens, closes)],
+            "close": closes,
+        },
+        index=pd.date_range("2026-07-05", periods=len(opens), freq="15min", tz="UTC"),
+    )
+    price_range = float(candles["high"].max() - candles["low"].min())
+
+    min_body_height = chart_renderer._min_body_height(candles, price_range)
+
+    quiet_bodies = (candles["open"] - candles["close"]).abs().drop(index=candles.index[10])
+    # The quiet candles' real bodies must mostly clear the floor so they keep
+    # their own (varying) height instead of collapsing to one shared value.
+    assert (quiet_bodies >= min_body_height).mean() > 0.5
+    # A naive window-wide floor (0.4% of the spike-dominated range) would
+    # have swallowed nearly all of them; confirm the new floor does much
+    # better.
+    naive_floor = price_range * 0.004
+    naive_forced_fraction = (quiet_bodies < naive_floor).mean()
+    new_forced_fraction = (quiet_bodies < min_body_height).mean()
+    assert naive_forced_fraction > 0.65
+    assert new_forced_fraction < naive_forced_fraction / 2
+
+
 def test_bollinger_event_context_selects_bands_and_highlight():
     context = chart_renderer.RenderContext(event_type="bollinger_lower_break", metadata={})
 
     assert chart_renderer._show_bollinger(context) is True
     assert chart_renderer._highlight_bollinger_band(context) == "lower"
     assert chart_renderer._calculate_bollinger_bands(make_candles()["close"])["upper"].notna().any()
+
+
+def test_render_chart_snapshot_draws_candlestick_wicks_and_bodies_from_ohlc(tmp_path, monkeypatch):
+    plt = pytest.importorskip("matplotlib.pyplot")
+
+    candles = pd.DataFrame(
+        {
+            "open": [1.00, 1.02, 1.01],
+            "high": [1.05, 1.06, 1.04],
+            "low": [0.98, 1.00, 0.99],
+            "close": [1.02, 1.01, 1.03],
+        },
+        index=pd.date_range("2026-07-05", periods=3, freq="15min", tz="UTC"),
+    )
+
+    wick_spans = []
+    original_vlines = plt.Axes.vlines
+
+    def spy_vlines(self, x, ymin, ymax, *args, **kwargs):
+        wick_spans.append((float(ymin), float(ymax)))
+        return original_vlines(self, x, ymin, ymax, *args, **kwargs)
+
+    body_heights = []
+    original_rectangle = plt.Rectangle
+
+    def spy_rectangle(xy, width, height, **kwargs):
+        body_heights.append(height)
+        return original_rectangle(xy, width, height, **kwargs)
+
+    monkeypatch.setattr(plt.Axes, "vlines", spy_vlines)
+    monkeypatch.setattr(plt, "Rectangle", spy_rectangle)
+
+    chart_renderer.render_chart_snapshot(
+        candles,
+        tmp_path / "snapshot.png",
+        title="candlestick wiring check",
+    )
+
+    # One wick + one body per candle, drawn from that candle's own high/low/open/close.
+    assert wick_spans == list(zip(candles["low"], candles["high"]))
+    assert len(body_heights) == len(candles)
+    # Bodies must vary with open/close, not collapse to a single repeated close marker.
+    assert len(set(round(height, 6) for height in body_heights)) > 1
 
 
 def test_render_chart_snapshot_requires_real_ohlc(tmp_path):

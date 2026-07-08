@@ -38,6 +38,22 @@ def _highlight_bollinger_band(context: RenderContext) -> str | None:
     return None
 
 
+def _min_body_height(frame: pd.DataFrame, price_range: float) -> float:
+    """Return the minimum candle-body height that keeps bodies visible.
+
+    Scaled off the *typical* per-candle body size (median), not the full
+    window's high/low span. A single outlier candle (e.g. a news spike)
+    would otherwise dominate the window-wide range and force every other,
+    genuinely small-bodied candle to the exact same forced height, making a
+    run of quiet candles collapse into one uniform flat bar instead of
+    showing their real (if small) variation.
+    """
+    body_sizes = (frame["open"] - frame["close"]).abs()
+    positive_bodies = body_sizes[body_sizes > 0]
+    typical_body = float(positive_bodies.median()) if not positive_bodies.empty else 0.0
+    return max(typical_body * 0.25, price_range * 0.0006, 0.00002)
+
+
 def _visible_body_bounds(open_price: float, close_price: float, min_body_height: float) -> tuple[float, float]:
     body_low = min(open_price, close_price)
     body_high = max(open_price, close_price)
@@ -95,7 +111,7 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
         candle_step = 0.02
     candle_width = min(max(0.68 * candle_step, 0.003), candle_step * 0.9)
     price_range = max(float(frame["high"].max() - frame["low"].min()), 0.00001)
-    min_body_height = max(price_range * 0.004, 0.00002)
+    min_body_height = _min_body_height(frame, price_range)
 
     fig, (price_ax, macd_ax) = plt.subplots(
         2,
@@ -195,7 +211,8 @@ def _render_with_pillow(frame: pd.DataFrame, output_path: Path, title: str, cont
     max_price = float(highs.max())
     price_range = max(max_price - min_price, 0.00001)
     step = (plot_right - plot_left) / max(len(frame), 1)
-    min_body_pixels = 4
+    pixels_per_price = (plot_bottom - plot_top) / price_range
+    min_body_pixels = max(_min_body_height(frame, price_range) * pixels_per_price, 2)
 
     def y_for(price: float) -> float:
         return plot_bottom - ((price - min_price) / price_range) * (plot_bottom - plot_top)
