@@ -67,7 +67,13 @@ def prepare_alert_image(
     )
     with tempfile.TemporaryDirectory(prefix="belial_alert_chart_") as temp_dir:
         local_path = Path(temp_dir) / f"{snapshot_id}.png"
-        render_chart_snapshot(frame, local_path, title=f"{symbol} {timeframe} {alert_type}")
+        render_chart_snapshot(
+            frame,
+            local_path,
+            title=f"{symbol} {timeframe} {alert_type}",
+            event_type=alert_type,
+            metadata=metadata,
+        )
         upload_chart_image(
             local_path,
             symbol,
