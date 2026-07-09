@@ -106,7 +106,8 @@ def test_format_technical_line_reports_unavailable_without_rsi():
     assert snap.format_technical_line("VIX", {"rsi": None}) == "- VIX: unavailable"
 
 
-def test_build_market_snapshot_message_includes_all_sections():
+def test_build_market_snapshot_message_includes_all_sections(monkeypatch):
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: record["market_bias_id"])
     market_data = {
         "VIX": make_snapshot(18.20, 17.40),
         "SP500": make_snapshot(5420.10, 5439.10),
@@ -200,7 +201,8 @@ def test_build_market_snapshot_message_includes_all_sections():
     assert "[Risk Label]" in message
 
 
-def test_build_market_snapshot_message_shows_unavailable_without_fred():
+def test_build_market_snapshot_message_shows_unavailable_without_fred(monkeypatch):
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: record["market_bias_id"])
     market_data = {"VIX": make_snapshot(18.20, 17.40)}
     tv_data = {}
 
@@ -292,6 +294,7 @@ def test_format_chart_summary_section_includes_rsi_from_indicator_snapshot():
 
 
 def test_get_market_snapshot_message_uses_all_three_sources(monkeypatch):
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: record["market_bias_id"])
     monkeypatch.setattr(snap, "get_market_data", lambda **kwargs: {"VIX": make_snapshot(18.2, 17.4)})
     monkeypatch.setattr(snap, "get_fred_data", lambda api_key, **kwargs: None)
     monkeypatch.setattr(snap, "get_tradingview_data", lambda **kwargs: {})
@@ -357,6 +360,87 @@ def test_fetch_snapshot_sources_runs_providers_and_keeps_partial_failures():
     assert sources["chart"][0]["symbol"] == "USDJPY"
     assert sources["calendar"][0]["event"] == "CPI"
     assert sources["fedwatch"]["hold_probability"] == 78.0
+
+
+# --- Issue #17: persisting Market Bias for Backtest lookup ----------------
+
+
+def test_persist_market_bias_saves_a_record_when_not_dry_run(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+
+    bias = {"market_bias": "Bull", "confidence": 0.8, "trend": "Bull", "reasons": ["x"]}
+    snap.persist_market_bias(bias, dry_run=False, source_snapshot_id="chart-snapshot-1")
+
+    assert len(saved) == 1
+    assert saved[0]["market_bias"] == "Bull"
+    assert saved[0]["confidence"] == 0.8
+    assert saved[0]["source_snapshot_id"] == "chart-snapshot-1"
+
+
+def test_persist_market_bias_is_a_noop_in_dry_run(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+
+    bias = {"market_bias": "Bull", "confidence": 0.8, "trend": "Bull", "reasons": ["x"]}
+    snap.persist_market_bias(bias, dry_run=True)
+
+    assert saved == []
+
+
+def test_persist_market_bias_never_raises_when_save_fails(monkeypatch):
+    def boom(record):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(snap, "save_market_bias", boom)
+
+    # Must not raise: a persistence failure must never break the Discord message.
+    snap.persist_market_bias({"market_bias": "Bear", "confidence": 0.5}, dry_run=False)
+
+
+def test_build_market_snapshot_message_dry_run_does_not_persist(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {"VIX": make_snapshot(18.20, 17.40)}
+
+    snap.build_market_snapshot_message(market_data, None, {}, dry_run=True)
+
+    assert saved == []
+
+
+def test_build_market_snapshot_message_persists_bias_by_default(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {
+        "VIX": make_snapshot(30.0, 20.0),
+        "SP500": make_snapshot(5380.0, 5420.0),
+        "NASDAQ": make_snapshot(17100.0, 17200.0),
+    }
+
+    snap.build_market_snapshot_message(market_data, None, {})
+
+    assert len(saved) == 1
+    assert saved[0]["market_bias"] == "Bear"
+    assert saved[0]["symbol"] == "GLOBAL"
+    assert saved[0]["timeframe"] == "1h"
+
+
+def test_build_market_snapshot_message_links_available_source_snapshot_id(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {"VIX": make_snapshot(30.0, 20.0)}
+    chart_snapshots = [
+        {"symbol": "USDJPY", "trend": "Neutral", "freshness": "Fresh", "bias_weight": 1.0, "id": "chart-1"},
+    ]
+
+    snap.build_market_snapshot_message(market_data, None, {}, chart_snapshots=chart_snapshots)
+
+    assert saved[0]["source_snapshot_id"] == "chart-1"
+
+
+def test_source_snapshot_id_from_chart_snapshots_accepts_common_id_names():
+    assert snap.source_snapshot_id_from_chart_snapshots([{"chart_snapshot_id": "chart-2"}]) == "chart-2"
+    assert snap.source_snapshot_id_from_chart_snapshots([{"snapshot_id": "chart-3"}]) == "chart-3"
 
 
 def test_calendar_and_fedwatch_formatters_report_unavailable():

@@ -469,7 +469,7 @@ def post_market_snapshot(*, dry_run=DRY_RUN):
         return
 
     try:
-        message = get_market_snapshot_message()
+        message = get_market_snapshot_message(dry_run=dry_run)
     except Exception as exc:
         print(f"[ERROR] Failed to build market snapshot: {exc}")
         return

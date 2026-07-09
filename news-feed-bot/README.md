@@ -145,6 +145,7 @@ Default is `false`. Keeping this enabled in production can produce a lot of logs
 | `MAX_ARTICLES_PER_RUN` | `5` | Per-feed candidate limit before global scoring. |
 | `MAX_TOTAL_ARTICLES_PER_RUN` | `5` | Overall post limit for one run after scoring all candidates. |
 | `FETCH_INTERVAL_MINUTES` | `60` | RSS polling interval. |
+| `MARKET_BIAS_DB_PATH` | `data/market_bias.sqlite3` | Market Bias の永続化DB。相対パスは `news-feed-bot/` 基準。Backtest / Paper Signal の過去時点参照に使う。 |
 
 ## 7. Tests
 
@@ -174,7 +175,13 @@ cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\news-feed-bot
 python market_snapshot.py
 ```
 
-コマンドラインで直接実行すると、Discordへは投稿せずスナップショットの内容をコンソールへ表示します。
+コマンドラインで直接実行すると、Discordへは投稿せずスナップショットの内容をコンソールへ表示します。通常実行ではMarket BiasをDBへ保存します。DB作成・更新を避けて表示だけ確認する場合は `--dry-run` を使います。
+
+```powershell
+python market_snapshot.py --dry-run
+```
+
+Market Bias は `MARKET_BIAS_DB_PATH` のSQLite DBへ保存され、Backtest / Paper Signal から指定時刻以前の最新レコードを参照できます。相対パスは `news-feed-bot/` 基準です。該当期間のMarket Biasが存在しない場合、参照側は `None` を扱い、エラー終了しない想定です。
 
 ### Data sources
 
@@ -203,6 +210,7 @@ python market_snapshot.py
 | `FRED_API_KEY` | empty | FREDの金利・マクロ指標取得用APIキー。未設定なら該当セクションのみスキップ。 |
 | `MARKET_SNAPSHOT_ENABLED` | `true` | 市場スナップショットの定期投稿を有効にするか。 |
 | `MARKET_SNAPSHOT_TIME` | `07:00` | 市場スナップショットを投稿する時刻(ローカル時刻、`HH:MM`)。 |
+| `MARKET_BIAS_DB_PATH` | `data/market_bias.sqlite3` | Market Bias永続化DB。相対パスは `news-feed-bot/` 基準。`--dry-run` では作成・更新しない。 |
 
 ## 9. Security notes
 

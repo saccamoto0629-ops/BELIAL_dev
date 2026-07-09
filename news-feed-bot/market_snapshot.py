@@ -13,6 +13,8 @@ from fedwatch import FedWatchSnapshot, get_fedwatch
 from fred_data import get_fred_data
 from market_data import get_market_data
 from market_bias import classify_market_bias, format_market_bias_section
+from market_bias_models import create_market_bias_record
+from market_bias_store import save_market_bias
 from tradingview_data import get_tradingview_data
 
 logger = logging.getLogger(__name__)
@@ -305,6 +307,53 @@ def compute_risk_label(market_data: dict, fred_data: dict | None) -> str:
     return "Neutral"
 
 
+def _snapshot_get_any(snapshot, *names):
+    if snapshot is None:
+        return None
+    if isinstance(snapshot, dict):
+        for name in names:
+            value = snapshot.get(name)
+            if value:
+                return value
+        return None
+    for name in names:
+        value = getattr(snapshot, name, None)
+        if value:
+            return value
+    return None
+
+
+def source_snapshot_id_from_chart_snapshots(chart_snapshots: list | None) -> str | None:
+    """Return the first source snapshot id available from chart summaries."""
+    for snapshot in chart_snapshots or []:
+        value = _snapshot_get_any(snapshot, "source_snapshot_id", "chart_snapshot_id", "snapshot_id", "id")
+        if value:
+            return str(value)
+    return None
+
+
+def persist_market_bias(
+    bias: dict,
+    *,
+    dry_run: bool = False,
+    source_snapshot_id: str | None = None,
+) -> None:
+    """Persist a computed Market Bias for later Backtest lookup.
+
+    Observation-only logging, not a trading action: never raises into the
+    caller (a persistence failure must not break the Discord message), and
+    never touches the DB in dry-run.
+    """
+    if dry_run:
+        logger.info("[market_snapshot] [DRY_RUN] Would persist Market Bias (no DB write).")
+        return
+    try:
+        record = create_market_bias_record(bias, source_snapshot_id=source_snapshot_id)
+        save_market_bias(record)
+    except Exception as exc:
+        logger.warning("[market_snapshot] Failed to persist Market Bias: %s", exc)
+
+
 def build_market_snapshot_message(
     market_data: dict,
     fred_data: dict | None,
@@ -314,6 +363,7 @@ def build_market_snapshot_message(
     *,
     macd_signal: str | None = None,
     chart_snapshots: list | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Build the Discord message body (plain Markdown) from already-fetched data."""
     lines = ["\U0001f4ca Market Snapshot", ""]
@@ -376,6 +426,11 @@ def build_market_snapshot_message(
             chart_data=chart_snapshots,
         )
         lines.append(format_market_bias_section(bias))
+        persist_market_bias(
+            bias,
+            dry_run=dry_run,
+            source_snapshot_id=source_snapshot_id_from_chart_snapshots(chart_snapshots),
+        )
     except Exception as exc:
         logger.warning("[market_snapshot] Market Bias failed: %s", exc)
 
@@ -448,7 +503,7 @@ def fetch_snapshot_sources(
     return defaults
 
 
-def get_market_snapshot_message() -> str:
+def get_market_snapshot_message(*, dry_run: bool = False) -> str:
     """Fetch all sources and return the finished Discord message body."""
     sources = fetch_snapshot_sources()
     return build_market_snapshot_message(
@@ -458,12 +513,22 @@ def get_market_snapshot_message() -> str:
         sources["calendar"],
         sources["fedwatch"],
         chart_snapshots=sources["chart"],
+        dry_run=dry_run,
     )
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
+
+    parser = argparse.ArgumentParser(description="Build a Market Snapshot message.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the Market Snapshot without persisting Market Bias.",
+    )
+    args = parser.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    print(get_market_snapshot_message())
+    print(get_market_snapshot_message(dry_run=args.dry_run))
