@@ -29,6 +29,7 @@ from chart_models import ChartTarget, IndicatorSnapshot
 from chart_renderer import render_chart_snapshot
 from chart_image_uploader import create_s3_client, generate_presigned_chart_url, load_s3_config, upload_chart_image
 from indicators import calculate_indicators, classify_bb_state, classify_trend
+from market_state import classify_market_state
 
 REQUEST_TIMEOUT_SECONDS = 20
 JST = timezone(timedelta(hours=9), name="JST")
@@ -103,6 +104,12 @@ def build_indicator_snapshot(
     is_stale = freshness == "Stale"
     is_market_closed = freshness in {"Weekend Closed", "Market Closed"}
 
+    market_state_result = (
+        {"market_state": "unknown", "confidence": 0.0, "reasons": ["Data is stale."]}
+        if is_stale
+        else classify_market_state(indicators)
+    )
+
     return IndicatorSnapshot(
         symbol=target.symbol,
         timeframe=target.timeframe,
@@ -130,6 +137,9 @@ def build_indicator_snapshot(
         display_name=target.display_name,
         chart_symbol=target.chart_symbol,
         asset_type=target.asset_type,
+        market_state=market_state_result["market_state"],
+        market_state_confidence=market_state_result["confidence"],
+        market_state_reasons=tuple(market_state_result["reasons"]),
     )
 
 
@@ -174,6 +184,7 @@ def format_snapshot(snapshot: IndicatorSnapshot) -> str:
             f"RSI State: {snapshot.rsi_state}",
             f"Trend: {snapshot.trend}",
             f"State: {snapshot.state}",
+            f"Market State: {snapshot.market_state} ({round(snapshot.market_state_confidence * 100)}%)",
         ]
     )
 

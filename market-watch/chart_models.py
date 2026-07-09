@@ -63,6 +63,9 @@ class IndicatorSnapshot:
     display_name: str = ""
     chart_symbol: str = ""
     asset_type: str = ""
+    market_state: str = "unknown"
+    market_state_confidence: float = 0.0
+    market_state_reasons: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:

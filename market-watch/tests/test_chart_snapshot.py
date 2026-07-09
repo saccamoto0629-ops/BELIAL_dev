@@ -177,6 +177,38 @@ def test_stale_data_is_not_used_for_trend_or_state():
     assert indicator.bias_weight == 0.0
 
 
+def test_build_indicator_snapshot_includes_market_state():
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+
+    indicator = snapshot.build_indicator_snapshot(
+        target,
+        make_candles(),
+        now_utc=pd.Timestamp("2026-07-06T01:45:00Z"),
+    )
+
+    assert indicator is not None
+    assert indicator.market_state in {"trend_up", "trend_down", "range", "volatile", "squeeze", "unknown"}
+    assert 0.0 <= indicator.market_state_confidence <= 1.0
+    assert indicator.market_state_reasons
+    assert f"Market State: {indicator.market_state}" in snapshot.format_snapshot(indicator)
+
+
+def test_stale_data_forces_market_state_unknown():
+    target = ChartTarget("USDJPY", "JPY=X", "15m")
+
+    indicator = snapshot.build_indicator_snapshot(
+        target,
+        make_candles(),
+        now_utc=pd.Timestamp("2026-07-07T20:45:00Z"),
+    )
+
+    assert indicator is not None
+    assert indicator.freshness == "Stale"
+    assert indicator.market_state == "unknown"
+    assert indicator.market_state_confidence == 0.0
+    assert indicator.market_state_reasons == ("Data is stale.",)
+
+
 def test_main_once_dry_run_uses_existing_sqlite_without_fetch(monkeypatch, tmp_path):
     target = ChartTarget("USDJPY", "JPY=X", "15m")
     calls = []

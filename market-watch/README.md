@@ -22,6 +22,7 @@ market-watch/
 ├─ chart_collector.py    # candle fetch, UTC normalization, SQLite persistence
 ├─ chart_models.py        # ChartTarget / Candle / IndicatorSnapshot
 ├─ indicators.py          # SMA / EMA / Bollinger / MACD / RSI / cross detection
+├─ market_state.py         # market_state classification (trend_up/trend_down/range/volatile/squeeze/unknown)
 ├─ chart_renderer.py       # shared PNG rendering (JST x-axis on display)
 ├─ chart_snapshot.py       # Chart Snapshot generation, Discord post, summary
 ├─ chart_alert_context.py  # shared alert-image + S3 + snapshot linking helper

@@ -29,6 +29,7 @@ market-watch/
 ├─ chart_collector.py        # ローソク足取得、SQLite保存、UTC正規化
 ├─ chart_models.py           # ChartTarget / Candle / IndicatorSnapshot
 ├─ indicators.py             # SMA / EMA / BB / MACD / RSI / クロス判定 / 状態分類
+├─ market_state.py           # 複数指標からのmarket_state分類(trend_up/trend_down/range/volatile/squeeze/unknown)
 ├─ chart_snapshot.py         # Chart Snapshot生成、Discord投稿、Summary生成
 ├─ macd_alert_bot.py         # MACDクロスのイベント通知Bot
 ├─ bollinger_alert_bot.py    # Bollinger Bandsの市場状態イベント通知Bot
@@ -43,6 +44,7 @@ market-watch/
    ├─ test_chart_collector.py
    ├─ test_chart_snapshot.py
    ├─ test_indicators.py
+   ├─ test_market_state.py
    ├─ test_macd_alert_bot.py
    └─ test_bollinger_alert_bot.py
 ```
@@ -257,6 +259,27 @@ Bollinger Band State:
 | `Near lower band` | `0.0 <= bb_position < 0.2` |
 | `Lower breakout` | `bb_position < 0.0` |
 | `Unavailable` | 値欠損 |
+
+## Market State分類(Issue #18)
+
+`market_state.py` は、既存の SMA / EMA / Bollinger Bands / MACD を組み合わせて、Chart Snapshotの1スナップショットを `market_state` / `confidence` / `reasons` に分類する。売買判断ではなく、Paper Signal / Backtest が参照するための状態分類である。`indicators.py` 側の個別指標計算・状態分類(Trend、Bollinger Band State など)は変更しない。責務が増えるため、`indicators.py` には入れず新規モジュールとして分離した。
+
+`market_state` は以下のいずれかを返す。
+
+| market_state | 意味 |
+|---|---|
+| `trend_up` | 短期(EMA20) > 中期(SMA20) > 長期(SMA75)、MACDがBullish、終値がSMA20より上 |
+| `trend_down` | 短期(EMA20) < 中期(SMA20) < 長期(SMA75)、MACDがBearish、終値がSMA20より下 |
+| `range` | MAが収束、MACDがNeutral、価格がBollinger Band内(上記のいずれにも該当しない場合のfallback) |
+| `volatile` | Bollinger Band幅が直近の中央値比で拡大 |
+| `squeeze` | Bollinger Band幅が直近ウィンドウの下位10%以下 |
+| `unknown` | 指標データ不足、または鮮度がStale |
+
+判定優先順位は `squeeze` → `trend_up` / `trend_down` → `volatile` → `range`(fallback)。`confidence` は各状態ごとのチェック項目数に対する一致数の割合として `0.0`〜`1.0` に収める。`reasons` は必ず1件以上を返す。
+
+`market-watch/chart_snapshot.py` の `build_indicator_snapshot()` が `IndicatorSnapshot` へ `market_state` / `market_state_confidence` / `market_state_reasons` を追加する。鮮度が `Stale` の場合は分類を行わず `unknown`(`reasons=["Data is stale."]`)を返す。Chart Snapshot本文にも `Market State: {market_state} ({confidence}%)` を1行追加する。
+
+現時点では `news-feed-bot/market_bias.py` や `paper-signal/signal_generator.py` はこの `market_state` を読み取らない(最小差分のため、このIssueでは配線しない)。構造化された戻り値として `IndicatorSnapshot` に保持しているため、将来これらのレイヤーから参照できる。
 
 ## Freshness / Bias Weight
 
