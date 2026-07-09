@@ -4,13 +4,28 @@ The classifier consumes data that Market Snapshot already fetched. It does not
 call external APIs and it never makes trading recommendations.
 """
 
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
 
 MarketBiasLabel = Literal["Bull", "Bear", "Neutral"]
+RiskLabel = Literal["Risk-On", "Risk-Off", "Neutral"]
+VolatilityLabel = Literal["Low", "Normal", "High"]
 
 NOTE = "Observation only. No trade recommendation."
 BULLISH_RECOMMENDATIONS = {"BUY", "STRONG_BUY"}
 BEARISH_RECOMMENDATIONS = {"SELL", "STRONG_SELL"}
+
+# Risk axis thresholds. Independent of the Trend scoring above -- Risk is a
+# market-environment filter (risk appetite), not a directional call.
+RISK_ON_VIX_LEVEL = 18.0
+RISK_OFF_VIX_LEVEL = 25.0
+RISK_GOLD_PCT_THRESHOLD = 0.3
+RISK_OIL_PCT_THRESHOLD = 1.5
+
+# Volatility axis thresholds. A minimal classifier: chart Bollinger Band
+# width (a stand-in for ATR/range expansion) plus raw day-over-day % moves.
+VOLATILITY_HIGH_BB_WIDTH_PCT = 1.2
+VOLATILITY_LOW_BB_WIDTH_PCT = 0.4
+VOLATILITY_RAPID_CHANGE_PCT = 1.0
 
 
 class MarketBiasResult(TypedDict):
@@ -20,6 +35,15 @@ class MarketBiasResult(TypedDict):
     reasons: list[str]
     warnings: list[str]
     note: str
+    trend: MarketBiasLabel
+    risk: RiskLabel
+    risk_confidence: float
+    risk_scores: dict[str, float]
+    risk_reasons: list[str]
+    volatility: VolatilityLabel
+    volatility_confidence: float
+    volatility_scores: dict[str, float]
+    volatility_reasons: list[str]
 
 
 def _pct(snapshot: dict | None) -> float | None:
@@ -217,6 +241,134 @@ def _build_warnings(core_scores: dict[str, float], macd_signal: str | None) -> l
     return []
 
 
+def _score_risk_signals(
+    market_data: dict | None,
+    fred_data: dict | None,
+) -> tuple[dict[str, float], list[str]]:
+    """Score Risk-On vs Risk-Off. Independent of the Trend (Bull/Bear) axis.
+
+    This is a market-environment filter, not a directional call: equities
+    can be risk-off while a currency pair's own trend is still Bull, and
+    vice versa.
+    """
+    market_data = market_data or {}
+    fred_data = fred_data or {}
+
+    scores = {"Risk-On": 0.0, "Risk-Off": 0.0}
+    reasons: list[str] = []
+
+    vix = market_data.get("VIX")
+    sp500 = market_data.get("SP500")
+    nasdaq = market_data.get("NASDAQ")
+    gold = market_data.get("GOLD")
+    oil = market_data.get("OIL")
+
+    if _above(vix, RISK_OFF_VIX_LEVEL):
+        scores["Risk-Off"] += 1
+        reasons.append(f"VIX is above {RISK_OFF_VIX_LEVEL:g} (risk-off)")
+    if _below(vix, RISK_ON_VIX_LEVEL):
+        scores["Risk-On"] += 1
+        reasons.append(f"VIX is below {RISK_ON_VIX_LEVEL:g} (risk-on)")
+
+    if _is_down(sp500):
+        scores["Risk-Off"] += 1
+        reasons.append("S&P500 is falling (risk-off)")
+    if _is_up(sp500):
+        scores["Risk-On"] += 1
+        reasons.append("S&P500 is rising (risk-on)")
+
+    if _is_down(nasdaq):
+        scores["Risk-Off"] += 1
+        reasons.append("Nasdaq is falling (risk-off)")
+    if _is_up(nasdaq):
+        scores["Risk-On"] += 1
+        reasons.append("Nasdaq is rising (risk-on)")
+
+    if _is_up(gold, threshold=RISK_GOLD_PCT_THRESHOLD):
+        scores["Risk-Off"] += 1
+        reasons.append("Gold is rising (safe-haven demand, risk-off)")
+    if _is_down(gold, threshold=RISK_GOLD_PCT_THRESHOLD):
+        scores["Risk-On"] += 1
+        reasons.append("Gold is soft (risk-on)")
+
+    if _is_up(oil, threshold=RISK_OIL_PCT_THRESHOLD):
+        scores["Risk-Off"] += 1
+        reasons.append("Oil is spiking (risk-off / geopolitical concern)")
+
+    return scores, reasons
+
+
+def _choose_risk(scores: dict[str, float], evidence_count: int) -> tuple[RiskLabel, float]:
+    if evidence_count == 0:
+        return "Neutral", 0.0
+
+    diff = scores["Risk-On"] - scores["Risk-Off"]
+    total = scores["Risk-On"] + scores["Risk-Off"]
+    if diff == 0:
+        return "Neutral", min(1.0, round(evidence_count / 6, 2))
+
+    label: RiskLabel = "Risk-On" if diff > 0 else "Risk-Off"
+    confidence = min(1.0, round(abs(diff) / max(total, 1), 2))
+    return label, confidence
+
+
+def _score_volatility_signals(
+    market_data: dict | None,
+    chart_data,
+) -> tuple[dict[str, float], list[str]]:
+    """Score Low / Normal / High volatility. Minimal implementation.
+
+    Uses chart Bollinger Band width (a stand-in for ATR/range expansion)
+    plus raw day-over-day percent moves as a proxy for "sudden change".
+    """
+    market_data = market_data or {}
+    scores = {"High": 0.0, "Normal": 0.0, "Low": 0.0}
+    reasons: list[str] = []
+
+    for snapshot in chart_data or []:
+        if _snapshot_get(snapshot, "freshness") == "Stale":
+            continue
+        symbol = _snapshot_get(snapshot, "symbol")
+        bb_width_pct = _snapshot_get(snapshot, "bb_width_pct")
+        if bb_width_pct is None:
+            continue
+        bb_width_pct = float(bb_width_pct)
+        if bb_width_pct >= VOLATILITY_HIGH_BB_WIDTH_PCT:
+            scores["High"] += 1
+            reasons.append(f"Chart {symbol} 1h Bollinger Band width is {bb_width_pct:.2f}% (expanded)")
+        elif bb_width_pct <= VOLATILITY_LOW_BB_WIDTH_PCT:
+            scores["Low"] += 1
+            reasons.append(f"Chart {symbol} 1h Bollinger Band width is {bb_width_pct:.2f}% (contracted)")
+        else:
+            scores["Normal"] += 1
+            reasons.append(f"Chart {symbol} 1h Bollinger Band width is {bb_width_pct:.2f}% (normal range)")
+
+    for name, key in (("S&P500", "SP500"), ("Nasdaq", "NASDAQ"), ("Gold", "GOLD"), ("Oil", "OIL")):
+        pct = _pct(market_data.get(key))
+        if pct is not None and abs(pct) >= VOLATILITY_RAPID_CHANGE_PCT:
+            scores["High"] += 1
+            reasons.append(f"{name} moved {pct:+.2f}% (rapid change)")
+
+    return scores, reasons
+
+
+def _choose_volatility(scores: dict[str, float], evidence_count: int) -> tuple[VolatilityLabel, float]:
+    if evidence_count == 0:
+        return "Normal", 0.0
+
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    top_label, top_score = ordered[0]
+    runner_up_score = ordered[1][1] if len(ordered) > 1 else 0.0
+    total = sum(scores.values())
+
+    if top_score == 0 or top_score == runner_up_score:
+        return "Normal", min(1.0, round(evidence_count / 6, 2))
+
+    label: VolatilityLabel = cast(VolatilityLabel, top_label)
+    confidence = min(1.0, round(top_score / max(total, 1), 2))
+    return label, confidence
+
+
 def classify_market_bias(
     market_data: dict | None = None,
     fred_data: dict | None = None,
@@ -225,11 +377,19 @@ def classify_market_bias(
     macd_signal: str | None = None,
     chart_data=None,
 ) -> MarketBiasResult:
-    """Classify market bias as Bull, Bear, or Neutral.
+    """Classify market bias along three independent axes.
 
-    MACD is treated as a near-term auxiliary signal. It can slightly adjust
-    the score and add warnings, but it cannot dominate when broader data is
-    missing or mixed.
+    - Trend (Bull/Bear/Neutral): the original directional classification,
+      unchanged from before this axis was named explicitly.
+    - Risk (Risk-On/Risk-Off/Neutral): a risk-appetite / market-environment
+      filter, scored independently of Trend.
+    - Volatility (Low/Normal/High): a minimal range/expansion classifier.
+
+    This is a market-environment filter, not a trading decision. MACD is
+    treated as a near-term auxiliary Trend signal only: it can slightly
+    adjust the Trend score and add warnings, but it cannot dominate when
+    broader data is missing or mixed, and it has no effect on Risk or
+    Volatility.
     """
     core_scores, reasons = _score_core_signals(market_data, fred_data, tv_data)
     chart_scores, chart_reasons = _score_chart_signals(chart_data, tv_data)
@@ -250,6 +410,22 @@ def classify_market_bias(
     elif bias == "Neutral" and abs(scores["Bull"] - scores["Bear"]) <= 1:
         reasons.append("Bull and Bear scores are close, so the bias is Neutral.")
 
+    risk_scores, risk_reasons = _score_risk_signals(market_data, fred_data)
+    risk_evidence_count = len(risk_reasons)
+    risk, risk_confidence = _choose_risk(risk_scores, risk_evidence_count)
+    if not risk_reasons:
+        risk_reasons = ["Insufficient market snapshot data for risk classification."]
+    elif risk == "Neutral":
+        risk_reasons.append("Risk-On and Risk-Off signals are balanced, so risk is Neutral.")
+
+    volatility_scores, volatility_reasons = _score_volatility_signals(market_data, chart_data)
+    volatility_evidence_count = len(volatility_reasons)
+    volatility, volatility_confidence = _choose_volatility(volatility_scores, volatility_evidence_count)
+    if not volatility_reasons:
+        volatility_reasons = [
+            "Insufficient chart/market data for volatility classification; defaulting to Normal."
+        ]
+
     return {
         "market_bias": bias,
         "confidence": max(0.0, min(1.0, confidence)),
@@ -257,18 +433,40 @@ def classify_market_bias(
         "reasons": reasons,
         "warnings": warnings,
         "note": NOTE,
+        "trend": bias,
+        "risk": risk,
+        "risk_confidence": max(0.0, min(1.0, risk_confidence)),
+        "risk_scores": risk_scores,
+        "risk_reasons": risk_reasons,
+        "volatility": volatility,
+        "volatility_confidence": max(0.0, min(1.0, volatility_confidence)),
+        "volatility_scores": volatility_scores,
+        "volatility_reasons": volatility_reasons,
     }
 
 
 def format_market_bias_section(result: MarketBiasResult) -> str:
     """Render a compact Discord Markdown section for Market Snapshot."""
     lines = ["## Market Bias", ""]
-    lines.append(f"Bias: {result['market_bias']}")
-    lines.append(f"Confidence: {round(result['confidence'] * 100)}%")
+    lines.append(f"Trend: {result['market_bias']}")
+    lines.append(f"Risk: {result.get('risk', 'Neutral')}")
+    lines.append(f"Volatility: {result.get('volatility', 'Normal')}")
+    lines.append(
+        "Confidence: "
+        f"Trend {round(result['confidence'] * 100)}% / "
+        f"Risk {round(result.get('risk_confidence', 0.0) * 100)}% / "
+        f"Volatility {round(result.get('volatility_confidence', 0.0) * 100)}%"
+    )
     lines.append(f"Scores: Bull {result['scores'].get('Bull', 0)} / Bear {result['scores'].get('Bear', 0)}")
     lines.append("")
-    lines.append("Reasons:")
+    lines.append("Reasons [Trend]:")
     lines.extend(f"- {reason}" for reason in result["reasons"][:5])
+    lines.append("")
+    lines.append("Reasons [Risk]:")
+    lines.extend(f"- {reason}" for reason in result.get("risk_reasons", [])[:5])
+    lines.append("")
+    lines.append("Reasons [Volatility]:")
+    lines.extend(f"- {reason}" for reason in result.get("volatility_reasons", [])[:5])
 
     if result["warnings"]:
         lines.append("")

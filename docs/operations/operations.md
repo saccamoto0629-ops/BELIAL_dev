@@ -169,26 +169,24 @@ Paper Signal の将来の systemd timer 案は [Roadmap](../product/roadmap.md) 
 ---
 ## Berial systemd helper scripts
 
-Development and production-like Linux environments can use the helper scripts
-under `scripts/` to avoid remembering individual `systemctl` and `journalctl`
-commands after code changes.
+開発環境および本番相当のLinux環境では、コード変更後に古いプロセスを動かし続けないように、`scripts/` 配下の補助スクリプトで systemd の再起動、状態確認、ログ確認を行う。
 
-Run them from the repository root:
+リポジトリルートから実行する。
 
 ```bash
 cd /opt/berial
 
-# Restart all long-running Berial services and refresh the chart snapshot timer.
+# Berial の常駐サービスをまとめて再起動し、Chart Snapshot timer を更新する。
 ./scripts/restart_all.sh
 
-# Restart only Market Watch alert services.
+# Market Watch alert 系だけを再起動する。
 ./scripts/restart_market_watch.sh
 
-# Check all major Berial service/timer units.
+# 主要な service / timer の状態をまとめて確認する。
 ./scripts/status.sh
 ```
 
-`restart_market_watch.sh` restarts:
+`restart_market_watch.sh` は以下を再起動する。
 
 ```text
 berial-ma-alert.service
@@ -196,7 +194,7 @@ berial-macd-alert.service
 berial-bollinger-alert.service
 ```
 
-`restart_all.sh` restarts:
+`restart_all.sh` は以下を再起動する。
 
 ```text
 berial-news.service
@@ -206,7 +204,7 @@ berial-bollinger-alert.service
 berial-chart-snapshot.timer
 ```
 
-Use `logs.sh` as a short wrapper around `journalctl`:
+`logs.sh` は `journalctl` の短縮ラッパーとして使う。
 
 ```bash
 ./scripts/logs.sh ma
@@ -218,10 +216,6 @@ Use `logs.sh` as a short wrapper around `journalctl`:
 ./scripts/logs.sh all --since today
 ```
 
-With no extra arguments, `logs.sh` follows the selected unit with the last 200
-lines. Extra arguments are passed through to `journalctl`, so commands such as
-`./scripts/logs.sh snapshot -n 100 --no-pager` are supported.
+追加引数なしの場合、`logs.sh` は選択したunitの直近200行を表示し、そのままfollowする。追加引数は `journalctl` に渡すため、`./scripts/logs.sh snapshot -n 100 --no-pager` のような指定も使える。
 
-The scripts use `systemctl` and `journalctl` by default. Override them with the
-`SYSTEMCTL` or `JOURNALCTL` environment variables only when testing the scripts
-without touching real systemd units.
+各スクリプトは通常 `systemctl` と `journalctl` を使う。実際のsystemd unitに触れずにスクリプトだけを検証したい場合のみ、`SYSTEMCTL` または `JOURNALCTL` 環境変数で差し替える。
