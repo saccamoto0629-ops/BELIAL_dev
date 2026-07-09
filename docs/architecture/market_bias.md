@@ -1,13 +1,15 @@
 # Market Bias
 
-v1.3 は、Berial が取得している市場データ(Yahoo Finance / FRED / TradingView / Chart Snapshot)をもとに、**Bull / Bear / Neutral の3分類だけ**を返す初期ロジックを追加するリリースである。
+v1.3 は、Berial が取得している市場データ(Yahoo Finance / FRED / TradingView / Chart Snapshot)をもとに、Bull / Bear / Neutral の3分類(Trend軸)を返す初期ロジックを追加するリリースである。その後、Trendとは独立した Risk(Risk-On / Risk-Off / Neutral)軸と Volatility(Low / Normal / High)軸を追加し(Issue #3)、判定結果をSQLiteへ永続化してBacktestから時点参照できるようにした(Issue #17)。
 
 ## 目的
 
 - 既存Providerが取得済みのデータから、市場の大まかな方向感をルールベースで判定する
 - Chart Snapshot由来のTrend / BB / MACD状態をBias計算へ反映する
 - Chart Snapshot由来のRSI14 / RSI Stateは表示・観測専用であり、Bias計算へは反映しない
+- Trend(方向感)とは独立に、Risk-On / Risk-Off(相場環境フィルタ)と Volatility(値動きの大きさ)を判定する
 - 判定結果、confidence、scores、reasons、warnings、note をDiscordへ出せる形にする
+- 判定結果をSQLiteへ保存し、Backtestや他コンポーネントから過去時点の状態を参照できるようにする
 - 「観測結果の可視化」を一段進めるものであり、売買判断や自動発注を行う機能ではない
 
 ## Market Bias Engine の位置づけ
@@ -56,7 +58,7 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 
 ```python
 {
-    "market_bias": "Bull",
+    "market_bias": "Bull",        # trend と同値。後方互換のため維持するフィールド名
     "confidence": 0.40,
     "scores": {"Bull": 3.5, "Bear": 1.5},
     "reasons": [
@@ -67,14 +69,25 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
     ],
     "warnings": [],
     "note": "Observation only. No trade recommendation.",
+
+    # Trend / Risk / Volatility を独立した軸として表示するための追加フィールド(Issue #3)
+    "trend": "Bull",
+    "risk": "Risk-On",
+    "risk_confidence": 0.50,
+    "risk_scores": {"Risk-On": 2.0, "Risk-Off": 0.0},
+    "risk_reasons": ["VIX is below 18 (risk-on)", "S&P500 is rising (risk-on)"],
+    "volatility": "Normal",
+    "volatility_confidence": 0.30,
+    "volatility_scores": {"High": 0.0, "Normal": 1.0, "Low": 0.0},
+    "volatility_reasons": [],
 }
 ```
 
-## 仕様: market_bias / confidence / scores / reasons / warnings
+## 仕様: market_bias / confidence / scores / reasons / warnings(Trend軸)
 
-#### market_bias
+#### market_bias / trend
 
-返却値は `Bull` / `Bear` / `Neutral` のいずれかのみとする。`Risk Off`、`USD Strength`、`Gold Strength` などの細かい市場状態ラベルは現行スコープ外であり、将来検討に回す。
+`market_bias` は `Bull` / `Bear` / `Neutral` のいずれかのみを返す。`trend` は `market_bias` と同じ値を持つエイリアスであり、Trend / Risk / Volatility を軸として明示するために追加した(Issue #3)。既存の呼び出し側(Paper Signal など)は引き続き `market_bias` を参照できる。
 
 - 入力データが不足している場合 → `Neutral`
 - Bull / Bear のスコア差が小さい場合 → `Neutral`
@@ -83,7 +96,7 @@ Market Bias Engine は、発注・執行・売買推奨を行うレイヤーに�
 
 #### confidence
 
-`confidence` は 0.0～1.0 の範囲に収める。入力不足の場合は `0.0` とし、スコア差と評価できた材料数をもとに算出する。
+`confidence` は 0.0～1.0 の範囲に収める。入力不足の場合は `0.0` とし、スコア差と評価できた材料数をもとに算出する。Trend軸のconfidenceであり、Risk / Volatility軸はそれぞれ独立した `risk_confidence` / `volatility_confidence` を持つ。
 
 #### scores
 
@@ -99,7 +112,7 @@ MACD StateはTrendより軽い補助指標として扱う。例: `0.5 * bias_wei
 
 #### reasons
 
-`reasons` は判定に使った根拠のlistで返す。Discord表示では長くなりすぎないよう最大数を制限する。
+`reasons` は判定に使った根拠のlistで返す。Discord表示では長くなりすぎないよう最大数を制限する。Trend軸の根拠のみを含み、Risk / Volatilityの根拠はそれぞれ `risk_reasons` / `volatility_reasons` に分離する(Issue #3)。
 
 Chart Snapshot由来の例:
 
@@ -116,6 +129,26 @@ TradingView recommendation と Chart Snapshot のTrend / MACD Stateが大きく�
 
 常に固定文字列 `"Observation only. No trade recommendation."` を含める。分岐によって売買推奨文に変化させない。
 
+## 仕様: risk / risk_confidence / risk_reasons(Risk軸)
+
+Trendとは独立に、相場のリスク選好(Risk-On / Risk-Off)を判定する。売買方向の判断ではなく、相場環境フィルタとして扱う。
+
+- 返却値は `Risk-On` / `Risk-Off` / `Neutral` のいずれか。
+- Risk-Off寄りの材料: VIX上昇、S&P500 / Nasdaq下落、原油急騰、Gold上昇(安全資産買い)。
+- Risk-On寄りの材料: VIX低下、S&P500 / Nasdaq上昇、Gold軟調。
+- `risk_reasons` にRisk軸の根拠だけを分離して記録する。
+- 地政学ニュースなど、現行Providerが未取得のシグナルは将来のProvider拡張時に追加する。
+
+## 仕様: volatility / volatility_confidence / volatility_reasons(Volatility軸)
+
+Trend / Riskとは独立に、値動きの大きさ(Low / Normal / High)を判定する最小実装。
+
+- 返却値は `Low` / `Normal` / `High` のいずれか。
+- 判定材料: Chart Snapshot由来のBollinger Band幅(`bb_width_pct`)、直近の値幅・急変率。
+- `volatility_reasons` にVolatility軸の根拠だけを分離して記録する。
+
+Trend / Risk / Volatility は互いに独立した軸のため、USD/JPYのように複数要因がぶつかる相場でも、Trendが `Neutral` になる一方でRiskやVolatilityは明確な値を返せる。
+
 ## 売買判断・自動発注は行わないこと(制約)
 
 Market Bias Engine は、以下を**実装しない**。
@@ -124,14 +157,24 @@ Market Bias Engine は、以下を**実装しない**。
 - エントリー推奨
 - 利確・損切り判断
 - 直接的な売買指示
-- 細かい `Risk Off`、`USD Strength`、`Gold Strength` などの複数ラベル分類
-- バックテスト
+- Backtestロジック本体(判定エンジン自身はバックテストを実行しない。Issue #17 により判定結果をDBへ保存し、**別レイヤーのBacktestが読み取れる**ようにしただけであり、Market Bias Engine自体が過去検証や最適化を行うわけではない)
 
 TradingView由来の `BUY` / `SELL` は内部データとして扱うことは許容するが、ユーザー向けMarkdownや `note` に売買指示として出さない。この制約は `tests/test_market_bias.py` で検証する。
 
+## 永続化とBacktest参照(Issue #17)
+
+Market Biasの評価結果は `news-feed-bot/market_bias_store.py` を通じてSQLiteへ保存する。
+
+- DB: `news-feed-bot/data/market_bias.sqlite3`(`MARKET_BIAS_DB_PATH` で上書き可能。相対パスは `news-feed-bot/` 基準)
+- テーブル: `market_bias`(`market_bias_id`, `evaluated_at`, `symbol`, `timeframe`, `market_bias`, `confidence`, `trend`, `risk`, `risk_confidence`, `volatility`, `volatility_confidence`, `reasons_json`, `risk_reasons_json`, `volatility_reasons_json`, `warnings_json`, `source_snapshot_id`)
+- レコードは `market_bias_models.create_market_bias_record()` が組み立てる。`symbol` は既定で `GLOBAL`(Market Biasは単一銘柄ではなく市場全体を見るクロスアセット判定のため)、`timeframe` は既定で `1h`(Chart Snapshot入力の代表時間足)。将来、銘柄別のMarket Biasに拡張する場合は呼び出し側で上書きできる。
+- 保存タイミング: `market_snapshot.build_market_snapshot_message()` がMarket Bias分類に成功した直後。`dry_run=True` のときはDBに一切書き込まない。
+- 参照: `market_bias_store.get_market_bias_as_of(symbol, timeframe, at)` は、指定時刻 `at` **以前**で最新のレコードを返す(未来のレコードを漏らさない、Backtestのlook-ahead防止のための設計)。DBやテーブルが存在しない場合、または該当レコードがない場合は例外を投げず `None` を返す。この関数は読み取り専用で、DBファイルを新規作成しない。
+- Paper Signal / Backtest からこのAPIを呼ぶ場合、`None` を「その期間はMarket Bias不明」として扱い、処理を継続する想定である。
+
 ## Market Snapshotとの連携
 
-`market_snapshot.build_market_snapshot_message()` は、本文内に `[Chart Snapshot Summary]` と `## Market Bias` セクションを追加する。生成時の例外は吸収し、Market Snapshot全体の投稿が壊れないようにする。
+`market_snapshot.build_market_snapshot_message()` は、本文内に `[Chart Snapshot Summary]` と `## Market Bias` セクションを追加し、Trend / Risk / Volatilityをそれぞれ表示する。生成時の例外は吸収し、Market Snapshot全体の投稿が壊れないようにする。Market Bias分類が成功した場合は、続けて上記の永続化も行う(dry-run時を除く)。
 
 `Chart Snapshot Summary` では、各Symbolの1hを代表値として以下を表示する。
 

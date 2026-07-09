@@ -193,6 +193,8 @@ Discord表示時のみJSTへ変換する。
 
 内部保存をUTCへ統一する理由は、USDJPY / SPX / VIX / XAUUSD のように市場・取得元ごとにタイムゾーンが異なるデータを同一基準で比較するためである。
 
+Chart Snapshot画像(`chart_renderer.py`)のx軸も同じ方針で、描画直前にJSTへ変換し、軸ラベルに `Time (JST)` を付けて表示する(Issue #15)。SQLite保存値そのものはUTCのまま変更しない。
+
 ## 指標仕様
 
 `indicators.py` はチャート指標の共通ライブラリである。`chart_snapshot.py`、`macd_alert_bot.py`、`ma_alert_bot.py`、`bollinger_alert_bot.py` は、可能な限りここにある共通関数を利用する。
@@ -379,9 +381,23 @@ distance_pct <= threshold_pct
 market-watch/state/ma_alert_state.json
 ```
 
-state keyは `symbol`、`timeframe`、`ma_name`、`candle_time` を区別できる形式とし、保存内容には `candle_time`、`ma_name`、`close`、`ma_value`、`distance_pct`、`side`、`notified_at` を含める。
+state keyは `symbol`、`timeframe`、`ma_name`、`candle_time` を区別できる形式とし、保存内容には `candle_time`、`ma_name`、`close`、`ma_value`、`distance_pct`、`side`、`notified_at`、`suppressed`、`suppress_reason` を含める。
 
-通知先は `BOT_ALERTS_WEBHOOK_URL` を使う。既存互換として、未設定の場合のみ `DISCORD_WEBHOOK_URL` へfallbackしてよい。Embed titleは `Berial Market Watch: MA Touch` とし、注意文として `This is a watch alert only, not a trade decision.` を含める。
+### 同一接触ゾーンの連続通知抑制(Issue #16)
+
+MAタッチの**生の検知結果**(raw detection)と、**Discordへ通知するかの判断**(notification decision)は責務を分離する。生の検知結果は抑制の有無にかかわらず常にログへ記録し、後からの分析・バックテストで参照できるようにする。抑制するのはDiscord通知だけであり、検知の事実そのものを消さない。
+
+通知判断は `symbol` / `timeframe` / `ma_type` / `ma_period` / `zone_key` ごとに `outside` / `touching` の2状態を保持する。
+
+| 状態遷移 | 通知 |
+|---|---|
+| `outside` → `touching`(初回接触) | 通知する |
+| `touching` → `touching`(同一ゾーン継続) | 抑制する。`suppress_reason = "same_touch_zone"` |
+| `touching` → `outside`(ゾーン離脱) | 通知なし。次回接触で再び通知可能になる |
+
+`ma_alert_bot.py` は state ファイル内に `touch_zones` という別領域を持ち、`symbol_timeframe_matype_maperiod_zonekey` 形式のキーで `outside` / `touching` を保持する。`--dry-run` ではこの state も更新しない。
+
+通知先は `BOT_ALERTS_WEBHOOK_URL` を使う。既存互換として、未設定の場合のみ `DISCORD_WEBHOOK_URL` へfallbackしてよい。Embed titleは `Berial Market Watch: MA Touch` とし、注意文として `This is a watch alert only, not a trade decision.` を含める。Embedのフォーマット自体はIssue #16で変更していない。
 
 設定は `market-watch/config.toml` の `[ma_alert]` に置く。
 

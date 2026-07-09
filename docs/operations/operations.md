@@ -1,10 +1,19 @@
 # Operations
 ## 方針
 
-`.env` はGit管理しない。Webhook URL、API key、token などの秘密情報の実値は設計書やREADMEに書かない。dry-run は Discord 送信と state 更新を行わない確認モードとして扱う。
+`.env` はGit管理しない。Webhook URL、API key、token などの秘密情報の実値は設計書やREADMEに書かない。
+
+dry-run は以下の副作用を一切発生させない確認モードとして扱う。
+
+- Discord送信
+- state ファイル更新
+- DB作成・更新
+- S3アップロード
+
+新機能を追加する場合も、`--dry-run`(または `dry_run=True`)でこれらの副作用が発生しないことをテストで確認する。
 ## 環境変数
 
-現行実装の主な環境変数は以下。
+現行実装の主な環境変数は以下。コンポーネントをまたぐ横断的な変数(DBパスなど)を含む。各コンポーネント固有の全変数は、そのコンポーネントの `README.md` / `.env.example` を正とする(`news-feed-bot/README.md`、`market-watch/README.md`、`paper-signal/README.md`)。
 
 | 変数 | 既定 | 用途 |
 |---|---:|---|
@@ -24,8 +33,10 @@
 | `MARKET_SNAPSHOT_TIME` | `07:00` | Market Snapshot投稿時刻 |
 | `ENABLE_FEDWATCH` | `false` | FedWatch optional Providerを有効化 |
 | `ENABLE_ECONOMIC_CALENDAR` | `false` | Economic Calendar optional Providerを有効化 |
+| `CHART_DB_PATH` | `market-watch/data/chart_data.sqlite3` | Chart DBのパス上書き(`market-watch/chart_collector.py`) |
+| `MARKET_BIAS_DB_PATH` | `news-feed-bot/data/market_bias.sqlite3` | Market Bias DBのパス上書き。Backtestから別プロセスで参照する場合に使う(`news-feed-bot/market_bias_store.py`) |
 
-注意: ユーザー向けに `DISCORD_WEBHOOK_URL` と呼ぶ場合があるが、現行コードで使用している実変数名は `NEWS_WEBHOOK_URL` である。実装と `.env.example` を変更しない限り、`DISCORD_WEBHOOK_URL` は有効な設定名ではない。
+注意: `news-feed-bot/` のニュース投稿では、現行コードで使用している実変数名は `NEWS_WEBHOOK_URL` である。`DISCORD_WEBHOOK_URL` はニュース投稿用の設定名ではない。一方、`market-watch/` のイベント通知では旧設定との互換性のため、`BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り `DISCORD_WEBHOOK_URL` をlegacy fallbackとして扱う。
 
 `.env` はGit管理しない。本物のWebhook URL、API key、tokenは `.env.example` や設計書に書かない。
 ## テスト方針

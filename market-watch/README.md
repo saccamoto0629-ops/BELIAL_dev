@@ -1,10 +1,16 @@
-# MACD Cross Alert Bot (v1.2.2)
+# Market Watch
 
-`market-watch/macd_alert_bot.py` monitors USD/JPY M15 candles and sends a Discord alert when MACD(12,26,9) makes a confirmed-candle bullish or bearish cross.
-`market-watch/bollinger_alert_bot.py` monitors confirmed candles for Bollinger Bands market-state signals and sends observation-only Discord alerts.
-`market-watch/rsi_alert_bot.py` monitors confirmed candles for RSI14 overbought/oversold threshold transitions and sends observation-only Discord alerts.
+`market-watch/` fetches candles, computes SMA/EMA/Bollinger Bands/MACD/RSI14, renders Chart Snapshots, and runs observation-only Discord event alerts. It never places orders, sizes lots, or generates entry/exit recommendations.
 
-v1.2.2 is an operations-hardening release. It does not add market-judgement logic. The bot only detects MACD crosses and notifies Discord.
+Full architecture and per-bot specs live in [docs/architecture/market_watch.md](../docs/architecture/market_watch.md). This README covers setup, run, and test commands.
+
+Bots in this directory:
+
+- `chart_snapshot.py` — scheduled Chart Snapshot report (candlestick + SMA/EMA/Bollinger/MACD PNG) posted to Discord, and the summary feed consumed by `news-feed-bot/market_snapshot.py` and `news-feed-bot/market_bias.py`.
+- `macd_alert_bot.py` — event alert when MACD(12,26,9) makes a confirmed-candle bullish/bearish cross.
+- `ma_alert_bot.py` — event alert when a confirmed candle's close touches a monitored moving average. Suppresses repeat notifications while price stays in the same touch zone (see [Duplicate prevention](#duplicate-prevention)).
+- `bollinger_alert_bot.py` — event alert for Bollinger Bands breaks, squeeze, and expansion_start.
+- `rsi_alert_bot.py` — event alert for RSI14 overbought/oversold zone entry and exit.
 
 ## Files
 
@@ -13,18 +19,32 @@ market-watch/
 ├─ .env.example          # secret-only sample
 ├─ config.toml           # public monitoring settings
 ├─ README.md
+├─ chart_collector.py    # candle fetch, UTC normalization, SQLite persistence
+├─ chart_models.py        # ChartTarget / Candle / IndicatorSnapshot
+├─ indicators.py          # SMA / EMA / Bollinger / MACD / RSI / cross detection
+├─ chart_renderer.py       # shared PNG rendering (JST x-axis on display)
+├─ chart_snapshot.py       # Chart Snapshot generation, Discord post, summary
+├─ chart_alert_context.py  # shared alert-image + S3 + snapshot linking helper
+├─ chart_image_uploader.py # private S3 upload + presigned URL generation
 ├─ macd_alert_bot.py
+├─ ma_alert_bot.py
+├─ bollinger_alert_bot.py
+├─ rsi_alert_bot.py
 └─ tests/
-   └─ test_macd_alert_bot.py
+   └─ test_*.py
 ```
 
 Runtime files are created outside Git:
 
 ```text
+logs/chart_snapshot.log
 logs/macd_alert_bot.log
+logs/ma_alert_bot.log
 logs/bollinger_alert_bot.log
 logs/rsi_alert_bot.log
+market-watch/data/chart_data.sqlite3
 market-watch/state/macd_alert_state.json
+market-watch/state/ma_alert_state.json
 market-watch/state/bollinger_alert_state.json
 market-watch/state/rsi_alert_state.json
 ```
@@ -116,7 +136,9 @@ One dry-run check:
 
 ```bash
 cd /opt/berial
+python market-watch/chart_snapshot.py --once --dry-run
 python market-watch/macd_alert_bot.py --once --dry-run
+python market-watch/ma_alert_bot.py --once --dry-run
 python market-watch/bollinger_alert_bot.py --once --dry-run
 python market-watch/rsi_alert_bot.py --once --dry-run
 ```
@@ -125,23 +147,24 @@ One real check:
 
 ```bash
 cd /opt/berial
+python market-watch/chart_snapshot.py --once
 python market-watch/macd_alert_bot.py --once
+python market-watch/ma_alert_bot.py --once
 python market-watch/bollinger_alert_bot.py --once
 python market-watch/rsi_alert_bot.py --once
 ```
 
-Continuous loop:
+Continuous loop (event alert bots only; `chart_snapshot.py` is intended for scheduled/oneshot runs):
 
 ```bash
 cd /opt/berial
 python market-watch/macd_alert_bot.py
+python market-watch/ma_alert_bot.py
 python market-watch/bollinger_alert_bot.py
 python market-watch/rsi_alert_bot.py
 ```
 
-`--dry-run` does not send to Discord and does not update `market-watch/state/macd_alert_state.json`.
-For Bollinger alerts, `--dry-run` also leaves `market-watch/state/bollinger_alert_state.json` unchanged.
-For RSI alerts, `--dry-run` also leaves `market-watch/state/rsi_alert_state.json` unchanged.
+`--dry-run` does not send to Discord, upload to S3, write to `chart_data.sqlite3`, or update any `market-watch/state/*.json` file, for every bot in this directory.
 
 ## Cross detection
 
@@ -191,6 +214,19 @@ market-watch/state/rsi_alert_state.json
 ```
 
 The key is `symbol + timeframe`. The value stores the latest recorded confirmed candle, RSI14 state, and last notified event. This prevents duplicate notifications for the same confirmed candle and keeps repeated candles in the same RSI zone quiet.
+
+For MA touch alerts, state is saved in:
+
+```text
+market-watch/state/ma_alert_state.json
+```
+
+`ma_alert_bot.py` separates the raw touch *detection* from the notification *decision*, so the raw fact is always recorded even when Discord notification is suppressed. State holds two things:
+
+- per-candle dedupe entries (`symbol + timeframe + ma_name + candle_time`), same shape as before, now also including `suppressed` and `suppress_reason`.
+- a `touch_zones` map keyed by `symbol + timeframe + ma_type + ma_period + zone_key`, holding `outside` / `touching`. The first touch after `outside` notifies; repeated touches while still `touching` are suppressed with `suppress_reason = "same_touch_zone"`; leaving the touch band resets the zone to `outside` so the next touch notifies again.
+
+Full spec: [docs/architecture/market_watch.md](../docs/architecture/market_watch.md#同一接触ゾーンの連続通知抑制issue-16).
 
 ## Bollinger alert detection
 
@@ -253,13 +289,7 @@ The tone is Berial-style market watch, but the content stays practical.
 
 ## Logs
 
-Logs are written to:
-
-```text
-logs/macd_alert_bot.log
-```
-
-The log directory is created automatically. Logs include:
+Each bot writes to its own log file under `logs/` (see [Files](#files)), created automatically on first run. Logs include:
 
 - bot startup
 - monitored target and MACD settings
@@ -310,8 +340,8 @@ Do not commit:
 - `.pytest_cache/`
 - `logs/`
 
-## Future
+## Scope
 
-v1.3 is reserved for market-judgement logic. v1.2.2 intentionally does not add judgement, scoring, or trade decisions.
+`market-watch/` is an Alert-layer implementation: it detects and reports facts (crosses, touches, band breaks, RSI zone transitions). It does not implement trade judgement, scoring, entries, exits, lot sizing, stop-loss/take-profit, or broker API integration. Interpreting these alerts (Strategy/Method) and executing trades (Execution) are separate, currently out-of-scope layers — see [docs/product/concept.md](../docs/product/concept.md#レイヤー分離).
 
-systemd service files and production daemonization are postponed to v1.4 or later.
+For the full current specification (indicator formulas, Freshness/Bias Weight rules, SQLite schema, systemd examples), see [docs/architecture/market_watch.md](../docs/architecture/market_watch.md). For planned v1.4 Backtest work, see [docs/product/roadmap.md](../docs/product/roadmap.md).

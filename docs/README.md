@@ -1,6 +1,6 @@
 # BELIAL Docs
 
-BELIAL のドキュメントは、目的別に以下のディレクトリへ分ける。
+BELIAL のドキュメントは、目的別に以下のディレクトリへ分ける。リポジトリ全体の入口は [ルートREADME](../README.md) を参照。
 
 ## Structure
 

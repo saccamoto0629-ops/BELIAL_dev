@@ -42,6 +42,6 @@ BELIAL は、いきなり執行判断へ進まない。まず市場を観測し�
 |---|---|---|
 | Observation | 価格、ニュース、指標を取得する | `news-feed-bot/`, `market-watch/chart_collector.py` |
 | Classification | 市場状態を分類する | `market-watch/indicators.py`, `market_bias.py` |
-| Alert | 事実を通知する | `macd_alert_bot.py`, `ma_alert_bot.py`, `bollinger_alert_bot.py` |
+| Alert | 事実を通知する | `macd_alert_bot.py`, `ma_alert_bot.py`, `bollinger_alert_bot.py`, `rsi_alert_bot.py` |
 | Hypothesis | paper_only の仮説を生成・保存する | `paper-signal/` |
 | Execution | 実注文、Exit、損切り、利確を扱う | 現行スコープ外 |

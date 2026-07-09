@@ -74,7 +74,9 @@ Paper Signal v1.4.0では、`rsi14` / `rsi_state` は記録・観測用の補助
 
 ## ストレージ
 
-SQLiteに保存する。パスは `paper-signal/data/paper_signals.sqlite3`(`paper-signal/paper_signal_store.py`)。テーブルは29.4の全フィールドを1行1シグナルとして保持する。`paper-signal/data/` はGit管理しない(`.gitignore`)。
+SQLiteに保存する。パスは `paper-signal/data/paper_signals.sqlite3`(`paper-signal/paper_signal_store.py`)。テーブルは上記「出力データ(Paper Signal)」の全フィールドを1行1シグナルとして保持する。`paper-signal/data/` はGit管理しない(`.gitignore`)。
+
+Market Bias自体は `news-feed-bot/data/market_bias.sqlite3` に別途保存される(Issue #17、詳細は [Market Bias](market_bias.md#永続化とbacktest参照issue-17))。Paper Signalは現状 `classify_market_bias()` をその場で呼び出しており、このDBを読み取らない。`market_bias_store.get_market_bias_as_of()` はDB不在・レコード不在時に例外を投げず `None` を返す設計のため、将来 Paper Signal や Backtest がこのAPIを使うように変わっても、Market Biasが存在しない期間で異常終了しない。
 
 ## Discord通知
 
