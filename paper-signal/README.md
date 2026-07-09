@@ -57,7 +57,86 @@ cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev
 python -m pytest paper-signal -q
 ```
 
-## 7. Security notes
+## 7. Backtest Exit Policy evaluation (paper-only)
+
+`exit_policy.py` は、確定済みのpaper signal(`entry_price` / `direction` など)と過去ローソク足から、**このsignalが過去データ上でどう終わったか**を判定するBacktest専用モジュールです。
+
+**これはExecution層の自動Exitではありません。** 実ポジションの決済、損切り注文、利確注文、Broker API連携は一切実装していません。`evaluate_exit()` はSQLite・Discord・HTTPのいずれにも触れない純粋関数で、過去足に対する事後的なマークを返すだけです。詳細は `exit_policy.py` のモジュールdocstringを参照してください。
+
+用語:
+
+- `entry_price` / `invalidation_price` / `take_profit_price`: いずれもpaper-only。実注文の価格ではありません。
+- `close_price` / `close_time` / `close_reason`: Exit Policyが「終了」と判定した時点の、過去足に対するシミュレーション結果です。
+
+### 7.1 設定はJSON config、`.env` にはパスだけ
+
+Exit Policyの判断値(どのpolicyを使うか、risk:reward、保有本数上限、MA期間、同一足TP/SL優先度など)は **`.env` に直接置きません**。`.env` に置くのは設定ファイルへのパスだけです。
+
+`paper-signal/.env`:
+
+```env
+BACKTEST_EXIT_CONFIG_PATH=config/backtest_exit_policy.json
+```
+
+`paper-signal/config/backtest_exit_policy.json`(コミット済みの実例。秘密情報を含まないため直接編集して使えます):
+
+```json
+{
+  "exit_policy": "fixed_rr",
+  "same_candle_priority": "stop_loss",
+  "policies": {
+    "fixed_rr": {
+      "enabled": true,
+      "risk_reward": 2.0,
+      "stop_loss_mode": "fixed_pct",
+      "fallback_stop_pct": 0.003
+    },
+    "time_based_close": {
+      "enabled": true,
+      "max_hold_bars": 48,
+      "close_as": "expired"
+    },
+    "ma_break_invalidation": {
+      "enabled": false,
+      "ma_type": "sma",
+      "period": 20
+    }
+  }
+}
+```
+
+`BACKTEST_EXIT_CONFIG_PATH` が未設定の場合は、安全な組み込みdefault(`default_exit_policy_config()`、上記とほぼ同内容)を使います。値の読み込み・default補完・検証は `load_exit_policy_config()` / `resolve_exit_policy_config()` / `validate_exit_policy_config()` が担当します。JSONの一部だけ書けば残りはdefaultで補完されます。
+
+### 7.2 Exit Policy一覧
+
+| policy | 判定 | status | close_reason |
+|---|---|---|---|
+| `fixed_rr`(既定) | entry/direction と `fallback_stop_pct`(entry比%のstop幅)・`risk_reward`(またはsignal自身のinvalidation_price/take_profit_price)から、ローソク足のhigh/lowが先にどちらへ到達したかで判定 | `win` / `loss` | `take_profit` / `stop_loss` |
+| `time_based_close` | `max_hold_bars` 本を超えたら強制終了。価格水準は見ない。statusは `close_as`(既定 `expired`)に従う | `expired`(既定) | `time_expired` |
+| `ma_break_invalidation` | 終値が方向に対してMAを割った/上抜けたら無効化。`ma_type` は現時点で `sma` のみ対応(`ema` などは `ValueError`)。`period` はJSONの値をそのまま使用 | `invalidated` | `ma_break` |
+
+いずれの policy も、供給したローソク足の範囲内で条件に到達しなければ `status="open"` / `close_reason="no_close"` を返します(エラーではありません)。
+
+**同一ローソク足でTP/SLの両方に到達した場合**、どちらを優先するかは `same_candle_priority`(`"stop_loss"` または `"take_profit"`)で決まります。ハードコードではなく設定値なので、同じconfigで実行すれば同じ判定を再現できます。
+
+不正な設定(未定義の `exit_policy`、`enabled: false` のpolicyを選択、不正な `same_candle_priority` / `ma_type`、`risk_reward` / `fallback_stop_pct` / `max_hold_bars` / `period` が0以下など)は、いずれも `ValueError` で明確に弾かれます。
+
+### 7.3 DBへの保存(Backtest)
+
+`backtest/backtest_store.py` の `backtest_signals` テーブルは signal 単位で `result_status` / `close_price` / `closed_at` / `close_reason` / `exit_policy` / `mfe` / `mae` を保存できます。`ExitPolicyResult` をそのまま渡せないため、`backtest/backtest_models.apply_exit_policy_result(signal_record, exit_result)` がフィールド変換を行います(`status`→`result_status`、`close_time`→`closed_at`、他は同名)。
+
+```powershell
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\paper-signal
+python -c "
+import exit_policy as ep, pandas as pd
+candles = pd.DataFrame({'open':[150.5],'high':[151.0],'low':[150.2],'close':[150.8]}, index=pd.date_range('2026-01-01', periods=1, freq='1h', tz='UTC'))
+signal = {'direction': 'long', 'entry_price': 150.0}
+config = ep.load_exit_policy_config('config/backtest_exit_policy.json')
+print(ep.evaluate_exit(signal, candles, config))
+"
+```
+
+## 8. Security notes
 
 - `paper-signal/.env` をコミットしない
 - `paper-signal/data/`(SQLite)はruntime生成物のためコミットしない

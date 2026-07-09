@@ -60,6 +60,7 @@ REQUIRED_SIGNAL_COLUMNS = {
     "mae",
     "closed_at",
     "close_reason",
+    "exit_policy",
     "created_at",
 }
 
@@ -68,8 +69,8 @@ _INSERT_SIGNAL_SQL = """
     (id, run_id, signal_time, symbol, timeframe, bias, confidence, direction,
      signal_type, trigger_type, reason_json, entry_price, invalidation_price,
      take_profit_price, close_price, result_status, pnl, mfe, mae, closed_at,
-     close_reason, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     close_reason, exit_policy, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -116,6 +117,17 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    """Add ``column_name`` to an existing table if it isn't there yet.
+
+    Lets a backtest_signals table created before ``exit_policy`` existed
+    upgrade in place: existing rows keep working (the new column reads as
+    NULL for them) and the process never needs a bespoke migration script.
+    """
+    if column_name not in _table_columns(connection, table_name):
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
@@ -194,11 +206,15 @@ def init_db(db_path: Path | None = None) -> None:
                 mae REAL,
                 closed_at TEXT,
                 close_reason TEXT,
+                exit_policy TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (run_id) REFERENCES backtest_runs(id)
             )
             """
         )
+
+        # Migrate a backtest_signals table created before exit_policy existed.
+        _ensure_column(connection, "backtest_signals", "exit_policy", "TEXT")
 
         _validate_schema(connection)
 
@@ -269,6 +285,7 @@ def _signal_row(record: dict) -> tuple:
         record.get("mae"),
         record.get("closed_at"),
         record.get("close_reason"),
+        record.get("exit_policy"),
         record["created_at"],
     )
 

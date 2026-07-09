@@ -48,6 +48,7 @@ def make_signal(run_id, **overrides):
         "mae": -0.3,
         "closed_at": "2026-01-05T15:00:00Z",
         "close_reason": "take_profit",
+        "exit_policy": "fixed_rr",
     }
     kwargs.update(overrides)
     return models.create_backtest_signal_record(run_id, **kwargs)
@@ -87,6 +88,81 @@ def test_init_db_raises_clear_error_for_incomplete_existing_schema(tmp_path):
 
     with pytest.raises(store.BacktestSchemaError, match="config_json"):
         store.init_db(db_path)
+
+
+def test_init_db_migrates_existing_backtest_signals_missing_exit_policy_column(tmp_path):
+    db_path = tmp_path / "backtest.sqlite3"
+    # Simulate a DB created before exit_policy existed on backtest_signals
+    # (i.e. the Issue #19 schema, pre-#21 fix): otherwise-complete tables,
+    # possibly with existing rows.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE backtest_runs (
+                id TEXT PRIMARY KEY,
+                run_name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                from_time TEXT NOT NULL,
+                to_time TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                exit_policy TEXT,
+                config_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE backtest_signals (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                signal_time TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                bias TEXT,
+                confidence REAL,
+                direction TEXT,
+                signal_type TEXT,
+                trigger_type TEXT,
+                reason_json TEXT,
+                entry_price REAL,
+                invalidation_price REAL,
+                take_profit_price REAL,
+                close_price REAL,
+                result_status TEXT,
+                pnl REAL,
+                mfe REAL,
+                mae REAL,
+                closed_at TEXT,
+                close_reason TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO backtest_runs (id, run_name, symbol, timeframe, from_time, to_time, "
+            "strategy_name, exit_policy, config_json, created_at) VALUES "
+            "('run-1', 'old-run', 'USD_JPY', '1h', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', "
+            "'sma_cross', 'fixed_rr', '{}', '2026-01-01T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO backtest_signals (id, run_id, signal_time, symbol, timeframe, created_at) "
+            "VALUES ('signal-1', 'run-1', '2026-01-05T09:00:00Z', 'USD_JPY', '1h', '2026-01-05T09:00:00Z')"
+        )
+
+    # Must not raise: exit_policy is auto-migrated onto the existing table,
+    # and pre-existing rows must still be readable afterward.
+    store.init_db(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(backtest_signals)").fetchall()}
+    assert "exit_policy" in columns
+
+    signals = store.list_backtest_signals("run-1", db_path=db_path)
+    assert len(signals) == 1
+    assert signals[0]["id"] == "signal-1"
+    assert signals[0]["exit_policy"] is None  # pre-existing row: nullable, not backfilled
 
 
 # --- backtest_runs -----------------------------------------------------------
@@ -170,6 +246,7 @@ def test_save_and_list_backtest_signals_round_trip_by_run_id(tmp_path):
     assert signals[0]["pnl"] == 1.5
     assert signals[0]["mfe"] == 1.8
     assert signals[0]["mae"] == -0.3
+    assert signals[0]["exit_policy"] == "fixed_rr"
     assert json.loads(signals[0]["reason_json"]) == ["Close touched SMA20", "Trend is Bull"]
 
 

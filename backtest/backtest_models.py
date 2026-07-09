@@ -49,6 +49,7 @@ class BacktestSignalRecord(TypedDict):
     mae: float | None
     closed_at: str | None
     close_reason: str | None
+    exit_policy: str | None
     created_at: str
 
 
@@ -117,6 +118,7 @@ def create_backtest_signal_record(
     mae: float | None = None,
     closed_at: str | None = None,
     close_reason: str | None = None,
+    exit_policy: str | None = None,
     signal_id: str | None = None,
     created_at: str | None = None,
 ) -> BacktestSignalRecord:
@@ -127,6 +129,13 @@ def create_backtest_signal_record(
     historical outcome computed by a (separate) backtest runner replaying
     past data -- this factory only shapes the record for storage and does
     not place orders, size positions, or make any live trading decision.
+
+    ``exit_policy`` names which paper-only Exit Policy (see
+    ``paper-signal/exit_policy.py``) produced the close fields on this
+    signal. It is nullable: a signal can be saved before its exit is known
+    (still "open"), and older rows saved before this column existed read
+    back as ``None``. See ``apply_exit_policy_result()`` below for the
+    usual way to fill it in once an ``ExitPolicyResult`` is available.
     """
     return {
         "id": signal_id or new_id(),
@@ -150,5 +159,49 @@ def create_backtest_signal_record(
         "mae": mae,
         "closed_at": closed_at,
         "close_reason": close_reason,
+        "exit_policy": exit_policy,
         "created_at": created_at or utc_now_iso(),
     }
+
+
+def apply_exit_policy_result(signal_record: dict, exit_result) -> dict:
+    """Merge a paper-signal ExitPolicyResult onto an existing BacktestSignalRecord dict.
+
+    This is the bridge between paper-only Exit Policy evaluation
+    (``paper-signal/exit_policy.evaluate_exit()``) and Backtest storage: it
+    is how "where did this hypothesis die" ends up reliably in
+    ``backtest_signals`` instead of being computed and then discarded.
+    Never places an order or touches a broker -- purely a field mapping.
+
+    ``exit_result`` is duck-typed: it accepts either an
+    ``exit_policy.ExitPolicyResult`` instance or an equivalent plain dict,
+    so this module does not need to import paper-signal/exit_policy.py.
+
+    Field mapping (ExitPolicyResult -> BacktestSignalRecord):
+      status       -> result_status
+      close_price  -> close_price
+      close_time   -> closed_at
+      close_reason -> close_reason
+      exit_policy  -> exit_policy
+      mfe          -> mfe
+      mae          -> mae
+
+    Returns a new dict (``signal_record`` is not mutated); all other
+    fields of ``signal_record`` (id, run_id, entry_price, ...) pass through
+    unchanged.
+    """
+
+    def _field(name, default=None):
+        if isinstance(exit_result, dict):
+            return exit_result.get(name, default)
+        return getattr(exit_result, name, default)
+
+    updated = dict(signal_record)
+    updated["result_status"] = _field("status")
+    updated["close_price"] = _field("close_price")
+    updated["closed_at"] = _field("close_time")
+    updated["close_reason"] = _field("close_reason")
+    updated["exit_policy"] = _field("exit_policy")
+    updated["mfe"] = _field("mfe")
+    updated["mae"] = _field("mae")
+    return updated

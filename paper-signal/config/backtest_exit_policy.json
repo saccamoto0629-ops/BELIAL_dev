@@ -1,0 +1,29 @@
+{
+  "exit_policy": "fixed_rr",
+  "same_candle_priority": "stop_loss",
+  "policies": {
+    "fixed_rr": {
+      "enabled": true,
+      "risk_reward": 2.0,
+      "stop_loss_mode": "fixed_pct",
+      "fallback_stop_pct": 0.003
+    },
+    "time_based_close": {
+      "enabled": true,
+      "max_hold_bars": 48,
+      "close_as": "expired"
+    },
+    "ma_break_invalidation": {
+      "enabled": false,
+      "ma_type": "sma",
+      "period": 20
+    },
+    "bias_reversal_close": {
+      "enabled": false
+    },
+    "recent_high_low_break": {
+      "enabled": false,
+      "lookback_bars": 20
+    }
+  }
+}
