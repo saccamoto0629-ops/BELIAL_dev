@@ -165,3 +165,63 @@ python signal_generator.py --once
 ## Paper Signal systemd timer案
 
 Paper Signal の将来の systemd timer 案は [Roadmap](../product/roadmap.md) に置く。
+
+---
+## Berial systemd helper scripts
+
+Development and production-like Linux environments can use the helper scripts
+under `scripts/` to avoid remembering individual `systemctl` and `journalctl`
+commands after code changes.
+
+Run them from the repository root:
+
+```bash
+cd /opt/berial
+
+# Restart all long-running Berial services and refresh the chart snapshot timer.
+./scripts/restart_all.sh
+
+# Restart only Market Watch alert services.
+./scripts/restart_market_watch.sh
+
+# Check all major Berial service/timer units.
+./scripts/status.sh
+```
+
+`restart_market_watch.sh` restarts:
+
+```text
+berial-ma-alert.service
+berial-macd-alert.service
+berial-bollinger-alert.service
+```
+
+`restart_all.sh` restarts:
+
+```text
+berial-news.service
+berial-ma-alert.service
+berial-macd-alert.service
+berial-bollinger-alert.service
+berial-chart-snapshot.timer
+```
+
+Use `logs.sh` as a short wrapper around `journalctl`:
+
+```bash
+./scripts/logs.sh ma
+./scripts/logs.sh macd
+./scripts/logs.sh bollinger
+./scripts/logs.sh snapshot
+./scripts/logs.sh timer
+./scripts/logs.sh news
+./scripts/logs.sh all --since today
+```
+
+With no extra arguments, `logs.sh` follows the selected unit with the last 200
+lines. Extra arguments are passed through to `journalctl`, so commands such as
+`./scripts/logs.sh snapshot -n 100 --no-pager` are supported.
+
+The scripts use `systemctl` and `journalctl` by default. Override them with the
+`SYSTEMCTL` or `JOURNALCTL` environment variables only when testing the scripts
+without touching real systemd units.
