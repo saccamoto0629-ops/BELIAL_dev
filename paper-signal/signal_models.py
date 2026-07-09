@@ -30,6 +30,54 @@ class PaperSignal(TypedDict):
     status: str
 
 
+class SignalContext(TypedDict):
+    """Already-fetched inputs for candidate generation.
+
+    Bundles exactly what ``signal_generator.build_candidates()`` needs, so
+    Backtest can build one directly from its own historical data slice and
+    call ``generate_signal_candidates()`` / ``generate_signal()`` without
+    touching any live Provider, DB, or Discord.
+    """
+
+    bias_result: dict
+    hourly_snapshots: list
+    confidence_threshold: float
+
+
+class SignalCandidate(TypedDict):
+    """A candidate produced by build_candidates(), before persistence.
+
+    This is not yet a PaperSignal: it has no signal_id, created_at_utc, or
+    status. create_paper_signal() converts a SignalCandidate into a
+    PaperSignal only when the caller decides to actually persist it.
+    """
+
+    symbol: str
+    timeframe: str
+    side: str
+    market_bias: str
+    confidence: float
+    macd_state: str
+    trend: str
+    state: str
+    freshness: str
+    reason: str
+
+
+def create_signal_context(
+    bias_result: dict,
+    hourly_snapshots: list,
+    *,
+    confidence_threshold: float,
+) -> SignalContext:
+    """Bundle Market Bias + Chart Snapshot data into a SignalContext."""
+    return {
+        "bias_result": bias_result,
+        "hourly_snapshots": hourly_snapshots,
+        "confidence_threshold": confidence_threshold,
+    }
+
+
 def new_signal_id() -> str:
     return uuid.uuid4().hex
 

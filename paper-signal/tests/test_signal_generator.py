@@ -144,6 +144,106 @@ def test_handles_missing_bias_fields_without_crashing():
     assert candidates == []
 
 
+# --- Issue #20: generate_signal_candidates() / generate_signal() for Backtest reuse ---
+
+
+def make_context(**overrides):
+    from signal_models import create_signal_context
+
+    kwargs = {
+        "bias_result": make_bias(market_bias="Bull", confidence=0.8),
+        "hourly_snapshots": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
+        "confidence_threshold": 0.40,
+    }
+    kwargs.update(overrides)
+    return create_signal_context(
+        kwargs["bias_result"], kwargs["hourly_snapshots"], confidence_threshold=kwargs["confidence_threshold"]
+    )
+
+
+def test_generate_signal_candidates_matches_build_candidates_with_no_side_effects(monkeypatch):
+    class FailingSession:
+        def post(self, *args, **kwargs):
+            raise AssertionError("HTTP must not be called by generate_signal_candidates()")
+
+    monkeypatch.setattr(sg.requests, "post", FailingSession().post)
+
+    class FailingStore:
+        def __getattr__(self, name):
+            raise AssertionError(f"paper_signal_store.{name} must not be called by generate_signal_candidates()")
+
+    monkeypatch.setattr(sg, "store", FailingStore())
+
+    context = make_context()
+    candidates = sg.generate_signal_candidates(context)
+
+    assert candidates == sg.build_candidates(
+        context["bias_result"], context["hourly_snapshots"], confidence_threshold=context["confidence_threshold"]
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["side"] == "long"
+
+
+def test_generate_signal_candidates_is_deterministic_for_the_same_context():
+    context = make_context()
+
+    first = sg.generate_signal_candidates(context)
+    second = sg.generate_signal_candidates(context)
+
+    assert first == second
+
+
+def test_generate_signal_returns_first_candidate():
+    context = make_context()
+
+    signal = sg.generate_signal(context)
+
+    candidates = sg.generate_signal_candidates(context)
+    assert signal == candidates[0]
+
+
+def test_generate_signal_returns_none_when_no_candidates():
+    context = make_context(bias_result=make_bias(market_bias="Neutral"))
+
+    assert sg.generate_signal(context) is None
+
+
+def test_generate_signal_candidates_never_creates_a_db_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sg, "DB_PATH", tmp_path / "paper_signals.sqlite3")
+
+    context = make_context()
+    sg.generate_signal_candidates(context)
+    sg.generate_signal(context)
+
+    assert not (tmp_path / "paper_signals.sqlite3").exists()
+
+
+def test_run_once_uses_generate_signal_candidates(monkeypatch):
+    sources = {
+        "market": {},
+        "fred": None,
+        "tradingview": {},
+        "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
+    }
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
+    monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False: None)
+
+    calls = []
+    original = sg.generate_signal_candidates
+
+    def spy(context):
+        calls.append(context)
+        return original(context)
+
+    monkeypatch.setattr(sg, "generate_signal_candidates", spy)
+
+    created = sg.run_once(dry_run=True)
+
+    assert len(calls) == 1
+    assert len(created) == 1
+
+
 # --- Rule 9: duplicate suppression within the run_once pipeline ---
 
 

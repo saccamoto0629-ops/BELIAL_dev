@@ -36,7 +36,7 @@ from market_bias import classify_market_bias  # noqa: E402  (news-feed-bot)
 from market_snapshot import fetch_snapshot_sources  # noqa: E402  (news-feed-bot)
 
 import paper_signal_store as store  # noqa: E402
-from signal_models import create_paper_signal  # noqa: E402
+from signal_models import create_paper_signal, create_signal_context  # noqa: E402
 
 REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_CONFIDENCE_THRESHOLD = 0.40
@@ -182,6 +182,31 @@ def build_candidates(
     return candidates
 
 
+def generate_signal_candidates(context: dict) -> list[dict]:
+    """Return paper-signal candidates for *context*, with zero side effects.
+
+    Pure reuse of build_candidates()'s existing rules over already-fetched
+    Market Bias + Chart Snapshot data (see ``signal_models.SignalContext``).
+    Never touches SQLite, Discord, HTTP, or paper_signal_store -- safe for
+    Backtest to call directly, repeatedly, with no persistence.
+    """
+    return build_candidates(
+        context["bias_result"],
+        context["hourly_snapshots"],
+        confidence_threshold=context.get("confidence_threshold", CONFIDENCE_THRESHOLD),
+    )
+
+
+def generate_signal(context: dict) -> dict | None:
+    """Return the first candidate from generate_signal_candidates(), or None.
+
+    Same zero-side-effect guarantee as generate_signal_candidates(): no DB,
+    no Discord, no HTTP, no store calls.
+    """
+    candidates = generate_signal_candidates(context)
+    return candidates[0] if candidates else None
+
+
 def format_discord_message(signal: dict) -> str:
     lines = [
         "\U0001f4dd Paper Signal",
@@ -233,7 +258,8 @@ def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
         chart_data=hourly_snapshots,
     )
 
-    candidates = build_candidates(bias_result, hourly_snapshots)
+    context = create_signal_context(bias_result, hourly_snapshots, confidence_threshold=CONFIDENCE_THRESHOLD)
+    candidates = generate_signal_candidates(context)
     created: list[dict] = []
 
     if not candidates:
