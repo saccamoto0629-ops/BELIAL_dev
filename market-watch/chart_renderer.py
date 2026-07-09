@@ -76,6 +76,22 @@ def _min_body_height(frame: pd.DataFrame, price_range: float, *, source: str = "
     return max(typical_body * 0.25, price_range * 0.0006, 0.00002)
 
 
+def _to_jst_naive_index(index: pd.Index) -> pd.DatetimeIndex:
+    """Convert a UTC-based candle index to JST wall-clock time for display.
+
+    Storage and provider timestamps stay UTC; only this rendering step
+    shifts to Asia/Tokyo so the x-axis matches how the chart is read
+    (e.g. on Discord). The tz is dropped after conversion so mdates treats
+    the values as plain JST wall-clock instants instead of re-localizing.
+    """
+    utc_index = pd.DatetimeIndex(pd.to_datetime(index))
+    if utc_index.tz is None:
+        utc_index = utc_index.tz_localize("UTC")
+    else:
+        utc_index = utc_index.tz_convert("UTC")
+    return utc_index.tz_convert("Asia/Tokyo").tz_localize(None)
+
+
 def _visible_body_bounds(open_price: float, close_price: float, min_body_height: float) -> tuple[float, float]:
     body_low = min(open_price, close_price)
     body_high = max(open_price, close_price)
@@ -189,7 +205,7 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
         title,
     )
 
-    x_values = mdates.date2num(pd.to_datetime(frame.index).to_pydatetime())
+    x_values = mdates.date2num(_to_jst_naive_index(frame.index).to_pydatetime())
     if len(x_values) > 1:
         candle_steps = pd.Series(x_values).diff().dropna()
         positive_steps = candle_steps[candle_steps > 0]
@@ -271,6 +287,7 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
     macd_ax.plot(x_values, signal, color="#f78166", linewidth=1.0, label="Signal")
     macd_ax.legend(facecolor="#161b22", edgecolor="#3d444d", labelcolor="#d0d7de")
     macd_ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    macd_ax.set_xlabel("Time (JST)", color="#d0d7de")
 
     fig.autofmt_xdate()
     fig.tight_layout()

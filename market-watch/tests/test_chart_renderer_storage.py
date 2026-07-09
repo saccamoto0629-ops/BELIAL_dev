@@ -184,6 +184,44 @@ def test_render_chart_snapshot_draws_candlestick_wicks_and_bodies_from_ohlc(tmp_
     assert len(set(round(height, 6) for height in body_heights)) > 1
 
 
+def test_to_jst_naive_index_shifts_utc_by_nine_hours():
+    utc_index = pd.date_range("2026-07-05T00:00:00", periods=3, freq="15min", tz="UTC")
+
+    jst_index = chart_renderer._to_jst_naive_index(utc_index)
+
+    assert jst_index.tz is None
+    assert list(jst_index) == list(pd.date_range("2026-07-05T09:00:00", periods=3, freq="15min"))
+
+
+def test_render_chart_snapshot_plots_x_axis_in_jst_not_utc(tmp_path, monkeypatch):
+    plt = pytest.importorskip("matplotlib.pyplot")
+    import matplotlib.dates as mdates
+
+    candles = make_candles()
+    expected_first_jst = candles.index[0].tz_convert("Asia/Tokyo").tz_localize(None).to_pydatetime()
+    expected_first_utc_naive = candles.index[0].tz_localize(None).to_pydatetime()
+
+    captured_x = []
+    original_vlines = plt.Axes.vlines
+
+    def spy_vlines(self, x, ymin, ymax, *args, **kwargs):
+        captured_x.append(x)
+        return original_vlines(self, x, ymin, ymax, *args, **kwargs)
+
+    monkeypatch.setattr(plt.Axes, "vlines", spy_vlines)
+
+    chart_renderer.render_chart_snapshot(
+        candles,
+        tmp_path / "snapshot.png",
+        title="USDJPY 15m Chart Snapshot",
+    )
+
+    # The candle's UTC storage timestamp must render nine hours ahead, at
+    # its JST wall-clock time, not at the raw UTC instant.
+    assert captured_x[0] == pytest.approx(mdates.date2num(expected_first_jst))
+    assert captured_x[0] != pytest.approx(mdates.date2num(expected_first_utc_naive))
+
+
 def test_render_chart_snapshot_requires_real_ohlc(tmp_path):
     close_only = pd.DataFrame(
         {"close": [1.0, 2.0, 3.0]},
