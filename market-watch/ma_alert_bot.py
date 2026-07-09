@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import time
 import tomllib
 from dataclasses import dataclass
@@ -35,6 +36,15 @@ STATE_FILE = STATE_DIR / "ma_alert_state.json"
 
 REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_MA_NAMES = ["sma20", "sma75", "ema20"]
+
+# Touch-zone notification state. This tracks whether a symbol/timeframe/MA is
+# still inside the same touch zone it was already notified for, so Discord
+# only hears about the outside -> touching transition, not every confirmed
+# candle that continues to touch. It never affects raw MA touch detection.
+TOUCH_STATUS_OUTSIDE = "outside"
+TOUCH_STATUS_TOUCHING = "touching"
+DEFAULT_ZONE_KEY = "default"
+SAME_TOUCH_ZONE_REASON = "same_touch_zone"
 
 DEFAULT_CONFIG = {
     "symbol": "USD_JPY",
@@ -252,6 +262,155 @@ def state_key(symbol, timeframe, ma_name, candle_time):
     return f"{symbol}_{timeframe}_{ma_name}_{candle_time}"
 
 
+def parse_ma_name(ma_name):
+    """Split an MA name like ``sma20`` into (``ma_type``, ``ma_period``).
+
+    Falls back to (ma_name, None) for names that do not match the usual
+    ``<type><period>`` shape, so unexpected config values never raise here.
+    """
+    match = re.fullmatch(r"([a-zA-Z]+)(\d+)", ma_name or "")
+    if not match:
+        return ma_name, None
+    return match.group(1).lower(), int(match.group(2))
+
+
+def zone_state_key(symbol, timeframe, ma_type, ma_period, zone_key=DEFAULT_ZONE_KEY):
+    """Identify a touch zone by symbol/timeframe/ma_type/ma_period/zone_key.
+
+    ``zone_key`` defaults to a single zone per MA today, but is a distinct
+    dimension so future work (e.g. multiple touch bands per MA) does not
+    require changing the state shape.
+    """
+    return f"{symbol}_{timeframe}_{ma_type}_{ma_period}_{zone_key}"
+
+
+@dataclass(frozen=True)
+class MaTouchNotificationDecision:
+    """Whether a raw MA touch event should reach Discord.
+
+    Suppressing a notification never means the raw touch didn't happen --
+    ``reason`` explains why Discord was skipped, for observability.
+    """
+
+    should_notify: bool
+    reason: str | None
+    previous_status: str
+    new_status: str
+    zone_key: str
+
+
+def decide_ma_touch_notification(raw_event, state, *, zone_key=DEFAULT_ZONE_KEY):
+    """Decide whether a raw MA touch event should notify Discord.
+
+    Pure function: reads ``state`` but never mutates or saves it. The first
+    touch after being outside the zone notifies; touches while still inside
+    the same zone are suppressed with reason=same_touch_zone.
+    """
+    key = zone_state_key(
+        raw_event["symbol"],
+        raw_event["timeframe"],
+        raw_event["ma_type"],
+        raw_event["ma_period"],
+        zone_key,
+    )
+    zone_state = (state.get("touch_zones") or {}).get(key)
+    previous_status = (zone_state or {}).get("status", TOUCH_STATUS_OUTSIDE)
+    should_notify = previous_status != TOUCH_STATUS_TOUCHING
+
+    return MaTouchNotificationDecision(
+        should_notify=should_notify,
+        reason=None if should_notify else SAME_TOUCH_ZONE_REASON,
+        previous_status=previous_status,
+        new_status=TOUCH_STATUS_TOUCHING,
+        zone_key=key,
+    )
+
+
+def build_touch_zone_state(*, candle_time, status, raw_event=None):
+    entry = {
+        "status": status,
+        "candle_time": candle_time,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if raw_event is not None:
+        entry["distance_pct"] = raw_event["distance_pct"]
+        entry["side"] = raw_event["side"]
+    return entry
+
+
+def save_raw_event(raw_event):
+    """Record the raw MA touch fact, independent of any notification decision.
+
+    This is what backtesting/analysis should read from: it is unaffected by
+    whether Discord notification was later suppressed.
+    """
+    logger.info(
+        "MA touch raw event: symbol=%s timeframe=%s ma=%s candle=%s distance_pct=%.5f side=%s "
+        "close=%.5f ma_value=%.5f",
+        raw_event["symbol"],
+        raw_event["timeframe"],
+        raw_event["ma_name"],
+        raw_event["candle_time"],
+        raw_event["distance_pct"],
+        raw_event["side"],
+        raw_event["close"],
+        raw_event["ma_value"],
+    )
+
+
+def save_notification_decision(raw_event, decision):
+    logger.info(
+        "MA touch notification decision: symbol=%s timeframe=%s ma=%s candle=%s should_notify=%s "
+        "previous_status=%s new_status=%s reason=%s",
+        raw_event["symbol"],
+        raw_event["timeframe"],
+        raw_event["ma_name"],
+        raw_event["candle_time"],
+        decision.should_notify,
+        decision.previous_status,
+        decision.new_status,
+        decision.reason,
+    )
+
+
+def update_state_if_left_touch_zone(
+    state,
+    *,
+    symbol,
+    timeframe,
+    ma_type,
+    ma_period,
+    candle_time,
+    dry_run=False,
+    zone_key=DEFAULT_ZONE_KEY,
+):
+    """Reset a touch zone to outside once price is no longer touching the MA.
+
+    No-op when the zone was already outside (or never seen), and never
+    persists anything in dry-run.
+    """
+    key = zone_state_key(symbol, timeframe, ma_type, ma_period, zone_key)
+    zone_state = (state.get("touch_zones") or {}).get(key)
+    if not zone_state or zone_state.get("status") != TOUCH_STATUS_TOUCHING:
+        return False
+
+    logger.info(
+        "MA touch zone exited: symbol=%s timeframe=%s ma_type=%s ma_period=%s candle=%s "
+        "(back to outside; next touch will notify again)",
+        symbol,
+        timeframe,
+        ma_type,
+        ma_period,
+        candle_time,
+    )
+    if not dry_run:
+        state.setdefault("touch_zones", {})[key] = build_touch_zone_state(
+            candle_time=candle_time,
+            status=TOUCH_STATUS_OUTSIDE,
+        )
+    return True
+
+
 def fetch_candles():
     ticker = yf.Ticker(TICKER)
     history = ticker.history(
@@ -355,10 +514,13 @@ def notify_touch(event, *, dry_run=False, candles=None):
 
 
 def build_touch_event(ma_name, candle_time, close_price, ma_value, touch):
+    ma_type, ma_period = parse_ma_name(ma_name)
     return {
         "symbol": SYMBOL,
         "timeframe": TIMEFRAME,
         "ma_name": ma_name,
+        "ma_type": ma_type,
+        "ma_period": ma_period,
         "candle_time": candle_time,
         "close": float(close_price),
         "ma_value": float(ma_value),
@@ -429,27 +591,67 @@ def run_once(state, *, dry_run=False):
             continue
 
         ma_value = row[ma_name]
+        ma_type, ma_period = parse_ma_name(ma_name)
+
+        # Raw detection: has price touched this MA on the confirmed candle?
+        # This fact is recorded below regardless of whether Discord ends up
+        # notified -- notification suppression must never erase it.
         touch = detect_ma_touch(close_price, ma_value, threshold_pct=THRESHOLD_PCT)
+
         if not touch:
+            state_changed = update_state_if_left_touch_zone(
+                state,
+                symbol=SYMBOL,
+                timeframe=TIMEFRAME,
+                ma_type=ma_type,
+                ma_period=ma_period,
+                candle_time=candle_time,
+                dry_run=dry_run,
+            )
+            if state_changed and not dry_run:
+                save_state(state)
             continue
 
         key = state_key(SYMBOL, TIMEFRAME, ma_name, candle_time)
         if key in state:
-            logger.info("MA touch already notified for %s; skipping.", key)
+            logger.info("MA touch already processed for %s; skipping.", key)
             continue
 
-        event = build_touch_event(ma_name, candle_time, close_price, ma_value, touch)
-        notify_touch(event, dry_run=dry_run, candles=candles)
+        raw_event = build_touch_event(ma_name, candle_time, close_price, ma_value, touch)
+        save_raw_event(raw_event)
+
+        decision = decide_ma_touch_notification(raw_event, state)
+        save_notification_decision(raw_event, decision)
+
+        if decision.should_notify:
+            notify_touch(raw_event, dry_run=dry_run, candles=candles)
+        else:
+            logger.info(
+                "MA touch notification suppressed: symbol=%s timeframe=%s ma=%s candle=%s reason=%s",
+                raw_event["symbol"],
+                raw_event["timeframe"],
+                raw_event["ma_name"],
+                raw_event["candle_time"],
+                decision.reason,
+            )
+
         if not dry_run:
             state[key] = {
                 "candle_time": candle_time,
                 "ma_name": ma_name,
-                "close": event["close"],
-                "ma_value": event["ma_value"],
-                "distance_pct": event["distance_pct"],
-                "side": event["side"],
-                "notified_at": event["notified_at"],
+                "close": raw_event["close"],
+                "ma_value": raw_event["ma_value"],
+                "distance_pct": raw_event["distance_pct"],
+                "side": raw_event["side"],
+                "notified_at": raw_event["notified_at"],
+                "suppressed": not decision.should_notify,
+                "suppress_reason": decision.reason,
             }
+            state.setdefault("touch_zones", {})[decision.zone_key] = build_touch_zone_state(
+                candle_time=candle_time,
+                status=decision.new_status,
+                raw_event=raw_event,
+            )
             save_state(state)
 
 

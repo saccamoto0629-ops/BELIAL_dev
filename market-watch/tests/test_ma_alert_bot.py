@@ -169,6 +169,258 @@ def test_debug_render_ma_touch_uses_alert_renderer(monkeypatch, tmp_path):
     assert captured["event_type"] == "ma_touch"
 
 
+def _touch_event(**overrides):
+    base = {
+        "symbol": "USD_JPY",
+        "timeframe": "M15",
+        "ma_name": "sma20",
+        "ma_type": "sma",
+        "ma_period": 20,
+        "candle_time": "2026-07-01T00:00:00+00:00",
+        "close": 100.0,
+        "ma_value": 100.0,
+        "distance_pct": 0.0,
+        "side": "above",
+        "notified_at": "2026-07-01T00:00:00+00:00",
+        "detected_at": "2026-07-01T00:00:00+00:00",
+    }
+    base.update(overrides)
+    return base
+
+
+# --- Issue #16: raw detection vs. notification decision separation --------
+
+
+def test_parse_ma_name_splits_type_and_period():
+    assert bot.parse_ma_name("sma20") == ("sma", 20)
+    assert bot.parse_ma_name("ema200") == ("ema", 200)
+
+
+def test_parse_ma_name_falls_back_for_unexpected_format():
+    assert bot.parse_ma_name("weird_name") == ("weird_name", None)
+
+
+def test_zone_state_key_differs_by_symbol_timeframe_ma_type_period():
+    keys = {
+        bot.zone_state_key("USD_JPY", "M15", "sma", 20),
+        bot.zone_state_key("EUR_USD", "M15", "sma", 20),
+        bot.zone_state_key("USD_JPY", "H1", "sma", 20),
+        bot.zone_state_key("USD_JPY", "M15", "ema", 20),
+        bot.zone_state_key("USD_JPY", "M15", "sma", 75),
+    }
+
+    assert len(keys) == 5
+
+
+def test_build_touch_event_includes_ma_type_and_period():
+    event = bot.build_touch_event("ema20", "t", 100.0, 100.0, {"distance_pct": 0.0, "side": "above"})
+
+    assert event["ma_type"] == "ema"
+    assert event["ma_period"] == 20
+
+
+def test_decide_ma_touch_notification_notifies_on_first_touch_from_outside():
+    decision = bot.decide_ma_touch_notification(_touch_event(), {})
+
+    assert decision.should_notify is True
+    assert decision.reason is None
+    assert decision.previous_status == "outside"
+    assert decision.new_status == "touching"
+
+
+def test_decide_ma_touch_notification_suppresses_while_still_touching():
+    zone_key = bot.zone_state_key("USD_JPY", "M15", "sma", 20)
+    state = {"touch_zones": {zone_key: {"status": "touching"}}}
+
+    decision = bot.decide_ma_touch_notification(_touch_event(), state)
+
+    assert decision.should_notify is False
+    assert decision.reason == "same_touch_zone"
+
+
+def test_decide_ma_touch_notification_is_pure_and_does_not_mutate_state():
+    """save_event() must not live inside the decision function."""
+    state = {"touch_zones": {}}
+
+    bot.decide_ma_touch_notification(_touch_event(), state)
+
+    assert state == {"touch_zones": {}}
+
+
+def test_decide_ma_touch_notification_is_independent_per_symbol():
+    zone_key = bot.zone_state_key("USD_JPY", "M15", "sma", 20)
+    state = {"touch_zones": {zone_key: {"status": "touching"}}}
+    other_symbol_event = _touch_event(symbol="EUR_USD")
+
+    decision = bot.decide_ma_touch_notification(other_symbol_event, state)
+
+    assert decision.should_notify is True
+
+
+def test_update_state_if_left_touch_zone_resets_touching_to_outside():
+    zone_key = bot.zone_state_key("USD_JPY", "M15", "sma", 20)
+    state = {"touch_zones": {zone_key: {"status": "touching"}}}
+
+    changed = bot.update_state_if_left_touch_zone(
+        state,
+        symbol="USD_JPY",
+        timeframe="M15",
+        ma_type="sma",
+        ma_period=20,
+        candle_time="2026-07-01T00:15:00+00:00",
+    )
+
+    assert changed is True
+    assert state["touch_zones"][zone_key]["status"] == "outside"
+
+
+def test_update_state_if_left_touch_zone_is_noop_when_already_outside():
+    state = {}
+
+    changed = bot.update_state_if_left_touch_zone(
+        state,
+        symbol="USD_JPY",
+        timeframe="M15",
+        ma_type="sma",
+        ma_period=20,
+        candle_time="2026-07-01T00:15:00+00:00",
+    )
+
+    assert changed is False
+    assert state == {}
+
+
+def test_update_state_if_left_touch_zone_respects_dry_run():
+    zone_key = bot.zone_state_key("USD_JPY", "M15", "sma", 20)
+    state = {"touch_zones": {zone_key: {"status": "touching"}}}
+
+    changed = bot.update_state_if_left_touch_zone(
+        state,
+        symbol="USD_JPY",
+        timeframe="M15",
+        ma_type="sma",
+        ma_period=20,
+        candle_time="2026-07-01T00:15:00+00:00",
+        dry_run=True,
+    )
+
+    assert changed is True
+    assert state["touch_zones"][zone_key]["status"] == "touching"
+
+
+def test_run_once_suppresses_consecutive_touch_in_same_zone(monkeypatch):
+    posted = []
+    saved = []
+    state = {}
+
+    first_candles = _make_candles([100.0] * 80)
+    _patch_common(monkeypatch, first_candles, posted, saved)
+    bot.run_once(state, dry_run=False)
+    assert len(posted) == 1
+
+    second_candles = _make_candles([100.0] * 81)
+    monkeypatch.setattr(bot, "fetch_candles", lambda: second_candles)
+    bot.run_once(state, dry_run=False)
+
+    # Still touching the same MA zone: no second Discord notification.
+    assert len(posted) == 1
+
+    candle_time = second_candles.index[-2].isoformat()
+    key = bot.state_key("USD_JPY", "M15", "sma20", candle_time)
+    assert key in state
+    assert state[key]["suppressed"] is True
+    assert state[key]["suppress_reason"] == "same_touch_zone"
+    # The raw touch fact is still fully recorded even though suppressed.
+    assert state[key]["candle_time"] == candle_time
+    assert state[key]["side"] == "above"
+
+
+def test_run_once_notifies_again_after_leaving_and_retouching_zone(monkeypatch):
+    posted = []
+    saved = []
+    state = {}
+
+    block_a = [100.0] * 80
+    block_b = [105.0] * 3  # far enough from SMA20 to clearly exit the zone
+    block_c = [100.0] * 25  # flushes the spike out of the 20-period window
+
+    first_candles = _make_candles(block_a)
+    _patch_common(monkeypatch, first_candles, posted, saved)
+    bot.run_once(state, dry_run=False)
+    assert len(posted) == 1  # first touch: outside -> touching
+
+    left_zone_candles = _make_candles(block_a + block_b)
+    monkeypatch.setattr(bot, "fetch_candles", lambda: left_zone_candles)
+    bot.run_once(state, dry_run=False)
+    assert len(posted) == 1  # not touching: zone resets to outside, no notification
+
+    zone_key = bot.zone_state_key("USD_JPY", "M15", "sma", 20)
+    assert state["touch_zones"][zone_key]["status"] == "outside"
+    assert saved[-1]["touch_zones"][zone_key]["status"] == "outside"
+
+    retouch_candles = _make_candles(block_a + block_b + block_c)
+    monkeypatch.setattr(bot, "fetch_candles", lambda: retouch_candles)
+    bot.run_once(state, dry_run=False)
+
+    # Re-entering the zone after fully leaving it notifies again.
+    assert len(posted) == 2
+    assert state["touch_zones"][zone_key]["status"] == "touching"
+
+
+def test_run_once_treats_different_symbol_as_independent_zone(monkeypatch):
+    posted = []
+    saved = []
+    state = {
+        "touch_zones": {
+            bot.zone_state_key("EUR_USD", "M15", "sma", 20): {"status": "touching"},
+        }
+    }
+
+    candles = _make_candles([100.0] * 80)
+    _patch_common(monkeypatch, candles, posted, saved)
+
+    bot.run_once(state, dry_run=False)
+
+    # USD_JPY's zone was never "touching", so this is a fresh first touch.
+    assert len(posted) == 1
+
+
+def test_run_once_dry_run_has_no_touch_zone_side_effects(monkeypatch):
+    candles = _make_candles([100.0] * 80)
+    posted = []
+    saved = []
+    _patch_common(monkeypatch, candles, posted, saved)
+
+    state = {}
+    bot.run_once(state, dry_run=True)
+    bot.run_once(state, dry_run=True)
+
+    # dry-run never persists state, so suppression can never kick in either;
+    # both calls notify, and no touch_zones (or any other) state is written.
+    assert len(posted) == 2
+    assert state == {}
+    assert saved == []
+
+
+def test_suppressed_touch_still_logs_raw_event_and_decision(monkeypatch, caplog):
+    posted = []
+    saved = []
+    state = {}
+
+    first_candles = _make_candles([100.0] * 80)
+    _patch_common(monkeypatch, first_candles, posted, saved)
+    bot.run_once(state, dry_run=False)
+
+    second_candles = _make_candles([100.0] * 81)
+    monkeypatch.setattr(bot, "fetch_candles", lambda: second_candles)
+
+    with caplog.at_level("INFO"):
+        bot.run_once(state, dry_run=False)
+
+    assert "MA touch raw event" in caplog.text
+    assert "same_touch_zone" in caplog.text
+
+
 def test_load_config_reads_ma_alert_section(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
