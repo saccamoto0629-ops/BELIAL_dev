@@ -14,6 +14,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | [docs/architecture/](docs/architecture/README.md) | 全体構成、コンポーネント責務、DB設計、各モジュールの現行仕様 |
 | [docs/operations/](docs/operations/README.md) | 環境変数、起動手順、dry-run方針、systemd運用 |
 | [docs/development/](docs/development/README.md) | Issue / PR 運用ルール |
+| [docs/testing/](docs/testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
 
 最初に読むべきドキュメント:
 
