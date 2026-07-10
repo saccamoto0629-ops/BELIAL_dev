@@ -76,6 +76,7 @@ def test_run_once_notifies_and_records_state_on_cross(monkeypatch):
     monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
 
     posted = []
+    monkeypatch.setattr(bot, "prepare_alert_image", lambda **kwargs: (None, None))
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append(embed))
     monkeypatch.setattr(bot, "save_state", lambda state: None)
 
@@ -97,6 +98,7 @@ def test_run_once_does_not_duplicate_notification_for_same_candle(monkeypatch):
     monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
 
     posted = []
+    monkeypatch.setattr(bot, "prepare_alert_image", lambda **kwargs: (None, None))
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append(embed))
     monkeypatch.setattr(bot, "save_state", lambda state: None)
 

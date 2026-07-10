@@ -44,6 +44,7 @@ def _patch_common(monkeypatch, candles, posted, saved):
         },
     )
     monkeypatch.setattr(bot, "fetch_candles", lambda: candles)
+    monkeypatch.setattr(bot, "prepare_alert_image", lambda **kwargs: (None, None))
     monkeypatch.setattr(bot, "post_discord_embed", lambda embed, dry_run=False, image_url=None: posted.append((embed, dry_run)))
     monkeypatch.setattr(bot, "save_state", lambda state: saved.append(dict(state)))
 
