@@ -19,6 +19,14 @@ Only candles at or after ``--from`` (and at or before ``--to``) are ever
 returned as a BarEvaluation (see warmup.split_warmup_and_validation() /
 evaluate_backtest_bars()); warm-up candles seed indicator calculations only
 and never appear in the result summary or in saved backtest_signals rows.
+
+Issue #23 adds a ``summary`` subcommand (``python -m backtest summary
+--run-id ...``) alongside the original flat/bare-flags invocation, which
+is preserved unchanged as an implicit ``run`` (see _normalize_argv()). It
+re-fetches a past run's signals and renders the same win/loss/pnl
+performance summary that ``run`` now also prints automatically after
+finishing -- see summary.py for the aggregation and report.py for
+text/JSON/Markdown rendering.
 """
 
 from __future__ import annotations
@@ -46,12 +54,19 @@ import warmup  # noqa: E402
 import chart_collector  # noqa: E402  (market-watch)
 import exit_policy  # noqa: E402  (paper-signal)
 from market_bias_store import get_market_bias_as_of, market_bias_db_path  # noqa: E402  (news-feed-bot)
+import summary as signal_summary  # noqa: E402  (Issue #23: signal-level win/loss/pnl aggregation)
+import report  # noqa: E402  (Issue #23: text/JSON/Markdown rendering)
 
 logger = logging.getLogger("backtest.runner")
 
 EXIT_OK = 0
 EXIT_USAGE_ERROR = 2
 EXIT_NO_DATA = 3
+
+# list_backtest_signals() defaults to limit=1000; re-fetching a past run's
+# signals for a summary must never silently truncate, so the "summary"
+# subcommand asks for a much larger cap explicitly instead.
+SUMMARY_SIGNAL_FETCH_LIMIT = 1_000_000
 
 DEFAULT_STRATEGY_NAME = "paper_signal_generator"
 NEUTRAL_BIAS_PLACEHOLDER = {
@@ -96,6 +111,23 @@ def _unit_float(value: str) -> float:
     return parsed
 
 
+def _normalize_argv(argv=None) -> list[str]:
+    """Prepend the "run" subcommand when the caller omitted it.
+
+    Issue #33 shipped a flat CLI (``--symbol --timeframe --from --to``,
+    no subcommand). Issue #23 adds a second "summary" subcommand, but every
+    existing invocation -- including every prior test's bare-flags
+    ``parse_args([...])`` call -- must keep working unchanged. Any argv
+    that doesn't already start with a known subcommand (or ``-h``/
+    ``--help``, so top-level help still shows the "run" options) is treated
+    as an implicit ``run``.
+    """
+    resolved = list(sys.argv[1:] if argv is None else argv)
+    if resolved and resolved[0] in ("run", "summary"):
+        return resolved
+    return ["run", *resolved]
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="backtest",
@@ -105,57 +137,85 @@ def parse_args(argv=None) -> argparse.Namespace:
             "Discord notification."
         ),
     )
-    parser.add_argument("--symbol", required=True, help="e.g. USD_JPY")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run a backtest over a validation window (default when no subcommand is given).",
+    )
+    run_parser.add_argument("--symbol", required=True, help="e.g. USD_JPY")
+    run_parser.add_argument(
         "--timeframe",
         required=True,
         help="Must match how candles were saved in the Chart DB, e.g. 15m, 1h, 4h.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--from",
         dest="from_time",
         required=True,
         help="Validation window start (inclusive), ISO-8601, e.g. 2026-06-01T00:00:00. "
         "Naive timestamps are treated as UTC.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--to",
         dest="to_time",
         required=True,
         help="Validation window end (inclusive), ISO-8601, e.g. 2026-06-30T23:59:59.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--db-path",
         help="Path to the Chart DB (candles). Defaults to CHART_DB_PATH / market-watch/data/chart_data.sqlite3.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--backtest-db-path",
         help="Path to the Backtest results DB. Defaults to BACKTEST_DB_PATH / backtest/data/backtest_results.sqlite3.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--market-bias-db-path",
         help="Path to the Market Bias DB. Defaults to MARKET_BIAS_DB_PATH / news-feed-bot/data/market_bias.sqlite3.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--warmup-bars",
         type=_positive_int,
         default=warmup.DEFAULT_WARMUP_BARS,
         help=f"Candles required before --from to seed indicators (default {warmup.DEFAULT_WARMUP_BARS}). Must be >= 1.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--confidence-threshold",
         type=_unit_float,
         default=None,
         help="Overrides the Paper Signal Generator's default confidence threshold. Must be between 0.0 and 1.0.",
     )
-    parser.add_argument(
+    run_parser.add_argument(
         "--exit-config",
         help="Path to an Exit Policy JSON config (see paper-signal/exit_policy.py). "
         "Defaults to BACKTEST_EXIT_CONFIG_PATH / built-in defaults.",
     )
-    parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
-    parser.add_argument("--strategy-name", default=DEFAULT_STRATEGY_NAME)
-    return parser.parse_args(argv)
+    run_parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
+    run_parser.add_argument("--strategy-name", default=DEFAULT_STRATEGY_NAME)
+
+    summary_parser = subparsers.add_parser(
+        "summary",
+        help="Re-display or export a past run's signal-level performance summary.",
+    )
+    summary_parser.add_argument("--run-id", required=True, help="backtest_runs.id to summarize.")
+    summary_parser.add_argument(
+        "--backtest-db-path",
+        help="Path to the Backtest results DB. Defaults to BACKTEST_DB_PATH / backtest/data/backtest_results.sqlite3.",
+    )
+    summary_parser.add_argument(
+        "--format",
+        choices=report.KNOWN_FORMATS,
+        default=report.FORMAT_TEXT,
+        help=f"Output format (default: {report.FORMAT_TEXT}).",
+    )
+    summary_parser.add_argument(
+        "--output",
+        help="Write the rendered summary to this file instead of only printing it. "
+        "Parent directories are created automatically; an existing file is overwritten.",
+    )
+
+    return parser.parse_args(_normalize_argv(argv))
 
 
 def _chart_symbol(symbol: str) -> str:
@@ -327,6 +387,10 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         "signals_generated": len(signal_records),
         "result_counts": _summarize(signal_records),
         "backtest_db_path": str(backtest_db_path),
+        # Issue #23: win/loss/pnl performance summary for this run, built
+        # from the exact signal_records just saved (no extra DB round-trip
+        # needed since they're already in memory). Safe when empty.
+        "signal_summary": signal_summary.build_summary(run_record["id"], signal_records),
     }
     return EXIT_OK, summary
 
@@ -351,15 +415,66 @@ def print_summary(summary: dict) -> None:
     print(f"Backtest DB:         {summary['backtest_db_path']}")
 
 
+def run_summary_command(args: argparse.Namespace) -> int:
+    """Re-fetch a past run_id's signals and print/export its performance summary.
+
+    Read-only against the Backtest DB except for the optional ``--output``
+    file write: never touches backtest_runs/backtest_signals, Discord, or
+    any broker/Execution API.
+    """
+    backtest_db_path = Path(args.backtest_db_path) if args.backtest_db_path else store.backtest_db_path()
+
+    run = store.get_backtest_run(args.run_id, db_path=backtest_db_path)
+    if run is None:
+        print(
+            f"error: no backtest run found for run_id={args.run_id!r} in {backtest_db_path}",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DATA
+
+    signals = store.list_backtest_signals(args.run_id, db_path=backtest_db_path, limit=SUMMARY_SIGNAL_FETCH_LIMIT)
+    result = signal_summary.build_summary(args.run_id, signals)
+
+    try:
+        content = report.render(result, args.format)
+    except ValueError as exc:
+        # e.g. render_json()'s allow_nan=False guard tripping on a NaN/Infinity
+        # that should never occur -- surfaced as a clean CLI error instead of
+        # a traceback, same as any other malformed-input case here.
+        print(f"error: could not render summary: {exc}", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+
+    if args.output:
+        try:
+            saved_path = report.save_summary(content, args.output)
+        except OSError as exc:
+            # A bad --output path (permission denied, --output pointing at an
+            # existing directory, disk full, ...) must surface as a short CLI
+            # error, not an uncaught traceback -- this is the only place this
+            # subcommand writes a file, so it's the only place this can fail.
+            print(f"error: could not write summary to {args.output}: {exc}", file=sys.stderr)
+            return EXIT_USAGE_ERROR
+        print(f"Saved summary to {saved_path}")
+    else:
+        print(content)
+
+    return EXIT_OK
+
+
 def main(argv=None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     args = parse_args(argv)
-    exit_code, summary = run_backtest(args)
-    if summary is not None:
-        print_summary(summary)
+    if args.command == "summary":
+        return run_summary_command(args)
+
+    exit_code, run_result = run_backtest(args)
+    if run_result is not None:
+        print_summary(run_result)
+        print()
+        print(report.render_text(run_result["signal_summary"]))
     return exit_code
 
 

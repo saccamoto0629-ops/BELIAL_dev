@@ -186,6 +186,16 @@ def apply_exit_policy_result(signal_record: dict, exit_result) -> dict:
       mfe          -> mfe
       mae          -> mae
 
+    ``pnl`` (price-units, ``close_price - entry_price`` for "long",
+    ``entry_price - close_price`` for "short") is computed here too, once
+    ``close_price``/``entry_price``/``direction`` are all available --
+    this is the only place a signal's pnl is ever derived, so Backtest
+    reporting (see backtest/summary.py) has a real value to aggregate
+    instead of every signal reading back with ``pnl=None``. When there is
+    no ``close_price`` yet (still "open"/"no_close"), ``pnl`` is left
+    exactly as it was on ``signal_record`` (``None`` unless the caller
+    already set one) -- never fabricated for an unresolved signal.
+
     Returns a new dict (``signal_record`` is not mutated); all other
     fields of ``signal_record`` (id, run_id, entry_price, ...) pass through
     unchanged.
@@ -204,4 +214,11 @@ def apply_exit_policy_result(signal_record: dict, exit_result) -> dict:
     updated["exit_policy"] = _field("exit_policy")
     updated["mfe"] = _field("mfe")
     updated["mae"] = _field("mae")
+
+    close_price = updated["close_price"]
+    entry_price = signal_record.get("entry_price")
+    direction = signal_record.get("direction")
+    if close_price is not None and entry_price is not None and direction in ("long", "short"):
+        updated["pnl"] = (close_price - entry_price) if direction == "long" else (entry_price - close_price)
+
     return updated

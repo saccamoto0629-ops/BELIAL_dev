@@ -113,6 +113,57 @@ def test_apply_exit_policy_result_preserves_unrelated_fields():
     assert updated["closed_at"] is None
 
 
+def test_apply_exit_policy_result_computes_pnl_for_a_long_win():
+    # Regression (Issue #23): backtest/summary.py's win/loss/pnl metrics are
+    # only meaningful if pnl actually gets populated here -- it previously
+    # never did, so every signal read back with pnl=None regardless of
+    # result_status.
+    signal_record = make_signal_record(direction="long", entry_price=150.0)
+    result = FakeExitPolicyResult(
+        status="win", close_price=152.0, close_time="2026-01-05T15:00:00Z",
+        close_reason="take_profit", exit_policy="fixed_rr",
+    )
+
+    updated = models.apply_exit_policy_result(signal_record, result)
+
+    assert updated["pnl"] == 2.0  # close_price - entry_price
+
+
+def test_apply_exit_policy_result_computes_pnl_for_a_short_win():
+    signal_record = make_signal_record(direction="short", entry_price=150.0)
+    result = FakeExitPolicyResult(
+        status="win", close_price=148.0, close_time="2026-01-05T15:00:00Z",
+        close_reason="take_profit", exit_policy="fixed_rr",
+    )
+
+    updated = models.apply_exit_policy_result(signal_record, result)
+
+    assert updated["pnl"] == 2.0  # entry_price - close_price
+
+
+def test_apply_exit_policy_result_computes_negative_pnl_for_a_loss():
+    signal_record = make_signal_record(direction="long", entry_price=150.0)
+    result = FakeExitPolicyResult(
+        status="loss", close_price=149.0, close_time="2026-01-05T11:00:00Z",
+        close_reason="stop_loss", exit_policy="fixed_rr",
+    )
+
+    updated = models.apply_exit_policy_result(signal_record, result)
+
+    assert updated["pnl"] == -1.0
+
+
+def test_apply_exit_policy_result_leaves_pnl_none_when_still_open():
+    signal_record = make_signal_record(direction="long", entry_price=150.0)
+    result = FakeExitPolicyResult(
+        status="open", close_price=None, close_time=None, close_reason="no_close", exit_policy="fixed_rr",
+    )
+
+    updated = models.apply_exit_policy_result(signal_record, result)
+
+    assert updated["pnl"] is None  # never fabricated for an unresolved signal
+
+
 def test_create_backtest_signal_record_accepts_exit_policy():
     record = make_signal_record(exit_policy="time_based_close")
 

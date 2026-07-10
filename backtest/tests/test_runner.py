@@ -20,6 +20,10 @@ import backtest_store as store  # noqa: E402
 import chart_collector as collector  # noqa: E402  (market-watch)
 from chart_models import Candle  # noqa: E402  (market-watch)
 import market_bias_store as bias_store  # noqa: E402  (news-feed-bot)
+import report  # noqa: E402  (Issue #23)
+import summary as signal_summary  # noqa: E402  (Issue #23; aliased so it never shadows the many
+# local variables named ``summary`` already used throughout this file for
+# run_backtest()'s returned dict)
 
 
 def make_uptrend_candles(n, *, start="2026-05-27T00:00:00Z", freq="1h", chart_symbol="USDJPY", timeframe="1h", step=0.05):
@@ -492,3 +496,288 @@ def test_signal_own_bar_high_low_never_decides_its_own_exit(tmp_path):
     # mfe must reflect only next_bar's modest +0.1 excursion, never
     # entry_bar's own high=500.0 (a ~300-point excursion relative to entry).
     assert entry_signal["mfe"] < 1.0
+
+
+# =============================================================================
+# Issue #23: signal_summary is generated automatically after a run
+# =============================================================================
+
+
+def test_run_backtest_result_includes_a_signal_summary(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, run_result = runner.run_backtest(args)
+
+    assert "signal_summary" in run_result
+    assert run_result["signal_summary"]["run_id"] == run_result["run_id"]
+    assert run_result["signal_summary"]["total_signals"] == run_result["signals_generated"]
+
+
+def test_run_backtest_signal_summary_is_zero_valued_when_no_signals_generated(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    index = seed_chart_db(chart_db, n=100)  # no market_bias.sqlite3 -> Neutral fallback -> 0 signals
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, run_result = runner.run_backtest(args)
+
+    assert run_result["signals_generated"] == 0
+    assert run_result["signal_summary"]["total_signals"] == 0
+    assert run_result["signal_summary"]["profit_factor"] == 0.0
+    assert run_result["signal_summary"]["max_drawdown"] == 0.0
+
+
+def test_main_prints_signal_summary_after_a_backtest_run(tmp_path, capsys):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+
+    argv = [
+        "--symbol", "USD_JPY", "--timeframe", "1h",
+        "--from", index[90].isoformat(), "--to", index[99].isoformat(),
+        "--db-path", str(chart_db),
+        "--backtest-db-path", str(tmp_path / "backtest_results.sqlite3"),
+        "--market-bias-db-path", str(bias_db),
+    ]
+
+    exit_code = runner.main(argv)
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Backtest Summary" in captured.out  # existing Issue #33 section, unchanged
+    assert "Backtest Signal Summary" in captured.out  # new Issue #23 section
+    assert "Total signals:       10" in captured.out
+
+
+# =============================================================================
+# Issue #23: `summary` subcommand -- re-fetch a past run_id
+# =============================================================================
+
+
+def _run_and_get_run_id(tmp_path, *, n=100, from_index=90, to_index=99):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=n)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(tmp_path, from_time=index[from_index].isoformat(), to_time=index[to_index].isoformat())
+    _, run_result = runner.run_backtest(args)
+    return run_result["run_id"], backtest_db
+
+
+def test_summary_command_reprints_a_past_run_as_text(tmp_path, capsys):
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+
+    exit_code = runner.main(["summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db)])
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_OK
+    assert "Backtest Signal Summary" in captured.out
+    assert run_id in captured.out
+    assert "Total signals:       10" in captured.out
+
+
+def test_summary_command_json_format_prints_valid_json_to_stdout(tmp_path, capsys):
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+
+    exit_code = runner.main(
+        ["summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db), "--format", "json"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_OK
+    parsed = json.loads(captured.out)
+    assert parsed["run_id"] == run_id
+    assert parsed["total_signals"] == 10
+    assert "NaN" not in captured.out
+    assert "Infinity" not in captured.out
+
+
+def test_summary_command_markdown_format_prints_markdown_to_stdout(tmp_path, capsys):
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+
+    exit_code = runner.main(
+        ["summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db), "--format", "markdown"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_OK
+    assert f"# Backtest Summary: {run_id}" in captured.out
+    assert "| Total signals | 10 |" in captured.out
+
+
+def test_summary_command_with_output_writes_file_and_prints_confirmation_not_full_dump(tmp_path, capsys):
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+    output_path = tmp_path / "reports" / f"run_{run_id}.json"
+
+    exit_code = runner.main(
+        [
+            "summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db),
+            "--format", "json", "--output", str(output_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_OK
+    assert output_path.exists()  # parent dir "reports/" created automatically
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert saved["run_id"] == run_id
+    assert saved["total_signals"] == 10
+    # stdout gets a short confirmation, not the (potentially large) file
+    # content duplicated a second time.
+    assert str(output_path) in captured.out
+    assert '"total_signals"' not in captured.out
+
+
+def test_summary_command_output_overwrites_an_existing_file(tmp_path):
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+    output_path = tmp_path / "run.md"
+    output_path.write_text("stale content", encoding="utf-8")
+
+    exit_code = runner.main(
+        [
+            "summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db),
+            "--format", "markdown", "--output", str(output_path),
+        ]
+    )
+
+    assert exit_code == runner.EXIT_OK
+    content = output_path.read_text(encoding="utf-8")
+    assert "stale content" not in content
+    assert run_id in content
+
+
+def test_summary_command_output_pointing_at_an_existing_directory_is_a_clean_cli_error(tmp_path, capsys):
+    # Regression (CodeX review): --output naming an existing *directory*
+    # must surface as a short CLI error, not an uncaught traceback.
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+    output_dir = tmp_path / "already_a_directory"
+    output_dir.mkdir()
+
+    exit_code = runner.main(
+        [
+            "summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db),
+            "--format", "json", "--output", str(output_dir),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_USAGE_ERROR
+    assert "Traceback" not in captured.err
+    assert "error: could not write summary to" in captured.err
+    assert str(output_dir) in captured.err
+
+
+def test_summary_command_output_write_failure_is_a_clean_cli_error_not_a_traceback(tmp_path, capsys, monkeypatch):
+    # Simulate an unwritable destination (permission denied, disk full, ...)
+    # without depending on actual filesystem permissions, which behave
+    # differently across platforms/CI.
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+    output_path = tmp_path / "run.json"
+
+    def _boom(content, output_path):
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(report, "save_summary", _boom)
+
+    exit_code = runner.main(
+        [
+            "summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db),
+            "--format", "json", "--output", str(output_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_USAGE_ERROR
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+    assert "error: could not write summary to" in captured.err
+    assert "simulated write failure" in captured.err
+    assert not output_path.exists()
+
+
+def test_summary_command_json_save_still_succeeds_after_error_handling_added(tmp_path):
+    # Not a regression test per se -- reconfirms the ordinary success path
+    # (JSON + --output) still works now that failure handling wraps it.
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+    output_path = tmp_path / "ok.json"
+
+    exit_code = runner.main(
+        [
+            "summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db),
+            "--format", "json", "--output", str(output_path),
+        ]
+    )
+
+    assert exit_code == runner.EXIT_OK
+    assert json.loads(output_path.read_text(encoding="utf-8"))["run_id"] == run_id
+
+
+def test_summary_command_markdown_save_still_succeeds_after_error_handling_added(tmp_path):
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+    output_path = tmp_path / "ok.md"
+
+    exit_code = runner.main(
+        [
+            "summary", "--run-id", run_id, "--backtest-db-path", str(backtest_db),
+            "--format", "markdown", "--output", str(output_path),
+        ]
+    )
+
+    assert exit_code == runner.EXIT_OK
+    assert run_id in output_path.read_text(encoding="utf-8")
+
+
+def test_summary_command_returns_no_data_for_unknown_run_id(tmp_path, capsys):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    store.init_db(backtest_db)
+
+    exit_code = runner.main(["summary", "--run-id", "does-not-exist", "--backtest-db-path", str(backtest_db)])
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_NO_DATA
+    assert "Backtest Signal Summary" not in captured.out
+
+
+def test_summary_command_handles_a_run_with_zero_signals(tmp_path, capsys):
+    # warm-up-insufficient window -> a real backtest_runs row with zero
+    # backtest_signals rows, exercising the 0-signal path end-to-end
+    # through the actual DB round-trip (not just summary.build_summary()
+    # called directly).
+    chart_db = tmp_path / "chart_data.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=20)
+    args = make_args(tmp_path, from_time=index[15].isoformat(), to_time=index[19].isoformat())
+    _, run_result = runner.run_backtest(args)
+    assert run_result["signals_generated"] == 0
+
+    exit_code = runner.main(
+        ["summary", "--run-id", run_result["run_id"], "--backtest-db-path", str(backtest_db), "--format", "json"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_OK
+    parsed = json.loads(captured.out)
+    assert parsed["total_signals"] == 0
+    assert parsed["profit_factor"] == 0.0
+    assert parsed["average_holding_bars"] is None
+
+
+def test_summary_command_signals_are_sorted_by_signal_time_not_db_row_order(tmp_path):
+    # Regression: build the summary from freshly re-fetched DB rows (not
+    # the in-memory list run_backtest() already had), proving the CLI path
+    # -- not just summary.build_summary() in isolation -- sorts explicitly.
+    run_id, backtest_db = _run_and_get_run_id(tmp_path)
+
+    fetched_signals = store.list_backtest_signals(run_id, db_path=backtest_db)
+    direct_result = signal_summary.build_summary(run_id, fetched_signals)
+
+    assert direct_result["total_signals"] == 10
+    # sanity: this run's uptrend fixture never actually closes within the
+    # loaded window (see other tests), so every signal is still open and
+    # max_drawdown/profit_factor must reflect "nothing resolved yet".
+    assert direct_result["max_drawdown"] == 0.0
