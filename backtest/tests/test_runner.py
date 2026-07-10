@@ -6,12 +6,13 @@ import sys
 import pandas as pd
 import pytest
 
-BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
+TESTS_DIR = pathlib.Path(__file__).resolve().parent
+BOT_DIR = TESTS_DIR.parent
 REPO_ROOT = BOT_DIR.parent
 MARKET_WATCH_DIR = REPO_ROOT / "market-watch"
 NEWS_FEED_BOT_DIR = REPO_ROOT / "news-feed-bot"
 
-for _dir in (BOT_DIR, MARKET_WATCH_DIR, NEWS_FEED_BOT_DIR):
+for _dir in (TESTS_DIR, BOT_DIR, MARKET_WATCH_DIR, NEWS_FEED_BOT_DIR):
     if str(_dir) not in sys.path:
         sys.path.insert(0, str(_dir))
 
@@ -25,51 +26,9 @@ import summary as signal_summary  # noqa: E402  (Issue #23; aliased so it never 
 # local variables named ``summary`` already used throughout this file for
 # run_backtest()'s returned dict)
 
-
-def make_uptrend_candles(n, *, start="2026-05-27T00:00:00Z", freq="1h", chart_symbol="USDJPY", timeframe="1h", step=0.05):
-    """A steady uptrend: after warm-up, this is Bull/Bullish MACD -- matches
-    backtest/tests/test_warmup.py's fixture shape, so it reliably produces
-    'long' candidates once ready.
-    """
-    index = pd.date_range(start, periods=n, freq=freq, tz="UTC")
-    candles = []
-    price = 150.0
-    for timestamp in index:
-        price += step
-        candles.append(
-            Candle(
-                symbol=chart_symbol,
-                timeframe=timeframe,
-                timestamp=collector.to_utc_iso_z(timestamp),
-                open=price - 0.02,
-                high=price + 0.05,
-                low=price - 0.05,
-                close=price,
-                volume=100.0,
-            )
-        )
-    return index, candles
-
-
-def seed_chart_db(db_path, *, n=100, chart_symbol="USDJPY", timeframe="1h", step=0.05):
-    index, candles = make_uptrend_candles(n, chart_symbol=chart_symbol, timeframe=timeframe, step=step)
-    collector.save_candles(db_path, candles)
-    return index
-
-
-def seed_bull_bias(db_path, *, evaluated_at, market_bias="Bull", confidence=0.8, bias_id="mb-1"):
-    bias_store.save_market_bias(
-        {
-            "market_bias_id": bias_id,
-            "evaluated_at": evaluated_at,
-            "symbol": "GLOBAL",
-            "timeframe": "1h",
-            "market_bias": market_bias,
-            "confidence": confidence,
-            "trend": market_bias,
-        },
-        db_path=db_path,
-    )
+# Shared candle/bias fixture builders (Issue #25): also used by
+# test_backtest_engine.py, so the same price-path fixture is defined once.
+from candle_fixtures import make_uptrend_candles, seed_bull_bias, seed_chart_db  # noqa: E402
 
 
 def make_args(tmp_path, *, symbol="USD_JPY", timeframe="1h", from_time, to_time, **overrides):

@@ -318,6 +318,12 @@ python -m pytest backtest/tests -q
 
 - `backtest/tests/test_runner.py`(Issue #33で新規追加、Issue #23でCLI統合テストを、
   Issue #24で `--exit-policy` / `--strategy-name` のテストを追記)
+- `backtest/tests/test_backtest_engine.py`(Issue #25で新規追加。手書きOHLCV fixtureで
+  Signal生成/Signal 0件/Exit到達(win・loss)/Invalidation到達のエンジン主要経路を固定。
+  warm-up不足skipと「validation_endより後の足がwarm-upへ混入しない」回帰は
+  `test_warmup.py` / `test_runner.py` の既存テストが担当しており、重複追加していない)
+- `backtest/tests/candle_fixtures.py`(Issue #25で新規追加。テスト間で共有する
+  小さなOHLCV fixtureビルダー。`test_runner.py` も同じビルダーを使うよう整理済み)
 - `backtest/tests/test_summary.py`(Issue #23で新規追加、集計ロジックの単体テスト)
 - `backtest/tests/test_report.py`(Issue #23で新規追加、レンダリング/ファイル保存の単体テスト)
 - `backtest/tests/test_backtest_models.py`(Issue #23で `apply_exit_policy_result()` の
