@@ -68,7 +68,9 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 
 ## v1.4 Backtest(準備中)
 
-v1.4 では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層の追加を計画しています。Issue #17〜#28 が対象範囲です。現時点でこのリポジトリ上に実装が確認できるのは Issue #17(Market Bias のDB永続化と時点参照API)のみで、残りは計画・設計段階です。詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
+v1.4 では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層の追加を計画しています。Issue #17〜#28 が対象範囲です。詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
+
+Backtest Engine を手元やEC2から実行するための Runner / CLI (`python -m backtest`) を追加済みです。実行方法・引数・終了コードは [docs/backtest.md](docs/backtest.md) を参照してください。
 
 ## 非スコープ(全レイヤー共通)
 

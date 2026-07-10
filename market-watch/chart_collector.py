@@ -340,6 +340,58 @@ def load_candles(db_path: Path, symbol: str, timeframe: str, *, limit: int = 200
     return frame.set_index("timestamp")
 
 
+def load_candles_range(
+    db_path: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    """Load every stored candle for symbol/timeframe within an optional [start, end] bound.
+
+    Unlike load_candles() (most-recent-N rows), this returns a full
+    historical slice, oldest first -- for Backtest, which replays a
+    specific date range rather than "the latest N bars". Read-only: never
+    creates the DB file/table as a side effect (unlike load_candles(),
+    which calls init_db()).
+
+    ``start``/``end`` are compared as strings against the stored
+    ``timestamp`` column, so callers must pass the same canonical
+    ``to_utc_iso_z()``-formatted form the candles were saved with (naive
+    or differently-formatted bounds can silently mis-compare against the
+    zero-padded, "Z"-suffixed stored strings).
+    """
+    if not db_path.exists():
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    clauses = ["symbol = ?", "timeframe = ?"]
+    params: list = [symbol.upper(), timeframe]
+    if start is not None:
+        clauses.append("timestamp >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("timestamp <= ?")
+        params.append(end)
+
+    query = (
+        "SELECT timestamp, open, high, low, close, volume FROM candles "
+        f"WHERE {' AND '.join(clauses)} ORDER BY timestamp ASC"
+    )
+    try:
+        with sqlite3.connect(db_path) as connection:
+            rows = connection.execute(query, params).fetchall()
+    except sqlite3.OperationalError:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    return frame.set_index("timestamp")
+
+
 def insert_chart_snapshot(
     db_path: Path,
     *,
