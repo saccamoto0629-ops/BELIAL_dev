@@ -7,6 +7,12 @@ Issue #33 (v1.4 Backtest)。既存の `backtest/backtest_models.py` / `backtest/
 Issue #23 で、run単位のSignal明細を集計するSummary report(`backtest/summary.py` / `backtest/report.py`)
 と、それを再取得する `summary` サブコマンドを追加した(後述)。
 
+Issue #24(Backtest CLI)は`symbol`/`timeframe`/`from`/`to`/`strategy_name`/`exit_policy`の指定、
+run_id・summaryの標準出力、Discord非送信をAcceptance Criteriaとしており、`--strategy-name`・
+run_idのstdout表示・summary表示・Discord非送信はIssue #33/#23の実装で既に満たされていた。
+このセッションで唯一未実装だった `--exit-policy` フラグを追加し、Issue #24を完了させた
+(詳細は下記「`run` の引数」を参照)。
+
 **Paper-only。** Discord通知、実発注、Broker API連携は一切行わない。読み取るのは
 `market-watch/data/chart_data.sqlite3`(ローソク足)と `news-feed-bot/data/market_bias.sqlite3`
 (Market Bias)のみで、書き込むのは既存の Backtest DB(`backtest_runs` / `backtest_signals`)のみ
@@ -76,6 +82,15 @@ python -m backtest run \
   --timeframe 1h \
   --from 2026-06-01T00:00:00 \
   --to 2026-06-30T23:59:59
+
+# strategy_name / exit_policy を明示する場合(Issue #24)
+python -m backtest run \
+  --symbol USD_JPY \
+  --timeframe 1h \
+  --from 2026-06-01T00:00:00 \
+  --to 2026-06-30T23:59:59 \
+  --strategy-name trend_pullback_v1 \
+  --exit-policy fixed_rr
 ```
 
 `python -m backtest.runner` も同じ意味(`backtest` の `__main__.py` はこちらへの薄いエイリアス)。
@@ -115,8 +130,9 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | `--warmup-bars` | | indicator計算に必要なwarm-up本数。既定は `warmup.DEFAULT_WARMUP_BARS`(=75、SMA75由来)。**1以上の整数のみ**(0以下は終了コード2)。 |
 | `--confidence-threshold` | | Paper Signal Generatorの信頼度しきい値を上書きする。既定は `signal_generator.DEFAULT_CONFIDENCE_THRESHOLD`(0.40)。**0.0以上1.0以下のみ**(範囲外は終了コード2)。 |
 | `--exit-config` | | Exit Policy JSON設定ファイルへのパス(`paper-signal/exit_policy.py` 参照)。既定は `BACKTEST_EXIT_CONFIG_PATH`、なければ組み込みのデフォルト設定。 |
+| `--exit-policy` | | どのExit Policyを使うかを明示的に選択する(`--exit-config` が指定する `exit_policy` より優先)。選択肢は `fixed_rr` / `time_based_close` / `ma_break_invalidation` / `bias_reversal_close` / `recent_high_low_break`(不正な値はargparseレベルで終了コード2)。既定は `--exit-config` の解決結果(未指定なら `fixed_rr`)。選択したポリシーが解決後のconfigで `enabled: true` になっていない場合(例: 既定では無効な `ma_break_invalidation` をconfigファイルなしで指定した場合)は、分かりやすいエラーメッセージとともに終了コード2を返す。保存される `backtest_runs.exit_policy` / 各 `backtest_signals.exit_policy` に、実際に使われたポリシー名がそのまま反映される。 |
 | `--run-name` | | 既定は `<symbol>_<timeframe>_<from>_<to>`。 |
-| `--strategy-name` | | 既定は `paper_signal_generator`(=Paper Signal Generatorの既存ルールをそのまま再生していることを示す)。 |
+| `--strategy-name` | | 既定は `paper_signal_generator`(=Paper Signal Generatorの既存ルールをそのまま再生していることを示す)。`backtest_runs.strategy_name` に保存されるラベルのみで、指定してもシグナル生成ロジック自体は変わらない。 |
 
 ### `summary` の引数
 
@@ -300,7 +316,8 @@ DBに保有バー数相当の列が追加されない限り実装しない(Signa
 python -m pytest backtest/tests -q
 ```
 
-- `backtest/tests/test_runner.py`(Issue #33で新規追加、Issue #23でCLI統合テストを追記)
+- `backtest/tests/test_runner.py`(Issue #33で新規追加、Issue #23でCLI統合テストを、
+  Issue #24で `--exit-policy` / `--strategy-name` のテストを追記)
 - `backtest/tests/test_summary.py`(Issue #23で新規追加、集計ロジックの単体テスト)
 - `backtest/tests/test_report.py`(Issue #23で新規追加、レンダリング/ファイル保存の単体テスト)
 - `backtest/tests/test_backtest_models.py`(Issue #23で `apply_exit_policy_result()` の

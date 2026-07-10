@@ -244,6 +244,106 @@ def test_run_backtest_saves_a_backtest_run_row(tmp_path):
     assert run["strategy_name"] == runner.DEFAULT_STRATEGY_NAME
 
 
+def test_run_backtest_strategy_name_flag_is_saved_on_the_run(tmp_path):
+    # Issue #24 checklist item: confirm --strategy-name (already implemented
+    # since Issue #33) actually reaches the saved backtest_runs row.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        strategy_name="trend_pullback_v1",
+    )
+
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    assert run["strategy_name"] == "trend_pullback_v1"
+
+
+def test_run_backtest_defaults_exit_policy_to_fixed_rr_when_not_specified(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    assert run["exit_policy"] == "fixed_rr"  # exit_policy.DEFAULT_EXIT_POLICY, unchanged behavior
+
+
+def test_run_backtest_exit_policy_flag_overrides_the_active_policy_and_is_saved(tmp_path):
+    # Issue #24: --exit-policy must actually reach exit evaluation, and the
+    # chosen policy must be reflected on both the saved run and every saved
+    # signal -- not just recorded as a label.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_policy="time_based_close",  # enabled by default, distinct from fixed_rr
+    )
+
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    assert run["exit_policy"] == "time_based_close"
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    assert signals  # sanity: this fixture does generate signals
+    assert all(signal["exit_policy"] == "time_based_close" for signal in signals)
+
+
+def test_run_backtest_rejects_a_valid_but_disabled_exit_policy_with_a_clean_usage_error(tmp_path, capsys):
+    # ma_break_invalidation is a real, known policy name (argparse accepts
+    # it) but is disabled in the built-in default config -- this must fail
+    # as a clear CLI usage error, not deep inside the first evaluate_exit().
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_policy="ma_break_invalidation",
+    )
+
+    exit_code, summary = runner.run_backtest(args)
+    captured = capsys.readouterr()
+
+    assert exit_code == runner.EXIT_USAGE_ERROR
+    assert summary is None
+    assert "error: --exit-policy 'ma_break_invalidation' is not usable" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_parse_args_rejects_an_unknown_exit_policy_choice(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        make_args(
+            tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+            exit_policy="not_a_real_policy",
+        )
+    assert exc_info.value.code == runner.EXIT_USAGE_ERROR
+
+
+def test_run_help_documents_exit_policy_and_its_choices(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        runner.parse_args(["run", "--help"])
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "--exit-policy" in captured.out
+    assert "fixed_rr" in captured.out
+    assert "time_based_close" in captured.out
+
+
 def test_run_backtest_generates_and_saves_long_signals_for_a_bull_uptrend(tmp_path):
     chart_db = tmp_path / "chart_data.sqlite3"
     bias_db = tmp_path / "market_bias.sqlite3"

@@ -27,6 +27,14 @@ re-fetches a past run's signals and renders the same win/loss/pnl
 performance summary that ``run`` now also prints automatically after
 finishing -- see summary.py for the aggregation and report.py for
 text/JSON/Markdown rendering.
+
+Issue #24 adds ``run``'s ``--exit-policy`` flag: an explicit choice among
+``exit_policy.KNOWN_POLICIES`` (e.g. ``fixed_rr``) that overrides whichever
+policy ``--exit-config`` (or the built-in default) would otherwise select.
+It is recorded on the saved backtest_runs row (and every backtest_signals
+row via apply_exit_policy_result()) exactly like a config-file-selected
+policy already was -- this only changes *how* the active policy is chosen,
+not how it is stored or evaluated.
 """
 
 from __future__ import annotations
@@ -191,8 +199,23 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Path to an Exit Policy JSON config (see paper-signal/exit_policy.py). "
         "Defaults to BACKTEST_EXIT_CONFIG_PATH / built-in defaults.",
     )
+    run_parser.add_argument(
+        "--exit-policy",
+        choices=sorted(exit_policy.KNOWN_POLICIES),
+        default=None,
+        help="Select which Exit Policy is active for this run (overrides --exit-config's own "
+        f"exit_policy, if any). Defaults to whatever --exit-config resolves to "
+        f"(built-in default: {exit_policy.DEFAULT_EXIT_POLICY}). The chosen policy must be "
+        "enabled=true in the resolved config, or this fails with a usage error.",
+    )
     run_parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
-    run_parser.add_argument("--strategy-name", default=DEFAULT_STRATEGY_NAME)
+    run_parser.add_argument(
+        "--strategy-name",
+        default=DEFAULT_STRATEGY_NAME,
+        help=f"A label recorded on the saved backtest_runs row (default: {DEFAULT_STRATEGY_NAME!r}). "
+        "Every run replays the same, unmodified Paper Signal rule set (paper-signal/signal_generator.py) "
+        "regardless of this value -- it does not select different signal-generation logic.",
+    )
 
     summary_parser = subparsers.add_parser(
         "summary",
@@ -316,6 +339,21 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
     )
 
     exit_config = exit_policy.load_exit_policy_config(args.exit_config)
+    if args.exit_policy is not None:
+        # Override --exit-config's own exit_policy selection (if any) with the
+        # explicit --exit-policy choice. All policy blocks are already present
+        # in the resolved config regardless of which one is active, so this
+        # only ever changes *which* one is used -- it never invents a new
+        # policies.<name> block. Re-validate immediately so an argparse-valid
+        # policy name (choices=KNOWN_POLICIES) that isn't enabled in the
+        # resolved config fails here with a clear usage error, not deep
+        # inside the first evaluate_exit() call.
+        exit_config = dict(exit_config, exit_policy=args.exit_policy)
+        try:
+            exit_policy.validate_exit_policy_config(exit_config)
+        except ValueError as exc:
+            print(f"error: --exit-policy {args.exit_policy!r} is not usable: {exc}", file=sys.stderr)
+            return EXIT_USAGE_ERROR, None
 
     run_record = models.create_backtest_run_record(
         run_name=args.run_name or _default_run_name(args.symbol, args.timeframe, args.from_time, args.to_time),
