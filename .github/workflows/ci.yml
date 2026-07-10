@@ -1,0 +1,59 @@
+name: CI
+
+# Issue #32: run the test suites on every pull request (open / update / reopen),
+# and on pushes to main only. No deploy steps -- test-only CI.
+# Feature-branch pushes do not trigger CI; they run via their pull request.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+
+# Least privilege: CI only needs to read the checked-out code.
+permissions:
+  contents: read
+
+# Cancel an in-progress run when the same PR is updated again.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Python 3.12: stable, with prebuilt wheels for pandas/matplotlib/
+      # yfinance/boto3, and new enough for the codebase's `X | None` syntax.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # The four component suites are run as separate pytest processes -- the
+      # project has no root pytest config / conftest.py, and each test file
+      # sets up its own sys.path. Separate steps keep component namespaces
+      # isolated and make a failing component obvious from the step name.
+      # These tests need no secrets / .env: they use tmp_path and monkeypatch
+      # and never reach Discord, AWS/S3, external APIs, or a real database.
+      - name: Run backtest tests
+        run: python -m pytest backtest/tests -q
+
+      - name: Run market-watch tests
+        run: python -m pytest market-watch/tests -q
+
+      - name: Run news-feed-bot tests
+        run: python -m pytest news-feed-bot/tests -q
+
+      - name: Run paper-signal tests
+        run: python -m pytest paper-signal/tests -q
