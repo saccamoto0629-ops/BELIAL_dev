@@ -840,3 +840,258 @@ def test_summary_command_signals_are_sorted_by_signal_time_not_db_row_order(tmp_
     # loaded window (see other tests), so every signal is still open and
     # max_drawdown/profit_factor must reflect "nothing resolved yet".
     assert direct_result["max_drawdown"] == 0.0
+
+
+# =============================================================================
+# Issue #26: virtual execution model (fixed spread + slippage)
+# =============================================================================
+
+import execution_model as execution  # noqa: E402
+
+
+# A tiny time_based_close config: closes each signal at the *next* bar's
+# market close. Unlike fixed_rr (whose take-profit/stop are derived from the
+# entry price), this yields a raw close_price that does NOT move with the
+# corrected entry -- so the spread/slippage adjustment applied to the close
+# is isolated and directly assertable.
+def _write_time_based_exit_config(tmp_path, *, max_hold_bars=1):
+    config_path = tmp_path / "exit_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "exit_policy": "time_based_close",
+                "policies": {
+                    "time_based_close": {
+                        "enabled": True,
+                        "max_hold_bars": max_hold_bars,
+                        "close_as": "closed",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def _seed_trend(tmp_path, *, step, market_bias):
+    """Seed a 100-bar trend (step<0 -> downtrend) + a matching bias; return the index."""
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    index = seed_chart_db(chart_db, n=100, step=step)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]), market_bias=market_bias)
+    return index
+
+
+def _run_and_fetch_signals(tmp_path, index, **overrides):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(), **overrides)
+    exit_code, summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    signals = sorted(
+        store.list_backtest_signals(summary["run_id"], db_path=backtest_db),
+        key=lambda s: s["signal_time"],
+    )
+    return summary, signals
+
+
+# --- CLI parsing: defaults + rejection of negatives --------------------------
+
+
+def test_parse_args_defaults_spread_and_slippage_to_zero(tmp_path):
+    args = make_args(tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00")
+    assert args.spread == 0.0
+    assert args.slippage == 0.0
+
+
+def test_parse_args_accepts_nonnegative_spread_and_slippage(tmp_path):
+    args = make_args(
+        tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+        spread="0.01", slippage="0.005",
+    )
+    assert args.spread == pytest.approx(0.01)
+    assert args.slippage == pytest.approx(0.005)
+
+
+@pytest.mark.parametrize("field", ["spread", "slippage"])
+@pytest.mark.parametrize("value", ["-0.01", "-1", "-100"])
+def test_parse_args_rejects_negative_spread_or_slippage(tmp_path, field, value):
+    with pytest.raises(SystemExit) as exc_info:
+        make_args(
+            tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+            **{field: value},
+        )
+    assert exc_info.value.code == runner.EXIT_USAGE_ERROR
+
+
+def test_run_help_documents_spread_and_slippage(capsys):
+    with pytest.raises(SystemExit):
+        runner.parse_args(["run", "--help"])
+    captured = capsys.readouterr()
+    assert "--spread" in captured.out
+    assert "--slippage" in captured.out
+
+
+# --- config_json + summary carry the execution model -------------------------
+
+
+def test_execution_model_settings_are_saved_to_config_json(tmp_path):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        spread="0.01", slippage="0.005",
+    )
+
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    config = json.loads(run["config_json"])
+    assert config["execution_model"] == {
+        "type": execution.EXECUTION_MODEL_TYPE,
+        "spread": 0.01,
+        "slippage": 0.005,
+    }
+    # existing config_json keys must not be dropped
+    for key in ("warmup_bars", "confidence_threshold", "chart_db_path", "market_bias_db_path"):
+        assert key in config
+
+
+def test_execution_model_settings_are_reflected_in_the_summary(tmp_path):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        spread="0.02", slippage="0.0",
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["execution_model"] == {
+        "type": execution.EXECUTION_MODEL_TYPE,
+        "spread": 0.02,
+        "slippage": 0.0,
+    }
+
+
+def test_print_summary_shows_spread_and_slippage(tmp_path, capsys):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        spread="0.01", slippage="0.005",
+    )
+    _, summary = runner.run_backtest(args)
+
+    runner.print_summary(summary)
+    captured = capsys.readouterr()
+
+    assert "Execution model:" in captured.out
+    assert "fixed_spread_slippage" in captured.out
+    assert "spread=0.01" in captured.out
+    assert "slippage=0.005" in captured.out
+
+
+# --- zero cost is a pure pass-through (backward compatibility) ----------------
+
+
+def test_zero_spread_slippage_leaves_entry_close_and_pnl_unchanged(tmp_path):
+    # With time_based_close, entry = signal bar's raw close and close = next
+    # bar's raw market close. A zero-cost model must reproduce exactly those
+    # raw prices and the raw pnl, i.e. change nothing vs pre-Issue-#26.
+    exit_config = _write_time_based_exit_config(tmp_path)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+
+    _, baseline = _run_and_fetch_signals(tmp_path, index, exit_config=str(exit_config))
+    _, zero_cost = _run_and_fetch_signals(
+        tmp_path, index, exit_config=str(exit_config), spread="0.0", slippage="0.0",
+    )
+
+    assert len(baseline) == len(zero_cost) == 10
+    for base, zero in zip(baseline, zero_cost):
+        assert base["signal_time"] == zero["signal_time"]
+        assert zero["entry_price"] == pytest.approx(base["entry_price"])
+        assert zero["close_price"] == (None if base["close_price"] is None else pytest.approx(base["close_price"]))
+        assert zero["pnl"] == (None if base["pnl"] is None else pytest.approx(base["pnl"]))
+
+
+# --- long: entry rises, close falls, pnl worsens by 2 * (spread + slippage) ---
+
+
+def test_long_entry_rises_and_close_falls_with_cost(tmp_path):
+    exit_config = _write_time_based_exit_config(tmp_path)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    spread, slippage = 0.01, 0.005
+    cost = spread + slippage
+
+    _, baseline = _run_and_fetch_signals(tmp_path, index, exit_config=str(exit_config))
+    _, with_cost = _run_and_fetch_signals(
+        tmp_path, index, exit_config=str(exit_config), spread=str(spread), slippage=str(slippage),
+    )
+
+    closed_pairs = [
+        (b, c) for b, c in zip(baseline, with_cost) if b["close_price"] is not None
+    ]
+    assert closed_pairs  # this fixture does close signals
+
+    for base, cost_signal in closed_pairs:
+        assert cost_signal["direction"] == "long"
+        # long entry filled higher (unfavorable)
+        assert cost_signal["entry_price"] == pytest.approx(base["entry_price"] + cost)
+        # long close filled lower (unfavorable)
+        assert cost_signal["close_price"] == pytest.approx(base["close_price"] - cost)
+        # net pnl worsens by exactly 2 * cost (paid on both entry and close)
+        assert cost_signal["pnl"] == pytest.approx(base["pnl"] - 2 * cost)
+        assert cost_signal["pnl"] < base["pnl"]
+
+
+# --- short: entry falls, close rises, pnl worsens by 2 * (spread + slippage) --
+
+
+def test_short_entry_falls_and_close_rises_with_cost(tmp_path):
+    exit_config = _write_time_based_exit_config(tmp_path)
+    index = _seed_trend(tmp_path, step=-0.05, market_bias="Bear")  # downtrend -> short signals
+    spread, slippage = 0.01, 0.005
+    cost = spread + slippage
+
+    _, baseline = _run_and_fetch_signals(tmp_path, index, exit_config=str(exit_config))
+    _, with_cost = _run_and_fetch_signals(
+        tmp_path, index, exit_config=str(exit_config), spread=str(spread), slippage=str(slippage),
+    )
+
+    closed_pairs = [
+        (b, c) for b, c in zip(baseline, with_cost) if b["close_price"] is not None
+    ]
+    assert closed_pairs
+
+    for base, cost_signal in closed_pairs:
+        assert cost_signal["direction"] == "short"
+        # short entry filled lower (unfavorable)
+        assert cost_signal["entry_price"] == pytest.approx(base["entry_price"] - cost)
+        # short close filled higher (unfavorable)
+        assert cost_signal["close_price"] == pytest.approx(base["close_price"] + cost)
+        # short pnl = entry - close, so both adjustments worsen it by 2 * cost
+        assert cost_signal["pnl"] == pytest.approx(base["pnl"] - 2 * cost)
+        assert cost_signal["pnl"] < base["pnl"]
+
+
+# --- open / no_close signals keep close_price = None even with cost ----------
+
+
+def test_open_signal_close_price_stays_none_with_cost(tmp_path):
+    # The default fixed_rr policy never closes this uptrend within the loaded
+    # window (see test_summary_command_signals_are_sorted...), so every signal
+    # stays "open" with close_price=None -- and a None close must never be
+    # turned into a fabricated adjusted price by the execution model.
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+
+    _, signals = _run_and_fetch_signals(tmp_path, index, spread="0.01", slippage="0.005")
+
+    assert signals
+    assert all(s["result_status"] == "open" for s in signals)
+    assert all(s["close_price"] is None for s in signals)
+    assert all(s["pnl"] is None for s in signals)
+    # entry price is still corrected upward for a long even when the signal
+    # never closes.
+    raw_entries = _run_and_fetch_signals(tmp_path, index)[1]
+    for corrected, raw in zip(signals, raw_entries):
+        assert corrected["entry_price"] == pytest.approx(raw["entry_price"] + 0.015)

@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -58,6 +59,7 @@ for _dir in (BASE_DIR, MARKET_WATCH_DIR, PAPER_SIGNAL_DIR, NEWS_FEED_BOT_DIR):
 
 import backtest_models as models  # noqa: E402
 import backtest_store as store  # noqa: E402
+import execution_model as execution  # noqa: E402  (Issue #26: virtual fill spread/slippage model)
 import warmup  # noqa: E402
 import chart_collector  # noqa: E402  (market-watch)
 import exit_policy  # noqa: E402  (paper-signal)
@@ -116,6 +118,23 @@ def _unit_float(value: str) -> float:
         raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
     if not (0.0 <= parsed <= 1.0):
         raise argparse.ArgumentTypeError(f"--confidence-threshold must be between 0.0 and 1.0, got {parsed}")
+    return parsed
+
+
+def _nonneg_float(value: str) -> float:
+    """argparse type for --spread / --slippage: a float >= 0.
+
+    A negative value is rejected here as an argparse usage error (exit code
+    2) rather than deep in the execution model, so ``--spread -0.1`` fails
+    immediately with a clear message. The execution model itself
+    re-validates (>= 0) as a defensive second layer.
+    """
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError(f"must be >= 0.0, got {parsed}")
     return parsed
 
 
@@ -207,6 +226,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         f"exit_policy, if any). Defaults to whatever --exit-config resolves to "
         f"(built-in default: {exit_policy.DEFAULT_EXIT_POLICY}). The chosen policy must be "
         "enabled=true in the resolved config, or this fails with a usage error.",
+    )
+    run_parser.add_argument(
+        "--spread",
+        type=_nonneg_float,
+        default=0.0,
+        help="Issue #26: fixed spread charged against every fill, as an absolute price "
+        "difference (not pips). Must be >= 0.0 (default 0.0). Applied always in the "
+        "direction unfavorable to the position.",
+    )
+    run_parser.add_argument(
+        "--slippage",
+        type=_nonneg_float,
+        default=0.0,
+        help="Issue #26: fixed slippage charged against every fill, as an absolute price "
+        "difference (not pips). Must be >= 0.0 (default 0.0). Applied always in the "
+        "direction unfavorable to the position.",
     )
     run_parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
     run_parser.add_argument(
@@ -327,6 +362,11 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         args.confidence_threshold if args.confidence_threshold is not None else warmup.DEFAULT_CONFIDENCE_THRESHOLD
     )
 
+    # Issue #26: a fixed spread/slippage virtual-fill model. --spread /
+    # --slippage default to 0.0, so an unchanged CLI invocation builds a
+    # no-op model that leaves every raw entry/close price exactly as before.
+    exec_model = execution.ExecutionModel(spread=args.spread, slippage=args.slippage)
+
     evaluations = warmup.evaluate_backtest_bars(
         candles,
         validation_start,
@@ -368,6 +408,9 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             "confidence_threshold": confidence_threshold,
             "chart_db_path": str(chart_db_path),
             "market_bias_db_path": str(bias_db_path),
+            # Issue #26: record exactly which virtual-fill model produced this
+            # run's entry/close prices, alongside the pre-existing keys.
+            "execution_model": exec_model.to_config(),
         },
     )
     store.save_backtest_run(run_record, db_path=backtest_db_path)
@@ -377,7 +420,7 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         if not evaluation.candidates:
             continue
         entry_timestamp = pd.Timestamp(evaluation.timestamp)
-        entry_price = float(candles.loc[entry_timestamp, "close"])
+        raw_entry_price = float(candles.loc[entry_timestamp, "close"])
         # signal_type="bar_close": the hypothesis enters at this bar's close,
         # so it can only ever be exposed to *subsequent* bars' high/low.
         # Exit evaluation must start at the next bar -- passing the entry
@@ -388,11 +431,24 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
 
         for candidate in evaluation.candidates:
             direction = "long" if candidate.get("side") == "long" else "short"
+            # Issue #26 ordering: (1) raw entry = signal bar's close;
+            # (2) direction decided above; (3) correct the entry with the
+            # virtual-fill model; (4) hand the corrected entry to the Exit
+            # Policy so its stop/target and walk are relative to the price
+            # the paper position actually "filled" at.
+            entry_price = exec_model.adjust_entry_price(raw_entry_price, direction)
             exit_result = exit_policy.evaluate_exit(
                 {"direction": direction, "entry_price": entry_price},
                 future_candles,
                 exit_config,
             )
+            # (5) correct the Exit Policy's raw close_price the same way. A
+            # None close_price (open / no_close) is left as None -- there is
+            # no fill to charge costs against. All other exit fields (mfe,
+            # mae, close_time, close_reason, exit_policy, status) are kept
+            # exactly as the policy returned them.
+            adjusted_close_price = exec_model.adjust_close_price(exit_result.close_price, direction)
+            exit_result = replace(exit_result, close_price=adjusted_close_price)
             record = models.create_backtest_signal_record(
                 run_record["id"],
                 signal_time=evaluation.timestamp,
@@ -406,6 +462,8 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
                 reasons=[candidate["reason"]] if candidate.get("reason") else None,
                 entry_price=entry_price,
             )
+            # (6)/(7) apply_exit_policy_result() maps the corrected exit onto
+            # the record and re-derives pnl from the corrected entry/close.
             record = models.apply_exit_policy_result(record, exit_result)
             signal_records.append(record)
 
@@ -425,6 +483,9 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         "signals_generated": len(signal_records),
         "result_counts": _summarize(signal_records),
         "backtest_db_path": str(backtest_db_path),
+        # Issue #26: echo the virtual-fill model settings that produced this
+        # run's entry/close prices (mirrors backtest_runs.config_json).
+        "execution_model": exec_model.to_config(),
         # Issue #23: win/loss/pnl performance summary for this run, built
         # from the exact signal_records just saved (no extra DB round-trip
         # needed since they're already in memory). Safe when empty.
@@ -446,6 +507,12 @@ def print_summary(summary: dict) -> None:
     )
     print(f"Bars processed:      {summary['bars_processed']}")
     print(f"Signals generated:   {summary['signals_generated']}")
+    execution_model = summary.get("execution_model") or {}
+    print(
+        f"Execution model:     {execution_model.get('type', 'n/a')} "
+        f"(spread={execution_model.get('spread', 0.0)}, "
+        f"slippage={execution_model.get('slippage', 0.0)})"
+    )
     print("Result breakdown:")
     for status, count in summary["result_counts"].items():
         print(f"  {status:<12} {count}")
