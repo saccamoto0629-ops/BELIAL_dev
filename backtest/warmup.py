@@ -47,6 +47,15 @@ for _dir in (MARKET_WATCH_DIR, PAPER_SIGNAL_DIR):
         sys.path.insert(0, str(_dir))
 
 from indicators import calculate_indicators, classify_bb_state, classify_trend  # noqa: E402  (market-watch)
+# Issue #28: Backtest resolves freshness / bias_weight through the SAME shared
+# rule as Live (chart_snapshot uses these too), never a hardcoded "Fresh"/1.0.
+# The ``freshness`` module is dependency-light (pandas + datetime only), so this
+# does not drag Live's rendering/upload dependencies into the Backtest path.
+from freshness import (  # noqa: E402  (market-watch)
+    resolve_freshness,
+    select_confirmed_candles,
+    timeframe_to_timedelta,
+)
 from signal_generator import DEFAULT_CONFIDENCE_THRESHOLD, generate_signal_candidates  # noqa: E402  (paper-signal)
 from signal_models import create_signal_context  # noqa: E402  (paper-signal)
 
@@ -159,28 +168,43 @@ def _format_timestamp(value) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
-def _build_snapshot(symbol: str, timeframe: str, row: pd.Series) -> dict:
+def _build_snapshot(
+    symbol: str,
+    timeframe: str,
+    row: pd.Series,
+    *,
+    candle_timestamp,
+    evaluation_time,
+) -> dict:
     """Build a minimal Chart-Snapshot-shaped dict for one historical bar.
 
     Mirrors the fields market-watch/chart_snapshot.build_indicator_snapshot()
     would produce for "the latest bar", but for an arbitrary historical
-    row -- reusing the same classify_trend()/classify_bb_state() rules, not
-    reimplementing them. A backtest bar that reaches this point is by
-    definition ready (see evaluate_backtest_bars()), so it is always
-    treated as freshness="Fresh"/bias_weight=1.0, matching how a live Fresh
-    Chart Snapshot would be scored.
+    row -- reusing the same classify_trend()/classify_bb_state() rules AND the
+    same freshness/bias_weight rule (freshness.resolve_freshness), not
+    reimplementing any of them.
+
+    Issue #28: freshness / bias_weight are NOT hardcoded. They are derived from
+    this bar's ``candle_timestamp`` observed at ``evaluation_time`` (the bar's
+    replay evaluation time) through exactly the shared rule Live uses -- so the
+    same (candle_timestamp, evaluation_time) yields the same freshness on either
+    path. When the market-closed / stale rule marks this bar non-Fresh, trend /
+    state are reported as "Stale" just like Live does, and the shared
+    generate_signal_candidates() then declines to emit a candidate.
     """
     close = float(row["close"])
     sma20 = float(row["sma20"]) if pd.notna(row.get("sma20")) else None
     sma75 = float(row["sma75"]) if pd.notna(row.get("sma75")) else None
     bb_position = float(row["bb_position"]) if pd.notna(row.get("bb_position")) else None
+    freshness, _age_seconds, bias_weight = resolve_freshness(candle_timestamp, evaluation_time=evaluation_time)
+    is_stale = freshness == "Stale"
     return {
         "symbol": symbol,
         "timeframe": timeframe,
-        "trend": classify_trend(close, sma20, sma75),
-        "state": classify_bb_state(bb_position),
-        "freshness": "Fresh",
-        "bias_weight": 1.0,
+        "trend": "Stale" if is_stale else classify_trend(close, sma20, sma75),
+        "state": "Stale" if is_stale else classify_bb_state(bb_position),
+        "freshness": freshness,
+        "bias_weight": bias_weight,
         "macd_state": str(row.get("macd_state") or "Neutral"),
     }
 
@@ -195,6 +219,7 @@ def evaluate_backtest_bars(
     bias_result: dict,
     warmup_bars: int = DEFAULT_WARMUP_BARS,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    evaluation_time=None,
 ) -> list[BarEvaluation]:
     """Walk the validation-period bars in *candles*, generating candidates only when ready.
 
@@ -210,8 +235,46 @@ def evaluate_backtest_bars(
     *bias_result* and a single-symbol snapshot built from that bar.
     Otherwise the bar is skipped and ``skip_reasons`` records why (e.g.
     "warmup_insufficient", "ma_not_ready"), logged at DEBUG level too.
+
+    Issue #28: each replayed bar is evaluated at its own **close time**
+    (``candle open + timeframe``) -- the instant that bar becomes the latest
+    confirmed candle, i.e. exactly when a Live run at that wall-clock would
+    first see it. freshness / bias_weight are then derived from that per-bar
+    evaluation time through the same shared rule Live uses.
+
+    Pass an explicit ``evaluation_time`` to instead observe the window as of a
+    single fixed "now" (used to reproduce Stale / market-closed cases and to
+    mirror a Live run at one wall-clock instant). In that fixed-time mode a
+    still-forming validation bar -- one whose close (``candle open + timeframe``)
+    is after ``evaluation_time`` -- is dropped BEFORE evaluation via the same
+    ``select_confirmed_candles()`` Live uses, so it never yields a
+    ``BarEvaluation`` or a Candidate and no future candle is ever read. This
+    makes the Backtest confirmed-candle set identical to Live's for the same
+    ``evaluation_time``. When ``evaluation_time`` is None (historical replay,
+    the runner default) every validation bar is evaluated at its own close, so
+    each is confirmed against itself and this filter is a no-op -- the existing
+    replay behaviour is unchanged.
     """
+    try:
+        timeframe_delta = timeframe_to_timedelta(timeframe)
+    except ValueError:
+        timeframe_delta = pd.Timedelta(0)
+
     warmup_frame, validation_frame = split_warmup_and_validation(candles, validation_start, validation_end)
+
+    # Fixed-time mode: restrict the evaluatable validation bars to those already
+    # CLOSED at evaluation_time, reusing Live's shared confirmed-candle rule
+    # (never a backtest-private reimplementation). None -> historical replay,
+    # every validation bar stays evaluatable (confirmed against its own close).
+    if evaluation_time is not None:
+        try:
+            evaluatable_index = select_confirmed_candles(
+                validation_frame, timeframe=timeframe, evaluation_time=evaluation_time
+            ).index
+        except ValueError:
+            evaluatable_index = validation_frame.index
+    else:
+        evaluatable_index = validation_frame.index
     warmup_insufficient = len(warmup_frame) < warmup_bars
     if warmup_insufficient:
         logger.debug(
@@ -223,8 +286,11 @@ def evaluate_backtest_bars(
     results: list[BarEvaluation] = []
 
     for position, (timestamp, row) in enumerate(indicators.iterrows(), start=1):
-        if timestamp not in validation_frame.index:
-            continue  # warm-up bar: used for indicator seeding only, never a result
+        if timestamp not in evaluatable_index:
+            # warm-up bar (seeding only), or -- in fixed evaluation_time mode --
+            # a still-forming validation bar not yet closed at evaluation_time.
+            # Neither ever becomes a BarEvaluation or a Candidate.
+            continue
 
         reasons: list[str] = [REASON_WARMUP_INSUFFICIENT] if warmup_insufficient else []
         readiness = check_indicator_readiness(row, position)
@@ -242,7 +308,14 @@ def evaluate_backtest_bars(
             )
             continue
 
-        snapshot = _build_snapshot(symbol, timeframe, row)
+        bar_evaluation_time = evaluation_time if evaluation_time is not None else timestamp + timeframe_delta
+        snapshot = _build_snapshot(
+            symbol,
+            timeframe,
+            row,
+            candle_timestamp=timestamp,
+            evaluation_time=bar_evaluation_time,
+        )
         context = create_signal_context(bias_result, [snapshot], confidence_threshold=confidence_threshold)
         candidates = generate_signal_candidates(context)
 

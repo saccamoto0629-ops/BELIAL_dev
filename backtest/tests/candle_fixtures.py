@@ -29,7 +29,13 @@ import chart_collector as collector  # noqa: E402  (market-watch)
 from chart_models import Candle  # noqa: E402  (market-watch)
 import market_bias_store as bias_store  # noqa: E402  (news-feed-bot)
 
-DEFAULT_START = "2026-05-27T00:00:00Z"
+# Issue #28: a Monday 00:00 UTC start so a 100-bar hourly series stays entirely
+# within the FX trading week (Mon..Fri). Under the shared freshness rule the
+# validation window's bars are evaluated at their close time; a start that let
+# them fall on the JST weekend would (correctly) mark them "Weekend Closed" and
+# suppress every candidate. Real FX data has no weekend bars -- these synthetic
+# fixtures now match that. 2026-06-01 is a Monday.
+DEFAULT_START = "2026-06-01T00:00:00Z"
 
 
 def make_uptrend_candles(n, *, start=DEFAULT_START, freq="1h", chart_symbol="USDJPY", timeframe="1h", step=0.05):

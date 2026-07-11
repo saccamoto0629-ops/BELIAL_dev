@@ -10,7 +10,10 @@ sys.path.insert(0, str(BOT_DIR))
 import warmup  # noqa: E402
 
 
-def make_candles(n, *, start="2026-01-01T00:00:00Z", freq="1h", slope=0.1):
+def make_candles(n, *, start="2026-06-01T00:00:00Z", freq="1h", slope=0.1):
+    # Issue #28: Monday 00:00 UTC start so validation bars, now evaluated at
+    # their close time through the shared freshness rule, stay on JST weekdays
+    # (Fresh) instead of landing on the weekend (Weekend Closed).
     closes = [100.0 + i * slope for i in range(n)]
     index = pd.date_range(start, periods=n, freq=freq, tz="UTC")
     return pd.DataFrame({"close": closes}, index=index)

@@ -31,10 +31,22 @@ from chart_image_uploader import create_s3_client, generate_presigned_chart_url,
 from indicators import calculate_indicators, classify_bb_state, classify_trend
 from market_state import classify_market_state
 
+# Issue #28: freshness / bias_weight / confirmed-candle rules are shared with
+# Backtest via the dependency-light ``freshness`` module. Re-exported here so
+# existing callers of ``chart_snapshot.freshness_from_timestamp`` /
+# ``is_market_closed_window`` keep working unchanged.
+from freshness import (  # noqa: F401  (re-exported for backward compatibility)
+    JST,
+    MARKET_CLOSED_BIAS_WEIGHT,
+    STALE_AFTER,
+    freshness_from_timestamp,
+    is_market_closed_window,
+    parse_timestamp_utc,
+    resolve_freshness,
+    select_confirmed_candles,
+)
+
 REQUEST_TIMEOUT_SECONDS = 20
-JST = timezone(timedelta(hours=9), name="JST")
-STALE_AFTER = timedelta(hours=24)
-MARKET_CLOSED_BIAS_WEIGHT = 0.25
 
 
 def _float_or_none(value) -> float | None:
@@ -43,49 +55,24 @@ def _float_or_none(value) -> float | None:
     return float(value)
 
 
-def parse_timestamp_utc(timestamp: str) -> pd.Timestamp:
-    parsed = pd.Timestamp(timestamp)
-    if parsed.tzinfo is None:
-        return parsed.tz_localize(UTC)
-    return parsed.tz_convert(UTC)
-
-
-def is_market_closed_window(now_utc: datetime | pd.Timestamp | None = None) -> tuple[bool, str | None]:
-    now = pd.Timestamp(now_utc if now_utc is not None else datetime.now(UTC))
-    if now.tzinfo is None:
-        now = now.tz_localize(UTC)
-    else:
-        now = now.tz_convert(UTC)
-    now_jst = now.tz_convert(JST)
-    weekday = now_jst.weekday()
-    if weekday in {5, 6}:
-        return True, "Weekend Closed"
-    if weekday == 0 and now_jst.hour < 7:
-        return True, "Market Closed"
-    return False, None
-
-
-def freshness_from_timestamp(timestamp: str, *, now_utc: datetime | pd.Timestamp | None = None) -> tuple[str, int]:
-    now = pd.Timestamp(now_utc if now_utc is not None else datetime.now(UTC))
-    if now.tzinfo is None:
-        now = now.tz_localize(UTC)
-    else:
-        now = now.tz_convert(UTC)
-    age = max(timedelta(0), now.to_pydatetime() - parse_timestamp_utc(timestamp).to_pydatetime())
-    is_closed, closed_label = is_market_closed_window(now)
-    if is_closed:
-        freshness = closed_label or "Market Closed"
-    else:
-        freshness = "Stale" if age > STALE_AFTER else "Fresh"
-    return freshness, int(age.total_seconds())
-
-
 def build_indicator_snapshot(
     target: ChartTarget,
     candles: pd.DataFrame,
     *,
     now_utc: datetime | pd.Timestamp | None = None,
 ) -> IndicatorSnapshot | None:
+    if candles.empty:
+        return None
+
+    # Issue #28: evaluate against an explicit time and drop the still-forming
+    # candle, so Live picks the same latest *confirmed* bar Backtest would for
+    # the same (candles, evaluation_time). Unknown timeframe labels fall back
+    # to using every candle, preserving the previous behaviour.
+    evaluation_time = now_utc if now_utc is not None else datetime.now(UTC)
+    try:
+        candles = select_confirmed_candles(candles, timeframe=target.timeframe, evaluation_time=evaluation_time)
+    except ValueError:
+        pass
     if candles.empty:
         return None
 
@@ -100,9 +87,11 @@ def build_indicator_snapshot(
     macd_hist = _float_or_none(latest.get("macd_hist"))
     rsi14 = _float_or_none(latest.get("rsi14"))
     timestamp = indicators.index[-1].isoformat()
-    freshness, age_seconds = freshness_from_timestamp(timestamp, now_utc=now_utc)
+    # Issue #28: freshness / age / bias_weight all come from the one shared
+    # rule, evaluated at the same explicit time used for confirmed-candle
+    # selection above.
+    freshness, age_seconds, bias_weight = resolve_freshness(timestamp, evaluation_time=evaluation_time)
     is_stale = freshness == "Stale"
-    is_market_closed = freshness in {"Weekend Closed", "Market Closed"}
 
     market_state_result = (
         {"market_state": "unknown", "confidence": 0.0, "reasons": ["Data is stale."]}
@@ -131,7 +120,7 @@ def build_indicator_snapshot(
         rsi_state=str(latest.get("rsi_state") or "Unavailable"),
         freshness=freshness,
         age_seconds=age_seconds,
-        bias_weight=MARKET_CLOSED_BIAS_WEIGHT if is_market_closed else (0.0 if is_stale else 1.0),
+        bias_weight=bias_weight,
         trend="Stale" if is_stale else classify_trend(close, sma20, sma75),
         state="Stale" if is_stale else classify_bb_state(bb_position),
         display_name=target.display_name,
