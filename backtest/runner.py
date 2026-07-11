@@ -40,6 +40,7 @@ not how it is stored or evaluated.
 from __future__ import annotations
 
 import argparse
+import bisect
 import logging
 import sys
 from dataclasses import replace
@@ -63,7 +64,11 @@ import execution_model as execution  # noqa: E402  (Issue #26: virtual fill spre
 import warmup  # noqa: E402
 import chart_collector  # noqa: E402  (market-watch)
 import exit_policy  # noqa: E402  (paper-signal)
-from market_bias_store import get_market_bias_as_of, market_bias_db_path  # noqa: E402  (news-feed-bot)
+from market_bias_store import (  # noqa: E402  (news-feed-bot)
+    get_market_bias_as_of,
+    load_market_bias_series,
+    market_bias_db_path,
+)
 import summary as signal_summary  # noqa: E402  (Issue #23: signal-level win/loss/pnl aggregation)
 import report  # noqa: E402  (Issue #23: text/JSON/Markdown rendering)
 
@@ -87,6 +92,66 @@ NEUTRAL_BIAS_PLACEHOLDER = {
     "warnings": [],
     "note": "no persisted Market Bias available at this point in time",
 }
+
+# Issue #38: how a run resolves Market Bias across the validation window.
+# "static" applies one as-of-``--from`` bias to every bar (pre-#38 behaviour,
+# the default); "time_series" resolves each bar's bias point-in-time at its
+# own close via --time-series-bias.
+BIAS_MODE_STATIC = "static"
+BIAS_MODE_TIME_SERIES = "time_series"
+
+
+def _to_utc_timestamp(value) -> pd.Timestamp:
+    """Normalize any bar/close/bias timestamp to a tz-aware UTC pandas Timestamp.
+
+    Issue #38: entry times (validation bar index), Exit Policy ``close_time``
+    strings, and Market Bias ``evaluated_at`` strings can arrive naive or
+    already tz-aware. Normalizing them all to UTC before any ``<=``/``<``
+    comparison keeps re-entry/cooldown suppression and point-in-time bias
+    lookups from ever raising on mixed tz-awareness or silently mis-ordering.
+    """
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+class TimeSeriesBiasLookup:
+    """Point-in-time Market Bias resolver over a preloaded bias series.
+
+    Issue #38: constructed once from the whole (GLOBAL, 1h) bias history
+    (loaded through a single SQLite connection -- never re-opened per bar),
+    then queried per validation bar. ``__call__(at)`` returns the latest bias
+    whose ``evaluated_at <= at`` -- never a future one -- or the Neutral
+    placeholder when no bias precedes ``at``. The series is pre-sorted
+    ascending and looked up with a binary search, so this already has the
+    "preload + time-series pointer" shape a future optimization would want.
+
+    Tie-break: the series is sorted by ``(UTC-normalized evaluated_at,
+    market_bias_id)`` ascending, so ``bisect_right`` + ``index - 1`` selects,
+    within the latest ``evaluated_at`` group at or before ``at``, the record
+    with the lexicographically greatest ``market_bias_id``. That is exactly
+    the record ``market_bias_store.get_market_bias_as_of`` (ORDER BY
+    evaluated_at DESC, market_bias_id DESC) returns -- so the static and
+    time-series paths agree on same-timestamp groups, and neither result
+    depends on DB insertion order.
+    """
+
+    def __init__(self, series: list[dict], *, neutral: dict) -> None:
+        ordered = sorted(
+            series,
+            key=lambda row: (_to_utc_timestamp(row["evaluated_at"]), row.get("market_bias_id", "")),
+        )
+        self._times = [_to_utc_timestamp(row["evaluated_at"]) for row in ordered]
+        self._biases = ordered
+        self._neutral = neutral
+
+    def __call__(self, at) -> dict:
+        at_ts = _to_utc_timestamp(at)
+        index = bisect.bisect_right(self._times, at_ts) - 1
+        if index < 0:
+            return self._neutral
+        return self._biases[index]
 
 # Terminal states an evaluated signal can end up in; "open" also covers
 # signals for which the loaded candle window ran out before any policy
@@ -243,6 +308,31 @@ def parse_args(argv=None) -> argparse.Namespace:
         "difference (not pips). Must be >= 0.0 (default 0.0). Applied always in the "
         "direction unfavorable to the position.",
     )
+    run_parser.add_argument(
+        "--no-reentry",
+        action="store_true",
+        help="Issue #38: forbid opening a new hypothesis while one is already held. "
+        "Enforces a single global position: any candidate whose entry falls within "
+        "entry <= T <= close_time of the currently-held position is suppressed. An open "
+        "position (no close within the window) is held until --to. Off by default "
+        "(overlapping signals allowed, pre-#38 behaviour).",
+    )
+    run_parser.add_argument(
+        "--cooldown-minutes",
+        type=_nonneg_float,
+        default=0.0,
+        help="Issue #38: after any position closes at time C, suppress every candidate "
+        "whose entry is < C + N minutes. Global (not per-side / per-signal-type). Must be "
+        ">= 0.0 (default 0.0 = disabled, pre-#38 behaviour).",
+    )
+    run_parser.add_argument(
+        "--time-series-bias",
+        action="store_true",
+        help="Issue #38: resolve Market Bias point-in-time at each bar's close "
+        "(evaluated_at <= close, never a future record; Neutral before the first bias) "
+        "instead of applying one as-of-'--from' bias to the whole run. Off by default "
+        "(static bias, pre-#38 behaviour).",
+    )
     run_parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
     run_parser.add_argument(
         "--strategy-name",
@@ -316,6 +406,8 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
 
     validation_start = pd.Timestamp(validation_start_iso)
     validation_end = pd.Timestamp(validation_end_iso)
+    # Issue #38: a tz-aware UTC copy for held-position / cooldown comparisons.
+    validation_end_utc = _to_utc_timestamp(validation_end)
     if validation_end < validation_start:
         print("error: --to must not be before --from", file=sys.stderr)
         return EXIT_USAGE_ERROR, None
@@ -349,14 +441,37 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             len(warmup_frame), args.from_time, args.warmup_bars, warmup.REASON_WARMUP_INSUFFICIENT,
         )
 
-    bias_result = get_market_bias_as_of("GLOBAL", "1h", validation_start_iso, db_path=bias_db_path)
-    if bias_result is None:
-        logger.warning(
-            "No persisted Market Bias found at or before %s (symbol=GLOBAL timeframe=1h in %s); "
-            "using a neutral placeholder, so no signal candidates will be generated this run.",
-            args.from_time, bias_db_path,
-        )
+    # Issue #38: two Market Bias resolution modes, both reading the same
+    # (GLOBAL, 1h) history point-in-time (never a future record).
+    #   static      -- one bias as of --from, applied to every bar (default).
+    #   time_series -- each bar's bias resolved at its own close via a
+    #                  preloaded, binary-searched series (--time-series-bias).
+    bias_lookup = None
+    if args.time_series_bias:
+        bias_mode = BIAS_MODE_TIME_SERIES
+        bias_series = load_market_bias_series("GLOBAL", "1h", db_path=bias_db_path)
+        if not bias_series:
+            logger.warning(
+                "No persisted Market Bias series found (symbol=GLOBAL timeframe=1h in %s); "
+                "time-series bias will fall back to Neutral for every bar, so no signal "
+                "candidates will be generated this run.",
+                bias_db_path,
+            )
+        bias_lookup = TimeSeriesBiasLookup(bias_series, neutral=dict(NEUTRAL_BIAS_PLACEHOLDER))
+        # evaluate_backtest_bars still requires a bias_result argument; in
+        # time-series mode bias_lookup supersedes it per bar, so pass a neutral
+        # placeholder that is never actually consulted.
         bias_result = dict(NEUTRAL_BIAS_PLACEHOLDER)
+    else:
+        bias_mode = BIAS_MODE_STATIC
+        bias_result = get_market_bias_as_of("GLOBAL", "1h", validation_start_iso, db_path=bias_db_path)
+        if bias_result is None:
+            logger.warning(
+                "No persisted Market Bias found at or before %s (symbol=GLOBAL timeframe=1h in %s); "
+                "using a neutral placeholder, so no signal candidates will be generated this run.",
+                args.from_time, bias_db_path,
+            )
+            bias_result = dict(NEUTRAL_BIAS_PLACEHOLDER)
 
     confidence_threshold = (
         args.confidence_threshold if args.confidence_threshold is not None else warmup.DEFAULT_CONFIDENCE_THRESHOLD
@@ -376,6 +491,7 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         bias_result=bias_result,
         warmup_bars=args.warmup_bars,
         confidence_threshold=confidence_threshold,
+        bias_lookup=bias_lookup,
     )
 
     exit_config = exit_policy.load_exit_policy_config(args.exit_config)
@@ -411,15 +527,38 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             # Issue #26: record exactly which virtual-fill model produced this
             # run's entry/close prices, alongside the pre-existing keys.
             "execution_model": exec_model.to_config(),
+            # Issue #38: record the opt-in realism settings for this run so a
+            # saved run is self-describing (all three default to "off").
+            "no_reentry": args.no_reentry,
+            "cooldown_minutes": args.cooldown_minutes,
+            "bias_mode": bias_mode,
         },
     )
     store.save_backtest_run(run_record, db_path=backtest_db_path)
+
+    # Issue #38: opt-in candidate suppression, enforced in strict entry-time
+    # order (evaluations are already ascending). Both are global (one position
+    # / one cooldown at a time), not per-side or per-signal-type.
+    #   --no-reentry     -- while a position is held, drop any candidate whose
+    #                       entry falls in [held position entry, close_time].
+    #                       An open position (close_time=None) is held until
+    #                       validation_end.
+    #   --cooldown-minutes N -- after a position closes at C, drop any candidate
+    #                       whose entry is < C + N minutes.
+    # With both flags off (the defaults) neither branch ever fires and every
+    # candidate is adopted exactly as before.
+    cooldown_delta = pd.Timedelta(minutes=args.cooldown_minutes)
+    held_until: pd.Timestamp | None = None
+    cooldown_until: pd.Timestamp | None = None
+    suppressed_reentry = 0
+    suppressed_cooldown = 0
 
     signal_records: list[dict] = []
     for evaluation in evaluations:
         if not evaluation.candidates:
             continue
         entry_timestamp = pd.Timestamp(evaluation.timestamp)
+        entry_ts_utc = _to_utc_timestamp(entry_timestamp)
         raw_entry_price = float(candles.loc[entry_timestamp, "close"])
         # The hypothesis enters at this bar's close, so it can only ever be
         # exposed to *subsequent* bars' high/low. Exit evaluation must start at
@@ -432,6 +571,17 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         future_candles = candles.iloc[entry_position + 1 :]
 
         for candidate in evaluation.candidates:
+            # Issue #38: re-entry suppression is checked before cooldown so
+            # the two counters never double-count the same candidate. Given a
+            # close at C with held_until=C and cooldown_until=C+N: entry <= C
+            # counts as re-entry; C < entry < C+N counts as cooldown.
+            if args.no_reentry and held_until is not None and entry_ts_utc <= held_until:
+                suppressed_reentry += 1
+                continue
+            if args.cooldown_minutes > 0 and cooldown_until is not None and entry_ts_utc < cooldown_until:
+                suppressed_cooldown += 1
+                continue
+
             direction = "long" if candidate.get("side") == "long" else "short"
             # Issue #26 ordering: (1) raw entry = signal bar's close;
             # (2) direction decided above; (3) correct the entry with the
@@ -480,6 +630,23 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             record = models.apply_exit_policy_result(record, exit_result)
             signal_records.append(record)
 
+            # Issue #38: update the single-position / cooldown state from THIS
+            # adopted position's close. close_time is the exit bar's timestamp
+            # (isoformat); None means the position never closed within the
+            # loaded window. Compared in UTC to stay tz-safe.
+            if args.no_reentry or args.cooldown_minutes > 0:
+                if exit_result.close_time is None:
+                    # Open position: held to the window end; a never-closed
+                    # position starts no cooldown.
+                    if args.no_reentry:
+                        held_until = validation_end_utc
+                else:
+                    close_ts_utc = _to_utc_timestamp(exit_result.close_time)
+                    if args.no_reentry:
+                        held_until = close_ts_utc
+                    if args.cooldown_minutes > 0:
+                        cooldown_until = close_ts_utc + cooldown_delta
+
     if signal_records:
         store.save_backtest_signals(signal_records, db_path=backtest_db_path)
 
@@ -496,6 +663,12 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         "signals_generated": len(signal_records),
         "result_counts": _summarize(signal_records),
         "backtest_db_path": str(backtest_db_path),
+        # Issue #38: how many candidates the opt-in filters dropped, and which
+        # Market Bias mode this run used. Both counts are 0 when the flags are
+        # off; bias_mode is "static" unless --time-series-bias was given.
+        "suppressed_reentry": suppressed_reentry,
+        "suppressed_cooldown": suppressed_cooldown,
+        "bias_mode": bias_mode,
         # Issue #26: echo the virtual-fill model settings that produced this
         # run's entry/close prices (mirrors backtest_runs.config_json).
         "execution_model": exec_model.to_config(),
@@ -520,6 +693,12 @@ def print_summary(summary: dict) -> None:
     )
     print(f"Bars processed:      {summary['bars_processed']}")
     print(f"Signals generated:   {summary['signals_generated']}")
+    # Issue #38: bias mode + how many candidates the opt-in filters dropped.
+    print(f"Bias mode:           {summary.get('bias_mode', BIAS_MODE_STATIC)}")
+    print(
+        f"Suppressed:          re-entry={summary.get('suppressed_reentry', 0)}, "
+        f"cooldown={summary.get('suppressed_cooldown', 0)}"
+    )
     execution_model = summary.get("execution_model") or {}
     print(
         f"Execution model:     {execution_model.get('type', 'n/a')} "

@@ -30,7 +30,12 @@ import summary as signal_summary  # noqa: E402  (Issue #23; aliased so it never 
 
 # Shared candle/bias fixture builders (Issue #25): also used by
 # test_backtest_engine.py, so the same price-path fixture is defined once.
-from candle_fixtures import make_uptrend_candles, seed_bull_bias, seed_chart_db  # noqa: E402
+from candle_fixtures import (  # noqa: E402
+    make_ohlcv_candles,
+    make_uptrend_candles,
+    seed_bull_bias,
+    seed_chart_db,
+)
 
 
 def make_args(tmp_path, *, symbol="USD_JPY", timeframe="1h", from_time, to_time, **overrides):
@@ -44,7 +49,15 @@ def make_args(tmp_path, *, symbol="USD_JPY", timeframe="1h", from_time, to_time,
         "--market-bias-db-path", str(overrides.pop("bias_db_path", tmp_path / "market_bias.sqlite3")),
     ]
     for key, value in overrides.items():
-        argv.extend([f"--{key.replace('_', '-')}", str(value)])
+        flag = f"--{key.replace('_', '-')}"
+        # store_true flags (Issue #38: --no-reentry / --time-series-bias) are
+        # passed as bare flags when True and omitted when False.
+        if value is True:
+            argv.append(flag)
+        elif value is False:
+            continue
+        else:
+            argv.extend([flag, str(value)])
     return runner.parse_args(argv)
 
 
@@ -1171,3 +1184,507 @@ def test_open_signal_close_price_stays_none_with_cost(tmp_path):
     raw_entries = _run_and_fetch_signals(tmp_path, index)[1]
     for corrected, raw in zip(signals, raw_entries):
         assert corrected["entry_price"] == pytest.approx(raw["entry_price"] + 0.015)
+
+
+# =============================================================================
+# Issue #38: re-entry suppression, global cooldown, time-series Market Bias
+# =============================================================================
+
+import market_bias_store as bias_store  # noqa: E402  (news-feed-bot)
+
+
+def _seed_vshape(tmp_path, *, n_warm=90, n_up=5, n_down=10, step=0.05, down_step=0.15):
+    """Seed a warm-up uptrend that continues up briefly then reverses hard down.
+
+    Returns (validation_index, first_bearish_close_iso). Over this path
+    calculate_indicators() reports a clean Bullish->Bearish MACD flip right
+    after the up segment, and every validation bar's close stays inside the FX
+    trading week (Mon..Fri), so freshness is always "Fresh". That lets one
+    time-series run legitimately produce BOTH long (Bull) and short (Bear)
+    signals -- see test_time_series_bias_produces_both_bull_and_bear_signals.
+    """
+    chart_db = tmp_path / "chart_data.sqlite3"
+    warmup_index, warmup_candles = make_uptrend_candles(n_warm, step=step)
+    start_val = warmup_index[-1] + pd.Timedelta(hours=1)
+    price = 150.0 + n_warm * step
+    bars = []
+    for _ in range(n_up):
+        price += step
+        bars.append((price - 0.02, price + 0.05, price - 0.05, price))
+    for _ in range(n_down):
+        price -= down_step
+        bars.append((price + 0.02, price + 0.05, price - 0.05, price))
+    validation_index, validation_candles = make_ohlcv_candles(bars, start=collector.to_utc_iso_z(start_val))
+    collector.save_candles(chart_db, warmup_candles + validation_candles)
+    # bar[n_up] is the first bearish bar; its close is one timeframe later.
+    first_bearish_close = collector.to_utc_iso_z(validation_index[n_up] + pd.Timedelta(hours=1))
+    return validation_index, first_bearish_close
+
+
+# --- CLI parsing: defaults, acceptance, rejection ----------------------------
+
+
+def test_parse_args_defaults_issue38_flags_to_off(tmp_path):
+    args = make_args(tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00")
+    assert args.no_reentry is False
+    assert args.cooldown_minutes == 0.0
+    assert args.time_series_bias is False
+
+
+def test_parse_args_accepts_issue38_flags(tmp_path):
+    args = make_args(
+        tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+        no_reentry=True, cooldown_minutes="90", time_series_bias=True,
+    )
+    assert args.no_reentry is True
+    assert args.cooldown_minutes == pytest.approx(90.0)
+    assert args.time_series_bias is True
+
+
+@pytest.mark.parametrize("value", ["-0.01", "-1", "-60"])
+def test_parse_args_rejects_negative_cooldown(tmp_path, value):
+    with pytest.raises(SystemExit) as exc_info:
+        make_args(
+            tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+            cooldown_minutes=value,
+        )
+    assert exc_info.value.code == runner.EXIT_USAGE_ERROR
+
+
+def test_run_help_documents_issue38_flags(capsys):
+    with pytest.raises(SystemExit):
+        runner.parse_args(["run", "--help"])
+    captured = capsys.readouterr()
+    assert "--no-reentry" in captured.out
+    assert "--cooldown-minutes" in captured.out
+    assert "--time-series-bias" in captured.out
+
+
+# --- --no-reentry: single global position ------------------------------------
+
+
+def test_no_reentry_suppresses_overlapping_positions_and_holds_are_disjoint(tmp_path):
+    # time_based_close(max_hold_bars=1) closes each adopted signal at the very
+    # next bar, so with --no-reentry every other validation bar is suppressed:
+    # bar90 held until bar91 -> bar91 suppressed -> bar92 adopted, and so on.
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+
+    _, baseline = _run_and_fetch_signals(tmp_path, index, exit_config=str(exit_config))
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_config=str(exit_config), no_reentry=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert len(baseline) == 10  # every bar generates a candidate without the flag
+    assert summary["signals_generated"] == 5  # every other bar adopted
+    assert summary["suppressed_reentry"] == 5  # the rest suppressed as re-entry
+    assert summary["suppressed_cooldown"] == 0
+
+    # adopted positions never overlap: each entry is strictly after the prior
+    # adopted position's close_time.
+    adopted = sorted(
+        store.list_backtest_signals(summary["run_id"], db_path=backtest_db),
+        key=lambda s: s["signal_time"],
+    )
+    for prev, curr in zip(adopted, adopted[1:]):
+        assert prev["closed_at"] is not None  # backtest_signals stores close_time as closed_at
+        assert curr["signal_time"] > prev["closed_at"]
+
+
+def test_no_reentry_suppresses_a_reentry_at_the_exact_close_timestamp(tmp_path):
+    # The bar whose entry timestamp equals the held position's close_time must
+    # be suppressed too (interval is inclusive: entry <= T <= close_time).
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_config=str(exit_config), no_reentry=True,
+    )
+    _, summary = runner.run_backtest(args)
+
+    adopted = {
+        s["signal_time"]
+        for s in store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    }
+    # bar90 is adopted and closes at bar91; bar91's entry == that close_time, so
+    # bar91 must NOT be among the adopted signals.
+    assert index[90].isoformat() in adopted
+    assert index[91].isoformat() not in adopted
+
+
+def test_no_reentry_open_position_is_held_until_validation_end(tmp_path):
+    # The default fixed_rr policy never closes in this steady uptrend, so the
+    # first adopted signal stays open (close_time=None) and, under --no-reentry,
+    # is treated as held until --to: every later candidate is suppressed.
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        no_reentry=True,
+    )
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 1
+    assert summary["suppressed_reentry"] == 9
+
+
+# --- --cooldown-minutes ------------------------------------------------------
+
+
+def test_cooldown_suppresses_candidates_within_the_window(tmp_path):
+    # time_based_close(max_hold_bars=1) closes each signal one 1h bar later; a
+    # 60-minute cooldown then blocks the immediately following bar, halving the
+    # adopted count -- without --no-reentry (cooldown is independent).
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_config=str(exit_config), cooldown_minutes=60,
+    )
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 5
+    assert summary["suppressed_cooldown"] == 5
+    assert summary["suppressed_reentry"] == 0
+
+
+def test_cooldown_zero_matches_the_no_flag_baseline(tmp_path):
+    # --cooldown-minutes 0 must be a pure no-op: identical signals to a run
+    # with no cooldown flag at all.
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+
+    _, baseline = _run_and_fetch_signals(tmp_path, index, exit_config=str(exit_config))
+    _, zero = _run_and_fetch_signals(
+        tmp_path, index, exit_config=str(exit_config), cooldown_minutes=0,
+    )
+
+    assert len(baseline) == len(zero) == 10
+    for base, z in zip(baseline, zero):
+        assert base["signal_time"] == z["signal_time"]
+        assert base["entry_price"] == pytest.approx(z["entry_price"])
+
+
+# --- --time-series-bias ------------------------------------------------------
+
+
+def test_time_series_bias_produces_both_bull_and_bear_signals(tmp_path):
+    # A V-shaped price path (up then hard down) flips MACD Bullish->Bearish. A
+    # bias series that is Bull early and Bear from the reversal onward -- read
+    # point-in-time per bar close -- yields both long (Bull) and short (Bear)
+    # signals in the same run.
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    validation_index, first_bearish_close = _seed_vshape(tmp_path)
+
+    seed_bull_bias(bias_db, evaluated_at="2026-06-01T00:00:00Z", market_bias="Bull", bias_id="bull-early")
+    seed_bull_bias(bias_db, evaluated_at=first_bearish_close, market_bias="Bear", bias_id="bear-late")
+
+    args = make_args(
+        tmp_path, from_time=validation_index[0].isoformat(), to_time=validation_index[-1].isoformat(),
+        time_series_bias=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert summary["bias_mode"] == "time_series"
+    by_bias = summary["signal_summary"]["breakdowns"]["by_bias"]
+    assert "Bull" in by_bias
+    assert "Bear" in by_bias
+
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    directions = {s["direction"] for s in signals}
+    assert directions == {"long", "short"}
+    # point-in-time correctness: every Bull-tagged signal precedes the Bear
+    # bias's evaluation time, every Bear-tagged one is at/after it.
+    for s in signals:
+        if s["bias"] == "Bull":
+            assert s["signal_time"] < first_bearish_close
+        elif s["bias"] == "Bear":
+            assert s["signal_time"] >= validation_index[5].isoformat()  # in the down segment
+
+
+def test_time_series_bias_is_neutral_before_the_first_persisted_bias(tmp_path):
+    # A steady uptrend whose only bias record is evaluated AFTER the window
+    # begins: bars before that record resolve to Neutral (no candidate), bars
+    # at/after it become Bull -> long.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    # First bias only known as of bar 95's close: bars 90..94 must be Neutral.
+    first_bias_at = collector.to_utc_iso_z(index[95] + pd.Timedelta(hours=1))
+    seed_bull_bias(bias_db, evaluated_at=first_bias_at, market_bias="Bull", bias_id="late-bull")
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        time_series_bias=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    # Only bars whose close is at/after the first bias produce a signal; bars
+    # 90..94 fell back to Neutral and produced nothing. bar95's close equals
+    # the first bias time, so bars 95..99 (5 bars) are Bull -> long.
+    assert signals
+    assert all(s["bias"] == "Bull" for s in signals)
+    assert all(s["signal_time"] >= index[95].isoformat() for s in signals)
+    assert summary["signals_generated"] == 5
+
+
+def test_time_series_bias_falls_back_to_neutral_when_no_bias_persisted(tmp_path):
+    # --time-series-bias with an empty/absent bias DB: every bar is Neutral, so
+    # no signals -- and it must not raise or create the DB.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        time_series_bias=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert summary["bias_mode"] == "time_series"
+    assert summary["signals_generated"] == 0
+    assert not (tmp_path / "market_bias.sqlite3").exists()  # read is side-effect-free
+
+
+# --- run config + summary carry the new settings -----------------------------
+
+
+def test_issue38_settings_are_saved_to_config_json(tmp_path):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        no_reentry=True, cooldown_minutes=30,
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    config = json.loads(run["config_json"])
+    assert config["no_reentry"] is True
+    assert config["cooldown_minutes"] == pytest.approx(30.0)
+    assert config["bias_mode"] == "static"
+
+
+def test_default_run_records_off_settings_and_static_bias_mode(tmp_path):
+    # Backward compatibility: with no Issue #38 flags a run still records the
+    # new keys, all in their "off" state, and reports zero suppression.
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["suppressed_reentry"] == 0
+    assert summary["suppressed_cooldown"] == 0
+    assert summary["bias_mode"] == "static"
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    config = json.loads(run["config_json"])
+    assert config["no_reentry"] is False
+    assert config["cooldown_minutes"] == 0.0
+    assert config["bias_mode"] == "static"
+
+
+def test_print_summary_shows_bias_mode_and_suppression(tmp_path, capsys):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_config=str(exit_config), no_reentry=True, cooldown_minutes=60,
+    )
+    _, summary = runner.run_backtest(args)
+
+    runner.print_summary(summary)
+    captured = capsys.readouterr()
+
+    assert "Bias mode:           static" in captured.out
+    assert "re-entry=" in captured.out
+    assert "cooldown=" in captured.out
+
+
+# --- point-in-time bias helpers (unit) ---------------------------------------
+
+
+def test_to_utc_timestamp_normalizes_naive_and_aware():
+    naive = runner._to_utc_timestamp("2026-06-01T00:00:00")
+    aware = runner._to_utc_timestamp("2026-06-01T09:00:00+09:00")
+    assert naive.tzinfo is not None
+    assert aware.tzinfo is not None
+    assert naive == aware  # 00:00 UTC == 09:00 JST
+
+
+def test_time_series_bias_lookup_is_point_in_time_and_never_future():
+    neutral = {"market_bias": "Neutral", "confidence": 0.0}
+    series = [
+        {"evaluated_at": "2026-06-01T00:00:00Z", "market_bias": "Bull"},
+        {"evaluated_at": "2026-06-03T00:00:00Z", "market_bias": "Bear"},
+    ]
+    lookup = runner.TimeSeriesBiasLookup(series, neutral=neutral)
+
+    # Before the first record -> Neutral (never leaks the future Bull/Bear).
+    assert lookup("2026-05-31T23:59:59Z")["market_bias"] == "Neutral"
+    # At/after the first, before the second -> Bull.
+    assert lookup("2026-06-01T00:00:00Z")["market_bias"] == "Bull"
+    assert lookup("2026-06-02T12:00:00Z")["market_bias"] == "Bull"
+    # At/after the second -> Bear.
+    assert lookup("2026-06-03T00:00:00Z")["market_bias"] == "Bear"
+    assert lookup("2026-06-10T00:00:00Z")["market_bias"] == "Bear"
+
+
+def test_time_series_bias_lookup_orders_an_unsorted_series():
+    neutral = {"market_bias": "Neutral", "confidence": 0.0}
+    # Deliberately out of order: the lookup must sort internally.
+    series = [
+        {"evaluated_at": "2026-06-03T00:00:00Z", "market_bias": "Bear"},
+        {"evaluated_at": "2026-06-01T00:00:00Z", "market_bias": "Bull"},
+    ]
+    lookup = runner.TimeSeriesBiasLookup(series, neutral=neutral)
+    assert lookup("2026-06-02T00:00:00Z")["market_bias"] == "Bull"
+
+
+def test_load_market_bias_series_is_side_effect_free_and_ordered(tmp_path):
+    bias_db = tmp_path / "market_bias.sqlite3"
+    # Missing DB -> [] and no file created.
+    assert bias_store.load_market_bias_series("GLOBAL", "1h", db_path=bias_db) == []
+    assert not bias_db.exists()
+
+    seed_bull_bias(bias_db, evaluated_at="2026-06-03T00:00:00Z", market_bias="Bear", bias_id="b2")
+    seed_bull_bias(bias_db, evaluated_at="2026-06-01T00:00:00Z", market_bias="Bull", bias_id="b1")
+
+    rows = bias_store.load_market_bias_series("GLOBAL", "1h", db_path=bias_db)
+    assert [r["evaluated_at"] for r in rows] == ["2026-06-01T00:00:00Z", "2026-06-03T00:00:00Z"]
+
+
+# --- deterministic tie-break on identical evaluated_at (review Medium) --------
+
+
+def _seed_two_biases_same_time(bias_db, *, at, first, second):
+    """Seed two GLOBAL/1h biases at the same evaluated_at, in the given order.
+
+    ``first`` / ``second`` are (bias_id, market_bias) tuples. Insertion order
+    is first-then-second so a caller can prove selection is independent of it.
+    """
+    for bias_id, market_bias in (first, second):
+        seed_bull_bias(bias_db, evaluated_at=at, market_bias=market_bias, bias_id=bias_id)
+
+
+def test_load_market_bias_series_orders_same_time_records_by_id_ascending(tmp_path):
+    # Two records share evaluated_at; regardless of insertion order the series
+    # must come back ordered by market_bias_id ASC within that timestamp group.
+    db_a = tmp_path / "a.sqlite3"
+    db_b = tmp_path / "b.sqlite3"
+    _seed_two_biases_same_time(db_a, at="2026-06-01T00:00:00Z", first=("id-a", "Bull"), second=("id-b", "Bear"))
+    _seed_two_biases_same_time(db_b, at="2026-06-01T00:00:00Z", first=("id-b", "Bear"), second=("id-a", "Bull"))
+
+    ids_a = [r["market_bias_id"] for r in bias_store.load_market_bias_series("GLOBAL", "1h", db_path=db_a)]
+    ids_b = [r["market_bias_id"] for r in bias_store.load_market_bias_series("GLOBAL", "1h", db_path=db_b)]
+    assert ids_a == ids_b == ["id-a", "id-b"]
+
+
+def test_get_market_bias_as_of_same_time_selection_is_insertion_order_independent(tmp_path):
+    # Static mode: at a shared evaluated_at the record with the greatest
+    # market_bias_id wins (ORDER BY ... market_bias_id DESC), whichever order
+    # the two rows were written in.
+    db_a = tmp_path / "a.sqlite3"
+    db_b = tmp_path / "b.sqlite3"
+    # "z-bull" > "a-bear" lexicographically, so Bull must always be selected.
+    _seed_two_biases_same_time(db_a, at="2026-06-01T00:00:00Z", first=("a-bear", "Bear"), second=("z-bull", "Bull"))
+    _seed_two_biases_same_time(db_b, at="2026-06-01T00:00:00Z", first=("z-bull", "Bull"), second=("a-bear", "Bear"))
+
+    pick_a = bias_store.get_market_bias_as_of("GLOBAL", "1h", "2026-06-02T00:00:00Z", db_path=db_a)
+    pick_b = bias_store.get_market_bias_as_of("GLOBAL", "1h", "2026-06-02T00:00:00Z", db_path=db_b)
+    assert pick_a["market_bias_id"] == pick_b["market_bias_id"] == "z-bull"
+    assert pick_a["market_bias"] == pick_b["market_bias"] == "Bull"
+
+
+def test_time_series_bias_lookup_same_time_selects_max_id_regardless_of_order():
+    neutral = {"market_bias": "Neutral", "confidence": 0.0}
+    rows = [
+        {"evaluated_at": "2026-06-01T00:00:00Z", "market_bias_id": "a-bear", "market_bias": "Bear"},
+        {"evaluated_at": "2026-06-01T00:00:00Z", "market_bias_id": "z-bull", "market_bias": "Bull"},
+    ]
+    forward = runner.TimeSeriesBiasLookup(rows, neutral=neutral)
+    reversed_ = runner.TimeSeriesBiasLookup(list(reversed(rows)), neutral=neutral)
+
+    # Same timestamp group -> lexicographically greatest market_bias_id ("z-bull").
+    for lookup in (forward, reversed_):
+        picked = lookup("2026-06-02T00:00:00Z")
+        assert picked["market_bias_id"] == "z-bull"
+        assert picked["market_bias"] == "Bull"
+
+
+def _run_time_series_with_same_time_biases(tmp_path, *, first, second):
+    """Run a Bull uptrend in time-series mode with two same-evaluated_at biases."""
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    # Both biases evaluated before the first validation bar's close, so every
+    # ready bar resolves the same same-time group.
+    at = collector.to_utc_iso_z(index[0])
+    _seed_two_biases_same_time(bias_db, at=at, first=first, second=second)
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        time_series_bias=True,
+    )
+    _, summary = runner.run_backtest(args)
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    directions = tuple(sorted({s["direction"] for s in signals}))
+    by_bias = tuple(sorted(summary["signal_summary"]["breakdowns"]["by_bias"].keys()))
+    return summary["signals_generated"], directions, by_bias
+
+
+def test_time_series_mode_result_is_independent_of_bias_insertion_order(tmp_path):
+    # Same two same-evaluated_at biases, inserted in opposite orders, must give
+    # an identical run: same signal count, direction set, and by_bias keys.
+    forward = _run_time_series_with_same_time_biases(
+        tmp_path / "fwd", first=("a-bear", "Bear"), second=("z-bull", "Bull"),
+    )
+    reverse = _run_time_series_with_same_time_biases(
+        tmp_path / "rev", first=("z-bull", "Bull"), second=("a-bear", "Bear"),
+    )
+
+    assert forward == reverse
+    # "z-bull" wins the tie -> Bull bias -> long signals in this uptrend.
+    signals_generated, directions, by_bias = forward
+    assert signals_generated == 10
+    assert directions == ("long",)
+    assert by_bias == ("Bull",)
+
+
+def test_static_mode_result_is_independent_of_bias_insertion_order(tmp_path):
+    # The same determinism in static mode: opposite insertion orders of two
+    # same-time biases select the same bias, hence the same signals.
+    def run(order_dir, first, second):
+        base = tmp_path / order_dir
+        chart_db = base / "chart_data.sqlite3"
+        bias_db = base / "market_bias.sqlite3"
+        backtest_db = base / "backtest_results.sqlite3"
+        index = seed_chart_db(chart_db, n=100)
+        _seed_two_biases_same_time(bias_db, at=collector.to_utc_iso_z(index[0]), first=first, second=second)
+        args = make_args(
+            base, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        )
+        _, summary = runner.run_backtest(args)
+        signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+        return summary["signals_generated"], tuple(sorted({s["bias"] for s in signals}))
+
+    forward = run("fwd", ("a-bear", "Bear"), ("z-bull", "Bull"))
+    reverse = run("rev", ("z-bull", "Bull"), ("a-bear", "Bear"))
+
+    assert forward == reverse
+    # "z-bull" (Bull) wins -> long signals generated in the uptrend.
+    assert forward == (10, ("Bull",))

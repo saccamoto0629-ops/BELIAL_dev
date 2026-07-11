@@ -122,6 +122,15 @@ def get_market_bias_as_of(
     a bias evaluated *after* the moment it is currently at, or it would leak
     future information into a past decision.
 
+    Ties are broken deterministically: when several records share the latest
+    ``evaluated_at`` at or before ``at``, the one with the lexicographically
+    greatest ``market_bias_id`` wins (``ORDER BY evaluated_at DESC,
+    market_bias_id DESC``). This matches ``load_market_bias_series`` +
+    ``runner.TimeSeriesBiasLookup`` (whose ascending sort + ``bisect_right``
+    selects that same max-id record), so the static and time-series paths
+    never disagree on a same-timestamp group -- and neither depends on DB
+    insertion order.
+
     Deliberately side-effect-free on read: unlike the rest of this module,
     this never creates the DB file/table. Returns None (never raises) when
     the DB doesn't exist yet, the table doesn't exist yet, or no record for
@@ -139,7 +148,7 @@ def get_market_bias_as_of(
                 """
                 SELECT * FROM market_bias
                 WHERE symbol = ? AND timeframe = ? AND evaluated_at <= ?
-                ORDER BY evaluated_at DESC
+                ORDER BY evaluated_at DESC, market_bias_id DESC
                 LIMIT 1
                 """,
                 (symbol, timeframe, at),
@@ -148,6 +157,53 @@ def get_market_bias_as_of(
         return None
 
     return dict(row) if row is not None else None
+
+
+def load_market_bias_series(
+    symbol: str,
+    timeframe: str,
+    *,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Return every persisted Market Bias for symbol/timeframe, oldest first.
+
+    Point-in-time consumers (Issue #38's time-series Backtest bias) load the
+    whole series once, up front, and then walk it in memory -- so this opens
+    a single SQLite connection for the entire run instead of re-querying the
+    DB per bar.
+
+    Ordered ``evaluated_at ASC, market_bias_id ASC`` so the result is fully
+    deterministic even when several records share an ``evaluated_at`` (never
+    dependent on DB insertion order). Consumers that binary-search this series
+    and take the last record at or before a time therefore pick the
+    lexicographically greatest ``market_bias_id`` within that timestamp group
+    -- the same record ``get_market_bias_as_of`` returns.
+
+    Deliberately side-effect-free on read, exactly like
+    ``get_market_bias_as_of``: it never creates the DB file/table and returns
+    an empty list (never raises) when the DB doesn't exist yet, the table
+    doesn't exist yet, or no record matches -- callers must treat that as "no
+    bias history", not an error.
+    """
+    db_path = Path(db_path) if db_path is not None else market_bias_db_path()
+    if not db_path.exists():
+        return []
+
+    try:
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM market_bias
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY evaluated_at ASC, market_bias_id ASC
+                """,
+                (symbol, timeframe),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    return [dict(row) for row in rows]
 
 
 def list_market_bias(*, db_path: Path | None = None, limit: int = 100) -> list[dict]:

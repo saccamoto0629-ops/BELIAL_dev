@@ -131,6 +131,11 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | `--confidence-threshold` | | Paper Signal Generatorの信頼度しきい値を上書きする。既定は `signal_generator.DEFAULT_CONFIDENCE_THRESHOLD`(0.40)。**0.0以上1.0以下のみ**(範囲外は終了コード2)。 |
 | `--exit-config` | | Exit Policy JSON設定ファイルへのパス(`paper-signal/exit_policy.py` 参照)。既定は `BACKTEST_EXIT_CONFIG_PATH`、なければ組み込みのデフォルト設定。 |
 | `--exit-policy` | | どのExit Policyを使うかを明示的に選択する(`--exit-config` が指定する `exit_policy` より優先)。選択肢は `fixed_rr` / `time_based_close` / `ma_break_invalidation` / `bias_reversal_close` / `recent_high_low_break`(不正な値はargparseレベルで終了コード2)。既定は `--exit-config` の解決結果(未指定なら `fixed_rr`)。選択したポリシーが解決後のconfigで `enabled: true` になっていない場合(例: 既定では無効な `ma_break_invalidation` をconfigファイルなしで指定した場合)は、分かりやすいエラーメッセージとともに終了コード2を返す。保存される `backtest_runs.exit_policy` / 各 `backtest_signals.exit_policy` に、実際に使われたポリシー名がそのまま反映される。 |
+| `--spread` | | Issue #26: 各約定に対して不利方向へ常時かけるスプレッド(pipsではなく絶対価格差)。**0.0以上のみ**(既定0.0=コストなし)。詳細は下記「コスト込みrun」を参照。 |
+| `--slippage` | | Issue #26: 各約定に対して不利方向へ常時かけるスリッページ(pipsではなく絶対価格差)。**0.0以上のみ**(既定0.0=コストなし)。 |
+| `--no-reentry` | | Issue #38: 保有中の再エントリーを禁止する(グローバルに常時1ポジション)。有効時、保有ポジションの `entry <= T <= close_time` の区間に発生した新規候補を抑制する。`close_time=None`(loaded window内で決済しなかったopenポジション)は `--to` まで保有扱い。既定は無効(候補の重なりを許容=Issue #38以前の挙動)。 |
+| `--cooldown-minutes` | | Issue #38: 任意のポジションが時刻 `C` で決済した後、`C + N分` 未満に発生した新規候補を抑制する。long/shortやsignal type単位ではなくグローバル。**0.0以上のみ**(既定0.0=無効=Issue #38以前の挙動)。`--no-reentry` とは独立したフラグで、両方指定も可能。 |
+| `--time-series-bias` | | Issue #38: Market Bias を run全体に固定適用せず、各バーのclose時刻ごとに `evaluated_at <= close` の最新biasをpoint-in-timeで参照する(未来のbiasは混入しない。対象バーより前にbiasが無ければNeutral)。既定は無効(static bias=Issue #38以前の挙動、下記「Market Bias の参照」を参照)。詳細は下記「時系列 Market Bias」を参照。 |
 | `--run-name` | | 既定は `<symbol>_<timeframe>_<from>_<to>`。 |
 | `--strategy-name` | | 既定は `paper_signal_generator`(=Paper Signal Generatorの既存ルールをそのまま再生していることを示す)。`backtest_runs.strategy_name` に保存されるラベルのみで、指定してもシグナル生成ロジック自体は変わらない。 |
 
@@ -148,7 +153,7 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | コード | 意味 |
 |---|---|
 | `0` | 実行成功(シグナル0件でも成功)。 |
-| `2` | 引数エラー(必須引数の欠落、`--from`/`--to` のパース失敗、`--to` が `--from` より前、`--warmup-bars` が1未満、`--confidence-threshold` が0.0〜1.0の範囲外など)。argparse自体の使用エラーも同じ2を返す。 |
+| `2` | 引数エラー(必須引数の欠落、`--from`/`--to` のパース失敗、`--to` が `--from` より前、`--warmup-bars` が1未満、`--confidence-threshold` が0.0〜1.0の範囲外、`--spread`/`--slippage`/`--cooldown-minutes` が負など)。argparse自体の使用エラーも同じ2を返す。 |
 | `3` | データ不足(`run`: 該当 symbol/timeframe のローソク足が1件もない、またはvalidation期間内に該当する足が1件もない。`summary`: 指定した `--run-id` が `backtest_runs` に存在しない)。 |
 
 ## warm-up期間とvalidation期間の分離
@@ -170,6 +175,105 @@ Runnerは外部APIを一切呼ばず、`news-feed-bot/market_bias_store.get_mark
 該当するMarket Biasが見つからない場合(DB未作成、対象期間より前の記録が1件もない等)は
 `market_bias="Neutral", confidence=0.0` のプレースホルダにフォールバックする。Neutral bias
 は `build_candidates()` のルール上シグナルを一切生成しないため、安全側に倒れる(警告ログのみ)。
+
+## 現実的な検証条件(Issue #38)
+
+現状の Runner は validation 期間の各バーを独立に評価するため、条件成立バーごとに重なり合う
+シグナルが密に生成される。Issue #38 は、**既存runの再現性を壊さないオプトイン方式**で、より
+現実的な検証条件を追加する。以下のフラグはすべて既定でOFFであり、未指定なら Issue #38 以前と
+完全に同一の結果になる(フラグ無しの既存1年runは変更前と同じシグナル数を再現する)。
+
+### 保有中の再エントリー禁止(`--no-reentry`)
+
+- 有効時はグローバルに常時1ポジションとして扱う。
+- 保有ポジションの `entry <= T <= close_time` の区間に発生した新規候補を抑制する
+  (close時刻と同一timestampの再entryも抑止する)。
+- `close_time=None`(loaded window内で決済しなかったopenポジション)は `--to`(validation_end)まで
+  保有扱いとし、以降の候補をすべて抑制する。
+- 抑止件数は summary の `Suppressed: re-entry=...` と、`backtest_runs.config_json` の
+  `no_reentry` に記録される。
+
+### 決済後グローバルcooldown(`--cooldown-minutes N`)
+
+- 単位は分、既定は `0.0`(無効)。
+- 任意のポジションが時刻 `C` で決済した後、`C + N分` 未満に発生した全候補を抑制する。
+- long/shortやsignal type単位ではなくグローバルなcooldownとして扱う。
+- `--no-reentry` とは独立で、両方を同時に指定できる(その場合、`entry <= C` は re-entry、
+  `C < entry < C + N分` は cooldown として、二重計上せずどちらか一方でカウントする)。
+- 抑止件数は summary の `Suppressed: cooldown=...` と `config_json` の `cooldown_minutes` に記録される。
+
+`--no-reentry --cooldown-minutes 60` を併用すると、密なシグナルが大幅に間引かれ、実運用の
+Paper Signal に近い発生頻度になる。
+
+### コスト込みrun(`--spread` / `--slippage`)
+
+既存の Issue #26 の仮想約定モデル(`backtest/execution_model.py`)をそのまま使う。両者とも
+「不利方向へ常時かける絶対価格差(pipsではない)」で、既定は `0.0`(コストなし)。エントリーと
+決済の双方でコストがかかるため、決済済みシグナルのpnlは概ね `2 * (spread + slippage)` 分だけ
+悪化する。
+
+```bash
+# スプレッド0.02・スリッページ0.01込みで1年run
+python -m backtest run \
+  --symbol USD_JPY \
+  --timeframe 1h \
+  --from 2025-07-25T00:00:00 \
+  --to 2026-07-11T00:00:00 \
+  --exit-policy fixed_rr \
+  --spread 0.02 \
+  --slippage 0.01
+```
+
+コストは `backtest_runs.config_json` の `execution_model`(`type` / `spread` / `slippage`)と
+summary の `Execution model:` 行に記録される。
+
+### Bull固定 / Bear固定の別run手順
+
+`--time-series-bias` を使わず、Bull だけ・Bear だけを含む Market Bias DB をそれぞれ用意して
+2回runすることで、特定biasに固定した挙動を検証できる(コード変更は不要)。
+
+```bash
+# 1) Bull固定のbias DBを用意(GLOBAL/1h に Bull レコードを1件入れておく)
+#    -> そのbias DBを指す --market-bias-db-path で run
+python -m backtest run \
+  --symbol USD_JPY --timeframe 1h \
+  --from 2025-07-25T00:00:00 --to 2026-07-11T00:00:00 \
+  --exit-policy fixed_rr \
+  --market-bias-db-path /path/to/bias_bull.sqlite3
+
+# 2) Bear固定のbias DBで別run
+python -m backtest run \
+  --symbol USD_JPY --timeframe 1h \
+  --from 2025-07-25T00:00:00 --to 2026-07-11T00:00:00 \
+  --exit-policy fixed_rr \
+  --market-bias-db-path /path/to/bias_bear.sqlite3
+```
+
+static bias モード(`--time-series-bias` 未指定)は `--from` 時点の直近1件を全期間へ固定適用する
+ため、上記のように「Bull だけ」「Bear だけ」の bias DB を用意すれば、その方向に固定した run に
+なる。
+
+### 時系列 Market Bias(`--time-series-bias`)
+
+static bias は `--from` 時点の1件を全期間へ固定適用するため、Bull/Bear が時間変化する実際の
+状態を再現できない。`--time-series-bias` を指定すると、Runner は
+`news-feed-bot/market_bias_store.load_market_bias_series("GLOBAL", "1h", ...)` で対象の全bias履歴を
+**runの最初に1回だけ**(=毎バーSQLiteを開閉しない、単一コネクション)ロードし、各バーの
+**close時刻**(`candle open + timeframe`)ごとに `evaluated_at <= close` の最新biasを二分探索で
+point-in-time参照する。
+
+- 未来のbias(close時刻より後に評価されたbias)は決して混入しない。
+- 対象バーより前にbiasが1件も無ければ Neutral(=そのバーは候補を生成しない)。
+- 内部実装は「bias事前ロード + 昇順ソート済み系列への二分探索」なので、将来の時系列ポインタ探索
+  への差し替えも容易(`backtest/runner.py:TimeSeriesBiasLookup`)。
+
+これにより、Bull期間のバーからは long、Bear期間のバーからは short が同一run内で生成され、
+summary の `by_bias` に Bull/Bear の双方が現れる。使用したモードは summary の `Bias mode:` 行と
+`config_json` の `bias_mode`(`static` / `time_series`)に記録される。
+
+> **Follow-up(既知の制約):** バーclose時点の指標で判定し、同じバーのclose価格でentryしている
+> ため、原理的にはlookaheadの可能性が残る(次バーopen entry対応は本Issueの範囲外)。次バーopen
+> entryへの切り替えは別Issue/TODOとして扱う。
 
 ## Backtest結果の保存とEntry/Exitの扱い
 
@@ -201,6 +305,9 @@ Validation window:   2026-06-01T00:00:00+00:00 .. 2026-06-30T23:59:59+00:00
 Warm-up candles:     120 (required >= 75)
 Bars processed:      2880
 Signals generated:   14
+Bias mode:           static
+Suppressed:          re-entry=0, cooldown=0
+Execution model:     fixed_spread_slippage (spread=0.0, slippage=0.0)
 Result breakdown:
   open         3
   win          6

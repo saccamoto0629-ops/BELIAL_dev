@@ -220,6 +220,7 @@ def evaluate_backtest_bars(
     warmup_bars: int = DEFAULT_WARMUP_BARS,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     evaluation_time=None,
+    bias_lookup=None,
 ) -> list[BarEvaluation]:
     """Walk the validation-period bars in *candles*, generating candidates only when ready.
 
@@ -254,6 +255,15 @@ def evaluate_backtest_bars(
     the runner default) every validation bar is evaluated at its own close, so
     each is confirmed against itself and this filter is a no-op -- the existing
     replay behaviour is unchanged.
+
+    Issue #38: pass ``bias_lookup`` to evaluate each ready bar against a
+    point-in-time Market Bias instead of one static ``bias_result`` fixed for
+    the whole run. It is a callable ``bias_lookup(bar_close_time) -> dict``
+    that must return the latest bias known at or before that bar's close
+    (``candle open + timeframe``), never a future one, and a Neutral-shaped
+    dict when no bias precedes the bar. When ``bias_lookup`` is None (the
+    default) the single ``bias_result`` is applied to every bar exactly as
+    before, so the existing static-bias behaviour is unchanged.
     """
     try:
         timeframe_delta = timeframe_to_timedelta(timeframe)
@@ -316,7 +326,11 @@ def evaluate_backtest_bars(
             candle_timestamp=timestamp,
             evaluation_time=bar_evaluation_time,
         )
-        context = create_signal_context(bias_result, [snapshot], confidence_threshold=confidence_threshold)
+        # Issue #38: in time-series mode, resolve the bias point-in-time at this
+        # bar's close (bias_lookup guarantees a non-None, Neutral-when-unknown
+        # dict); otherwise apply the one static bias_result to every bar.
+        bar_bias = bias_lookup(timestamp + timeframe_delta) if bias_lookup is not None else bias_result
+        context = create_signal_context(bar_bias, [snapshot], confidence_threshold=confidence_threshold)
         candidates = generate_signal_candidates(context)
 
         results.append(
