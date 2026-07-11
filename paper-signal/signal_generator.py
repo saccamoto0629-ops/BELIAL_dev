@@ -115,7 +115,23 @@ def setup_logger():
     return logger
 
 
-logger = setup_logger()
+# Issue #31: `import signal_generator` must never create logs/ or initialize a
+# file handler as a side effect. setup_logger() is therefore only ever called
+# lazily, on first actual log use, via _get_logger() -- never at import time.
+_logger_instance: logging.Logger | None = None
+
+
+def _get_logger() -> logging.Logger:
+    """Return the module logger, initializing it on first use only.
+
+    Cached in _logger_instance so repeated calls reuse the same logger/handlers
+    instead of re-running setup_logger() (and its handler-dedup check) on every
+    log statement.
+    """
+    global _logger_instance
+    if _logger_instance is None:
+        _logger_instance = setup_logger()
+    return _logger_instance
 
 
 def _snapshot_get(snapshot, key, default=None):
@@ -250,10 +266,10 @@ def format_discord_message(signal: dict) -> str:
 
 def post_discord_message(message: str, *, dry_run: bool = False, session=requests) -> None:
     if dry_run:
-        logger.info("[DRY_RUN] Would post Paper Signal:\n%s", message)
+        _get_logger().info("[DRY_RUN] Would post Paper Signal:\n%s", message)
         return
     if not DISCORD_WEBHOOK_URL:
-        logger.warning("DISCORD_WEBHOOK_URL is not set; skipping Discord notification.")
+        _get_logger().warning("DISCORD_WEBHOOK_URL is not set; skipping Discord notification.")
         return
     response = session.post(
         DISCORD_WEBHOOK_URL,
@@ -284,7 +300,7 @@ def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
     created: list[dict] = []
 
     if not candidates:
-        logger.info(
+        _get_logger().info(
             "No paper signal candidates this run (bias=%s, confidence=%.2f).",
             bias_result.get("market_bias"),
             bias_result.get("confidence", 0.0),
@@ -299,7 +315,7 @@ def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
             within_minutes=DUPLICATE_WINDOW_MINUTES,
             db_path=db_path,
         ):
-            logger.info(
+            _get_logger().info(
                 "Skipping duplicate paper signal: %s %s %s (within %sm)",
                 candidate["symbol"], candidate["timeframe"], candidate["side"], DUPLICATE_WINDOW_MINUTES,
             )
@@ -312,9 +328,9 @@ def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
         try:
             post_discord_message(format_discord_message(signal), dry_run=dry_run)
         except requests.RequestException as exc:
-            logger.error("Failed to post paper signal to Discord: %s", exc)
+            _get_logger().error("Failed to post paper signal to Discord: %s", exc)
 
-        logger.info(
+        _get_logger().info(
             "Paper signal generated: %s %s %s (%s)",
             signal["symbol"], signal["timeframe"], signal["side"], signal["signal_id"],
         )
@@ -338,7 +354,7 @@ def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args(argv)
-    logger.info(
+    _get_logger().info(
         "=== Paper Signal Generator === confidence_threshold=%.2f duplicate_window=%sm dry_run=%s",
         CONFIDENCE_THRESHOLD, DUPLICATE_WINDOW_MINUTES, args.dry_run,
     )
@@ -347,7 +363,7 @@ def main(argv=None):
         try:
             run_once(dry_run=args.dry_run)
         except Exception as exc:
-            logger.error("Run failed: %s", exc)
+            _get_logger().error("Run failed: %s", exc)
 
         if args.once:
             break
