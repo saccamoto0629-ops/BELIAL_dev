@@ -37,6 +37,44 @@ def make_signal_record(**overrides):
     return models.create_backtest_signal_record(run_id, **kwargs)
 
 
+def test_create_backtest_signal_record_holds_all_four_classification_fields():
+    # Issue #27 review Major 1: the Backtest Signal model must carry all four
+    # classification fields (signal_type / trigger_type / alert_source /
+    # strategy_profile), not just signal_type / trigger_type.
+    record = make_signal_record(
+        signal_type="trend_follow",
+        trigger_type="macd_state_alignment",
+        alert_source="composite",
+        strategy_profile="market_bias_macd_alignment_v1",
+    )
+
+    assert record["signal_type"] == "trend_follow"
+    assert record["trigger_type"] == "macd_state_alignment"
+    assert record["alert_source"] == "composite"
+    assert record["strategy_profile"] == "market_bias_macd_alignment_v1"
+
+
+def test_create_backtest_signal_record_classification_fields_default_to_none():
+    # Kept nullable at the model layer (the runner supplies real values); the
+    # store backfills any NULL/empty to the safe defaults.
+    record = make_signal_record()
+
+    assert record["alert_source"] is None
+    assert record["strategy_profile"] is None
+
+
+def test_backtest_migration_classification_defaults_have_expected_values():
+    # Literal sanity check (self-contained; no paper-signal import). The
+    # cross-package equality with paper-signal's CLASSIFICATION_FIELD_DEFAULTS
+    # is asserted in test_runner.py, where paper-signal is already on sys.path.
+    assert models.BACKTEST_MIGRATION_CLASSIFICATION_DEFAULTS == {
+        "signal_type": "trend_follow",
+        "trigger_type": "macd_state_alignment",
+        "alert_source": "composite",
+        "strategy_profile": "market_bias_macd_alignment_v1",
+    }
+
+
 def test_apply_exit_policy_result_maps_dataclass_fields_onto_signal_record():
     signal_record = make_signal_record()
     result = FakeExitPolicyResult(

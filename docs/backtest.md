@@ -176,8 +176,11 @@ Runnerは外部APIを一切呼ばず、`news-feed-bot/market_bias_store.get_mark
 - validation期間の各バーで `warmup.evaluate_backtest_bars()` がPaper Signal候補を生成する
   (bias + そのバーのindicator状態から `paper-signal/signal_generator.generate_signal_candidates()`
   を呼ぶだけで、DB・Discord・HTTPには一切触れない)。
-- 候補が出たバー(`trigger_type="bar_close"`)について、そのバーの close 価格を仮の entry_price
-  として扱う。Exit評価(`paper-signal/exit_policy.evaluate_exit()`、既定は `fixed_rr`)に渡す
+- 候補が出たバーについて、そのバーの close 価格を仮の entry_price
+  として扱う(この「バーの終値でエントリーする」のはBacktestの評価タイミングであって、
+  シグナルの生成契機ではない。`trigger_type` にはPaper Signal候補の実際の生成契機
+  `macd_state_alignment` がそのまま入り、`bar_close` で上書きすることはしない)。
+  Exit評価(`paper-signal/exit_policy.evaluate_exit()`、既定は `fixed_rr`)に渡す
   候補足は**signalが発生したバーの次の足以降のみ**であり、signal発生バー自身のhigh/lowはTP/SL判定に
   一切使わない(同一足のhigh/lowで即座にexitが決まってしまう先読みを防ぐため)。読み込み範囲は
   `--to` までなので、`--to` 付近で生成されたシグナルは将来の足が無く `open` のまま残ることがある
@@ -222,7 +225,7 @@ by_bias:
   Bull: signals=9 win=4 loss=2 win_rate=0.6667 total_pnl=2.5000
   Bear: signals=5 win=2 loss=2 win_rate=0.5000 total_pnl=0.7000
 by_signal_type:
-  paper_signal: signals=14 win=6 loss=4 win_rate=0.6000 total_pnl=3.2000
+  trend_follow: signals=14 win=6 loss=4 win_rate=0.6000 total_pnl=3.2000
 by_timeframe:
   1h: signals=14 win=6 loss=4 win_rate=0.6000 total_pnl=3.2000
 ```
@@ -276,6 +279,8 @@ by_timeframe:
 使っており、推測値・ダミー値は一切含まない。値が無い(例: `bias` が `NULL`)Signalは
 `"unknown"` バケットに入る(欠損の事実をそのまま表現するためで、値の捏造ではない)。
 各バケットの中身は最上位と同じMetricsサブセット(`total_signals` 〜 `max_drawdown`)。
+
+Issue #27以降、Backtest RunnerはPaper Signal候補の4分類フィールド(`signal_type` / `trigger_type` / `alert_source` / `strategy_profile`)をそのまま `backtest_signals` へ引き継ぐ。したがって `signal_type` には戦略的分類(現行は `trend_follow`)が入り、`by_signal_type` は戦略種別ごとの集計になる。`backtest_signals` テーブルにも `alert_source` / `strategy_profile` 列を持ち、既存DBには冪等migration(不足列を `ALTER TABLE ADD COLUMN` し、NULL・空文字を安全なデフォルト値へ補完)で追加する。候補が当該フィールドを持たない稀なケースのみ、`backtest_models.CLASSIFICATION_FIELD_DEFAULTS` の既定値にフォールバックする。
 
 ### 未実装の軸・指標: `average_holding_bars`
 

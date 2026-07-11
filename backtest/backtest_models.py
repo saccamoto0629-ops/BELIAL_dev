@@ -13,6 +13,27 @@ import uuid
 from datetime import UTC, datetime
 from typing import TypedDict
 
+# Issue #27: MIGRATION-ONLY fallback values for a Backtest Signal's four
+# classification columns.
+#
+# Normal processing never uses this: the Backtest Runner copies all four fields
+# straight off the Paper Signal candidate and saves those exact values (see
+# backtest/runner.py). This constant exists *solely* to repair pre-Issue-#27
+# databases and legacy/partial rows -- i.e. backtest_store.py's schema migration
+# backfills any NULL/empty classification cell with these defaults.
+#
+# By contract these values must stay identical to paper-signal/
+# signal_models.CLASSIFICATION_FIELD_DEFAULTS (a backfilled legacy row should
+# read exactly as a freshly generated one would). They are duplicated here --
+# not imported -- to keep this low-level backtest module free of a cross-package
+# import into paper-signal; a backtest test asserts the two dicts stay equal.
+BACKTEST_MIGRATION_CLASSIFICATION_DEFAULTS: dict[str, str] = {
+    "signal_type": "trend_follow",
+    "trigger_type": "macd_state_alignment",
+    "alert_source": "composite",
+    "strategy_profile": "market_bias_macd_alignment_v1",
+}
+
 
 class BacktestRunRecord(TypedDict):
     id: str
@@ -38,6 +59,8 @@ class BacktestSignalRecord(TypedDict):
     direction: str | None
     signal_type: str | None
     trigger_type: str | None
+    alert_source: str | None
+    strategy_profile: str | None
     reason_json: str
     entry_price: float | None
     invalidation_price: float | None
@@ -107,6 +130,8 @@ def create_backtest_signal_record(
     direction: str | None = None,
     signal_type: str | None = None,
     trigger_type: str | None = None,
+    alert_source: str | None = None,
+    strategy_profile: str | None = None,
     reasons: list[str] | None = None,
     entry_price: float | None = None,
     invalidation_price: float | None = None,
@@ -148,6 +173,8 @@ def create_backtest_signal_record(
         "direction": direction,
         "signal_type": signal_type,
         "trigger_type": trigger_type,
+        "alert_source": alert_source,
+        "strategy_profile": strategy_profile,
         "reason_json": json.dumps(reasons or [], ensure_ascii=False),
         "entry_price": entry_price,
         "invalidation_price": invalidation_price,

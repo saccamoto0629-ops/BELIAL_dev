@@ -20,11 +20,17 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 DEFAULT_DB_PATH = BASE_DIR / "data" / "backtest_results.sqlite3"
+
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from backtest_models import BACKTEST_MIGRATION_CLASSIFICATION_DEFAULTS  # noqa: E402  (Issue #27 migration fallback)
 
 REQUIRED_RUN_COLUMNS = {
     "id",
@@ -49,6 +55,8 @@ REQUIRED_SIGNAL_COLUMNS = {
     "direction",
     "signal_type",
     "trigger_type",
+    "alert_source",
+    "strategy_profile",
     "reason_json",
     "entry_price",
     "invalidation_price",
@@ -67,10 +75,11 @@ REQUIRED_SIGNAL_COLUMNS = {
 _INSERT_SIGNAL_SQL = """
     INSERT INTO backtest_signals
     (id, run_id, signal_time, symbol, timeframe, bias, confidence, direction,
-     signal_type, trigger_type, reason_json, entry_price, invalidation_price,
-     take_profit_price, close_price, result_status, pnl, mfe, mae, closed_at,
-     close_reason, exit_policy, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     signal_type, trigger_type, alert_source, strategy_profile, reason_json,
+     entry_price, invalidation_price, take_profit_price, close_price,
+     result_status, pnl, mfe, mae, closed_at, close_reason, exit_policy,
+     created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -128,6 +137,26 @@ def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name:
     """
     if column_name not in _table_columns(connection, table_name):
         connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _backfill_classification_defaults(connection: sqlite3.Connection) -> None:
+    """Fill NULL/empty Issue #27 classification values with the safe defaults.
+
+    Applies to all four columns (signal_type / trigger_type / alert_source /
+    strategy_profile), so a row from before these columns existed -- or a
+    partial/intermediate schema that left them NULL or empty -- ends up with a
+    valid value instead of NULL. Only touches NULL/empty cells, so a row that
+    already carries a real value (e.g. a candidate's "trend_follow") is never
+    overwritten, and re-running is a no-op. Column names come from a fixed
+    constant, never user input. This is the *only* consumer of
+    ``BACKTEST_MIGRATION_CLASSIFICATION_DEFAULTS`` -- normal signal saves store
+    the candidate's own values (see backtest/runner.py), never these fallbacks.
+    """
+    for column, default in BACKTEST_MIGRATION_CLASSIFICATION_DEFAULTS.items():
+        connection.execute(
+            f"UPDATE backtest_signals SET {column} = ? WHERE {column} IS NULL OR {column} = ''",
+            (default,),
+        )
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
@@ -195,6 +224,8 @@ def init_db(db_path: Path | None = None) -> None:
                 direction TEXT,
                 signal_type TEXT,
                 trigger_type TEXT,
+                alert_source TEXT,
+                strategy_profile TEXT,
                 reason_json TEXT,
                 entry_price REAL,
                 invalidation_price REAL,
@@ -215,6 +246,15 @@ def init_db(db_path: Path | None = None) -> None:
 
         # Migrate a backtest_signals table created before exit_policy existed.
         _ensure_column(connection, "backtest_signals", "exit_policy", "TEXT")
+
+        # Issue #27: add the two new classification columns to a
+        # backtest_signals table created before they existed, then backfill any
+        # NULL/empty classification value (including the older signal_type /
+        # trigger_type columns) with the current Paper Signal defaults. Both
+        # steps are idempotent, so this is safe to run on every init_db().
+        _ensure_column(connection, "backtest_signals", "alert_source", "TEXT")
+        _ensure_column(connection, "backtest_signals", "strategy_profile", "TEXT")
+        _backfill_classification_defaults(connection)
 
         _validate_schema(connection)
 
@@ -274,6 +314,8 @@ def _signal_row(record: dict) -> tuple:
         record.get("direction"),
         record.get("signal_type"),
         record.get("trigger_type"),
+        record.get("alert_source"),
+        record.get("strategy_profile"),
         record.get("reason_json"),
         record.get("entry_price"),
         record.get("invalidation_price"),

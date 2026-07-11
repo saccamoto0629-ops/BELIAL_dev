@@ -16,8 +16,10 @@ for _dir in (TESTS_DIR, BOT_DIR, MARKET_WATCH_DIR, NEWS_FEED_BOT_DIR):
     if str(_dir) not in sys.path:
         sys.path.insert(0, str(_dir))
 
-import runner  # noqa: E402
+import runner  # noqa: E402  (also puts paper-signal on sys.path -> signal_models importable below)
+import backtest_models as backtest_models  # noqa: E402
 import backtest_store as store  # noqa: E402
+import signal_models  # noqa: E402  (paper-signal; on sys.path via `import runner` above)
 import chart_collector as collector  # noqa: E402  (market-watch)
 from chart_models import Candle  # noqa: E402  (market-watch)
 import market_bias_store as bias_store  # noqa: E402  (news-feed-bot)
@@ -320,6 +322,80 @@ def test_run_backtest_generates_and_saves_long_signals_for_a_bull_uptrend(tmp_pa
     assert all(signal["direction"] == "long" for signal in signals)
     assert all(signal["entry_price"] is not None for signal in signals)
     assert all(signal["result_status"] is not None for signal in signals)  # every signal was exit-evaluated
+
+
+def test_run_backtest_carries_all_four_classification_fields_from_candidate(tmp_path):
+    # Issue #27 review Major 1: the runner must copy ALL four Paper Signal
+    # classification fields straight from the candidate onto every saved
+    # backtest_signals row -- not just signal_type.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, run_result = runner.run_backtest(args)
+
+    signals = store.list_backtest_signals(run_result["run_id"], db_path=backtest_db)
+    assert signals
+    for signal in signals:
+        assert signal["signal_type"] == "trend_follow"
+        assert signal["trigger_type"] == "macd_state_alignment"
+        assert signal["alert_source"] == "composite"
+        assert signal["strategy_profile"] == "market_bias_macd_alignment_v1"
+
+
+def test_backtest_migration_defaults_match_paper_signal_classification_defaults():
+    # Issue #27 review (Minor): the backtest migration-fallback constant is a
+    # deliberate duplicate of paper-signal's CLASSIFICATION_FIELD_DEFAULTS. This
+    # guards the contract that a backfilled legacy backtest row reads exactly as
+    # a freshly generated Paper Signal would. paper-signal is already on
+    # sys.path here (via `import runner`), so this compares the real dicts.
+    assert (
+        backtest_models.BACKTEST_MIGRATION_CLASSIFICATION_DEFAULTS
+        == signal_models.CLASSIFICATION_FIELD_DEFAULTS
+    )
+
+
+def test_run_backtest_never_overwrites_trigger_type_with_bar_close(tmp_path):
+    # Issue #27 review: "bar_close" is the Backtest evaluation timing, not the
+    # signal's generation trigger. It must never be stored in trigger_type.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, run_result = runner.run_backtest(args)
+
+    signals = store.list_backtest_signals(run_result["run_id"], db_path=backtest_db)
+    assert signals
+    assert all(signal["trigger_type"] != "bar_close" for signal in signals)
+
+
+def test_run_backtest_records_candidate_signal_type_for_by_type_aggregation(tmp_path):
+    # Issue #27: the paper-signal candidate now carries signal_type="trend_follow".
+    # The runner must record that value on each backtest_signals row so
+    # summary.build_summary()'s existing by_signal_type breakdown groups by the
+    # strategic classification instead of a single hardcoded bucket.
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, run_result = runner.run_backtest(args)
+
+    signals = store.list_backtest_signals(run_result["run_id"], db_path=backtest_db)
+    assert signals
+    assert all(signal["signal_type"] == "trend_follow" for signal in signals)
+    # the by_signal_type breakdown groups under the strategic type
+    by_signal_type = run_result["signal_summary"]["breakdowns"]["by_signal_type"]
+    assert "trend_follow" in by_signal_type
+    assert by_signal_type["trend_follow"]["total_signals"] == run_result["signals_generated"]
 
 
 def test_run_backtest_result_counts_match_saved_signal_statuses(tmp_path):

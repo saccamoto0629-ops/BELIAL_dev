@@ -51,11 +51,30 @@ Paper Signal v1.4.0では、`rsi14` / `rsi_state` は記録・観測用の補助
     "state": "Inside band",
     "freshness": "Fresh",
     "reason": "Market Bias=Bull (72%); USDJPY 1h MACD=Bullish, Trend=Bull, State=Inside band, Freshness=Fresh.",
+    "signal_type": "trend_follow",
+    "trigger_type": "macd_state_alignment",
+    "alert_source": "composite",
+    "strategy_profile": "market_bias_macd_alignment_v1",
     "status": "paper_only",
 }
 ```
 
 `status` は常に `"paper_only"` であり、他の値を取ることはない。
+
+### 分類フィールド(Issue #27)
+
+Signalの戦略的分類(Strategy / Method層)と、生成契機・入力元(Alert層)を区別して追跡するための4フィールド。いずれも記録用であり、entry / exit / サイズ / 発注等の判断には一切用いない。定数は `paper-signal/signal_models.py` に一元定義する(`CLASSIFICATION_FIELD_DEFAULTS`)。
+
+| フィールド | 現行値 | 意味 |
+| --- | --- | --- |
+| `signal_type` | `trend_follow` | Signalの戦略的分類(トレンドフォロー) |
+| `trigger_type` | `macd_state_alignment` | 生成契機。Market BiasとMACD**状態**の整合で候補化していることを表す |
+| `alert_source` | `composite` | 入力元。単一イベント検知ではなく複数入力の合成であること |
+| `strategy_profile` | `market_bias_macd_alignment_v1` | 適用ロジックのプロファイル名 |
+
+現行ロジックは**MACDクロスイベントを直接検知していない**。Market Biasと現在のMACD状態の整合によって候補を生成しているため、`trigger_type` は `macd_cross` ではなく `macd_state_alignment` とする(クロス検知を入力としていないため、`macd_cross` と記録すると事実と異なる)。
+
+古い形式のcandidate(4フィールドを持たない)を `create_paper_signal()` に渡した場合も、`.get()` により上表の既定値で補完されるため後方互換を保つ。`paper_signals` テーブルはこの4列をTEXTで持ち、既存DBには `init_db()` の冪等マイグレーション(`PRAGMA table_info` で不足列だけ `ALTER TABLE ... ADD COLUMN`、`NOT NULL DEFAULT` で既存行を補完)で追加する。
 
 ## シグナル生成ルール
 

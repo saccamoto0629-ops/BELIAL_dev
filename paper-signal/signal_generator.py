@@ -36,7 +36,14 @@ from market_bias import classify_market_bias  # noqa: E402  (news-feed-bot)
 from market_snapshot import fetch_snapshot_sources  # noqa: E402  (news-feed-bot)
 
 import paper_signal_store as store  # noqa: E402
-from signal_models import create_paper_signal, create_signal_context  # noqa: E402
+from signal_models import (  # noqa: E402
+    ALERT_SOURCE_COMPOSITE,
+    SIGNAL_TYPE_TREND_FOLLOW,
+    STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1,
+    TRIGGER_TYPE_MACD_STATE_ALIGNMENT,
+    create_paper_signal,
+    create_signal_context,
+)
 
 REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_CONFIDENCE_THRESHOLD = 0.40
@@ -177,6 +184,13 @@ def build_candidates(
                 "state": state,
                 "freshness": freshness,
                 "reason": reason,
+                # Issue #27: this candidate is produced by Market Bias / MACD
+                # *state* alignment, not by detecting a live MACD cross event
+                # -- so trigger_type is macd_state_alignment, never macd_cross.
+                "signal_type": SIGNAL_TYPE_TREND_FOLLOW,
+                "trigger_type": TRIGGER_TYPE_MACD_STATE_ALIGNMENT,
+                "alert_source": ALERT_SOURCE_COMPOSITE,
+                "strategy_profile": STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1,
             }
         )
     return candidates
@@ -219,6 +233,13 @@ def format_discord_message(signal: dict) -> str:
         f"Trend: {signal['trend']}",
         f"State: {signal['state']}",
         f"Freshness: {signal['freshness']}",
+        # Issue #27: surface the strategic classification (Strategy/Method
+        # layer). alert_source is intentionally omitted here to keep the
+        # message compact -- it is still persisted in SQLite. .get() keeps
+        # this safe for any legacy signal dict lacking the fields.
+        f"Signal Type: {signal.get('signal_type', SIGNAL_TYPE_TREND_FOLLOW)}",
+        f"Trigger Type: {signal.get('trigger_type', TRIGGER_TYPE_MACD_STATE_ALIGNMENT)}",
+        f"Strategy Profile: {signal.get('strategy_profile', STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1)}",
         "",
         f"Reason: {signal['reason']}",
         "",

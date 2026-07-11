@@ -70,6 +70,35 @@ def test_bull_bias_with_bullish_macd_generates_long_signal():
     assert candidates[0]["market_bias"] == "Bull"
 
 
+# --- Issue #27: every candidate carries the four classification fields ---
+
+
+def test_build_candidates_includes_classification_fields():
+    candidates = sg.build_candidates(
+        make_bias(market_bias="Bull"),
+        [make_chart_snapshot(trend="Bull", macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["signal_type"] == "trend_follow"
+    assert candidate["trigger_type"] == "macd_state_alignment"
+    assert candidate["alert_source"] == "composite"
+    assert candidate["strategy_profile"] == "market_bias_macd_alignment_v1"
+
+
+def test_build_candidates_never_records_a_macd_cross_trigger():
+    # The current logic aligns Market Bias with the MACD *state*; it does not
+    # detect a live MACD cross event, so recording macd_cross would be false.
+    candidates = sg.build_candidates(
+        make_bias(market_bias="Bear"),
+        [make_chart_snapshot(trend="Bear", macd_state="Bearish", freshness="Fresh", bias_weight=1.0)],
+    )
+
+    assert candidates[0]["trigger_type"] != "macd_cross"
+    assert candidates[0]["trigger_type"] == "macd_state_alignment"
+
+
 def test_bull_bias_with_non_bullish_macd_generates_no_signal():
     candidates = sg.build_candidates(
         make_bias(market_bias="Bull"),
@@ -334,6 +363,24 @@ def test_discord_message_always_includes_paper_only_disclaimer():
     message = sg.format_discord_message(signal)
 
     assert "Paper signal only. No trade execution." in message
+
+
+def test_discord_message_includes_classification_labels():
+    from signal_models import create_paper_signal
+
+    candidate = sg.build_candidates(
+        make_bias(market_bias="Bull", confidence=0.8),
+        [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
+    )[0]
+    signal = create_paper_signal(candidate)
+
+    message = sg.format_discord_message(signal)
+
+    assert "Signal Type: trend_follow" in message
+    assert "Trigger Type: macd_state_alignment" in message
+    assert "Strategy Profile: market_bias_macd_alignment_v1" in message
+    # the paper-only disclaimer must still be present and last
+    assert message.rstrip().endswith("Paper signal only. No trade execution.")
 
 
 def test_discord_message_contains_no_trade_execution_language():

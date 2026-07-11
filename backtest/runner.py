@@ -421,11 +421,13 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             continue
         entry_timestamp = pd.Timestamp(evaluation.timestamp)
         raw_entry_price = float(candles.loc[entry_timestamp, "close"])
-        # signal_type="bar_close": the hypothesis enters at this bar's close,
-        # so it can only ever be exposed to *subsequent* bars' high/low.
-        # Exit evaluation must start at the next bar -- passing the entry
-        # bar itself here would let its own high/low decide the exit before
-        # the paper position could actually have been open against it.
+        # The hypothesis enters at this bar's close, so it can only ever be
+        # exposed to *subsequent* bars' high/low. Exit evaluation must start at
+        # the next bar -- passing the entry bar itself here would let its own
+        # high/low decide the exit before the paper position could actually
+        # have been open against it. (This "enter at bar close" is a Backtest
+        # evaluation-timing detail, not the Paper Signal's trigger_type -- see
+        # the record below, which never overwrites trigger_type with it.)
         entry_position = candles.index.get_loc(entry_timestamp)
         future_candles = candles.iloc[entry_position + 1 :]
 
@@ -457,8 +459,19 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
                 bias=candidate.get("market_bias"),
                 confidence=candidate.get("confidence"),
                 direction=direction,
-                signal_type="paper_signal",
-                trigger_type="bar_close",
+                # Issue #27: carry all four Paper Signal classification fields
+                # straight through from the candidate onto the Backtest Signal,
+                # unchanged, so they survive to storage/aggregation. Normal
+                # processing always saves the candidate's own values (never a
+                # fallback constant) -- build_candidates() guarantees all four
+                # are present. trigger_type is the signal's real generation
+                # trigger ("macd_state_alignment"), never the backtest's
+                # bar-close evaluation timing. (The migration-only fallback in
+                # backtest_store.py is solely for repairing legacy DB rows.)
+                signal_type=candidate["signal_type"],
+                trigger_type=candidate["trigger_type"],
+                alert_source=candidate["alert_source"],
+                strategy_profile=candidate["strategy_profile"],
                 reasons=[candidate["reason"]] if candidate.get("reason") else None,
                 entry_price=entry_price,
             )

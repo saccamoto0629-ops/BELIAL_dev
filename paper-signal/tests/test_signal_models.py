@@ -40,7 +40,58 @@ def test_create_paper_signal_has_all_required_fields():
         "state",
         "freshness",
         "reason",
+        "signal_type",
+        "trigger_type",
+        "alert_source",
+        "strategy_profile",
         "status",
+    }
+
+
+# --- Issue #27: signal_type / trigger_type / alert_source / strategy_profile ---
+
+
+def test_create_paper_signal_preserves_classification_fields_from_candidate():
+    candidate = make_candidate(
+        signal_type="trend_follow",
+        trigger_type="macd_state_alignment",
+        alert_source="composite",
+        strategy_profile="market_bias_macd_alignment_v1",
+    )
+
+    signal = sm.create_paper_signal(candidate)
+
+    assert signal["signal_type"] == "trend_follow"
+    assert signal["trigger_type"] == "macd_state_alignment"
+    assert signal["alert_source"] == "composite"
+    assert signal["strategy_profile"] == "market_bias_macd_alignment_v1"
+
+
+def test_create_paper_signal_defaults_classification_fields_for_a_legacy_candidate():
+    # A candidate built before Issue #27 has none of the four fields; the
+    # factory must still succeed and backfill the current Paper Signal's
+    # values via CLASSIFICATION_FIELD_DEFAULTS.
+    legacy_candidate = make_candidate()
+    for field in ("signal_type", "trigger_type", "alert_source", "strategy_profile"):
+        assert field not in legacy_candidate  # sanity: truly legacy
+
+    signal = sm.create_paper_signal(legacy_candidate)
+
+    assert signal["signal_type"] == "trend_follow"
+    assert signal["trigger_type"] == "macd_state_alignment"
+    assert signal["alert_source"] == "composite"
+    assert signal["strategy_profile"] == "market_bias_macd_alignment_v1"
+    # never the misleading "macd_cross": the current logic reads MACD *state*,
+    # not a live crossover event.
+    assert signal["trigger_type"] != "macd_cross"
+
+
+def test_classification_field_defaults_match_the_documented_values():
+    assert sm.CLASSIFICATION_FIELD_DEFAULTS == {
+        "signal_type": "trend_follow",
+        "trigger_type": "macd_state_alignment",
+        "alert_source": "composite",
+        "strategy_profile": "market_bias_macd_alignment_v1",
     }
 
 

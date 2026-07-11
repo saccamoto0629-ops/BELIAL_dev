@@ -250,6 +250,120 @@ def test_save_and_list_backtest_signals_round_trip_by_run_id(tmp_path):
     assert json.loads(signals[0]["reason_json"]) == ["Close touched SMA20", "Trend is Bull"]
 
 
+# --- Issue #27 review Major 1: all four classification fields on Backtest Signal ---
+
+
+def test_save_and_list_backtest_signals_round_trip_classification_fields(tmp_path):
+    db_path = tmp_path / "backtest.sqlite3"
+    run = make_run()
+    store.save_backtest_run(run, db_path=db_path)
+    signal = make_signal(
+        run["id"],
+        signal_type="trend_follow",
+        trigger_type="macd_state_alignment",
+        alert_source="composite",
+        strategy_profile="market_bias_macd_alignment_v1",
+    )
+
+    store.save_backtest_signal(signal, db_path=db_path)
+    signals = store.list_backtest_signals(run["id"], db_path=db_path)
+
+    assert len(signals) == 1
+    row = signals[0]
+    assert row["signal_type"] == "trend_follow"
+    assert row["trigger_type"] == "macd_state_alignment"
+    assert row["alert_source"] == "composite"
+    assert row["strategy_profile"] == "market_bias_macd_alignment_v1"
+
+
+def _create_pre_issue27_backtest_db(db_path, *, signal_type=None, trigger_type=None):
+    """A backtest DB whose backtest_signals table predates Issue #27's two new
+    columns (alert_source / strategy_profile), with one pre-existing row.
+    Returns the row id."""
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE backtest_runs (
+                id TEXT PRIMARY KEY, run_name TEXT NOT NULL, symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL, from_time TEXT NOT NULL, to_time TEXT NOT NULL,
+                strategy_name TEXT NOT NULL, exit_policy TEXT, config_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE backtest_signals (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL, signal_time TEXT NOT NULL,
+                symbol TEXT NOT NULL, timeframe TEXT NOT NULL, bias TEXT, confidence REAL,
+                direction TEXT, signal_type TEXT, trigger_type TEXT, reason_json TEXT,
+                entry_price REAL, invalidation_price REAL, take_profit_price REAL,
+                close_price REAL, result_status TEXT, pnl REAL, mfe REAL, mae REAL,
+                closed_at TEXT, close_reason TEXT, exit_policy TEXT, created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO backtest_runs (id, run_name, symbol, timeframe, from_time, to_time, "
+            "strategy_name, exit_policy, config_json, created_at) VALUES "
+            "('run-1', 'old-run', 'USD_JPY', '1h', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', "
+            "'sma_cross', 'fixed_rr', '{}', '2026-01-01T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO backtest_signals (id, run_id, signal_time, symbol, timeframe, "
+            "signal_type, trigger_type, created_at) VALUES "
+            "('signal-1', 'run-1', '2026-01-05T09:00:00Z', 'USD_JPY', '1h', ?, ?, '2026-01-05T09:00:00Z')",
+            (signal_type, trigger_type),
+        )
+    return "signal-1"
+
+
+def test_init_db_migrates_backtest_signals_missing_alert_source_and_strategy_profile(tmp_path):
+    db_path = tmp_path / "backtest.sqlite3"
+    _create_pre_issue27_backtest_db(db_path)  # signal_type/trigger_type NULL too
+    before = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(backtest_signals)")}
+    assert "alert_source" not in before and "strategy_profile" not in before
+
+    store.init_db(db_path)
+
+    after = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(backtest_signals)")}
+    assert "alert_source" in after and "strategy_profile" in after
+
+    # pre-existing row's NULL classification values are backfilled with defaults
+    row = store.list_backtest_signals("run-1", db_path=db_path)[0]
+    assert row["signal_type"] == "trend_follow"
+    assert row["trigger_type"] == "macd_state_alignment"
+    assert row["alert_source"] == "composite"
+    assert row["strategy_profile"] == "market_bias_macd_alignment_v1"
+
+
+def test_backtest_classification_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "backtest.sqlite3"
+    _create_pre_issue27_backtest_db(db_path)
+
+    store.init_db(db_path)
+    store.init_db(db_path)
+    store.init_db(db_path)  # must never raise "duplicate column name"
+
+    columns = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(backtest_signals)")}
+    for column in ("signal_type", "trigger_type", "alert_source", "strategy_profile"):
+        assert column in columns
+
+
+def test_backtest_backfill_only_touches_null_or_empty_values(tmp_path):
+    # A pre-existing row carrying a real signal_type must not be overwritten by
+    # the default; only NULL/empty are repaired.
+    db_path = tmp_path / "backtest.sqlite3"
+    _create_pre_issue27_backtest_db(db_path, signal_type="ma_touch", trigger_type="")
+
+    store.init_db(db_path)
+
+    row = store.list_backtest_signals("run-1", db_path=db_path)[0]
+    assert row["signal_type"] == "ma_touch"  # real value preserved
+    assert row["trigger_type"] == "macd_state_alignment"  # empty string backfilled
+    assert row["alert_source"] == "composite"  # newly-added column backfilled
+
+
 def test_save_backtest_signal_with_duplicate_id_raises_integrity_error(tmp_path):
     db_path = tmp_path / "backtest.sqlite3"
     run = make_run()
