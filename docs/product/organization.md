@@ -9,7 +9,7 @@ BELIAL軍団の眷属は、炎・辛味・スパイスをモチーフとした�
 | 名前 | 役割 | ステータス |
 |---|---|---|
 | Berial | 軍団長 / 市場監視・戦略立案 | 実装中 |
-| Pepperoni | エントリー執行 | 構想追加 |
+| Pepperoni | 将来の Execution(エントリー執行)担当 | 構想追加(未実装) |
 | Jalapeño | ブレイクアウト・モメンタム担当 | 未定 |
 | Habanero | 高リスク戦略・危険相場担当 | 未定 |
 | Tabasco | Discord通知・アラート担当 | 未定 |
@@ -18,7 +18,7 @@ BELIAL軍団の眷属は、炎・辛味・スパイスをモチーフとした�
 
 ```text
 Berial
-  ├─ Pepperoni  # Entry Execution
+  ├─ Pepperoni  # Execution (Entry / Order) — 将来・未実装
   ├─ Jalapeño   # Momentum / Breakout
   ├─ Habanero   # High Risk Strategy
   ├─ Tabasco    # Alert / Notification
@@ -28,9 +28,11 @@ Berial
 
 ## Pepperoni の役割
 
-Pepperoni は、Berial から渡された市場判断をもとに、実際のエントリーを実行する執行担当の悪魔である。
+Pepperoni は、Berial から渡された市場判断をもとに、エントリーを実行する将来の **Execution** 担当の悪魔である。約定・ポジション管理・執行ログを受け持つ。
 
 裁量判断は苦手だが、命令を忠実かつ高速に実行することを得意とする。市場判断そのものは Berial が担当し、Pepperoni は「いつ、どの条件で、どの注文を出すか」を実装上の責務として受け持つ。
+
+Execution 層は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価)と **Live Execution**(Broker API による実注文・実約定)に分かれるが、どちらも未実装であり、Pepperoni がそのどちらを(あるいは両方を)担うかは現時点では確定しない。いずれの場合も、過去データで仮説を検証する Backtest(検証基盤)とは別レイヤーである。
 
 ## Pepperoni の責務
 
@@ -45,7 +47,7 @@ Pepperoni は、Berial から渡された市場判断をもとに、実際のエ
 
 ```text
 Berial
-  └─ Pepperoni
+  └─ Pepperoni  # Execution(将来・未実装)
       ├─ Entry Execution
       ├─ Order Management
       ├─ Position Open
@@ -94,4 +96,6 @@ Pepperoni 自身は炎のエフェクトを出さないが、このペンだけ�
 
 ## 実装上の注意
 
-Pepperoni は将来的な自動発注レイヤーを象徴するキャラクターである。ただし、現行の v1.3 では自動売買・自動発注・エントリー推奨は実装しない。
+Pepperoni は将来的な **Execution** レイヤー(発注・約定・ポジション管理)を象徴するキャラクターである。Execution は Paper Execution(仮想約定・仮想ポジション管理、未実装)と Live Execution(Broker API による実注文、未実装)に分かれるが、Pepperoni がどちらを担うかは現時点では確定しない。現行スコープ(v1.4.0 時点)では、いずれの Execution も実装しない。
+
+なお、過去データで仮説を遡及検証する Backtest は独立した検証基盤であり、Execution レイヤーそのものではない。

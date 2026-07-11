@@ -32,23 +32,29 @@ Paper Signal
 
 ## Alert / Strategy / Execution の責務分離
 
-| Layer | Responsibility | Example |
+Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う未実装レイヤー)と **Live Execution**(Broker API による実注文・実約定の未実装レイヤー)に分かれる。どちらも v1.4 では未実装である。
+
+| Layer | Responsibility | Status |
 |---|---|---|
-| Alert | 事実を検知して通知する | MACD cross, MA touch, Bollinger upper_break, RSI14 overbought/oversold |
-| Strategy / Method | Alert の情報をどう解釈するか判断する | トレンド相場では順張り候補、レンジ相場では過熱警戒 |
-| Execution | 実際の注文、Exit、損切り、利確を担当する | 現行スコープ外 |
+| Alert | 事実を検知して通知する | 実装済み(MACD cross, MA touch, Bollinger upper_break, RSI14 overbought/oversold) |
+| Strategy / Method | Alert の情報をどう解釈するか判断する | 実装済み(Paper Signal のルールベース候補生成) |
+| Paper Execution | Paper Signal を入力に、仮想約定・仮想ポジション管理・Exit・損益計算を行う | 未実装(次フェーズ) |
+| Live Execution | Broker API による実際の注文・約定・ポジション管理 | 未実装(将来) |
 
-Alert は売買判断をしない。Strategy / Method は複数の観測情報を文脈化する。Execution は実際の発注とポジション管理を担当するが、現行実装には含めない。
+Alert は売買判断をしない。Strategy / Method は複数の観測情報を文脈化する。Paper Execution / Live Execution はいずれも現行実装に含めない。
 
-この3層は、[Concept](../product/concept.md) の Observation / Classification / Alert / Hypothesis / Execution の5層分離のうち、Alert 以降を実装観点で細分化したものである。Market Bias / `indicators.py` が Classification、`paper-signal/` が Hypothesis(paper_only 仮説)にあたる。層の対応は以下の通り。
+Backtest はこの責務分離の直列フローには含まれない独立した **Validation レイヤー(検証基盤)** であり、過去データで Paper Signal や将来の Execution 設計を遡及検証する。`backtest/execution_model.py` の spread / slippage / fill は Backtest 内部のシミュレーションモデルであって、Paper Execution レイヤーの実装ではない(詳細は [Backtest](../backtest.md))。
 
-| Concept (5層) | Architecture (3層) | 現行モジュール |
+この分離は、[Concept](../product/concept.md) の Observation / Classification / Alert / Hypothesis / Execution の5層分離のうち、Alert 以降を実装観点で細分化したものである(Execution は Paper Execution / Live Execution に分かれる)。Market Bias / `indicators.py` が Classification、`paper-signal/signal_generator.py` が Hypothesis(Paper Signal, paper_only 仮説)にあたる。層の対応は以下の通り。
+
+| Concept (5層) | Architecture | 状態 / 現行モジュール |
 |---|---|---|
 | Observation | (Alert以前の入力) | 各Provider, `chart_collector.py` |
 | Classification | (Alert以前の入力) | `indicators.py`, `market_bias.py` |
 | Alert | Alert | `macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` |
-| Hypothesis | Strategy / Method に相当する仮説生成の実装 | `paper-signal/signal_generator.py` |
-| Execution | Execution | 現行スコープ外 |
+| Hypothesis | Strategy / Method に相当する仮説生成(Paper Signal)の実装 | `paper-signal/signal_generator.py`(実装済み) |
+| Execution | Paper Execution | 未実装(次フェーズ) |
+| Execution | Live Execution | 未実装(将来) |
 
 ## データ連携概要
 

@@ -17,10 +17,18 @@ Market Snapshot(可視化)─ Market Bias(市場状態の分類)
                                          │
                                          └─ Paper Signal Generator(paper-signal/, 本章)
                                                   │
-                                          (まだ存在しない) Entry Bot
+                                                  ├─ Paper Execution(次フェーズ・未実装)
+                                                  └─ Live Execution(将来・未実装)
 ```
 
-Paper Signal は、Market Bias が示す「市場の大まかな方向」と、Chart Snapshot が示す「チャート状態(1h)」を組み合わせて、シグナル仮説を記録するだけの層である。エントリー実行を担当する層(Entry Bot / Pepperoni)はv1.4.0では実装しない。
+Paper Signal は、Market Bias が示す「市場の大まかな方向」と、Chart Snapshot が示す「チャート状態(1h)」を組み合わせて、シグナル仮説を記録するだけの層である。Paper Signal 自身は entry / exit を一切決めない。
+
+- **Paper Execution**: Paper Signal を入力として、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う将来レイヤー。v1.4 では**未実装**。
+- **Live Execution**: Broker API を利用した実注文・実約定・実ポジション管理の将来レイヤー。**未実装**。
+
+Paper Execution も Live Execution も Paper Signal の外側の別レイヤーであり、いずれも未実装。本章(Paper Signal)では扱わない。
+
+なお、生成済みの Paper Signal を過去のローソク足で遡及検証する **Backtest** は、この執行フローとは独立した検証基盤(Validation)である。Backtest 内部の Exit 判定(`paper-signal/exit_policy.py`)や仮想約定モデル(`backtest/execution_model.py` の spread / slippage / fill)は検証用のシミュレーションであって、Paper Execution レイヤーの実装ではない(詳細は [Backtest](../backtest.md))。
 
 ## 入力データ
 
@@ -110,5 +118,7 @@ Paper Signal Generator は、以下を**実装しない**。
 - ロット計算・レバレッジ計算
 - 利確・損切り(stop-loss / take-profit)判断
 - エントリー実行
+
+これらの entry / exit / 発注は Paper Signal の外側の執行層(**Paper Execution** / **Live Execution**)の責務であり、いずれも未実装である。Paper Signal Generator 自身は entry / exit をいっさい決めない。なお TP / SL の評価は Backtest(検証基盤)が過去データ上で遡及的に行うが、これは検証用シミュレーションであって Paper Execution レイヤーの実装ではない。
 
 `paper-signal/signal_generator.py` のソースコードは、broker APIのimportや発注関数呼び出しが存在しないことをテスト(`test_module_source_has_no_broker_api_integration`)で検証する。生成されるレコードの各フィールド値にも、order / lot / leverage / stop-loss / take-profit 等の語が含まれないことを検証する。
