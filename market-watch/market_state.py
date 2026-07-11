@@ -11,11 +11,18 @@ indicators into one higher-level state label.
 from __future__ import annotations
 
 import math
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, get_args
 
 import pandas as pd
 
 MarketState = Literal["trend_up", "trend_down", "range", "volatile", "squeeze", "unknown"]
+
+# The full set of labels classify_market_state() can ever return, derived
+# straight from the MarketState Literal so the two can never drift apart.
+# Consumers that let a user pick states to allow/deny (e.g. Backtest's Issue #39
+# ``--allowed-market-states`` filter) validate against this instead of
+# re-listing the labels.
+KNOWN_MARKET_STATES: tuple[MarketState, ...] = get_args(MarketState)
 
 REQUIRED_FIELDS = (
     "close",

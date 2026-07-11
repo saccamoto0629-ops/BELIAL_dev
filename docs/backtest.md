@@ -136,6 +136,7 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | `--no-reentry` | | Issue #38: 保有中の再エントリーを禁止する(グローバルに常時1ポジション)。有効時、保有ポジションの `entry <= T <= close_time` の区間に発生した新規候補を抑制する。`close_time=None`(loaded window内で決済しなかったopenポジション)は `--to` まで保有扱い。既定は無効(候補の重なりを許容=Issue #38以前の挙動)。 |
 | `--cooldown-minutes` | | Issue #38: 任意のポジションが時刻 `C` で決済した後、`C + N分` 未満に発生した新規候補を抑制する。long/shortやsignal type単位ではなくグローバル。**0.0以上のみ**(既定0.0=無効=Issue #38以前の挙動)。`--no-reentry` とは独立したフラグで、両方指定も可能。 |
 | `--time-series-bias` | | Issue #38: Market Bias を run全体に固定適用せず、各バーのclose時刻ごとに `evaluated_at <= close` の最新biasをpoint-in-timeで参照する(未来のbiasは混入しない。対象バーより前にbiasが無ければNeutral)。既定は無効(static bias=Issue #38以前の挙動、下記「Market Bias の参照」を参照)。詳細は下記「時系列 Market Bias」を参照。 |
+| `--allowed-market-states` | | Issue #39: 各候補を、そのバーの Market State がこの許可リストに含まれる場合のみ採用する(カンマ区切り。有効値: `trend_up` / `trend_down` / `range` / `volatile` / `squeeze` / `unknown`)。全バーの Market State は指定有無に関わらず常に判定・記録され、このフラグは「どの候補を保存シグナルにするか」だけをゲートする。未指定(既定)=state フィルタなし(Issue #39以前の挙動、全候補が対象)。不正・空・未知の state 名は終了コード2。詳細は下記「Market State によるエントリー制御」を参照。 |
 | `--run-name` | | 既定は `<symbol>_<timeframe>_<from>_<to>`。 |
 | `--strategy-name` | | 既定は `paper_signal_generator`(=Paper Signal Generatorの既存ルールをそのまま再生していることを示す)。`backtest_runs.strategy_name` に保存されるラベルのみで、指定してもシグナル生成ロジック自体は変わらない。 |
 
@@ -153,7 +154,7 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | コード | 意味 |
 |---|---|
 | `0` | 実行成功(シグナル0件でも成功)。 |
-| `2` | 引数エラー(必須引数の欠落、`--from`/`--to` のパース失敗、`--to` が `--from` より前、`--warmup-bars` が1未満、`--confidence-threshold` が0.0〜1.0の範囲外、`--spread`/`--slippage`/`--cooldown-minutes` が負など)。argparse自体の使用エラーも同じ2を返す。 |
+| `2` | 引数エラー(必須引数の欠落、`--from`/`--to` のパース失敗、`--to` が `--from` より前、`--warmup-bars` が1未満、`--confidence-threshold` が0.0〜1.0の範囲外、`--spread`/`--slippage`/`--cooldown-minutes` が負、`--allowed-market-states` が空/未知の state 名など)。argparse自体の使用エラーも同じ2を返す。 |
 | `3` | データ不足(`run`: 該当 symbol/timeframe のローソク足が1件もない、またはvalidation期間内に該当する足が1件もない。`summary`: 指定した `--run-id` が `backtest_runs` に存在しない)。 |
 
 ## warm-up期間とvalidation期間の分離
@@ -275,6 +276,71 @@ summary の `by_bias` に Bull/Bear の双方が現れる。使用したモー�
 > ため、原理的にはlookaheadの可能性が残る(次バーopen entry対応は本Issueの範囲外)。次バーopen
 > entryへの切り替えは別Issue/TODOとして扱う。
 
+## Market State によるエントリー制御(Issue #39)
+
+#38 の realistic backtest で「USDJPY では PF>1 だが XAUUSD/SPX では PF<1」というトレンド依存性が
+確認された。根因候補は、GLOBAL bias が銘柄自身のトレンドと無関係に適用され、下落中の銘柄を
+Bull 判定で買い続けること。Issue #39 は **相場局面(Market State)を各バーで判定し、局面ごとに
+エントリーを制御できるようにする**。
+
+### Market State の定義(判定ロジックは新規実装しない)
+
+Backtest は Live と同じ分類器 `market-watch/market_state.py:classify_market_state()`(Live の
+Chart Snapshot が使っているものと同一)を再利用する。新しい語彙(Bull/Bear 等)は作らず、既存の
+ラベルをそのまま採用する:
+
+| Issue 本文の表現 | 既存ラベル | 判定内容(要約) |
+|---|---|---|
+| Bull | `trend_up` | EMA20 > SMA20 > SMA75 かつ MACD Bullish かつ close > SMA20 |
+| Bear | `trend_down` | 上記の逆(下降スタック + MACD Bearish + close < SMA20) |
+| Range | `range` | MA収束・MACD Neutral・BB内側(フォールバック) |
+| (等) | `squeeze` | BB幅が直近レンジの下位パーセンタイル(最初に判定) |
+| (等) | `volatile` | BB幅が直近ベースラインから拡大 |
+| (等) | `unknown` | 指標欠損等で判定不能 |
+
+### 各バーでの判定(point-in-time)
+
+- validation 期間の **ready なバーごと**に、そのバーまで(自身を含む)の指標だけで Market State を
+  判定する(`warmup.evaluate_backtest_bars()`)。スライスは当該バーを最終行に含み、**未来のバーは
+  一切参照しない**(off-by-one 回帰テストあり: 未来バーを変更しても過去 state は不変、当該バーを
+  変更するとその state は変化しうる)。
+- 判定結果(`market_state` とその confidence)は、採用された各シグナルの `backtest_signals` 行に
+  保存される。**全バーの state 履歴を別途保存することは本 Issue のスコープ外**で、永続化するのは
+  採用された Backtest Signal のみ(フィルタ未指定でも記録される)。
+- 性能注記: `classify_market_state()` は実際には直近約21本(BB の lookback)しか参照しないが、Live と
+  byte-identical にするため毎バー履歴全体スライスを渡している。現状規模(1年1h ≒ 6千本)では許容。
+  run が大きく育つ場合は、ready バーでは等価な bounded tail スライスへ差し替え可能
+  (`backtest/warmup.py` のコメント参照)。
+
+### エントリー制御(`--allowed-market-states`)
+
+```bash
+# 対象銘柄自身が trend_up のバーでのみ long を採用(下落局面での買いを止める)
+python -m backtest run \
+  --symbol XAU_USD --timeframe 1h \
+  --from 2025-07-20T00:00:00 --to 2026-07-10T23:59:59 \
+  --no-reentry --cooldown-minutes 60 --time-series-bias \
+  --allowed-market-states trend_up
+```
+
+- カンマ区切りの許可リスト。指定した state のバーの候補のみ採用し、それ以外は抑制する。
+- **未指定(既定)= フィルタ無効 = Issue #39以前の挙動**(全候補が対象)。空文字・未知の state 名は
+  終了コード2。
+- 抑制は #38 の re-entry / cooldown と同じ「採用ループでの suppression + カウンタ」方式。3つの
+  suppression カウンタ(`market_state` / `re-entry` / `cooldown`)は **相互排他**で、1つの候補は
+  **market_state → re-entry → cooldown の順で最初に該当した理由でのみ**1回カウントされる(複数条件
+  への該当を二重計上しない)。market_state はバー自体の性質でポジション管理より上流のため先頭に置く。
+- 許可リストは summary の `Allowed states:` 行(未指定時は `all`)と `backtest_runs.config_json` の
+  `allowed_market_states`(ソート済みリスト、未指定時は null)に記録される。抑制件数は summary の
+  `Suppressed: market-state=...` に出る。
+
+### 局面別の成績確認(`by_market_state`)
+
+集計に `by_market_state` breakdown が追加され、Bull/Bear/Range 別の勝率・PF が text/JSON/Markdown
+全形式で確認できる(下記「標準出力の集計例」参照)。state を持たない古い行(NULL)は `unknown`
+バケットに入る。まず **フィルタなしで1本回して `by_market_state` の分布を見てから**許可リストを
+決める進め方を推奨する(フィルタ未指定でも全シグナルに state は記録されるため)。
+
 ## Backtest結果の保存とEntry/Exitの扱い
 
 - validation期間の各バーで `warmup.evaluate_backtest_bars()` がPaper Signal候補を生成する
@@ -306,7 +372,8 @@ Warm-up candles:     120 (required >= 75)
 Bars processed:      2880
 Signals generated:   14
 Bias mode:           static
-Suppressed:          re-entry=0, cooldown=0
+Allowed states:      all
+Suppressed:          market-state=0, re-entry=0, cooldown=0
 Execution model:     fixed_spread_slippage (spread=0.0, slippage=0.0)
 Result breakdown:
   open         3
@@ -335,6 +402,9 @@ by_signal_type:
   trend_follow: signals=14 win=6 loss=4 win_rate=0.6000 total_pnl=3.2000
 by_timeframe:
   1h: signals=14 win=6 loss=4 win_rate=0.6000 total_pnl=3.2000
+by_market_state:
+  trend_up: signals=9 win=5 loss=1 win_rate=0.8333 total_pnl=2.9000
+  range: signals=5 win=1 loss=3 win_rate=0.2500 total_pnl=0.3000
 ```
 
 ## Signal Summary report (Issue #23)
@@ -389,6 +459,8 @@ by_timeframe:
 
 Issue #27以降、Backtest RunnerはPaper Signal候補の4分類フィールド(`signal_type` / `trigger_type` / `alert_source` / `strategy_profile`)をそのまま `backtest_signals` へ引き継ぐ。したがって `signal_type` には戦略的分類(現行は `trend_follow`)が入り、`by_signal_type` は戦略種別ごとの集計になる。`backtest_signals` テーブルにも `alert_source` / `strategy_profile` 列を持ち、既存DBには冪等migration(不足列を `ALTER TABLE ADD COLUMN` し、NULL・空文字を安全なデフォルト値へ補完)で追加する。候補が当該フィールドを持たない稀なケースのみ、`backtest_models.CLASSIFICATION_FIELD_DEFAULTS` の既定値にフォールバックする。
 
+Issue #39 は同様に `market_state` 列を追加し、`by_market_state` 軸(相場局面別の勝率・PF)を提供する。ただし分類フィールドと違い **NULL のバックフィルはしない**: 古い行の当時の Market State は事後的に復元不能なため、捏造した既定値ではなく NULL(=`by_market_state` の `unknown` バケット)が正しい値となる。既存DBへの列追加は同じ冪等 `ALTER TABLE ADD COLUMN` migration による。
+
 ### 未実装の軸・指標: `average_holding_bars`
 
 `backtest_signals` には保有バー数に相当する列が存在しない(`signal_time` / `closed_at` という
@@ -417,7 +489,8 @@ DBに保有バー数相当の列が追加されない限り実装しない(Signa
   "breakdowns": {
     "by_bias": {},
     "by_signal_type": {},
-    "by_timeframe": {}
+    "by_timeframe": {},
+    "by_market_state": {}
   }
 }
 ```
@@ -440,4 +513,7 @@ python -m pytest backtest/tests -q
 - `backtest/tests/test_report.py`(Issue #23で新規追加、レンダリング/ファイル保存の単体テスト)
 - `backtest/tests/test_backtest_models.py`(Issue #23で `apply_exit_policy_result()` の
   pnl計算テストを追記。既存テストの内容は変更していない)
-- `test_backtest_store.py` / `test_warmup.py` は変更していない
+- Issue #39で `test_warmup.py`(各バーの Market State 判定と point-in-time / off-by-one 回帰)・
+  `test_runner.py`(`--allowed-market-states` のパース/フィルタ/相互排他カウンタ/config・summary記録)・
+  `test_backtest_store.py`(market_state 列の in-place migration と round-trip)・
+  `test_summary.py`(`by_market_state` breakdown)へテストを追記

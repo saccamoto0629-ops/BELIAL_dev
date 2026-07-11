@@ -27,8 +27,10 @@ from typing import Any
 
 # Existing backtest_signals columns (see backtest_store.REQUIRED_SIGNAL_COLUMNS)
 # usable as a future breakdown axis today, without inventing any new column
-# or guessing a value the DB doesn't have.
-BREAKDOWN_FIELDS = ("bias", "signal_type", "timeframe")
+# or guessing a value the DB doesn't have. Issue #39 adds ``market_state`` so
+# by_market_state win-rate / PF is available in every report format; a signal
+# with no state (legacy/NULL row) falls into the UNKNOWN_BREAKDOWN_KEY bucket.
+BREAKDOWN_FIELDS = ("bias", "signal_type", "timeframe", "market_state")
 UNKNOWN_BREAKDOWN_KEY = "unknown"
 
 

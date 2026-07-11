@@ -328,10 +328,63 @@ def test_breakdown_by_bias_groups_real_column_values():
     assert by_bias[summary.UNKNOWN_BREAKDOWN_KEY]["total_signals"] == 1
 
 
+def test_breakdown_by_market_state_groups_real_column_values():
+    # Issue #39: by_market_state groups on the recorded market_state column, and
+    # a signal with no state (legacy/NULL row) falls into the unknown bucket --
+    # never guessed.
+    signals = [
+        make_signal(id="s1", signal_time="2026-01-01T00:00:00Z", market_state="trend_up", pnl=2.0),
+        make_signal(id="s2", signal_time="2026-01-01T01:00:00Z", market_state="trend_up", pnl=-1.0),
+        make_signal(id="s3", signal_time="2026-01-01T02:00:00Z", market_state="range", pnl=0.5),
+        make_signal(id="s4", signal_time="2026-01-01T03:00:00Z", market_state=None, pnl=0.3),
+    ]
+
+    result = summary.build_summary("run-1", signals)
+
+    by_market_state = result["breakdowns"]["by_market_state"]
+    assert set(by_market_state) == {"trend_up", "range", summary.UNKNOWN_BREAKDOWN_KEY}
+    assert by_market_state["trend_up"]["total_signals"] == 2
+    assert by_market_state["trend_up"]["win_count"] == 1
+    assert by_market_state["trend_up"]["loss_count"] == 1
+    assert by_market_state["trend_up"]["win_rate"] == pytest.approx(0.5)
+    assert by_market_state["trend_up"]["profit_factor"] == pytest.approx(2.0)
+    assert by_market_state["trend_up"]["total_pnl"] == pytest.approx(1.0)
+    assert by_market_state["trend_up"]["average_pnl"] == pytest.approx(0.5)
+    assert by_market_state["range"]["total_signals"] == 1
+    assert by_market_state[summary.UNKNOWN_BREAKDOWN_KEY]["total_signals"] == 1
+
+
+def test_market_state_metrics_render_in_text_json_and_markdown():
+    signals = [
+        make_signal(id="s1", signal_time="2026-01-01T00:00:00Z", market_state="trend_up", pnl=2.0),
+        make_signal(id="s2", signal_time="2026-01-01T01:00:00Z", market_state="trend_up", pnl=-1.0),
+        make_signal(id="s3", signal_time="2026-01-01T02:00:00Z", market_state=None, pnl=0.5),
+        make_signal(id="s4", signal_time="2026-01-01T03:00:00Z", market_state="unknown", pnl=-0.25),
+    ]
+    result = summary.build_summary("run-1", signals)
+
+    unknown = result["breakdowns"]["by_market_state"]["unknown"]
+    assert unknown["total_signals"] == 2
+    assert unknown["profit_factor"] == pytest.approx(2.0)
+
+    text_output = report.render_text(result)
+    assert "by_market_state:" in text_output
+    assert "trend_up:" in text_output
+    assert "profit_factor=2.0000" in text_output
+
+    parsed = json.loads(report.render_json(result))
+    assert parsed["breakdowns"]["by_market_state"]["trend_up"]["profit_factor"] == pytest.approx(2.0)
+
+    markdown = report.render_markdown(result)
+    assert "## by_market_state" in markdown
+    assert "| Profit factor |" in markdown
+    assert "| trend_up | 2 | 1 | 1 | 0.5000 | 2.0000 |" in markdown
+
+
 def test_breakdowns_present_but_empty_for_zero_signals():
     result = summary.build_summary("run-empty", [])
 
-    for axis in ("by_bias", "by_signal_type", "by_timeframe"):
+    for axis in ("by_bias", "by_signal_type", "by_timeframe", "by_market_state"):
         assert result["breakdowns"][axis] == {}
 
 
@@ -368,7 +421,7 @@ def test_json_round_trips_all_required_fields_for_zero_signals():
         "profit_factor": 0.0,
         "max_drawdown": 0.0,
         "average_holding_bars": None,
-        "breakdowns": {"by_bias": {}, "by_signal_type": {}, "by_timeframe": {}},
+        "breakdowns": {"by_bias": {}, "by_signal_type": {}, "by_timeframe": {}, "by_market_state": {}},
     }
     for value in parsed.values():
         if isinstance(value, float):

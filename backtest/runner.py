@@ -63,6 +63,7 @@ import backtest_store as store  # noqa: E402
 import execution_model as execution  # noqa: E402  (Issue #26: virtual fill spread/slippage model)
 import warmup  # noqa: E402
 import chart_collector  # noqa: E402  (market-watch)
+from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch, Issue #39)
 import exit_policy  # noqa: E402  (paper-signal)
 from market_bias_store import (  # noqa: E402  (news-feed-bot)
     get_market_bias_as_of,
@@ -203,6 +204,32 @@ def _nonneg_float(value: str) -> float:
     return parsed
 
 
+def _market_state_set(value: str) -> frozenset[str]:
+    """argparse type for --allowed-market-states: a comma-separated allow-list.
+
+    Issue #39: parses e.g. ``trend_up,range`` into ``frozenset({"trend_up",
+    "range"})``. Whitespace around each name is ignored and duplicates collapse.
+    Every name must be one of ``market_state.KNOWN_MARKET_STATES`` -- an empty
+    list or any unknown label is rejected here as a usage error (exit code 2)
+    with a message listing the valid states, rather than silently filtering
+    everything out deep in the run.
+    """
+    names = [part.strip() for part in value.split(",")]
+    if not names or any(not name for name in names):
+        raise argparse.ArgumentTypeError(
+            "must be a comma-separated list with no empty market states; "
+            f"valid states: {', '.join(sorted(KNOWN_MARKET_STATES))}"
+        )
+    parsed = frozenset(names)
+    unknown = sorted(parsed - set(KNOWN_MARKET_STATES))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown market state(s): {', '.join(unknown)}. "
+            f"Valid states: {', '.join(sorted(KNOWN_MARKET_STATES))}"
+        )
+    return parsed
+
+
 def _normalize_argv(argv=None) -> list[str]:
     """Prepend the "run" subcommand when the caller omitted it.
 
@@ -332,6 +359,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(evaluated_at <= close, never a future record; Neutral before the first bias) "
         "instead of applying one as-of-'--from' bias to the whole run. Off by default "
         "(static bias, pre-#38 behaviour).",
+    )
+    run_parser.add_argument(
+        "--allowed-market-states",
+        type=_market_state_set,
+        default=None,
+        metavar="STATE[,STATE...]",
+        help="Issue #39: only adopt a candidate when its bar's Market State is in this "
+        f"comma-separated allow-list (valid: {', '.join(sorted(KNOWN_MARKET_STATES))}). "
+        "Every bar's state is still classified and recorded regardless; this only gates "
+        "which candidates become saved signals. Unspecified (the default) means no state "
+        "filter -- pre-#39 behaviour, every candidate is eligible.",
     )
     run_parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
     run_parser.add_argument(
@@ -532,24 +570,38 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             "no_reentry": args.no_reentry,
             "cooldown_minutes": args.cooldown_minutes,
             "bias_mode": bias_mode,
+            # Issue #39: the Market State entry filter for this run, sorted for a
+            # stable record, or null when no filter was applied (the default).
+            "allowed_market_states": (
+                sorted(args.allowed_market_states) if args.allowed_market_states is not None else None
+            ),
         },
     )
     store.save_backtest_run(run_record, db_path=backtest_db_path)
 
-    # Issue #38: opt-in candidate suppression, enforced in strict entry-time
-    # order (evaluations are already ascending). Both are global (one position
-    # / one cooldown at a time), not per-side or per-signal-type.
+    # Issue #38/#39: opt-in candidate suppression, enforced in strict entry-time
+    # order (evaluations are already ascending). All three are global (one
+    # position / one cooldown at a time), not per-side or per-signal-type.
+    #   --allowed-market-states -- drop any candidate whose bar's Market State is
+    #                       not in the allow-list (checked first: it is a property
+    #                       of the bar itself, upstream of position management).
     #   --no-reentry     -- while a position is held, drop any candidate whose
     #                       entry falls in [held position entry, close_time].
     #                       An open position (close_time=None) is held until
     #                       validation_end.
     #   --cooldown-minutes N -- after a position closes at C, drop any candidate
     #                       whose entry is < C + N minutes.
-    # With both flags off (the defaults) neither branch ever fires and every
-    # candidate is adopted exactly as before.
+    # The three suppression counters are mutually exclusive: a candidate is
+    # counted under the FIRST reason that drops it (market_state, then re-entry,
+    # then cooldown) and never re-tested against the others -- so the counts sum
+    # to the number of suppressed candidates, never over-count one. With all
+    # flags off (the defaults) no branch ever fires and every candidate is
+    # adopted exactly as before.
+    allowed_market_states = args.allowed_market_states
     cooldown_delta = pd.Timedelta(minutes=args.cooldown_minutes)
     held_until: pd.Timestamp | None = None
     cooldown_until: pd.Timestamp | None = None
+    suppressed_market_state = 0
     suppressed_reentry = 0
     suppressed_cooldown = 0
 
@@ -571,6 +623,13 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         future_candles = candles.iloc[entry_position + 1 :]
 
         for candidate in evaluation.candidates:
+            # Issue #39: Market State gate first -- a candidate on a bar whose
+            # state is not allowed is dropped before any position-management
+            # check, and never touches held_until / cooldown_until (a
+            # never-adopted position neither holds nor starts a cooldown).
+            if allowed_market_states is not None and evaluation.market_state not in allowed_market_states:
+                suppressed_market_state += 1
+                continue
             # Issue #38: re-entry suppression is checked before cooldown so
             # the two counters never double-count the same candidate. Given a
             # close at C with held_until=C and cooldown_until=C+N: entry <= C
@@ -624,6 +683,12 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
                 strategy_profile=candidate["strategy_profile"],
                 reasons=[candidate["reason"]] if candidate.get("reason") else None,
                 entry_price=entry_price,
+                # Issue #39: record this bar's classified Market State (and the
+                # classifier's confidence) on the saved signal so by_market_state
+                # aggregation has a real value, whether or not a state filter was
+                # applied this run.
+                market_state=evaluation.market_state,
+                market_state_confidence=evaluation.market_state_confidence,
             )
             # (6)/(7) apply_exit_policy_result() maps the corrected exit onto
             # the record and re-derives pnl from the corrected entry/close.
@@ -669,6 +734,13 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         "suppressed_reentry": suppressed_reentry,
         "suppressed_cooldown": suppressed_cooldown,
         "bias_mode": bias_mode,
+        # Issue #39: how many candidates the Market State filter dropped (0 when
+        # --allowed-market-states was not given), and the allow-list itself
+        # (sorted, or None when no filter was applied).
+        "suppressed_market_state": suppressed_market_state,
+        "allowed_market_states": (
+            sorted(allowed_market_states) if allowed_market_states is not None else None
+        ),
         # Issue #26: echo the virtual-fill model settings that produced this
         # run's entry/close prices (mirrors backtest_runs.config_json).
         "execution_model": exec_model.to_config(),
@@ -695,8 +767,13 @@ def print_summary(summary: dict) -> None:
     print(f"Signals generated:   {summary['signals_generated']}")
     # Issue #38: bias mode + how many candidates the opt-in filters dropped.
     print(f"Bias mode:           {summary.get('bias_mode', BIAS_MODE_STATIC)}")
+    # Issue #39: the Market State filter (if any) and its suppression count,
+    # shown alongside #38's re-entry/cooldown counts.
+    allowed_states = summary.get("allowed_market_states")
+    print(f"Allowed states:      {', '.join(allowed_states) if allowed_states else 'all'}")
     print(
-        f"Suppressed:          re-entry={summary.get('suppressed_reentry', 0)}, "
+        f"Suppressed:          market-state={summary.get('suppressed_market_state', 0)}, "
+        f"re-entry={summary.get('suppressed_reentry', 0)}, "
         f"cooldown={summary.get('suppressed_cooldown', 0)}"
     )
     execution_model = summary.get("execution_model") or {}

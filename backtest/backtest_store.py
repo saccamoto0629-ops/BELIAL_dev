@@ -69,6 +69,8 @@ REQUIRED_SIGNAL_COLUMNS = {
     "closed_at",
     "close_reason",
     "exit_policy",
+    "market_state",
+    "market_state_confidence",
     "created_at",
 }
 
@@ -78,8 +80,8 @@ _INSERT_SIGNAL_SQL = """
      signal_type, trigger_type, alert_source, strategy_profile, reason_json,
      entry_price, invalidation_price, take_profit_price, close_price,
      result_status, pnl, mfe, mae, closed_at, close_reason, exit_policy,
-     created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     market_state, market_state_confidence, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -238,6 +240,8 @@ def init_db(db_path: Path | None = None) -> None:
                 closed_at TEXT,
                 close_reason TEXT,
                 exit_policy TEXT,
+                market_state TEXT,
+                market_state_confidence REAL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (run_id) REFERENCES backtest_runs(id)
             )
@@ -255,6 +259,14 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_column(connection, "backtest_signals", "alert_source", "TEXT")
         _ensure_column(connection, "backtest_signals", "strategy_profile", "TEXT")
         _backfill_classification_defaults(connection)
+
+        # Issue #39: add the Market State columns to a backtest_signals table
+        # created before they existed. Unlike the Issue #27 classification
+        # columns, these are NOT backfilled: a legacy row's true Market State is
+        # unknowable after the fact, so NULL (== "unknown" in the by_market_state
+        # breakdown) is the honest value rather than a fabricated default.
+        _ensure_column(connection, "backtest_signals", "market_state", "TEXT")
+        _ensure_column(connection, "backtest_signals", "market_state_confidence", "REAL")
 
         _validate_schema(connection)
 
@@ -328,6 +340,8 @@ def _signal_row(record: dict) -> tuple:
         record.get("closed_at"),
         record.get("close_reason"),
         record.get("exit_policy"),
+        record.get("market_state"),
+        record.get("market_state_confidence"),
         record["created_at"],
     )
 

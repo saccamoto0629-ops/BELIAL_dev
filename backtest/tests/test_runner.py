@@ -1688,3 +1688,226 @@ def test_static_mode_result_is_independent_of_bias_insertion_order(tmp_path):
     assert forward == reverse
     # "z-bull" (Bull) wins -> long signals generated in the uptrend.
     assert forward == (10, ("Bull",))
+
+
+# =============================================================================
+# Issue #39: Market State classification + --allowed-market-states entry filter
+# =============================================================================
+#
+# The shared Bull uptrend fixture (seed_chart_db / _seed_trend, step=0.05)
+# classifies every ready bar as "squeeze" (a perfectly steady climb has a very
+# tight Bollinger band, and squeeze is checked before trend). That is what makes
+# it a clean filter fixture: it still generates 10 long candidates, but their
+# bar state is "squeeze", so filtering to "trend_up" suppresses all of them
+# while filtering to "squeeze" keeps all of them.
+STEADY_UPTREND_STATE = "squeeze"
+
+
+# --- CLI parsing: default, acceptance, rejection -----------------------------
+
+
+def test_parse_args_defaults_allowed_market_states_to_none(tmp_path):
+    args = make_args(tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00")
+    assert args.allowed_market_states is None
+
+
+def test_parse_args_accepts_allowed_market_states_list_ignoring_whitespace(tmp_path):
+    args = make_args(
+        tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+        allowed_market_states="trend_up, range ,trend_up",  # dup + spaces
+    )
+    assert args.allowed_market_states == frozenset({"trend_up", "range"})
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not_a_state", "trend_up,bogus", "", " , ", "trend_up,", ",trend_up", "trend_up,,range"],
+)
+def test_parse_args_rejects_unknown_or_empty_allowed_market_states(tmp_path, value):
+    with pytest.raises(SystemExit) as exc_info:
+        make_args(
+            tmp_path, from_time="2026-06-01T00:00:00", to_time="2026-06-02T00:00:00",
+            allowed_market_states=value,
+        )
+    assert exc_info.value.code == runner.EXIT_USAGE_ERROR
+
+
+def test_run_help_documents_allowed_market_states(capsys):
+    with pytest.raises(SystemExit):
+        runner.parse_args(["run", "--help"])
+    captured = capsys.readouterr()
+    assert "--allowed-market-states" in captured.out
+    assert "trend_up" in captured.out
+
+
+# --- the filter itself -------------------------------------------------------
+
+
+def test_allowed_market_states_suppresses_candidates_on_a_disallowed_state(tmp_path):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        allowed_market_states="trend_up",  # the steady uptrend is "squeeze", never trend_up
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 0
+    assert summary["suppressed_market_state"] == 10
+    assert summary["suppressed_reentry"] == 0
+    assert summary["suppressed_cooldown"] == 0
+
+
+def test_allowed_market_states_keeps_candidates_on_the_matching_state(tmp_path):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        allowed_market_states=f"{STEADY_UPTREND_STATE},trend_up",  # allow-list includes the real state
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 10
+    assert summary["suppressed_market_state"] == 0
+
+
+def test_no_allowed_market_states_flag_is_a_pure_passthrough(tmp_path):
+    # Without the flag every candidate is eligible and nothing is state-suppressed.
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 10
+    assert summary["suppressed_market_state"] == 0
+    assert summary["allowed_market_states"] is None
+
+
+def test_market_state_filter_is_upstream_of_reentry_and_cooldown(tmp_path):
+    # A candidate dropped by the state filter is counted ONLY as market_state --
+    # re-entry/cooldown are never consulted for it, so those counters stay 0.
+    # This proves the three suppression counters are mutually exclusive.
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        allowed_market_states="trend_up", no_reentry=True, cooldown_minutes=60,
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 0
+    assert summary["suppressed_market_state"] == 10
+    assert summary["suppressed_reentry"] == 0
+    assert summary["suppressed_cooldown"] == 0
+
+
+def test_reentry_precedes_cooldown_when_market_state_is_allowed(tmp_path):
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_config=str(exit_config), allowed_market_states=STEADY_UPTREND_STATE,
+        no_reentry=True, cooldown_minutes=60,
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 5
+    assert summary["suppressed_market_state"] == 0
+    assert summary["suppressed_reentry"] == 5
+    assert summary["suppressed_cooldown"] == 0
+
+
+def test_cooldown_is_counted_when_state_allowed_and_not_reentry(tmp_path):
+    exit_config = _write_time_based_exit_config(tmp_path, max_hold_bars=1)
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        exit_config=str(exit_config), allowed_market_states=STEADY_UPTREND_STATE,
+        cooldown_minutes=60,
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    assert summary["signals_generated"] == 5
+    assert summary["suppressed_market_state"] == 0
+    assert summary["suppressed_reentry"] == 0
+    assert summary["suppressed_cooldown"] == 5
+
+
+# --- per-signal Market State is recorded regardless of the filter ------------
+
+
+def test_run_backtest_records_market_state_on_every_signal(tmp_path):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, run_result = runner.run_backtest(args)
+
+    signals = store.list_backtest_signals(run_result["run_id"], db_path=backtest_db)
+    assert signals
+    assert all(s["market_state"] == STEADY_UPTREND_STATE for s in signals)
+    assert all(s["market_state_confidence"] is not None for s in signals)
+    # the by_market_state breakdown groups under the real state
+    by_market_state = run_result["signal_summary"]["breakdowns"]["by_market_state"]
+    assert STEADY_UPTREND_STATE in by_market_state
+    assert by_market_state[STEADY_UPTREND_STATE]["total_signals"] == run_result["signals_generated"]
+
+
+# --- run config + summary carry the new setting ------------------------------
+
+
+def test_allowed_market_states_saved_to_config_json_sorted(tmp_path):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        allowed_market_states="trend_up,squeeze",
+    )
+
+    _, summary = runner.run_backtest(args)
+
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    config = json.loads(run["config_json"])
+    assert config["allowed_market_states"] == ["squeeze", "trend_up"]  # sorted, deterministic
+    assert summary["allowed_market_states"] == ["squeeze", "trend_up"]
+
+
+def test_default_run_records_null_allowed_market_states(tmp_path):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, summary = runner.run_backtest(args)
+
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    config = json.loads(run["config_json"])
+    assert config["allowed_market_states"] is None
+    assert summary["suppressed_market_state"] == 0
+
+
+def test_print_summary_shows_allowed_states_and_market_state_suppression(tmp_path, capsys):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        allowed_market_states="trend_up",
+    )
+    _, summary = runner.run_backtest(args)
+
+    runner.print_summary(summary)
+    captured = capsys.readouterr()
+
+    assert "Allowed states:      trend_up" in captured.out
+    assert "market-state=" in captured.out
+
+
+def test_print_summary_shows_all_when_no_state_filter(tmp_path, capsys):
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+    _, summary = runner.run_backtest(args)
+
+    runner.print_summary(summary)
+    captured = capsys.readouterr()
+
+    assert "Allowed states:      all" in captured.out

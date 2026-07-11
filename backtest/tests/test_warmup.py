@@ -335,5 +335,85 @@ def test_neutral_bias_produces_no_candidates_even_when_fully_ready():
 
 
 # =============================================================================
+# Issue #39: per-bar Market State classification (point-in-time)
+# =============================================================================
+
+from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch; on sys.path via `import warmup`)
+
+
+def _ready_states(candles, validation_start, validation_end=None):
+    """Map each ready bar's timestamp -> (market_state, confidence)."""
+    results = warmup.evaluate_backtest_bars(
+        candles, validation_start, validation_end,
+        symbol="USDJPY", timeframe="1h", bias_result=make_bias(),
+    )
+    return {r.timestamp: (r.market_state, r.market_state_confidence) for r in results if r.is_ready}
+
+
+def test_ready_bars_carry_a_market_state_and_skipped_bars_do_not():
+    candles = make_candles(85)  # 80 warm-up + 5 validation, every validation bar ready
+    validation_start = candles.index[80]
+
+    results = warmup.evaluate_backtest_bars(
+        candles, validation_start, symbol="USDJPY", timeframe="1h", bias_result=make_bias(),
+    )
+
+    assert all(r.is_ready for r in results)
+    for r in results:
+        assert r.market_state in KNOWN_MARKET_STATES
+        assert 0.0 <= r.market_state_confidence <= 1.0
+
+
+def test_skipped_bars_leave_market_state_none():
+    candles = make_candles(20)  # far fewer than DEFAULT_WARMUP_BARS -> every bar skipped
+    validation_start = candles.index[15]
+
+    results = warmup.evaluate_backtest_bars(
+        candles, validation_start, symbol="USDJPY", timeframe="1h", bias_result=make_bias(),
+    )
+
+    assert all(not r.is_ready for r in results)
+    assert all(r.market_state is None for r in results)
+    assert all(r.market_state_confidence is None for r in results)
+
+
+def test_market_state_never_depends_on_a_future_bar():
+    # A past bar's state is classified from indicators up to and including
+    # itself only. Mutating any bar *after* the evaluated window must not change
+    # a single already-classified state -- the slice excludes future bars and the
+    # indicators at each row are causal.
+    base = make_candles(120, slope=0.1)
+    start, end = base.index[110], base.index[116]  # bars 117..119 are "future" here
+    before = _ready_states(base, start, end)
+
+    mutated = base.copy()
+    mutated.iloc[119, mutated.columns.get_loc("close")] = 9_999.0  # a wild future outlier
+    after = _ready_states(mutated, start, end)
+
+    assert before == after  # no past state (or confidence) moved
+
+
+def test_market_state_reflects_a_change_to_the_current_bar_itself():
+    # Off-by-one guard: the classification slice is inclusive of the current bar,
+    # so mutating the last in-window bar's own close must change ITS OWN state (or
+    # at least its confidence). If the slice were exclusive of the current bar,
+    # this mutation would be invisible and the tuple would be unchanged.
+    base = make_candles(120, slope=0.1)
+    start, end = base.index[110], base.index[116]
+    target = base.index[116]  # the last evaluated bar
+    before = _ready_states(base, start, end)
+
+    mutated = base.copy()
+    mutated.loc[target, "close"] = float(base.loc[target, "close"]) + 50.0
+    after = _ready_states(mutated, start, end)
+
+    # Only the mutated bar's own reading changes; earlier bars stay put.
+    assert after[target.isoformat()] != before[target.isoformat()]
+    for ts in before:
+        if ts != target.isoformat():
+            assert after[ts] == before[ts]
+
+
+# =============================================================================
 # existing test suites must still pass (see verification command in the report)
 # =============================================================================

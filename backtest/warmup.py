@@ -47,6 +47,11 @@ for _dir in (MARKET_WATCH_DIR, PAPER_SIGNAL_DIR):
         sys.path.insert(0, str(_dir))
 
 from indicators import calculate_indicators, classify_bb_state, classify_trend  # noqa: E402  (market-watch)
+# Issue #39: Backtest reuses Live's existing Market State classifier (the same
+# one chart_snapshot.py runs) rather than defining a second taxonomy. Each ready
+# validation bar is classified point-in-time so its state can later gate entry
+# and drive a per-state performance breakdown.
+from market_state import classify_market_state  # noqa: E402  (market-watch)
 # Issue #28: Backtest resolves freshness / bias_weight through the SAME shared
 # rule as Live (chart_snapshot uses these too), never a hardcoded "Fresh"/1.0.
 # The ``freshness`` module is dependency-light (pandas + datetime only), so this
@@ -132,6 +137,12 @@ class BarEvaluation:
     is_ready: bool
     skip_reasons: tuple[str, ...] = ()
     candidates: tuple[dict, ...] = ()
+    # Issue #39: the Market State classified for this bar (point-in-time, from
+    # indicators up to and including this bar). Only ready bars carry a value;
+    # a skipped bar leaves both None. market_state_confidence is the classifier's
+    # own matched/total ratio for that state.
+    market_state: str | None = None
+    market_state_confidence: float | None = None
 
 
 def _align_timestamp(reference_index: pd.DatetimeIndex, timestamp) -> pd.Timestamp:
@@ -264,6 +275,13 @@ def evaluate_backtest_bars(
     dict when no bias precedes the bar. When ``bias_lookup`` is None (the
     default) the single ``bias_result`` is applied to every bar exactly as
     before, so the existing static-bias behaviour is unchanged.
+
+    Issue #39: every ready bar is additionally classified into a Market State
+    (``market_state.classify_market_state``) over indicators up to and including
+    that bar only -- never a future row -- and the label + confidence are
+    attached to the BarEvaluation. This is a pure observation recorded per bar;
+    the runner (not this module) decides whether to gate entry on it. Skipped
+    (not-ready) bars leave both fields None.
     """
     try:
         timeframe_delta = timeframe_to_timedelta(timeframe)
@@ -326,6 +344,22 @@ def evaluate_backtest_bars(
             candle_timestamp=timestamp,
             evaluation_time=bar_evaluation_time,
         )
+        # Issue #39: classify this bar's Market State from indicators up to and
+        # including it. ``position`` is the 1-indexed bar count, so ``iloc[:position]``
+        # ends exactly at the current bar -- classify_market_state() reads its last
+        # row, guaranteeing no future bar can influence this bar's state.
+        #
+        # Perf note: classify_market_state() only ever consults the last row plus
+        # a trailing bandwidth window (max(squeeze_lookback, expansion_lookback)+1
+        # ~= 21 rows). This full ``iloc[:position]`` slice per bar is therefore an
+        # O(n^2) allocation across a run and is kept only to stay byte-identical to
+        # Live (chart_snapshot passes the whole indicators frame). It is acceptable
+        # at current scale (a 1-year 1h run is ~6k bars); if runs grow much larger,
+        # pass a bounded tail slice instead -- equivalent for any ready bar, whose
+        # recent bandwidth is always non-NaN.
+        state_result = classify_market_state(indicators.iloc[:position])
+        market_state = state_result["market_state"]
+        market_state_confidence = state_result["confidence"]
         # Issue #38: in time-series mode, resolve the bias point-in-time at this
         # bar's close (bias_lookup guarantees a non-None, Neutral-when-unknown
         # dict); otherwise apply the one static bias_result to every bar.
@@ -339,6 +373,8 @@ def evaluate_backtest_bars(
                 symbol=symbol,
                 is_ready=True,
                 candidates=tuple(candidates),
+                market_state=market_state,
+                market_state_confidence=market_state_confidence,
             )
         )
 

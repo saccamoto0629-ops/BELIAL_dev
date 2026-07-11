@@ -49,7 +49,10 @@ def render_text(summary: dict[str, Any]) -> str:
                 f"  {key}: signals={metrics['total_signals']} "
                 f"win={metrics['win_count']} loss={metrics['loss_count']} "
                 f"win_rate={_format_metric(metrics['win_rate'])} "
-                f"total_pnl={_format_metric(metrics['total_pnl'])}"
+                f"profit_factor={_format_metric(metrics['profit_factor'])} "
+                f"total_pnl={_format_metric(metrics['total_pnl'])} "
+                f"average_pnl={_format_metric(metrics['average_pnl'])} "
+                f"max_drawdown={_format_metric(metrics['max_drawdown'])}"
             )
     return "\n".join(lines)
 
@@ -88,13 +91,16 @@ def render_markdown(summary: dict[str, Any]) -> str:
         if not buckets:
             lines.append("(no data)")
             continue
-        lines.append("| Key | Signals | Win | Loss | Win rate | Total PnL |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| Key | Signals | Win | Loss | Win rate | Profit factor | Total PnL | Average PnL | Max drawdown |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for key, metrics in buckets.items():
             lines.append(
                 f"| {key} | {metrics['total_signals']} | {metrics['win_count']} | "
                 f"{metrics['loss_count']} | {_format_metric(metrics['win_rate'])} | "
-                f"{_format_metric(metrics['total_pnl'])} |"
+                f"{_format_metric(metrics['profit_factor'])} | "
+                f"{_format_metric(metrics['total_pnl'])} | "
+                f"{_format_metric(metrics['average_pnl'])} | "
+                f"{_format_metric(metrics['max_drawdown'])} |"
             )
     return "\n".join(lines) + "\n"
 

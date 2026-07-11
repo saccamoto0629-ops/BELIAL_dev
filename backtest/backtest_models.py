@@ -73,6 +73,11 @@ class BacktestSignalRecord(TypedDict):
     closed_at: str | None
     close_reason: str | None
     exit_policy: str | None
+    # Issue #39: the Market State classified for this signal's bar, and the
+    # classifier's confidence for it. Nullable: signals saved before this column
+    # existed (or generated when no state was resolvable) read back as None.
+    market_state: str | None
+    market_state_confidence: float | None
     created_at: str
 
 
@@ -144,6 +149,8 @@ def create_backtest_signal_record(
     closed_at: str | None = None,
     close_reason: str | None = None,
     exit_policy: str | None = None,
+    market_state: str | None = None,
+    market_state_confidence: float | None = None,
     signal_id: str | None = None,
     created_at: str | None = None,
 ) -> BacktestSignalRecord:
@@ -187,6 +194,8 @@ def create_backtest_signal_record(
         "closed_at": closed_at,
         "close_reason": close_reason,
         "exit_policy": exit_policy,
+        "market_state": market_state,
+        "market_state_confidence": market_state_confidence,
         "created_at": created_at or utc_now_iso(),
     }
 

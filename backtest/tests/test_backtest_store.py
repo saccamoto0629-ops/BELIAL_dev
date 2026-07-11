@@ -364,6 +364,50 @@ def test_backtest_backfill_only_touches_null_or_empty_values(tmp_path):
     assert row["alert_source"] == "composite"  # newly-added column backfilled
 
 
+def test_init_db_migrates_backtest_signals_missing_market_state_columns(tmp_path):
+    # Issue #39: a DB whose backtest_signals predates the market_state columns
+    # must gain them in place, and its pre-existing row must still be readable --
+    # with market_state NULL (NOT backfilled: a legacy row's true state is
+    # unknowable, unlike the Issue #27 classification defaults).
+    db_path = tmp_path / "backtest.sqlite3"
+    _create_pre_issue27_backtest_db(db_path)  # also predates market_state
+    before = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(backtest_signals)")}
+    assert "market_state" not in before and "market_state_confidence" not in before
+
+    store.init_db(db_path)
+
+    after = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(backtest_signals)")}
+    assert "market_state" in after and "market_state_confidence" in after
+
+    row = store.list_backtest_signals("run-1", db_path=db_path)[0]
+    assert row["market_state"] is None  # nullable, never fabricated
+    assert row["market_state_confidence"] is None
+
+
+def test_init_db_market_state_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "backtest.sqlite3"
+    _create_pre_issue27_backtest_db(db_path)
+
+    store.init_db(db_path)
+    store.init_db(db_path)  # must never raise "duplicate column name"
+
+    columns = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(backtest_signals)")}
+    assert "market_state" in columns and "market_state_confidence" in columns
+
+
+def test_save_and_read_back_market_state_round_trips(tmp_path):
+    db_path = tmp_path / "backtest.sqlite3"
+    run = make_run()
+    store.save_backtest_run(run, db_path=db_path)
+    signal = make_signal(run["id"], signal_id="sig-ms", market_state="trend_up", market_state_confidence=0.75)
+
+    store.save_backtest_signal(signal, db_path=db_path)
+
+    row = store.list_backtest_signals(run["id"], db_path=db_path)[0]
+    assert row["market_state"] == "trend_up"
+    assert row["market_state_confidence"] == pytest.approx(0.75)
+
+
 def test_save_backtest_signal_with_duplicate_id_raises_integrity_error(tmp_path):
     db_path = tmp_path / "backtest.sqlite3"
     run = make_run()
