@@ -447,7 +447,7 @@ ma_names = ["sma20", "sma75", "ema20"]
 |---|---|---|
 | Alert | 事実を検知して通知する | 終値が +2σ を突破した、squeeze から expansion_start に移行した |
 | Strategy / Method | Alert の情報を文脈に応じて解釈する | トレンド相場では順張り候補、レンジ相場では過熱警戒、他指標と組み合わせた条件判定 |
-| Execution | 実際の注文、Exit、損切り、利確を担当する | Bollinger Alert では扱わない |
+| Execution | 執行層(**Paper Execution** / **Live Execution** の総称)。約定・ポジション管理・Exit・損益を担当する | Bollinger Alert では扱わない |
 
 計算仕様:
 
