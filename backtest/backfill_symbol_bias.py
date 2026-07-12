@@ -84,7 +84,6 @@ from market_bias_models import (  # noqa: E402  (news-feed-bot)
 from market_bias_store import (  # noqa: E402  (news-feed-bot)
     init_db,
     market_bias_db_path,
-    save_market_bias,
 )
 
 logger = logging.getLogger("backtest.backfill_symbol_bias")
@@ -96,6 +95,51 @@ EXIT_NO_DATA = 3
 # Match Live's per-snapshot candle fetch (chart_collector.load_candles' default
 # limit) so indicator values for the latest row are identical to what Live saw.
 DEFAULT_WINDOW = 200
+
+# How long to wait for a competing writer's lock before giving up. The live
+# news-feed-bot writes GLOBAL/per-symbol bias to this same DB on a schedule, so
+# a bulk backfill must tolerate a transient write lock rather than fail.
+BUSY_TIMEOUT_MS = 30_000
+
+# Columns mirror market_bias_store.save_market_bias's INSERT exactly. We insert
+# through a single long-lived connection here (rather than calling
+# save_market_bias per record, which re-opens the DB + re-runs init_db every
+# time) so a year-long backfill does thousands of inserts over ONE file handle
+# in one transaction per symbol -- far fewer opens, and no per-record
+# reconnect storm that can exhaust file descriptors ("unable to open database
+# file").
+_INSERT_SQL = """
+    INSERT OR REPLACE INTO market_bias
+    (market_bias_id, evaluated_at, symbol, timeframe, market_bias, confidence,
+     trend, risk, risk_confidence, volatility, volatility_confidence,
+     reasons_json, risk_reasons_json, volatility_reasons_json, warnings_json,
+     source_snapshot_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _insert_record(connection: sqlite3.Connection, record: dict) -> None:
+    connection.execute(
+        _INSERT_SQL,
+        (
+            record["market_bias_id"],
+            record["evaluated_at"],
+            normalize_bias_symbol(record["symbol"]),
+            normalize_bias_timeframe(record["timeframe"]),
+            record["market_bias"],
+            record["confidence"],
+            record["trend"],
+            record.get("risk"),
+            record.get("risk_confidence"),
+            record.get("volatility"),
+            record.get("volatility_confidence"),
+            record.get("reasons_json"),
+            record.get("risk_reasons_json"),
+            record.get("volatility_reasons_json"),
+            record.get("warnings_json"),
+            record.get("source_snapshot_id"),
+        ),
+    )
 
 
 def _to_z(timestamp: pd.Timestamp) -> str:
@@ -143,14 +187,17 @@ def backfill_symbol(
     symbol: str,
     *,
     chart_db_path: Path,
-    bias_db_path: Path,
+    connection: sqlite3.Connection | None,
     timeframe: str,
     window: int,
     from_bound: pd.Timestamp | None,
     to_bound: pd.Timestamp | None,
-    dry_run: bool,
 ) -> dict:
-    """Backfill one symbol; return a small stats dict for reporting."""
+    """Backfill one symbol; return a small stats dict for reporting.
+
+    ``connection`` is a single open Market Bias DB connection (shared across all
+    symbols in the run) or ``None`` for a dry run that writes nothing.
+    """
     end_str = _to_z(to_bound) if to_bound is not None else None
     candles = chart_collector.load_candles_range(
         chart_db_path, symbol, timeframe, start=None, end=end_str
@@ -199,8 +246,8 @@ def backfill_symbol(
             evaluated_at=evaluated_at,
         )
         stats["written"] += 1
-        if not dry_run:
-            save_market_bias(record, db_path=bias_db_path)
+        if connection is not None:
+            _insert_record(connection, record)
 
     return stats
 
@@ -270,30 +317,40 @@ def main(argv: list[str] | None = None) -> int:
     if from_bound is not None and to_bound is not None and to_bound < from_bound:
         parser.error("--to must not be earlier than --from")
 
+    connection: sqlite3.Connection | None = None
     if not args.dry_run:
         init_db(bias_db_path)
         if not args.keep_existing:
             deleted = _delete_existing(bias_db_path, symbols, timeframe)
             logger.info("Deleted %d existing per-symbol row(s) for %s @ %s", deleted, ",".join(symbols), timeframe)
+        # One shared connection for the whole run (see _INSERT_SQL). busy_timeout
+        # lets us wait out the live writer's lock instead of failing outright.
+        connection = sqlite3.connect(bias_db_path, timeout=BUSY_TIMEOUT_MS / 1000)
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
 
     grand_written = 0
-    for symbol in symbols:
-        stats = backfill_symbol(
-            symbol,
-            chart_db_path=chart_db_path,
-            bias_db_path=bias_db_path,
-            timeframe=timeframe,
-            window=args.window,
-            from_bound=from_bound,
-            to_bound=to_bound,
-            dry_run=args.dry_run,
-        )
-        grand_written += stats["written"]
-        logger.info(
-            "%-8s candles=%-6d evaluated: Bull=%d Bear=%d Neutral=%d (skipped_none=%d) -> %d record(s)%s",
-            stats["symbol"], stats["candles"], stats["Bull"], stats["Bear"], stats["Neutral"],
-            stats["skipped_none"], stats["written"], " [DRY_RUN]" if args.dry_run else "",
-        )
+    try:
+        for symbol in symbols:
+            stats = backfill_symbol(
+                symbol,
+                chart_db_path=chart_db_path,
+                connection=connection,
+                timeframe=timeframe,
+                window=args.window,
+                from_bound=from_bound,
+                to_bound=to_bound,
+            )
+            if connection is not None:
+                connection.commit()  # persist this symbol before moving on
+            grand_written += stats["written"]
+            logger.info(
+                "%-8s candles=%-6d evaluated: Bull=%d Bear=%d Neutral=%d (skipped_none=%d) -> %d record(s)%s",
+                stats["symbol"], stats["candles"], stats["Bull"], stats["Bear"], stats["Neutral"],
+                stats["skipped_none"], stats["written"], " [DRY_RUN]" if args.dry_run else "",
+            )
+    finally:
+        if connection is not None:
+            connection.close()
 
     logger.info("%sTotal records %s: %d",
                 "[DRY_RUN] " if args.dry_run else "",
