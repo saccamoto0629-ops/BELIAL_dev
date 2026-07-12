@@ -407,7 +407,7 @@ def test_run_once_and_run_backtest_emit_the_same_candidate_fields(tmp_path, monk
     live_snap = live_snapshot(frame, symbol=symbol, evaluation_time=eval_ts)
     monkeypatch.setattr(
         sg, "fetch_snapshot_sources",
-        lambda: {"market": {}, "fred": None, "tradingview": {}, "chart": [live_snap]},
+        lambda **kwargs: {"market": {}, "fred": None, "tradingview": {}, "chart": [live_snap]},
     )
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: bias)
 

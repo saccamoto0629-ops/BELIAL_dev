@@ -32,12 +32,13 @@ if MARKET_WATCH_DIR.exists() and str(MARKET_WATCH_DIR) not in sys.path:
 
 try:
     from chart_collector import chart_db_path, load_chart_targets, load_env_file as load_chart_env_file
-    from chart_snapshot import collect_and_build_snapshots
+    from chart_snapshot import build_snapshots_in_memory, collect_and_build_snapshots
 except Exception as exc:  # optional chart layer; keep Market Snapshot alive
     chart_db_path = None
     load_chart_targets = None
     load_chart_env_file = None
     collect_and_build_snapshots = None
+    build_snapshots_in_memory = None
     logger.debug("[market_snapshot] Chart Snapshot summary unavailable: %s", exc)
 
 VIX_RISK_OFF_LEVEL = 25
@@ -214,11 +215,17 @@ def format_fedwatch_section(snapshot: FedWatchSnapshot | None) -> str:
     return "\n".join(lines)
 
 
-def get_chart_snapshot_summaries() -> list:
+def get_chart_snapshot_summaries(*, persist: bool = True) -> list:
     """Return 1h chart snapshots for Market Snapshot summary only.
 
     Detailed Chart Snapshot Discord notifications remain owned by
     market-watch/chart_snapshot.py and are not sent from here.
+
+    Issue #41: with ``persist=False`` the snapshots are built entirely in memory
+    (``build_snapshots_in_memory``) with no chart-SQLite create/update -- used by
+    Paper Signal's ``--dry-run`` so a dry run has no persistent side effect. The
+    default ``persist=True`` keeps the normal collect-and-store path for every
+    other caller.
     """
     if not all([chart_db_path, load_chart_targets, load_chart_env_file, collect_and_build_snapshots]):
         return []
@@ -226,10 +233,13 @@ def get_chart_snapshot_summaries() -> list:
     targets = [target for target in load_chart_targets(env_values) if target.timeframe == "1h"]
     if not targets:
         return []
+    period = env_values.get("CHART_HISTORY_PERIOD", "60d")
+    if not persist:
+        return build_snapshots_in_memory(targets, period=period)
     return collect_and_build_snapshots(
         targets,
         chart_db_path(env_values),
-        period=env_values.get("CHART_HISTORY_PERIOD", "60d"),
+        period=period,
         collect=True,
     )
 
@@ -513,14 +523,20 @@ def fetch_snapshot_sources(
     providers: dict[str, ProviderCallable] | None = None,
     *,
     timeout: int = PROVIDER_TIMEOUT_SECONDS,
+    persist: bool = True,
 ) -> SnapshotSources:
-    """Fetch all providers in parallel without allowing one provider to stop the bot."""
+    """Fetch all providers in parallel without allowing one provider to stop the bot.
+
+    Issue #41: ``persist=False`` routes the chart provider through the
+    non-persistent in-memory path so a Paper Signal dry run creates/updates no
+    chart SQLite. Ignored when an explicit ``providers`` mapping is supplied.
+    """
     if providers is None:
         providers = {
             "market": lambda: get_market_data(timeout=5),
             "fred": lambda: get_fred_data(FRED_API_KEY, timeout=5),
             "tradingview": lambda: get_tradingview_data(timeout=5),
-            "chart": get_chart_snapshot_summaries,
+            "chart": lambda: get_chart_snapshot_summaries(persist=persist),
         }
         if ENABLE_ECONOMIC_CALENDAR:
             providers["calendar"] = lambda: get_economic_calendar(timeout=FAST_PROVIDER_TIMEOUT_SECONDS)

@@ -131,6 +131,8 @@ def make_chart_snapshot(**overrides):
     snapshot = {
         "symbol": "USDJPY",
         "timeframe": "1h",
+        # Issue #41: confirmed-candle open timestamp (past -> always closed).
+        "timestamp": "2026-07-05T12:00:00Z",
         "trend": "Bull",
         "state": "Inside band",
         "freshness": "Fresh",
@@ -152,7 +154,7 @@ def test_run_once_makes_the_logger_available(reset_logger_state, monkeypatch):
         "tradingview": {},
         "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
     }
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
 
     assert sg._logger_instance is None  # pristine before run_once()
@@ -201,7 +203,7 @@ def test_run_once_dry_run_still_has_no_db_or_http_side_effects(reset_logger_stat
         "tradingview": {},
         "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
     }
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
 
     class FailingSession:

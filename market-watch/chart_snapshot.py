@@ -20,6 +20,7 @@ from chart_collector import (
     DEFAULT_PERIOD,
     chart_db_path,
     collect_all,
+    fetch_ohlcv,
     insert_chart_snapshot,
     load_candles,
     load_chart_targets,
@@ -234,6 +235,30 @@ def collect_and_build_snapshots(
     for target in targets:
         candles = load_candles(db_path, target.symbol, target.timeframe, limit=200)
         snapshot = build_indicator_snapshot(target, candles)
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def build_snapshots_in_memory(
+    targets: list[ChartTarget],
+    *,
+    period: str = DEFAULT_PERIOD,
+    now_utc: datetime | None = None,
+) -> list[IndicatorSnapshot]:
+    """Build IndicatorSnapshots WITHOUT touching any SQLite (Issue #41 dry-run).
+
+    Fetches OHLCV per target directly into memory (``fetch_ohlcv``) and builds the
+    same IndicatorSnapshot ``build_indicator_snapshot`` produces on the persistent
+    path -- but never calls ``init_db`` / ``save_candles`` / ``load_candles``, so no
+    chart database file is created or mutated. Used only by the non-persistent
+    (Paper Signal ``--dry-run``) path; the normal ``collect_and_build_snapshots``
+    collection path is unchanged.
+    """
+    snapshots: list[IndicatorSnapshot] = []
+    for target in targets:
+        frame = fetch_ohlcv(target, period=period)
+        snapshot = build_indicator_snapshot(target, frame, now_utc=now_utc)
         if snapshot is not None:
             snapshots.append(snapshot)
     return snapshots

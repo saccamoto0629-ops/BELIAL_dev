@@ -18,6 +18,10 @@ def make_chart_snapshot(**overrides):
     snapshot = {
         "symbol": "USDJPY",
         "timeframe": "1h",
+        # Issue #41: a confirmed-candle open timestamp well in the past, so the
+        # candle is closed at any real evaluation time. build_candidates() ignores
+        # it; run_once() uses it as the target candle. Override for candle tests.
+        "timestamp": "2026-07-05T12:00:00Z",
         "trend": "Bull",
         "state": "Inside band",
         "freshness": "Fresh",
@@ -247,30 +251,34 @@ def test_generate_signal_candidates_never_creates_a_db_file(tmp_path, monkeypatc
     assert not (tmp_path / "paper_signals.sqlite3").exists()
 
 
-def test_run_once_uses_generate_signal_candidates(monkeypatch):
+def test_run_once_uses_build_confirmed_candidate(monkeypatch):
+    # Issue #41: run_once() delegates per-snapshot generation to
+    # build_confirmed_candidate() (which reuses the unchanged build_candidates
+    # strategy) once per snapshot, and yields the confirmed candidate.
     sources = {
         "market": {},
         "fred": None,
         "tradingview": {},
         "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
     }
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
     monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False: None)
 
     calls = []
-    original = sg.generate_signal_candidates
+    original = sg.build_confirmed_candidate
 
-    def spy(context):
-        calls.append(context)
-        return original(context)
+    def spy(snapshot, bias, provenance, **kwargs):
+        calls.append((snapshot, bias, provenance))
+        return original(snapshot, bias, provenance, **kwargs)
 
-    monkeypatch.setattr(sg, "generate_signal_candidates", spy)
+    monkeypatch.setattr(sg, "build_confirmed_candidate", spy)
 
     created = sg.run_once(dry_run=True)
 
     assert len(calls) == 1
     assert len(created) == 1
+    assert created[0]["target_candle_utc"] == "2026-07-05T12:00:00Z"
 
 
 # --- Rule 9: duplicate suppression within the run_once pipeline ---
@@ -286,7 +294,7 @@ def test_run_once_generates_signal_then_suppresses_duplicate(tmp_path, monkeypat
         "tradingview": {},
         "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
     }
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
 
     posted = []
@@ -309,7 +317,7 @@ def test_run_once_dry_run_does_not_create_db_or_call_discord_http(tmp_path, monk
         "tradingview": {},
         "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
     }
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
 
     class FailingSession:
@@ -333,7 +341,7 @@ def test_run_once_normal_mode_persists_signal(tmp_path, monkeypatch):
         "tradingview": {},
         "chart": [make_chart_snapshot(macd_state="Bullish", freshness="Fresh", bias_weight=1.0)],
     }
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
     monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False: None)
 
@@ -543,7 +551,7 @@ def test_run_once_uses_per_symbol_bias_so_one_symbol_bull_does_not_force_another
     usdjpy = make_chart_snapshot(symbol="USDJPY", macd_state="Bullish", trend="Bull")
     xauusd = make_chart_snapshot(symbol="XAUUSD", macd_state="Bullish", trend="Bull")
     sources = {"market": {}, "fred": None, "tradingview": {}, "chart": [usdjpy, xauusd]}
-    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
 
     def fake_classify(*args, **kwargs):
         chart = kwargs.get("chart_data") or []

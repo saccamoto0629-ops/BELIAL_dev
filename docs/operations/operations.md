@@ -162,20 +162,46 @@ ps -aux | grep .py
 ---
 ## CLI
 
+Paper Signal の正式な実行エントリーポイントは `paper-signal/paper_signal_bot.py`(常駐ループのロジック本体は `signal_generator.py`。`paper_signal_bot.py` はそれを呼ぶ薄いエントリーポイント。`python signal_generator.py ...` も後方互換で同等に動く)。
+
 ```bash
 cd /opt/berial/paper-signal
 
-# 確認のみ(Discord送信・SQLite保存なし)
-python signal_generator.py --once --dry-run
+# 確認のみ(Discord送信・SQLite保存・logfile作成なし=永続副作用なし)
+python paper_signal_bot.py --once --dry-run
 
-# 1回実行(Discord送信・SQLite保存あり)
-python signal_generator.py --once
+# 1回実行(Discord送信・SQLite保存あり、sleepなし)
+python paper_signal_bot.py --once
+
+# 常駐(ExecStartと同じ。--onceなしで PAPER_SIGNAL_CHECK_INTERVAL_SECONDS 既定900秒ごとにループ)
+python paper_signal_bot.py
 ```
 
-`--once` を付けない場合は `PAPER_SIGNAL_CHECK_INTERVAL_SECONDS`(既定900秒)ごとにループする常駐プロセスとして動作する。
-## Paper Signal systemd timer案
+1周期の処理(`run_once`)と常駐ループ(`run_service`)は分離されており、`--once` は sleep せず1周期だけ実行する。`--dry-run` は SQLite保存・Discord送信・state更新・logfile作成など永続的副作用を一切行わず(console-only logger)、使用予定の入力・target candle timestamp・生成結果・no-signal・skip理由・重複判定のみをログ出力する。
 
-Paper Signal の将来の systemd timer 案は [Roadmap](../product/roadmap.md) に置く。
+## Paper Signal systemd(常駐サービス, Issue #41)
+
+`paper_signal_bot.py` を `macd_alert_bot.py` などと同様に systemd で常駐させる。SIGTERM / SIGINT を受けると現在の周期を終えて安全に停止し、`TimeoutStopSec` 内に終了しなければ systemd が SIGKILL する。多重起動・restart・競合が起きても、同一 `strategy_profile` / `symbol` / `timeframe` / target candle timestamp の Paper Signal は SQLite の UNIQUE 制約で重複保存・重複通知されない(`ps -aux | grep .py` での二重起動確認は従来どおり推奨)。
+
+unit定義は **リポジトリにコミット済み**のテンプレート `scripts/systemd/berial-paper-signal.service` を正とする(全ディレクティブ入り)。配備手順:
+
+```bash
+# 1. テンプレートを配置(User/パスは環境に合わせて調整)
+sudo cp /opt/berial/scripts/systemd/berial-paper-signal.service /etc/systemd/system/
+sudo nano /etc/systemd/system/berial-paper-signal.service   # 必要なら User / WorkingDirectory / venv path を調整
+
+# 2. 反映して有効化・起動
+sudo systemctl daemon-reload
+sudo systemctl enable --now berial-paper-signal
+
+# 3. 確認
+systemctl status berial-paper-signal --no-pager
+journalctl -u berial-paper-signal -f        # または ./scripts/logs.sh signal
+```
+
+主要ディレクティブ(テンプレート参照): `ExecStart=<venv>/python .../paper_signal_bot.py` / `EnvironmentFile=-.../paper-signal/.env`(`.env` 欠如でも起動、Discordはスキップ)/ `Restart=always` / `RestartSec=10` / `KillSignal=SIGTERM` / `TimeoutStopSec=30` / `StandardOutput=journal` / `StandardError=journal`。
+
+> `scripts/restart_all.sh` は上記 unit が **未配備でも** 後続 unit の restart を止めず、失敗を報告して非0で終了する(POSIX sh)。この unit を配備するまで `berial-paper-signal.service` の restart は失敗する点に注意。
 
 ---
 ## Berial systemd helper scripts
@@ -212,6 +238,7 @@ berial-news.service
 berial-ma-alert.service
 berial-macd-alert.service
 berial-bollinger-alert.service
+berial-paper-signal.service
 berial-chart-snapshot.timer
 ```
 
@@ -221,6 +248,7 @@ berial-chart-snapshot.timer
 ./scripts/logs.sh ma
 ./scripts/logs.sh macd
 ./scripts/logs.sh bollinger
+./scripts/logs.sh signal
 ./scripts/logs.sh snapshot
 ./scripts/logs.sh timer
 ./scripts/logs.sh news

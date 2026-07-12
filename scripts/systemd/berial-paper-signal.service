@@ -1,0 +1,31 @@
+[Unit]
+# Berial Paper Signal Generator resident service (Issue #41).
+# Copy/adapt this template to /etc/systemd/system/berial-paper-signal.service,
+# then: systemctl daemon-reload && systemctl enable --now berial-paper-signal.
+# See docs/operations/operations.md for the full deploy/enable/start steps.
+Description=Berial Paper Signal Generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/berial/paper-signal
+# Load DISCORD_WEBHOOK_URL and PAPER_SIGNAL_* from the (uncommitted) .env.
+# "-" makes a missing file non-fatal; the service still starts (Discord skipped).
+EnvironmentFile=-/opt/berial/paper-signal/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/berial/.venv/bin/python /opt/berial/paper-signal/paper_signal_bot.py
+Restart=always
+RestartSec=10
+# Graceful shutdown: systemd sends SIGTERM (handled by the bot -> stops after the
+# current cycle), then SIGKILL if it has not exited within TimeoutStopSec.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# stdout/stderr go to the journal (journalctl -u berial-paper-signal); the bot
+# also writes logs/paper_signal_generator.log itself on non-dry-run.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

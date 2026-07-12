@@ -104,9 +104,30 @@ Signalの戦略的分類(Strategy / Method層)と、生成契機・入力元(Ale
 - 銘柄別Biasは `GLOBAL` と同じ `classify_market_bias()` を、その銘柄のchart_dataだけに絞って呼ぶ(マクロ/Risk/Volatilityは共有、他銘柄のchart trend / MACDは混入させない)。`GLOBAL` のみの既存環境でも従来どおり候補生成できる。
 - `build_candidates()` / `generate_signal_candidates()` は**pure関数のまま**(SQLite / HTTP / Discord へアクセスしない)。BiasのDB lookupやin-memory計算は `run_once()` 側で完結し、pure関数には解決済みBiasを渡す。Backtestは1バーごとに解決済みの単一Biasを渡すため、pure・DB非依存のまま変更なし(既存の単一 `bias_result` を受け取るAPIも後方互換で残す)。
 
+## 常駐サービス化(Issue #41)
+
+Paper Signal Generator は、既存入力(Market Bias / Chart Snapshot)を使って定期的にPaper Signalを生成・保存・通知する常駐サービスである。実行エントリーポイントは `paper-signal/paper_signal_bot.py`(薄いエントリーポイント)で、ロジック本体は `signal_generator.py`。戦略判定(`build_candidates`)・Market Bias分類・Chart Snapshot生成のロジックは一切変更せず、以下の運用規律を追加している。
+
+- **確定足のみを使用**: `signal_generator.run_once()` は周期開始時刻(`evaluation_time`)を1つ固定し、symbol / timeframe ごとに対象となる **確定足(closed candle)の open timestamp** を Chart Snapshot 自身が持つ candle timestamp から明示的に決定する。共有ルール `market-watch/freshness.py`(`candle_close_time` / `select_confirmed_candles`, Issue #28)を再利用し、`T + timeframe <= evaluation_time` を満たさない未確定足は使わない。timeframeが未知で確定時刻を計算できない場合は **fail closed** として未確定扱いで skip する。「現在時刻に最も近いレコードを無条件に使う」ことはしない。
+- **入力整合(provenance照合)**: Market Bias の provenance(その Bias が実際に分類に使った入力の `symbol` / `timeframe` / target candle / source snapshot id)を **Bias生成時点で固定して記録**する(`build_bias_provenance_by_scope()`。各銘柄の Bias は `build_bias_by_scope()` と同じく自銘柄の snapshot だけから分類され、その入力の candle を provenance として持つ)。`build_confirmed_candidate()` はこの provenance と Chart Snapshot 側の実 timestamp / source id を明示的に比較する。**Chart 側の timestamp を Bias へ後付けコピーして一致させることはしない**ため、symbol / timeframe / target candle / source dataset のいずれかが食い違えば skip となり(欠損も skip)、不一致の入力同士から Signal は生成されない。
+- **処理順**: Signal候補生成 → SQLite保存 → 保存成功後にDiscord通知(`_process_candidate()`)。DB保存に失敗した場合は Discord を呼ばずにログして次symbolへ継続。Discord通知が失敗しても保存済みSignalは削除・ロールバックせず、失敗はログに記録して次周期・他symbolの処理を継続する。
+- **dry-run(永続副作用なし)**: `--dry-run` では (1) Paper Signal の SQLite保存、(2) Discord送信、(3) chart SQLite の作成・更新、(4) logfile / `logs/` の作成 のいずれも行わない。Chart Snapshot は `fetch_snapshot_sources(persist=False)` 経由の **メモリ上のみの非永続経路**(`chart_snapshot.build_snapshots_in_memory()`)で生成し、ログは **console-only logger**(ファイルハンドラを付けない)を使う。使用予定の入力・target candle・生成結果・no-signal・skip理由・重複判定はログで確認できる。
+- **CLI/構造**: 常駐ループ(`run_service()`)と1周期(`run_once()`)を分離。`--once` は sleep せず1周期だけ実行する。
+- **起動/終了**: SIGTERM / SIGINT で現在の周期を終えて安全に停止する(`run_service` は sleep ではなく停止イベントを待つので即座に中断される)。systemd unit は `scripts/systemd/berial-paper-signal.service`(コミット済みテンプレート、`KillSignal=SIGTERM` / `TimeoutStopSec=30`)。`scripts/restart_all.sh`(POSIX sh)の再起動対象に `berial-paper-signal.service` を追加済みで、この unit が未配備でも他 unit の restart は止めず失敗を非0で報告する。配備手順は [operations.md](../operations/operations.md#paper-signal-systemd常駐サービス-issue-41)。
+
 ## 重複防止
 
-`paper-signal/paper_signal_store.has_recent_signal()` により、同一 `symbol` / `timeframe` / `side` の組み合わせで `PAPER_SIGNAL_DUPLICATE_WINDOW_MINUTES`(既定60分)以内に生成済みの場合はスキップする。
+Issue #41 以降、重複防止は時間ウィンドウではなく **確定足単位の冪等性** で行う。`paper_signals` テーブルに `target_candle_utc` 列を追加し、`(strategy_profile, symbol, timeframe, target_candle_utc)` に SQLite の UNIQUE インデックスを張る。`paper_signal_store.save_signal_for_candle()` は `INSERT ... ON CONFLICT DO NOTHING` で挿入し、新規挿入時のみ `True` を返す。呼び出し側は **新規挿入時だけDiscord通知** するため、多重起動・競合・再周期でも同一 target candle のSignalは重複保存も重複通知もされない。
+
+既存DB(Issue #27時点)には `init_db()` の冪等マイグレーションで `target_candle_utc` 列(nullable)を追加する。旧データは `target_candle_utc = NULL` のままだが、SQLite は UNIQUE インデックス上の NULL を相互に distinct として扱うため、旧行が新制約で拒否されることはない。
+
+**通知状態の管理(仕様判断)**: Paper Signal は通知成否を専用列で持たない。上記の確定足冪等性により「一度保存済みの target candle は次周期以降 duplicate として通知前に skip される」ため、Discord通知は各Signalにつき生成時に一度だけ試行され、失敗しても自動再送しない。これが「無制限再送を避ける最小方針」である。
+
+なお `has_recent_signal()`(旧・時間ウィンドウ判定)と `PAPER_SIGNAL_DUPLICATE_WINDOW_MINUTES` は後方互換のため残しているが、常駐サービスの重複防止経路では使用しない。
+
+### 時刻の扱い
+
+DB保存時刻(`created_at_utc`)と target candle timestamp(`target_candle_utc`)はいずれも UTC の ISO-8601(`...Z`)で保存する。Discord表示では target candle を `<UTC-Z> (<JST> JST)` の形で併記し、JSTは常にUTC値から導出する表示専用値とする(UTCとJSTを暗黙に混在させない)。
 
 ## ストレージ
 

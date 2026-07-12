@@ -15,6 +15,10 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "paper_signals.sqlite3"
 
+# Issue #41 review: tolerate transient SQLite locks under concurrent writers
+# (multiple cycles / threads / service instances) instead of erroring out.
+BUSY_TIMEOUT_SECONDS = 30
+
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
@@ -54,6 +58,30 @@ def _migrate_add_classification_columns(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE paper_signals ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'"
             )
+
+
+# Issue #41: the Paper Signal resident service keys idempotency on the target
+# *confirmed candle*, not a wall-clock time window. ``target_candle_utc`` records
+# which closed candle a signal was generated for, and the UNIQUE index below makes
+# "one signal per (strategy_profile, symbol, timeframe, target candle)" a
+# database-level guarantee -- so concurrent cycles or multiple service instances
+# can never persist or (therefore) re-notify a duplicate. Legacy rows predating
+# this column keep ``target_candle_utc = NULL``; SQLite treats NULLs as distinct in
+# a UNIQUE index, so existing data is never rejected by the new constraint.
+TARGET_CANDLE_COLUMN = "target_candle_utc"
+
+
+def _migrate_add_target_candle_column(connection: sqlite3.Connection) -> None:
+    """Idempotently add the Issue #41 ``target_candle_utc`` column if missing.
+
+    Runs *after* the Issue #27 classification migration so, on both a fresh
+    CREATE TABLE and an ALTER-migrated legacy/partial DB, ``target_candle_utc``
+    is always the final column -- keeping the physical column order identical
+    regardless of how the DB came to be. Safe to run any number of times.
+    """
+    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(paper_signals)")}
+    if TARGET_CANDLE_COLUMN not in existing_columns:
+        connection.execute(f"ALTER TABLE paper_signals ADD COLUMN {TARGET_CANDLE_COLUMN} TEXT")
 
 
 def _backfill_classification_defaults(connection: sqlite3.Connection) -> None:
@@ -96,19 +124,32 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 freshness TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 status TEXT NOT NULL,
-                {_classification_columns_ddl()}
+                {_classification_columns_ddl()},
+                {TARGET_CANDLE_COLUMN} TEXT
             )
             """
         )
         # Bring a pre-Issue-#27 DB up to the current schema (no-op on new DBs),
         # then repair any NULL/empty classification values left by a partial
-        # schema. Both steps are idempotent.
+        # schema. Both steps are idempotent. The Issue #41 target-candle column is
+        # added last so fresh and ALTER-migrated DBs share one column order.
         _migrate_add_classification_columns(connection)
+        _migrate_add_target_candle_column(connection)
         _backfill_classification_defaults(connection)
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_paper_signals_dedup
             ON paper_signals (symbol, timeframe, side, created_at_utc)
+            """
+        )
+        # Issue #41: DB-level idempotency for the resident service. One Paper
+        # Signal per (strategy_profile, symbol, timeframe, target candle). NULL
+        # target_candle_utc (legacy rows) are treated as distinct by SQLite, so
+        # this never conflicts with pre-#41 data.
+        connection.execute(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_signals_candle_unique
+            ON paper_signals (strategy_profile, symbol, timeframe, {TARGET_CANDLE_COLUMN})
             """
         )
 
@@ -146,6 +187,107 @@ def save_signal(signal: dict, *, db_path: Path = DEFAULT_DB_PATH) -> None:
                 signal["status"],
             ),
         )
+
+
+def save_signal_for_candle(
+    signal: dict,
+    *,
+    target_candle_utc: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> bool:
+    """Persist *signal* for one confirmed candle, idempotently.
+
+    Issue #41: unlike :func:`save_signal` (which upserts on ``signal_id``), this
+    relies on the UNIQUE index over
+    ``(strategy_profile, symbol, timeframe, target_candle_utc)``. The insert uses
+    ``ON CONFLICT DO NOTHING`` so a second attempt for the same target candle --
+    from the next cycle, a concurrent cycle, or a second service instance -- is a
+    no-op rather than a duplicate row (and, because the caller only notifies on a
+    fresh insert, never a duplicate Discord message).
+
+    Returns ``True`` when a new row was inserted, ``False`` when the target candle
+    was already stored. Never raises on a duplicate.
+
+    Concurrency (Issue #41 review): a ``busy_timeout`` lets genuinely concurrent
+    writers (a second cycle, thread, or process) serialize instead of failing on
+    a transient lock. ``ON CONFLICT DO NOTHING`` makes the loser of a race a no-op
+    (rowcount 0). As a defensive belt-and-braces, a raised ``IntegrityError`` (e.g.
+    if the UNIQUE index were reached without the ON CONFLICT clause taking effect)
+    is also reported as a duplicate rather than propagated -- so the invariant
+    "one row, one notification per target candle" holds under real contention.
+    """
+    init_db(db_path)
+    with sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS) as connection:
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
+        try:
+            cursor = connection.execute(
+                f"""
+                INSERT INTO paper_signals
+                (signal_id, created_at_utc, symbol, timeframe, side, market_bias,
+                 confidence, macd_state, trend, state, freshness, reason,
+                 signal_type, trigger_type, alert_source, strategy_profile, status,
+                 {TARGET_CANDLE_COLUMN})
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    signal["signal_id"],
+                    signal["created_at_utc"],
+                    signal["symbol"],
+                    signal["timeframe"],
+                    signal["side"],
+                    signal["market_bias"],
+                    signal["confidence"],
+                    signal["macd_state"],
+                    signal["trend"],
+                    signal["state"],
+                    signal["freshness"],
+                    signal["reason"],
+                    signal.get("signal_type", signal_models.SIGNAL_TYPE_TREND_FOLLOW),
+                    signal.get("trigger_type", signal_models.TRIGGER_TYPE_MACD_STATE_ALIGNMENT),
+                    signal.get("alert_source", signal_models.ALERT_SOURCE_COMPOSITE),
+                    signal.get("strategy_profile", signal_models.STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1),
+                    signal["status"],
+                    target_candle_utc,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return cursor.rowcount > 0
+
+
+def signal_exists_for_candle(
+    strategy_profile: str,
+    symbol: str,
+    timeframe: str,
+    target_candle_utc: str,
+    *,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> bool:
+    """Return True if a Paper Signal is already stored for this target candle.
+
+    Issue #41: read-only duplicate probe used by ``--dry-run`` to report what
+    *would* happen without any side effect. Deliberately never creates the DB
+    file/table (mirrors ``market_bias_store.get_market_bias_as_of``): returns
+    ``False`` when the DB or table does not exist yet, so a dry-run stays free of
+    persistent side effects.
+    """
+    if not db_path.exists():
+        return False
+    try:
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                f"""
+                SELECT 1 FROM paper_signals
+                WHERE strategy_profile = ? AND symbol = ? AND timeframe = ?
+                  AND {TARGET_CANDLE_COLUMN} = ?
+                LIMIT 1
+                """,
+                (strategy_profile, symbol, timeframe, target_candle_utc),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
 
 
 def has_recent_signal(

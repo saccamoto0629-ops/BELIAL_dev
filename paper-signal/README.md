@@ -18,17 +18,22 @@ copy paper-signal\.env.example paper-signal\.env
 
 ## 2. Run
 
+実行エントリーポイントは `paper_signal_bot.py`(常駐ロジック本体は `signal_generator.py`。`python signal_generator.py ...` も後方互換で同等)。
+
 ```powershell
 cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\paper-signal
 
-# 一度だけ確認(Discord送信・SQLite保存なし)
-python signal_generator.py --once --dry-run
+# 一度だけ確認(永続副作用なし: SQLite保存・Discord送信・chart DB・logfile を作らない)
+python paper_signal_bot.py --once --dry-run
 
-# 一度だけ実行(Discord送信・SQLite保存あり)
-python signal_generator.py --once
+# 一度だけ実行(Discord送信・SQLite保存あり、sleepなし)
+python paper_signal_bot.py --once
+
+# 常駐(systemd ExecStart と同じ)
+python paper_signal_bot.py
 ```
 
-`--once` を付けない場合は `PAPER_SIGNAL_CHECK_INTERVAL_SECONDS`(既定900秒)ごとにループします。
+`--once` を付けない場合は `PAPER_SIGNAL_CHECK_INTERVAL_SECONDS`(既定900秒)ごとにループします。1周期(`run_once`)と常駐ループ(`run_service`)は分離され、SIGTERM / SIGINT で安全に停止します。systemd 配備は [docs/operations/operations.md](../docs/operations/operations.md) と `scripts/systemd/berial-paper-signal.service` を参照。
 
 ## 3. Signal generation rules
 
@@ -38,13 +43,19 @@ python signal_generator.py --once
 4. Bull: `macd_state == Bullish` かつ `freshness == Fresh` かつ `bias_weight > 0` → `side = long`
 5. Bear: `macd_state == Bearish` かつ `freshness == Fresh` かつ `bias_weight > 0` → `side = short`
 6. `Weekend Closed` / `Market Closed` / `Stale` の場合はシグナルを生成しない
-7. 同一 `symbol` / `timeframe` / `side` で `PAPER_SIGNAL_DUPLICATE_WINDOW_MINUTES`(既定60分)以内に重複生成しない
+7. **確定足のみ**を使う。symbol/timeframe ごとに対象確定足(closed candle)の open timestamp を Chart Snapshot から明示的に決定し、未確定足は使わない(Issue #41、共有ルール `market-watch/freshness.py`)
+8. Market Bias と Chart Snapshot は `symbol` / `timeframe` / target candle timestamp が一致する場合のみ組み合わせる。欠損・不一致は正常系skip(理由をログ出力)
+9. 重複防止は **確定足単位の冪等性**。`(strategy_profile, symbol, timeframe, target_candle_utc)` の UNIQUE 制約で、多重起動・競合・再周期でも同一 target candle を重複保存・重複通知しない
 
 ## 4. Storage
 
 `paper-signal/data/paper_signals.sqlite3` にSQLiteで保存します(`paper_signal_store.py`)。レコードは以下を含みます。
 
-`signal_id` / `created_at_utc` / `symbol` / `timeframe` / `side` / `market_bias` / `confidence` / `macd_state` / `trend` / `state` / `freshness` / `reason` / `status`(常に `paper_only`)
+`signal_id` / `created_at_utc` / `symbol` / `timeframe` / `side` / `market_bias` / `confidence` / `macd_state` / `trend` / `state` / `freshness` / `reason` / `signal_type` / `trigger_type` / `alert_source` / `strategy_profile` / `status`(常に `paper_only`)/ `target_candle_utc`(Issue #41: 対象確定足のopen timestamp, UTC `...Z`)
+
+保存順は「候補生成 → SQLite保存 → 保存成功後にDiscord通知」で、通知失敗時も保存済みSignalは残します(`save_signal_for_candle()` は新規挿入時のみ通知)。既存DBには `init_db()` の冪等マイグレーションで `target_candle_utc` 列とUNIQUEインデックスを追加します(旧データは非破壊)。
+
+常駐サービスとしての起動・終了・冪等性・restart は [operations.md](../docs/operations/operations.md) と [paper_signal.md](../docs/architecture/paper_signal.md) を参照。
 
 ## 5. Discord notification
 

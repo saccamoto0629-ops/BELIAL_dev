@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
-import time
+import threading
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -22,6 +24,7 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 NEWS_FEED_BOT_DIR = REPO_ROOT / "news-feed-bot"
+MARKET_WATCH_DIR = REPO_ROOT / "market-watch"
 ENV_FILE = BASE_DIR / ".env"
 LOGS_DIR = REPO_ROOT / "logs"
 LOG_FILE = LOGS_DIR / "paper_signal_generator.log"
@@ -29,6 +32,8 @@ DB_PATH = BASE_DIR / "data" / "paper_signals.sqlite3"
 
 if str(NEWS_FEED_BOT_DIR) not in sys.path:
     sys.path.insert(0, str(NEWS_FEED_BOT_DIR))
+if str(MARKET_WATCH_DIR) not in sys.path:
+    sys.path.insert(0, str(MARKET_WATCH_DIR))
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
@@ -39,6 +44,15 @@ from market_bias_models import (  # noqa: E402  (news-feed-bot)
     normalize_bias_symbol,
 )
 from market_snapshot import fetch_snapshot_sources  # noqa: E402  (news-feed-bot)
+
+# Issue #41: reuse the single shared confirmed-candle rule (Issue #28) so the
+# resident service determines the same "latest closed candle" that Live Chart
+# Snapshot and Backtest do -- never re-implementing candle timing here.
+from freshness import (  # noqa: E402  (market-watch, dependency-light)
+    JST,
+    candle_close_time,
+    parse_timestamp_utc,
+)
 
 import paper_signal_store as store  # noqa: E402
 from signal_models import (  # noqa: E402
@@ -100,8 +114,29 @@ DUPLICATE_WINDOW_MINUTES = _env_int("PAPER_SIGNAL_DUPLICATE_WINDOW_MINUTES", DEF
 CHECK_INTERVAL_SECONDS = _env_int("PAPER_SIGNAL_CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS)
 
 
+# Issue #41 review (Major 3): a --dry-run must not create logs/ or open the
+# rotating logfile. When this is True, setup_logger() attaches a console handler
+# only. configure_logging() sets it before the first log use (main() does this);
+# it defaults to False so normal runs keep their file log unchanged.
+_console_only_logging = False
+
+
+def configure_logging(*, dry_run: bool) -> None:
+    """Select console-only logging for a dry run (no ``logs/`` dir, no logfile).
+
+    Must be called before the first :func:`_get_logger` use. Idempotent before
+    initialization; a no-op afterwards (the cached logger's handlers are fixed).
+    """
+    global _console_only_logging, _logger_instance
+    if _logger_instance is not None and _console_only_logging != dry_run:
+        for handler in list(_logger_instance.handlers):
+            _logger_instance.removeHandler(handler)
+            handler.close()
+        _logger_instance = None
+    _console_only_logging = dry_run
+
+
 def setup_logger():
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("paper_signal_generator")
     logger.setLevel(logging.INFO)
     if logger.handlers:
@@ -109,9 +144,12 @@ def setup_logger():
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    # Dry-run: console handler only -- never create logs/ or open a file handler.
+    if not _console_only_logging:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
@@ -302,6 +340,155 @@ def generate_signal(context: dict) -> dict | None:
     return candidates[0] if candidates else None
 
 
+# --- Issue #41: confirmed-candle discipline + input integrity ----------------
+#
+# Skip-reason codes surfaced to the log so every non-generating cycle is
+# explainable (never a silent drop). These are *normal* outcomes, not errors.
+SKIP_CHART_SNAPSHOT_MISSING = "chart_snapshot_missing"
+SKIP_MARKET_BIAS_MISSING = "market_bias_missing"
+SKIP_SYMBOL_TIMEFRAME_MISMATCH = "symbol_timeframe_mismatch"
+SKIP_TARGET_CANDLE_MISMATCH = "target_candle_timestamp_mismatch"
+SKIP_PROVENANCE_MISMATCH = "provenance_mismatch"
+SKIP_UNCONFIRMED_CANDLE = "unconfirmed_candle"
+RESULT_NO_SIGNAL = "no_signal"
+RESULT_SIGNAL = "signal"
+
+
+def canonical_candle_timestamp(value) -> str | None:
+    """Return a candle timestamp as canonical UTC ISO-8601 (``...Z``), or None.
+
+    Normalizes whatever form the Chart Snapshot carried its confirmed-candle
+    timestamp in (e.g. ``2026-07-05T12:00:00+00:00``) to the same ``...Z`` form
+    the rest of Berial stores (see ``chart_collector.to_utc_iso_z``), so the
+    idempotency key and Discord display are byte-stable. Returns None for a
+    missing/blank value so the caller can treat it as an unusable snapshot.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        return parse_timestamp_utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
+        return None
+
+
+def is_candle_confirmed(target_candle_utc: str, timeframe: str, evaluation_time: datetime) -> bool:
+    """Return True if the candle opening at *target_candle_utc* has fully closed.
+
+    Issue #41: a candle labelled with its open time ``T`` on *timeframe* closes
+    at ``T + timeframe``; only then may it drive a signal. Uses the shared
+    ``freshness.candle_close_time`` rule so Paper Signal never acts on a still
+    forming candle. Unknown timeframe labels cannot be timed, so this check fails
+    closed and treats them as unconfirmed.
+    """
+    try:
+        close_time = candle_close_time(target_candle_utc, timeframe)
+    except ValueError:
+        return False
+    return close_time <= parse_timestamp_utc(evaluation_time)
+
+
+def _snapshot_source_id(snapshot) -> str | None:
+    """Best-effort provenance id of a chart snapshot (may be None for live ones)."""
+    for key in ("source_snapshot_id", "id", "snapshot_id", "chart_snapshot_id"):
+        value = _snapshot_get(snapshot, key)
+        if value:
+            return str(value)
+    return None
+
+
+def build_confirmed_candidate(
+    chart_snapshot,
+    market_bias,
+    bias_provenance,
+    *,
+    evaluation_time: datetime,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> tuple[dict | None, str]:
+    """Return ``(candidate, result_code)`` for one Chart Snapshot + Market Bias pair.
+
+    Issue #41 input-integrity + confirmed-candle contract, as a pure function
+    (no DB / Discord / HTTP).
+
+    Major 2 (review): the Market Bias's provenance -- the symbol / timeframe /
+    target candle / source id of the data it was ACTUALLY classified from -- is
+    supplied separately in ``bias_provenance``, captured at bias-generation time
+    (see :func:`build_bias_provenance_by_scope`). It is compared against the Chart
+    Snapshot's own symbol / timeframe / candle / source id. The chart snapshot's
+    timestamp is never copied onto the bias to force agreement: a bias whose
+    recorded provenance differs from the chart snapshot is a *skip*, so combining
+    a bias and a snapshot from different symbols, timeframes, candles, or source
+    datasets can never silently produce a signal.
+
+    Order of checks (each a normal, logged skip -- not an error):
+
+    1. Chart Snapshot missing / no candle timestamp -> ``chart_snapshot_missing``
+    2. Market Bias or its provenance missing / no provenance candle -> ``market_bias_missing``
+    3. provenance symbol or timeframe disagree -> ``symbol_timeframe_mismatch``
+    4. provenance target candle disagrees -> ``target_candle_timestamp_mismatch``
+    5. provenance source id disagrees -> ``provenance_mismatch``
+    6. the candle has not closed yet at ``evaluation_time`` -> ``unconfirmed_candle``
+
+    Only when all pass are the unchanged strategy rules (:func:`build_candidates`)
+    applied. On a generated candidate the resolved ``target_candle_utc`` is
+    attached and ``(candidate, "signal")`` returned; when the rules produce
+    nothing, ``(None, "no_signal")``.
+    """
+    if chart_snapshot is None:
+        return None, SKIP_CHART_SNAPSHOT_MISSING
+    target_candle = canonical_candle_timestamp(_snapshot_get(chart_snapshot, "timestamp"))
+    if target_candle is None:
+        return None, SKIP_CHART_SNAPSHOT_MISSING
+    if market_bias is None or bias_provenance is None:
+        return None, SKIP_MARKET_BIAS_MISSING
+
+    symbol = _snapshot_get(chart_snapshot, "symbol")
+    timeframe = _snapshot_get(chart_snapshot, "timeframe", REPRESENTATIVE_TIMEFRAME)
+
+    # Provenance recorded when the bias was classified -- NOT copied from this
+    # chart snapshot. A bias without a recorded input candle cannot be verified.
+    prov_symbol = bias_provenance.get("symbol")
+    prov_timeframe = bias_provenance.get("timeframe")
+    prov_candle = canonical_candle_timestamp(bias_provenance.get("target_candle_utc"))
+    if prov_candle is None:
+        return None, SKIP_MARKET_BIAS_MISSING
+
+    if prov_symbol is None or normalize_bias_symbol(prov_symbol) != normalize_bias_symbol(symbol):
+        return None, SKIP_SYMBOL_TIMEFRAME_MISMATCH
+    if prov_timeframe is None or prov_timeframe != timeframe:
+        return None, SKIP_SYMBOL_TIMEFRAME_MISMATCH
+    if prov_candle != target_candle:
+        return None, SKIP_TARGET_CANDLE_MISMATCH
+
+    # If both sides carry a source-dataset id, they must identify the same input.
+    chart_source_id = _snapshot_source_id(chart_snapshot)
+    prov_source_id = bias_provenance.get("source_snapshot_id")
+    if chart_source_id is not None and prov_source_id is not None and str(prov_source_id) != chart_source_id:
+        return None, SKIP_PROVENANCE_MISMATCH
+
+    if not is_candle_confirmed(target_candle, timeframe, evaluation_time):
+        return None, SKIP_UNCONFIRMED_CANDLE
+
+    candidates = build_candidates(market_bias, [chart_snapshot], confidence_threshold=confidence_threshold)
+    if not candidates:
+        return None, RESULT_NO_SIGNAL
+    candidate = candidates[0]
+    candidate["target_candle_utc"] = target_candle
+    return candidate, RESULT_SIGNAL
+
+
+def format_target_candle_display(target_candle_utc: str) -> str:
+    """Render a target candle timestamp as ``<UTC-Z> (<JST> JST)``.
+
+    Issue #41: makes the UTC<->JST relationship explicit and unambiguous in the
+    Discord message. The stored/idempotency value is always the UTC ``...Z`` form;
+    the JST rendering is display-only and derived from it, never a second source
+    of truth.
+    """
+    utc_ts = parse_timestamp_utc(target_candle_utc)
+    jst_ts = utc_ts.tz_convert(JST)
+    return f"{utc_ts.strftime('%Y-%m-%dT%H:%M:%SZ')} ({jst_ts.strftime('%Y-%m-%d %H:%M')} JST)"
+
+
 def format_discord_message(signal: dict) -> str:
     lines = [
         "\U0001f4dd Paper Signal",
@@ -321,11 +508,20 @@ def format_discord_message(signal: dict) -> str:
         f"Signal Type: {signal.get('signal_type', SIGNAL_TYPE_TREND_FOLLOW)}",
         f"Trigger Type: {signal.get('trigger_type', TRIGGER_TYPE_MACD_STATE_ALIGNMENT)}",
         f"Strategy Profile: {signal.get('strategy_profile', STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1)}",
-        "",
-        f"Reason: {signal['reason']}",
-        "",
-        PAPER_SIGNAL_NOTE,
     ]
+    # Issue #41: the confirmed candle this signal is for (present on resident
+    # service signals; absent on ad-hoc/legacy candidates, which simply omit it).
+    target_candle = signal.get("target_candle_utc")
+    if target_candle:
+        lines.append(f"Target Candle: {format_target_candle_display(target_candle)}")
+    lines.extend(
+        [
+            "",
+            f"Reason: {signal['reason']}",
+            "",
+            PAPER_SIGNAL_NOTE,
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -387,13 +583,75 @@ def build_bias_by_scope(
     return bias_by_scope
 
 
-def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
-    """Fetch Market Bias + 1h Chart Snapshot, then generate/store/notify new paper signals.
+def build_bias_provenance_by_scope(hourly_snapshots: list) -> dict:
+    """Record each per-symbol Market Bias's input provenance at generation time.
 
-    Returns the list of newly created signals (empty if nothing qualified or
-    every candidate was a duplicate within the dedup window).
+    Issue #41 review (Major 2): mirrors :func:`build_bias_by_scope`'s per-symbol
+    grouping. Each per-symbol bias is classified from that symbol's OWN 1h
+    snapshot(s); this captures the ``symbol`` / ``timeframe`` / confirmed
+    ``target_candle_utc`` / ``source_snapshot_id`` of *that* classification input
+    -- fixed at the moment the bias is generated, from the bias's own data, not
+    copied from whatever chart snapshot it is later paired with. Keyed identically
+    to ``build_bias_by_scope`` so :func:`resolve_scope_bias` resolves the matching
+    provenance for a snapshot; the ``(GLOBAL, 1h)`` fallback carries ``None``
+    (a GLOBAL bias spans all symbols and has no single input candle).
     """
-    sources = fetch_snapshot_sources()
+    provenance_by_scope: dict = {(GLOBAL_SCOPE_SYMBOL, REPRESENTATIVE_TIMEFRAME): None}
+    seen: set[str] = set()
+    for snapshot in hourly_snapshots:
+        raw_symbol = _snapshot_get(snapshot, "symbol")
+        if not raw_symbol:
+            continue
+        canonical = normalize_bias_symbol(raw_symbol)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        own_snapshots = [
+            snap for snap in hourly_snapshots if normalize_bias_symbol(_snapshot_get(snap, "symbol")) == canonical
+        ]
+        source_snapshot = own_snapshots[0]
+        provenance_by_scope[(canonical, REPRESENTATIVE_TIMEFRAME)] = {
+            "symbol": canonical,
+            "timeframe": _snapshot_get(source_snapshot, "timeframe", REPRESENTATIVE_TIMEFRAME),
+            "target_candle_utc": canonical_candle_timestamp(_snapshot_get(source_snapshot, "timestamp")),
+            "source_snapshot_id": _snapshot_source_id(source_snapshot),
+        }
+    return provenance_by_scope
+
+
+def run_once(
+    *,
+    dry_run: bool = False,
+    db_path: Path = DB_PATH,
+    now_utc: datetime | None = None,
+) -> list[dict]:
+    """Run ONE resident-service cycle: read inputs, generate, store, notify.
+
+    Issue #41: a single cycle of the Paper Signal resident service, fully
+    decoupled from the loop (:func:`main`). For each symbol it explicitly
+    determines the target *confirmed* candle from the 1h Chart Snapshot's own
+    candle timestamp (never "the record closest to now"), verifies the Market
+    Bias and Chart Snapshot agree on symbol/timeframe/target candle, and only
+    then applies the unchanged strategy rules. The processing order is strictly
+    generate -> SQLite save -> Discord notify; a notify failure is logged and
+    never rolls back the saved signal, and one symbol failing never stops the
+    others.
+
+    ``now_utc`` fixes the evaluation time for the whole cycle (defaults to the
+    current UTC clock), so the confirmed-candle decision is deterministic and
+    identical from the first startup cycle onward.
+
+    Returns the signals produced this cycle: in normal mode only the ones newly
+    persisted (duplicates are skipped before notifying); in ``--dry-run`` the
+    would-be signals, with no persistent side effect of any kind.
+    """
+    # Programmatic callers use run_once(dry_run=True) directly in tests and
+    # tooling, so enforce the same console-only no-file contract as the CLI.
+    configure_logging(dry_run=dry_run)
+    evaluation_time = now_utc if now_utc is not None else datetime.now(UTC)
+    # Issue #41 review (Major 1): a dry run must not create/update the chart
+    # SQLite. persist=False routes the chart provider through the in-memory path.
+    sources = fetch_snapshot_sources(persist=not dry_run)
     hourly_snapshots = sources.get("chart") or []
 
     bias_result = classify_market_bias(
@@ -403,57 +661,120 @@ def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
         chart_data=hourly_snapshots,
     )
 
-    # Issue #40: resolve a per-symbol bias per snapshot (GLOBAL fallback). The DB
-    # is never consulted here -- biases are computed up front and handed to the
-    # pure candidate functions via the context's bias_by_scope map.
+    # Issue #40: resolve a per-symbol bias (GLOBAL fallback), unchanged. The DB is
+    # never consulted -- biases are computed in-memory from the same fetch as the
+    # snapshots. Issue #41 (Major 2): each bias's input provenance is recorded
+    # separately at generation time so input integrity is a genuine comparison,
+    # not a value copied from the paired chart snapshot.
     bias_by_scope = build_bias_by_scope(sources, hourly_snapshots, bias_result)
-    context = create_signal_context(
-        bias_result,
-        hourly_snapshots,
-        confidence_threshold=CONFIDENCE_THRESHOLD,
-        bias_by_scope=bias_by_scope,
-    )
-    candidates = generate_signal_candidates(context)
+    provenance_by_scope = build_bias_provenance_by_scope(hourly_snapshots)
     created: list[dict] = []
 
-    if not candidates:
-        _get_logger().info(
-            "No paper signal candidates this run (bias=%s, confidence=%.2f).",
-            bias_result.get("market_bias"),
-            bias_result.get("confidence", 0.0),
-        )
+    if not hourly_snapshots:
+        _get_logger().info("No Chart Snapshot inputs this cycle; nothing to evaluate.")
         return created
 
-    for candidate in candidates:
-        if not dry_run and store.has_recent_signal(
-            candidate["symbol"],
-            candidate["timeframe"],
-            candidate["side"],
-            within_minutes=DUPLICATE_WINDOW_MINUTES,
-            db_path=db_path,
-        ):
+    for snapshot in hourly_snapshots:
+        symbol = _snapshot_get(snapshot, "symbol")
+        timeframe = _snapshot_get(snapshot, "timeframe", REPRESENTATIVE_TIMEFRAME)
+        target_candle = canonical_candle_timestamp(_snapshot_get(snapshot, "timestamp"))
+
+        bias = resolve_scope_bias(bias_by_scope, symbol, timeframe)
+        provenance = resolve_scope_bias(provenance_by_scope, symbol, timeframe)
+
+        candidate, result = build_confirmed_candidate(
+            snapshot,
+            bias,
+            provenance,
+            evaluation_time=evaluation_time,
+            confidence_threshold=CONFIDENCE_THRESHOLD,
+        )
+
+        if candidate is None:
             _get_logger().info(
-                "Skipping duplicate paper signal: %s %s %s (within %sm)",
-                candidate["symbol"], candidate["timeframe"], candidate["side"], DUPLICATE_WINDOW_MINUTES,
+                "Skip/no-signal [%s]: symbol=%s timeframe=%s target_candle=%s",
+                result, symbol, timeframe, target_candle,
             )
             continue
 
-        signal = create_paper_signal(candidate)
-        if not dry_run:
-            store.save_signal(signal, db_path=db_path)
-
         try:
-            post_discord_message(format_discord_message(signal), dry_run=dry_run)
-        except requests.RequestException as exc:
-            _get_logger().error("Failed to post paper signal to Discord: %s", exc)
-
-        _get_logger().info(
-            "Paper signal generated: %s %s %s (%s)",
-            signal["symbol"], signal["timeframe"], signal["side"], signal["signal_id"],
-        )
-        created.append(signal)
+            _process_candidate(candidate, dry_run=dry_run, db_path=db_path, created=created)
+        except Exception as exc:  # one symbol's failure must not stop the others
+            _get_logger().error(
+                "Paper signal processing failed for %s %s (target_candle=%s): %s",
+                symbol, timeframe, target_candle, exc,
+            )
 
     return created
+
+
+def _process_candidate(candidate: dict, *, dry_run: bool, db_path: Path, created: list[dict]) -> None:
+    """Save-then-notify one confirmed candidate (Issue #41 ordering + idempotency).
+
+    Normal mode: SQLite save first (idempotent on the target candle); only a
+    *newly* inserted signal is then notified, so a duplicate is never re-sent and
+    a Discord failure -- logged, never fatal -- leaves the saved signal intact.
+    Dry-run: no save, no send, no state; just log the intended input, target
+    candle, the generated signal, and the duplicate determination.
+    """
+    logger = _get_logger()
+    signal = create_paper_signal(candidate)
+    target_candle = candidate["target_candle_utc"]
+    # Carry the confirmed-candle key on the record so the Discord message can
+    # show it. It is stored in its own DB column via save_signal_for_candle()'s
+    # explicit target_candle_utc arg, not from this dict key.
+    signal["target_candle_utc"] = target_candle
+    strategy_profile = signal["strategy_profile"]
+
+    logger.info(
+        "Signal generated: %s %s %s strategy=%s target_candle=%s bias=%s conf=%.2f",
+        signal["symbol"], signal["timeframe"], signal["side"], strategy_profile,
+        target_candle, signal["market_bias"], signal["confidence"],
+    )
+
+    if dry_run:
+        would_duplicate = store.signal_exists_for_candle(
+            strategy_profile, signal["symbol"], signal["timeframe"], target_candle, db_path=db_path
+        )
+        logger.info(
+            "[DRY_RUN] target_candle=%s would_persist=%s duplicate=%s",
+            target_candle, not would_duplicate, would_duplicate,
+        )
+        post_discord_message(format_discord_message(signal), dry_run=True)
+        created.append(signal)
+        return
+
+    try:
+        inserted = store.save_signal_for_candle(signal, target_candle_utc=target_candle, db_path=db_path)
+    except Exception as exc:
+        # DB save failed: Discord is NOT notified (save-then-notify ordering) and
+        # the failure is re-raised so run_once's per-symbol isolation logs it and
+        # continues with the next symbol.
+        logger.error(
+            "DB save failure for %s %s (target_candle=%s): %s -- Discord NOT notified.",
+            signal["symbol"], signal["timeframe"], target_candle, exc,
+        )
+        raise
+
+    if not inserted:
+        logger.info(
+            "Duplicate skipped: %s %s strategy=%s target_candle=%s (already stored)",
+            signal["symbol"], signal["timeframe"], strategy_profile, target_candle,
+        )
+        return
+
+    logger.info("DB save success: %s (target_candle=%s)", signal["signal_id"], target_candle)
+
+    try:
+        post_discord_message(format_discord_message(signal), dry_run=False)
+        logger.info("Discord send success: %s (target_candle=%s)", signal["signal_id"], target_candle)
+    except requests.RequestException as exc:
+        logger.error(
+            "Discord send failure for %s (target_candle=%s): %s -- saved signal retained.",
+            signal["signal_id"], target_candle, exc,
+        )
+
+    created.append(signal)
 
 
 def parse_args(argv=None):
@@ -467,24 +788,76 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+# Issue #41: a process-wide stop flag set by SIGTERM/SIGINT. The loop waits on it
+# (instead of a bare sleep) so a systemd stop/restart shuts the service down
+# promptly and cleanly, without leaving an orphaned process behind.
+_STOP_EVENT = threading.Event()
+
+
+def _handle_shutdown_signal(signum, _frame) -> None:
+    _get_logger().info(
+        "Received signal %s; Paper Signal service will stop after the current cycle.", signum
+    )
+    _STOP_EVENT.set()
+
+
+def _install_signal_handlers() -> None:
+    """Install SIGTERM/SIGINT handlers when possible.
+
+    ``signal.signal`` only works on the main thread of the main interpreter; in
+    other contexts (some test runners) it raises, which we ignore -- the resident
+    service always runs on the main thread, so production shutdown is unaffected.
+    """
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handle_shutdown_signal)
+        except (ValueError, OSError):
+            pass
+
+
+def run_service(
+    *,
+    dry_run: bool = False,
+    once: bool = False,
+    interval_seconds: int = CHECK_INTERVAL_SECONDS,
+    db_path: Path = DB_PATH,
+) -> None:
+    """Run the resident loop: one :func:`run_once` cycle per interval until stopped.
+
+    Issue #41: the loop is deliberately thin and separate from the per-cycle work
+    (:func:`run_once`), and ``once=True`` runs exactly one cycle with no sleep --
+    so tests exercise a single cycle without ever starting the loop or depending
+    on real time. Between cycles it waits on the shutdown event rather than
+    sleeping, so SIGTERM/SIGINT ends the wait immediately.
+    """
+    logger = _get_logger()
+    logger.info(
+        "=== Paper Signal service start === interval=%ss once=%s dry_run=%s confidence_threshold=%.2f",
+        interval_seconds, once, dry_run, CONFIDENCE_THRESHOLD,
+    )
+    try:
+        while not _STOP_EVENT.is_set():
+            try:
+                run_once(dry_run=dry_run, db_path=db_path)
+            except Exception as exc:  # never let one cycle kill the resident loop
+                logger.error("Cycle failed: %s", exc)
+            if once:
+                break
+            if _STOP_EVENT.wait(interval_seconds):
+                break
+    finally:
+        logger.info("=== Paper Signal service stop ===")
+
+
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args(argv)
-    _get_logger().info(
-        "=== Paper Signal Generator === confidence_threshold=%.2f duplicate_window=%sm dry_run=%s",
-        CONFIDENCE_THRESHOLD, DUPLICATE_WINDOW_MINUTES, args.dry_run,
-    )
-
-    while True:
-        try:
-            run_once(dry_run=args.dry_run)
-        except Exception as exc:
-            _get_logger().error("Run failed: %s", exc)
-
-        if args.once:
-            break
-        time.sleep(CHECK_INTERVAL_SECONDS)
+    # Issue #41 (Major 3): choose console-only logging BEFORE any log call so a
+    # --dry-run never creates logs/ or opens the rotating logfile.
+    configure_logging(dry_run=args.dry_run)
+    _install_signal_handlers()
+    run_service(dry_run=args.dry_run, once=args.once)
 
 
 if __name__ == "__main__":

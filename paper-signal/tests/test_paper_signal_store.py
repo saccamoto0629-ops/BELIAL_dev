@@ -244,14 +244,16 @@ def test_new_and_migrated_db_have_identical_column_order(tmp_path):
     migrated_order = _ordered_column_names(migrated_db)
 
     assert new_order == migrated_order
-    # and the four classification columns really are the trailing columns,
-    # right after status (the documented final order).
-    assert new_order[-5:] == [
+    # status, then the four Issue #27 classification columns, then the Issue #41
+    # target_candle_utc column, are the trailing columns in the documented final
+    # order -- identical whether the DB was freshly created or ALTER-migrated.
+    assert new_order[-6:] == [
         "status",
         "signal_type",
         "trigger_type",
         "alert_source",
         "strategy_profile",
+        "target_candle_utc",
     ]
 
 
@@ -334,3 +336,62 @@ def test_backfill_is_idempotent_and_preserves_real_values(tmp_path):
     real = rows["real-row"]
     assert real["signal_type"] == "mean_reversion"  # never overwritten by the default
     assert real["strategy_profile"] == "custom_profile_v2"
+
+
+# --- Issue #41: target-candle column, migration, candle-keyed idempotency -----
+
+
+def test_new_db_has_target_candle_column(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    store.init_db(db_path)
+    assert "target_candle_utc" in _column_names(db_path)
+
+
+def test_legacy_db_migrates_to_add_target_candle_column(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    _create_legacy_db(db_path)
+    assert "target_candle_utc" not in _column_names(db_path)  # sanity
+
+    store.init_db(db_path)
+
+    assert "target_candle_utc" in _column_names(db_path)
+
+
+def test_save_signal_for_candle_inserts_once_then_dedupes(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    candle = "2026-07-05T12:00:00Z"
+
+    first = store.save_signal_for_candle(make_signal(), target_candle_utc=candle, db_path=db_path)
+    # A brand-new signal_id but the same (strategy_profile, symbol, timeframe,
+    # target candle) must be rejected by the UNIQUE index.
+    second = store.save_signal_for_candle(make_signal(), target_candle_utc=candle, db_path=db_path)
+
+    assert first is True
+    assert second is False
+    rows = store.list_signals(db_path=db_path)
+    assert len(rows) == 1
+    assert rows[0]["target_candle_utc"] == candle
+
+
+def test_save_signal_for_candle_allows_different_candles(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    assert store.save_signal_for_candle(make_signal(), target_candle_utc="2026-07-05T12:00:00Z", db_path=db_path)
+    assert store.save_signal_for_candle(make_signal(), target_candle_utc="2026-07-05T13:00:00Z", db_path=db_path)
+    assert len(store.list_signals(db_path=db_path)) == 2
+
+
+def test_signal_exists_for_candle_is_read_only(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    # No DB yet: the probe must return False WITHOUT creating the file.
+    assert not store.signal_exists_for_candle(
+        "market_bias_macd_alignment_v1", "USDJPY", "1h", "2026-07-05T12:00:00Z", db_path=db_path
+    )
+    assert not db_path.exists()
+
+    store.save_signal_for_candle(make_signal(), target_candle_utc="2026-07-05T12:00:00Z", db_path=db_path)
+    assert store.signal_exists_for_candle(
+        "market_bias_macd_alignment_v1", "USDJPY", "1h", "2026-07-05T12:00:00Z", db_path=db_path
+    )
+    assert not store.signal_exists_for_candle(
+        "market_bias_macd_alignment_v1", "USDJPY", "1h", "2026-07-05T99:00:00Z", db_path=db_path
+    )

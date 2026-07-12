@@ -12,6 +12,7 @@ Targets:
   ma          berial-ma-alert.service
   macd        berial-macd-alert.service
   bollinger   berial-bollinger-alert.service
+  signal      berial-paper-signal.service
   snapshot    berial-chart-snapshot.service
   timer       berial-chart-snapshot.timer
   all         all Berial units
@@ -44,6 +45,9 @@ case "${target}" in
   bollinger)
     units=("berial-bollinger-alert.service")
     ;;
+  signal)
+    units=("berial-paper-signal.service")
+    ;;
   snapshot)
     units=("berial-chart-snapshot.service")
     ;;
@@ -56,6 +60,7 @@ case "${target}" in
       "berial-ma-alert.service"
       "berial-macd-alert.service"
       "berial-bollinger-alert.service"
+      "berial-paper-signal.service"
       "berial-chart-snapshot.service"
       "berial-chart-snapshot.timer"
     )
