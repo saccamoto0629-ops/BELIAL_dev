@@ -26,10 +26,58 @@ def _format_metric(value: Any) -> str:
     return str(value)
 
 
+def _execution_model_text(run_meta: dict[str, Any]) -> str:
+    execution_model = run_meta.get("execution_model") or {}
+    return (
+        f"{execution_model.get('type') or 'n/a'} "
+        f"(spread={_format_metric(execution_model.get('spread'))}, "
+        f"slippage={_format_metric(execution_model.get('slippage'))})"
+    )
+
+
+def _run_meta_text_lines(run_meta: dict[str, Any] | None) -> list[str]:
+    """Text lines identifying the run's strategy + execution conditions.
+
+    Issue #44 review (Major): rendered whenever a summary carries ``run_meta``
+    (attached by the runner from the saved run config). Absent for the pre-#44
+    signal-only summaries, so those render exactly as before.
+    """
+    if not run_meta:
+        return []
+    lines = [f"Strategy profile:    {run_meta.get('strategy_profile') or 'unknown'}"]
+    if run_meta.get("symbol") or run_meta.get("timeframe"):
+        lines.append(f"Symbol / timeframe:  {run_meta.get('symbol')} / {run_meta.get('timeframe')}")
+    if run_meta.get("from_time") or run_meta.get("to_time"):
+        lines.append(f"Window:              {run_meta.get('from_time')} .. {run_meta.get('to_time')}")
+    if run_meta.get("exit_policy"):
+        lines.append(f"Exit policy:         {run_meta.get('exit_policy')}")
+    lines.append(f"Execution model:     {_execution_model_text(run_meta)}")
+    return lines
+
+
+def _run_meta_markdown_lines(run_meta: dict[str, Any] | None) -> list[str]:
+    if not run_meta:
+        return []
+    lines = [
+        "## Run",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Strategy profile | {run_meta.get('strategy_profile') or 'unknown'} |",
+        f"| Symbol / timeframe | {run_meta.get('symbol')} / {run_meta.get('timeframe')} |",
+        f"| Window | {run_meta.get('from_time')} .. {run_meta.get('to_time')} |",
+        f"| Exit policy | {run_meta.get('exit_policy') or 'n/a'} |",
+        f"| Execution model | {_execution_model_text(run_meta)} |",
+        "",
+    ]
+    return lines
+
+
 def render_text(summary: dict[str, Any]) -> str:
     lines = [
         "=== Backtest Signal Summary ===",
         f"Run ID:              {summary['run_id']}",
+        *_run_meta_text_lines(summary.get("run_meta")),
         f"Total signals:       {summary['total_signals']}",
         f"Win / Loss:          {summary['win_count']} / {summary['loss_count']}",
         f"Win rate:            {_format_metric(summary['win_rate'])}",
@@ -72,6 +120,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines = [
         f"# Backtest Summary: {summary['run_id']}",
         "",
+        *_run_meta_markdown_lines(summary.get("run_meta")),
         "| Metric | Value |",
         "|---|---|",
         f"| Total signals | {summary['total_signals']} |",

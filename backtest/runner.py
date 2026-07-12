@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import json
 import logging
 import sys
 from dataclasses import replace
@@ -61,6 +62,7 @@ for _dir in (BASE_DIR, MARKET_WATCH_DIR, PAPER_SIGNAL_DIR, NEWS_FEED_BOT_DIR):
 import backtest_models as models  # noqa: E402
 import backtest_store as store  # noqa: E402
 import execution_model as execution  # noqa: E402  (Issue #26: virtual fill spread/slippage model)
+import squeeze_breakout  # noqa: E402  (Issue #44: XAUUSD 1h squeeze-episode breakout strategy A)
 import warmup  # noqa: E402
 import chart_collector  # noqa: E402  (market-watch)
 from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch, Issue #39)
@@ -90,6 +92,13 @@ EXIT_NO_DATA = 3
 SUMMARY_SIGNAL_FETCH_LIMIT = 1_000_000
 
 DEFAULT_STRATEGY_NAME = "paper_signal_generator"
+
+# Issue #44: which strategy the run replays. The default keeps the existing
+# paper-signal (trend_follow / macd alignment) candidate path byte-for-byte;
+# selecting the squeeze-breakout profile routes to squeeze_breakout.py instead.
+STRATEGY_PROFILE_TREND_FOLLOW = "trend_follow"
+KNOWN_STRATEGY_PROFILES = (STRATEGY_PROFILE_TREND_FOLLOW, squeeze_breakout.STRATEGY_PROFILE)
+DEFAULT_STRATEGY_PROFILE = STRATEGY_PROFILE_TREND_FOLLOW
 NEUTRAL_BIAS_PLACEHOLDER = {
     "market_bias": "Neutral",
     "confidence": 0.0,
@@ -376,6 +385,19 @@ def parse_args(argv=None) -> argparse.Namespace:
         "which candidates become saved signals. Unspecified (the default) means no state "
         "filter -- pre-#39 behaviour, every candidate is eligible.",
     )
+    run_parser.add_argument(
+        "--strategy-profile",
+        choices=KNOWN_STRATEGY_PROFILES,
+        default=DEFAULT_STRATEGY_PROFILE,
+        help="Issue #44: which strategy this run replays. "
+        f"{STRATEGY_PROFILE_TREND_FOLLOW!r} (the default) keeps the existing paper-signal "
+        "candidate path (Market Bias + MACD alignment) unchanged. "
+        f"{squeeze_breakout.STRATEGY_PROFILE!r} replays the XAUUSD 1h squeeze-episode "
+        "Bollinger close-break strategy instead (its own Trigger-bar stop, 2R target, and "
+        "gap -> SL/TP -> 24-bar time-exit composite); Market Bias, MACD, and the "
+        "--exit-policy / --allowed-market-states / --no-reentry / --cooldown-minutes flags "
+        "do not apply to it.",
+    )
     run_parser.add_argument("--run-name", help="Defaults to '<symbol>_<timeframe>_<from>_<to>'.")
     run_parser.add_argument(
         "--strategy-name",
@@ -430,12 +452,190 @@ def _load_candles(chart_db_path: Path, symbol: str, timeframe: str, *, end_iso: 
     )
 
 
+def _run_meta_from_run(run: dict) -> dict:
+    """Extract a run's strategy identity + execution conditions from its own row.
+
+    Issue #44 review (Major): the ``summary`` subcommand must be able to show a
+    saved run's strategy profile and spread/slippage in every format, even when
+    the run produced zero signals. Those facts are taken *only* from the run's
+    ``config_json`` / columns -- never inferred from its signals -- so a
+    zero-signal run is still self-identifying. A legacy run saved before
+    ``strategy_profile`` was recorded falls back to its ``strategy_name``.
+    """
+    try:
+        config = json.loads(run.get("config_json") or "{}")
+    except (TypeError, ValueError):
+        config = {}
+    execution_model = config.get("execution_model") or {}
+    return {
+        "strategy_profile": config.get("strategy_profile") or run.get("strategy_name"),
+        "symbol": run.get("symbol"),
+        "timeframe": run.get("timeframe"),
+        "from_time": run.get("from_time"),
+        "to_time": run.get("to_time"),
+        "exit_policy": run.get("exit_policy"),
+        "execution_model": {
+            "type": execution_model.get("type"),
+            "spread": execution_model.get("spread"),
+            "slippage": execution_model.get("slippage"),
+        },
+    }
+
+
 def _summarize(records: list[dict]) -> dict[str, int]:
     counts = {status: 0 for status in RESULT_STATUS_ORDER}
     for record in records:
         status = record.get("result_status") or "open"
         counts[status] = counts.get(status, 0) + 1
     return counts
+
+
+def _run_squeeze_breakout(
+    args: argparse.Namespace,
+    *,
+    candles: pd.DataFrame,
+    chart_db_path: Path,
+    backtest_db_path: Path,
+    warmup_frame: pd.DataFrame,
+    validation_frame: pd.DataFrame,
+    warmup_insufficient: bool,
+    validation_start: pd.Timestamp,
+    validation_end: pd.Timestamp,
+) -> tuple[int, dict | None]:
+    """Issue #44: run the XAUUSD 1h squeeze-episode breakout strategy A.
+
+    Entirely separate from the paper-signal (trend_follow) path: no Market
+    Bias, no generate_signal_candidates(), no #38/#39 suppression flags. The
+    squeeze episode state machine is single-position by construction (one entry
+    per episode, a new squeeze episode required before re-entry), so global
+    no-reentry is structurally enforced and cooldown is 0. Saves the same
+    backtest_runs / backtest_signals shape as the trend_follow path, with the
+    squeeze signal_type / trigger_type / strategy_profile on every row so the
+    two strategies are never confused in storage or summaries.
+    """
+    # Issue #26: the same virtual-fill model the trend_follow path uses. Defaults
+    # (spread=slippage=0.0) leave raw prices unchanged.
+    exec_model = execution.ExecutionModel(spread=args.spread, slippage=args.slippage)
+
+    run_record = models.create_backtest_run_record(
+        run_name=args.run_name or _default_run_name(args.symbol, args.timeframe, args.from_time, args.to_time),
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        from_time=args.from_time,
+        to_time=args.to_time,
+        strategy_name=args.strategy_name,
+        exit_policy=squeeze_breakout.EXIT_POLICY_LABEL,
+        config={
+            "warmup_bars": args.warmup_bars,
+            "chart_db_path": str(chart_db_path),
+            "execution_model": exec_model.to_config(),
+            # Issue #44: the fixed, pre-committed strategy parameters (Issue #43:
+            # not tuned on Issue #42 PnL). Recorded so a saved run is fully
+            # reproducible from its config alone.
+            "strategy_profile": squeeze_breakout.STRATEGY_PROFILE,
+            "signal_type": squeeze_breakout.SIGNAL_TYPE,
+            "trigger_type": squeeze_breakout.TRIGGER_TYPE,
+            "risk_reward": squeeze_breakout.RISK_REWARD,
+            "time_exit_bars": squeeze_breakout.TIME_EXIT_BARS,
+            "same_candle_priority": exit_policy.SAME_CANDLE_PRIORITY_STOP_LOSS,
+            # The episode state machine enforces a single position and a
+            # new-episode-before-re-entry rule; there is no time-based cooldown.
+            "no_reentry": True,
+            "cooldown_minutes": 0.0,
+        },
+    )
+    store.save_backtest_run(run_record, db_path=backtest_db_path)
+
+    signals = squeeze_breakout.evaluate_squeeze_breakout_signals(
+        candles,
+        validation_start,
+        validation_end,
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        warmup_bars=args.warmup_bars,
+        exec_model=exec_model,
+    )
+
+    signal_records: list[dict] = []
+    for signal in signals:
+        # Issue #44 review (Blocker): a squeeze-breakout take-profit fills
+        # exactly at the strategy's 2R target *by design* -- Issue #43 pins its
+        # PnL to the defined R multiple and defers execution-cost realism to a
+        # future policy. So the close-side Execution Model cost must NOT be
+        # re-applied to a TP close, or the saved close_price/pnl would drift off
+        # target for any non-zero spread/slippage. Every other exit (stop, time
+        # exit, or an unresolved open) still takes the realistic close-side cost.
+        # Keyed on the take_profit close_reason so ONLY this strategy's TP leg is
+        # exempted -- the trend_follow path (run_backtest) is a separate code
+        # path and is untouched, and squeeze stops/time-exits keep their costs.
+        exit_result = signal.exit_result
+        if exit_result.close_reason == exit_policy.REASON_TAKE_PROFIT:
+            costed_close_price = exit_result.close_price  # == target, left exactly
+        else:
+            costed_close_price = exec_model.adjust_close_price(exit_result.close_price, signal.direction)
+        exit_result = replace(exit_result, close_price=costed_close_price)
+        record = models.create_backtest_signal_record(
+            run_record["id"],
+            signal_time=signal.signal_time,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            # Bias / confidence are not part of this strategy.
+            bias=None,
+            confidence=None,
+            direction=signal.direction,
+            signal_type=squeeze_breakout.SIGNAL_TYPE,
+            trigger_type=squeeze_breakout.TRIGGER_TYPE,
+            alert_source=squeeze_breakout.ALERT_SOURCE,
+            strategy_profile=squeeze_breakout.STRATEGY_PROFILE,
+            reasons=None,
+            entry_price=signal.entry_price,
+            # Issue #44: unlike the trend_follow path (which falls back to a %
+            # stop), squeeze breakout carries an explicit Trigger-bar stop and a
+            # 2R target, so both are persisted for reproducibility.
+            invalidation_price=signal.stop_price,
+            take_profit_price=signal.target_price,
+            market_state=signal.market_state,
+            market_state_confidence=signal.market_state_confidence,
+        )
+        record = models.apply_exit_policy_result(record, exit_result)
+        signal_records.append(record)
+
+    if signal_records:
+        store.save_backtest_signals(signal_records, db_path=backtest_db_path)
+
+    # Issue #44 review (Major): attach the run's strategy profile + execution
+    # conditions (from the run's own config, not inferred from signals) so the
+    # rendered summary identifies the strategy even with zero signals.
+    run_signal_summary = signal_summary.build_summary(run_record["id"], signal_records)
+    run_signal_summary["run_meta"] = _run_meta_from_run(run_record)
+
+    summary = {
+        "run_id": run_record["id"],
+        "symbol": args.symbol,
+        "timeframe": args.timeframe,
+        "from_time": args.from_time,
+        "to_time": args.to_time,
+        "strategy_profile": squeeze_breakout.STRATEGY_PROFILE,
+        "warmup_bars_available": len(warmup_frame),
+        "warmup_bars_required": args.warmup_bars,
+        "warmup_insufficient": warmup_insufficient,
+        "bars_processed": len(validation_frame),
+        "signals_generated": len(signal_records),
+        "result_counts": _summarize(signal_records),
+        "backtest_db_path": str(backtest_db_path),
+        # These #38/#39/#40 fields don't apply to this strategy; report neutral
+        # values so print_summary stays uniform across both paths.
+        "suppressed_reentry": 0,
+        "suppressed_cooldown": 0,
+        "suppressed_market_state": 0,
+        "allowed_market_states": None,
+        "bias_mode": "n/a",
+        "bias_resolution": {},
+        "bias_global_fallback": False,
+        "execution_model": exec_model.to_config(),
+        "signal_summary": run_signal_summary,
+    }
+    return EXIT_OK, summary
 
 
 def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
@@ -482,6 +682,23 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             "Warm-up allocation is insufficient: have %s candles before %s, need %s. "
             "Every validation bar will be skipped with reason=%s.",
             len(warmup_frame), args.from_time, args.warmup_bars, warmup.REASON_WARMUP_INSUFFICIENT,
+        )
+
+    # Issue #44: the squeeze-breakout profile has its own Trigger generation,
+    # stop/target, and composite exit -- it does not use Market Bias, the
+    # paper-signal candidate path, or the #38/#39 suppression flags. Route to it
+    # here so none of the bias-resolution machinery below runs for it.
+    if args.strategy_profile == squeeze_breakout.STRATEGY_PROFILE:
+        return _run_squeeze_breakout(
+            args,
+            candles=candles,
+            chart_db_path=chart_db_path,
+            backtest_db_path=backtest_db_path,
+            warmup_frame=warmup_frame,
+            validation_frame=validation_frame,
+            warmup_insufficient=warmup_insufficient,
+            validation_start=validation_start,
+            validation_end=validation_end,
         )
 
     # Issue #38/#40: two Market Bias resolution modes, both resolving the same
@@ -602,6 +819,9 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             "confidence_threshold": confidence_threshold,
             "chart_db_path": str(chart_db_path),
             "market_bias_db_path": str(bias_db_path),
+            # Issue #44: record which strategy this run replayed so a saved run
+            # is self-identifying (the default trend_follow path here).
+            "strategy_profile": args.strategy_profile,
             # Issue #26: record exactly which virtual-fill model produced this
             # run's entry/close prices, alongside the pre-existing keys.
             "execution_model": exec_model.to_config(),
@@ -765,6 +985,9 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         "timeframe": args.timeframe,
         "from_time": args.from_time,
         "to_time": args.to_time,
+        # Issue #44: which strategy produced these signals (the default
+        # trend_follow path here; the squeeze path sets its own).
+        "strategy_profile": args.strategy_profile,
         "warmup_bars_available": len(warmup_frame),
         "warmup_bars_required": args.warmup_bars,
         "warmup_insufficient": warmup_insufficient,
@@ -795,7 +1018,13 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         # Issue #23: win/loss/pnl performance summary for this run, built
         # from the exact signal_records just saved (no extra DB round-trip
         # needed since they're already in memory). Safe when empty.
-        "signal_summary": signal_summary.build_summary(run_record["id"], signal_records),
+        # Issue #44 (Major): carry the run's strategy profile + execution
+        # conditions on the summary (from the run config, not inferred from
+        # signals) so every render identifies the strategy, even with 0 signals.
+        "signal_summary": {
+            **signal_summary.build_summary(run_record["id"], signal_records),
+            "run_meta": _run_meta_from_run(run_record),
+        },
     }
     return EXIT_OK, summary
 
@@ -804,6 +1033,8 @@ def print_summary(summary: dict) -> None:
     print("=== Backtest Summary ===")
     print(f"Symbol:              {summary['symbol']}")
     print(f"Timeframe:           {summary['timeframe']}")
+    # Issue #44: which strategy this run replayed.
+    print(f"Strategy profile:    {summary.get('strategy_profile', STRATEGY_PROFILE_TREND_FOLLOW)}")
     print(f"Validation window:   {summary['from_time']} .. {summary['to_time']}")
     print(
         f"Warm-up candles:     {summary['warmup_bars_available']} "
@@ -868,6 +1099,11 @@ def run_summary_command(args: argparse.Namespace) -> int:
 
     signals = store.list_backtest_signals(args.run_id, db_path=backtest_db_path, limit=SUMMARY_SIGNAL_FETCH_LIMIT)
     result = signal_summary.build_summary(args.run_id, signals)
+    # Issue #44 review (Major): re-render the strategy profile + execution
+    # conditions from the saved run row (never inferred from its signals), so a
+    # re-displayed run stays self-identifying in text / JSON / Markdown -- even
+    # when it has zero signals.
+    result["run_meta"] = _run_meta_from_run(run)
 
     try:
         content = report.render(result, args.format)
