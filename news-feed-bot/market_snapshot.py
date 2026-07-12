@@ -12,8 +12,12 @@ from economic_calendar import EconomicEvent, get_economic_calendar
 from fedwatch import FedWatchSnapshot, get_fedwatch
 from fred_data import get_fred_data
 from market_data import get_market_data
-from market_bias import classify_market_bias, format_market_bias_section
-from market_bias_models import create_market_bias_record
+from market_bias import classify_market_bias, classify_market_bias_for_symbol, format_market_bias_section
+from market_bias_models import (
+    REPRESENTATIVE_TIMEFRAME,
+    create_market_bias_record,
+    normalize_bias_symbol,
+)
 from market_bias_store import save_market_bias
 from tradingview_data import get_tradingview_data
 
@@ -354,6 +358,63 @@ def persist_market_bias(
         logger.warning("[market_snapshot] Failed to persist Market Bias: %s", exc)
 
 
+def _group_chart_snapshots_by_symbol(chart_snapshots: list | None) -> dict[str, list]:
+    """Group chart snapshots by their normalized symbol (skipping unnamed ones)."""
+    grouped: dict[str, list] = {}
+    for snapshot in chart_snapshots or []:
+        raw_symbol = _snapshot_get(snapshot, "symbol")
+        if not raw_symbol:
+            continue
+        grouped.setdefault(normalize_bias_symbol(raw_symbol), []).append(snapshot)
+    return grouped
+
+
+def persist_symbol_market_biases(
+    market_data: dict,
+    fred_data: dict | None,
+    tv_data: dict,
+    chart_snapshots: list | None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Persist one per-symbol Market Bias per instrument in ``chart_snapshots``.
+
+    Issue #40: alongside the existing GLOBAL bias (still saved by
+    :func:`persist_market_bias`), compute and store a symbol-scoped bias for each
+    charted instrument. Shared market-environment inputs (core cross-asset
+    signals + Risk/Volatility) are reused, but each symbol's directional score
+    sees only its own chart trend/MACD (see
+    ``market_bias.classify_market_bias_for_symbol``). The record is stored under
+    the normalized symbol at the representative 1h timeframe, linked to that
+    symbol's own source snapshot id.
+
+    Observation-only logging, exactly like :func:`persist_market_bias`: never
+    raises into the caller, and never touches the DB in dry-run.
+    """
+    if dry_run:
+        logger.info("[market_snapshot] [DRY_RUN] Would persist per-symbol Market Bias (no DB write).")
+        return
+
+    for symbol, snapshots in _group_chart_snapshots_by_symbol(chart_snapshots).items():
+        try:
+            symbol_bias = classify_market_bias_for_symbol(
+                symbol,
+                market_data,
+                fred_data,
+                tv_data,
+                chart_data=snapshots,
+            )
+            record = create_market_bias_record(
+                symbol_bias,
+                symbol=symbol,
+                timeframe=REPRESENTATIVE_TIMEFRAME,
+                source_snapshot_id=source_snapshot_id_from_chart_snapshots(snapshots),
+            )
+            save_market_bias(record)
+        except Exception as exc:
+            logger.warning("[market_snapshot] Failed to persist Market Bias for %s: %s", symbol, exc)
+
+
 def build_market_snapshot_message(
     market_data: dict,
     fred_data: dict | None,
@@ -426,10 +487,21 @@ def build_market_snapshot_message(
             chart_data=chart_snapshots,
         )
         lines.append(format_market_bias_section(bias))
+        # GLOBAL (market-wide) bias -- unchanged from before Issue #40.
         persist_market_bias(
             bias,
             dry_run=dry_run,
             source_snapshot_id=source_snapshot_id_from_chart_snapshots(chart_snapshots),
+        )
+        # Issue #40: additionally persist a per-symbol bias for each charted
+        # instrument. Runs after the GLOBAL save so the GLOBAL record stays the
+        # first-written one, and is a no-op in dry-run / when no charts exist.
+        persist_symbol_market_biases(
+            market_data,
+            fred_data,
+            tv_data,
+            chart_snapshots,
+            dry_run=dry_run,
         )
     except Exception as exc:
         logger.warning("[market_snapshot] Market Bias failed: %s", exc)

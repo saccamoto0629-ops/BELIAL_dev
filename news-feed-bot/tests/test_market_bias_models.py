@@ -54,7 +54,7 @@ def test_create_market_bias_record_accepts_symbol_timeframe_and_snapshot_id_over
         source_snapshot_id="snapshot-123",
     )
 
-    assert record["symbol"] == "USD_JPY"
+    assert record["symbol"] == "USDJPY"
     assert record["timeframe"] == "4h"
     assert record["source_snapshot_id"] == "snapshot-123"
 
@@ -77,3 +77,61 @@ def test_create_market_bias_record_generates_unique_ids_and_timestamps():
 
     assert record_a["market_bias_id"] != record_b["market_bias_id"]
     assert record_a["evaluated_at"].endswith("Z")
+
+
+# --- Issue #40: symbol normalization + fallback scope ordering ---------------
+
+
+def test_normalize_bias_symbol_canonicalizes_punctuation_and_case():
+    assert models.normalize_bias_symbol("USD_JPY") == "USDJPY"
+    assert models.normalize_bias_symbol("usd_jpy") == "USDJPY"
+    assert models.normalize_bias_symbol("XAU/USD") == "XAUUSD"
+    assert models.normalize_bias_symbol("USDJPY") == "USDJPY"
+
+
+def test_normalize_bias_symbol_maps_global_and_empty_to_global():
+    assert models.normalize_bias_symbol("GLOBAL") == "GLOBAL"
+    assert models.normalize_bias_symbol("global") == "GLOBAL"
+    assert models.normalize_bias_symbol("") == "GLOBAL"
+    assert models.normalize_bias_symbol(None) == "GLOBAL"
+
+
+def test_create_market_bias_record_normalizes_symbol_and_timeframe():
+    record = models.create_market_bias_record(
+        {"market_bias": "Bull", "confidence": 0.8},
+        symbol=" usd_jpy ",
+        timeframe=" 1H ",
+    )
+
+    assert record["symbol"] == "USDJPY"
+    assert record["timeframe"] == "1h"
+
+
+def test_invalid_symbol_and_timeframe_are_rejected():
+    import pytest
+
+    with pytest.raises(TypeError):
+        models.normalize_bias_symbol(123)
+    with pytest.raises(ValueError):
+        models.effective_bias_scopes("USDJPY", "   ")
+
+
+def test_effective_bias_scopes_full_priority_for_non_1h_timeframe():
+    assert models.effective_bias_scopes("USD_JPY", "15m") == [
+        ("USDJPY", "15m"),
+        ("USDJPY", "1h"),
+        ("GLOBAL", "15m"),
+        ("GLOBAL", "1h"),
+    ]
+
+
+def test_effective_bias_scopes_dedupes_when_timeframe_is_1h():
+    assert models.effective_bias_scopes("USD_JPY", "1h") == [
+        ("USDJPY", "1h"),
+        ("GLOBAL", "1h"),
+    ]
+
+
+def test_effective_bias_scopes_for_global_request_is_global_only():
+    assert models.effective_bias_scopes("GLOBAL", "1h") == [("GLOBAL", "1h")]
+    assert models.effective_bias_scopes("GLOBAL", "15m") == [("GLOBAL", "15m"), ("GLOBAL", "1h")]

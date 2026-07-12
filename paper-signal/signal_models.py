@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 STATUS_PAPER_ONLY = "paper_only"
 
@@ -69,11 +69,22 @@ class SignalContext(TypedDict):
     Backtest can build one directly from its own historical data slice and
     call ``generate_signal_candidates()`` / ``generate_signal()`` without
     touching any live Provider, DB, or Discord.
+
+    Issue #40: ``bias_by_scope`` optionally carries a per-symbol Market Bias map
+    ``{(normalized_symbol, timeframe): bias_result}`` (always including the
+    ``(GLOBAL, 1h)`` fallback scope). When present, candidate generation resolves
+    each snapshot's bias by its own symbol/timeframe (falling back to GLOBAL);
+    when absent, the single ``bias_result`` is applied to every snapshot exactly
+    as before. Backtest keeps passing a single pre-resolved ``bias_result`` per
+    bar, so its pure, DB-free path is unchanged -- ``bias_by_scope`` is only used
+    by live Paper Signal, and it too must already be resolved (no DB lookup
+    happens inside the pure candidate functions).
     """
 
     bias_result: dict
     hourly_snapshots: list
     confidence_threshold: float
+    bias_by_scope: NotRequired[dict]
 
 
 class SignalCandidate(TypedDict):
@@ -115,13 +126,22 @@ def create_signal_context(
     hourly_snapshots: list,
     *,
     confidence_threshold: float,
+    bias_by_scope: dict | None = None,
 ) -> SignalContext:
-    """Bundle Market Bias + Chart Snapshot data into a SignalContext."""
-    return {
+    """Bundle Market Bias + Chart Snapshot data into a SignalContext.
+
+    Issue #40: pass ``bias_by_scope`` to have candidate generation resolve each
+    snapshot's bias per symbol/timeframe (GLOBAL fallback). Omit it to keep the
+    pre-#40 behaviour of applying the single ``bias_result`` to every snapshot.
+    """
+    context: SignalContext = {
         "bias_result": bias_result,
         "hourly_snapshots": hourly_snapshots,
         "confidence_threshold": confidence_threshold,
     }
+    if bias_by_scope is not None:
+        context["bias_by_scope"] = bias_by_scope
+    return context
 
 
 def new_signal_id() -> str:

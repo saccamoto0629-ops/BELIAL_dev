@@ -413,3 +413,149 @@ def test_module_source_has_no_broker_api_integration():
     for forbidden_call in ("place_order", "submit_order", "broker_api("):
         assert forbidden_call not in source.lower(), f"unexpected broker call: {forbidden_call!r}"
     assert "fxtrade.oanda.com" not in source.lower()
+
+
+# =============================================================================
+# Issue #40: per-symbol Market Bias (symbol-specific preferred, GLOBAL fallback)
+# =============================================================================
+
+
+def _scope_context(bias_by_scope, snapshots, *, confidence_threshold=0.40):
+    from signal_models import create_signal_context
+
+    # bias_result is required by SignalContext but must be ignored when
+    # bias_by_scope is present; pass a Neutral one to prove it is unused.
+    return create_signal_context(
+        make_bias(market_bias="Neutral", confidence=0.0),
+        snapshots,
+        confidence_threshold=confidence_threshold,
+        bias_by_scope=bias_by_scope,
+    )
+
+
+def test_scope_bias_processes_two_symbols_with_opposite_bias_in_one_run():
+    # USDJPY is Bull (+Bullish MACD) -> long; XAUUSD is Bear (+Bearish MACD) -> short.
+    usdjpy = make_chart_snapshot(symbol="USDJPY", macd_state="Bullish")
+    xauusd = make_chart_snapshot(symbol="XAUUSD", macd_state="Bearish", trend="Bear")
+    bias_by_scope = {
+        ("USDJPY", "1h"): make_bias(market_bias="Bull", confidence=0.8),
+        ("XAUUSD", "1h"): make_bias(market_bias="Bear", confidence=0.8),
+        ("GLOBAL", "1h"): make_bias(market_bias="Neutral", confidence=0.0),
+    }
+
+    candidates = sg.generate_signal_candidates(_scope_context(bias_by_scope, [usdjpy, xauusd]))
+
+    by_symbol = {c["symbol"]: c for c in candidates}
+    assert by_symbol["USDJPY"]["side"] == "long"
+    assert by_symbol["XAUUSD"]["side"] == "short"
+
+
+def test_scope_bias_falls_back_to_global_only_for_symbols_without_specific_bias():
+    # USDJPY has its own Bull bias; SPX has none, so it uses the GLOBAL Bear bias.
+    usdjpy = make_chart_snapshot(symbol="USDJPY", macd_state="Bullish")
+    spx = make_chart_snapshot(symbol="SPX", macd_state="Bearish", trend="Bear")
+    bias_by_scope = {
+        ("USDJPY", "1h"): make_bias(market_bias="Bull", confidence=0.8),
+        ("GLOBAL", "1h"): make_bias(market_bias="Bear", confidence=0.8),
+    }
+
+    candidates = sg.generate_signal_candidates(_scope_context(bias_by_scope, [usdjpy, spx]))
+
+    by_symbol = {c["symbol"]: c for c in candidates}
+    assert by_symbol["USDJPY"]["side"] == "long"  # symbol-specific
+    assert by_symbol["SPX"]["side"] == "short"    # GLOBAL fallback
+
+
+def test_scope_bias_symbol_with_neutral_bias_produces_no_candidate():
+    # XAUUSD is Neutral even though GLOBAL is Bull: no XAUUSD candidate.
+    usdjpy = make_chart_snapshot(symbol="USDJPY", macd_state="Bullish")
+    xauusd = make_chart_snapshot(symbol="XAUUSD", macd_state="Bullish")
+    bias_by_scope = {
+        ("USDJPY", "1h"): make_bias(market_bias="Bull", confidence=0.8),
+        ("XAUUSD", "1h"): make_bias(market_bias="Neutral", confidence=0.0),
+        ("GLOBAL", "1h"): make_bias(market_bias="Bull", confidence=0.8),
+    }
+
+    candidates = sg.generate_signal_candidates(_scope_context(bias_by_scope, [usdjpy, xauusd]))
+
+    symbols = {c["symbol"] for c in candidates}
+    assert symbols == {"USDJPY"}  # XAUUSD's own Neutral bias wins over GLOBAL Bull
+
+
+def test_scope_bias_applies_confidence_threshold_per_symbol():
+    # Same threshold, but each symbol's own confidence decides eligibility.
+    usdjpy = make_chart_snapshot(symbol="USDJPY", macd_state="Bullish")
+    xauusd = make_chart_snapshot(symbol="XAUUSD", macd_state="Bullish")
+    bias_by_scope = {
+        ("USDJPY", "1h"): make_bias(market_bias="Bull", confidence=0.60),
+        ("XAUUSD", "1h"): make_bias(market_bias="Bull", confidence=0.30),
+        ("GLOBAL", "1h"): make_bias(market_bias="Bull", confidence=0.90),
+    }
+
+    candidates = sg.generate_signal_candidates(_scope_context(bias_by_scope, [usdjpy, xauusd], confidence_threshold=0.50))
+
+    symbols = {c["symbol"] for c in candidates}
+    assert symbols == {"USDJPY"}  # XAUUSD (0.30) is below threshold, USDJPY (0.60) passes
+
+
+def test_scope_bias_generation_is_pure_no_db_discord_http(tmp_path, monkeypatch):
+    monkeypatch.setattr(sg, "DB_PATH", tmp_path / "paper_signals.sqlite3")
+
+    class FailingSession:
+        def post(self, *args, **kwargs):
+            raise AssertionError("HTTP must not be called by scope-based candidate generation")
+
+    monkeypatch.setattr(sg.requests, "post", FailingSession().post)
+
+    class FailingStore:
+        def __getattr__(self, name):
+            raise AssertionError(f"paper_signal_store.{name} must not be called")
+
+    monkeypatch.setattr(sg, "store", FailingStore())
+
+    bias_by_scope = {("USDJPY", "1h"): make_bias(market_bias="Bull", confidence=0.8)}
+    context = _scope_context(bias_by_scope, [make_chart_snapshot(symbol="USDJPY", macd_state="Bullish")])
+    sg.generate_signal_candidates(context)
+
+    assert not (tmp_path / "paper_signals.sqlite3").exists()
+
+
+def test_legacy_single_bias_context_still_supported():
+    # No bias_by_scope: the single bias_result is applied to every snapshot,
+    # exactly as before Issue #40 (Backtest's path).
+    from signal_models import create_signal_context
+
+    context = create_signal_context(
+        make_bias(market_bias="Bull", confidence=0.8),
+        [make_chart_snapshot(symbol="USDJPY", macd_state="Bullish")],
+        confidence_threshold=0.40,
+    )
+    candidates = sg.generate_signal_candidates(context)
+
+    assert len(candidates) == 1
+    assert candidates[0]["side"] == "long"
+
+
+def test_run_once_uses_per_symbol_bias_so_one_symbol_bull_does_not_force_another(monkeypatch):
+    # Two symbols share one live run. classify_market_bias returns Bull only when
+    # the (filtered) chart data is the USDJPY Bullish snapshot; XAUUSD's own
+    # (Bearish) snapshot classifies Neutral -> no XAUUSD candidate from a Bull.
+    usdjpy = make_chart_snapshot(symbol="USDJPY", macd_state="Bullish", trend="Bull")
+    xauusd = make_chart_snapshot(symbol="XAUUSD", macd_state="Bullish", trend="Bull")
+    sources = {"market": {}, "fred": None, "tradingview": {}, "chart": [usdjpy, xauusd]}
+    monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda: sources)
+
+    def fake_classify(*args, **kwargs):
+        chart = kwargs.get("chart_data") or []
+        symbols = {sg._snapshot_get(s, "symbol") for s in chart}
+        # USDJPY-only classification -> Bull; anything else (GLOBAL mix or XAUUSD) -> Neutral.
+        if symbols == {"USDJPY"}:
+            return make_bias(market_bias="Bull", confidence=0.8)
+        return make_bias(market_bias="Neutral", confidence=0.0)
+
+    monkeypatch.setattr(sg, "classify_market_bias", fake_classify)
+    monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False: None)
+
+    created = sg.run_once(dry_run=True)
+
+    assert {c["symbol"] for c in created} == {"USDJPY"}

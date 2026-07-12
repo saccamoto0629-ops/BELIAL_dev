@@ -66,9 +66,14 @@ import chart_collector  # noqa: E402  (market-watch)
 from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch, Issue #39)
 import exit_policy  # noqa: E402  (paper-signal)
 from market_bias_store import (  # noqa: E402  (news-feed-bot)
-    get_market_bias_as_of,
-    load_market_bias_series,
+    get_effective_market_bias_as_of,
+    load_effective_market_bias_series,
     market_bias_db_path,
+)
+from market_bias_models import (  # noqa: E402  (news-feed-bot)
+    GLOBAL_SCOPE_SYMBOL,
+    effective_bias_scopes,
+    normalize_bias_symbol,
 )
 import summary as signal_summary  # noqa: E402  (Issue #23: signal-level win/loss/pnl aggregation)
 import report  # noqa: E402  (Issue #23: text/JSON/Markdown rendering)
@@ -479,37 +484,72 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             len(warmup_frame), args.from_time, args.warmup_bars, warmup.REASON_WARMUP_INSUFFICIENT,
         )
 
-    # Issue #38: two Market Bias resolution modes, both reading the same
-    # (GLOBAL, 1h) history point-in-time (never a future record).
-    #   static      -- one bias as of --from, applied to every bar (default).
-    #   time_series -- each bar's bias resolved at its own close via a
-    #                  preloaded, binary-searched series (--time-series-bias).
+    # Issue #38/#40: two Market Bias resolution modes, both resolving the same
+    # per-symbol-with-GLOBAL-fallback priority point-in-time (never a future
+    # record). Issue #40: instead of the fixed (GLOBAL, 1h) scope, both modes now
+    # resolve against args.symbol/args.timeframe first, falling back to GLOBAL --
+    # so a GLOBAL-only DB behaves exactly as before, while a DB that also has a
+    # symbol-specific bias prefers it.
+    #   static      -- one effective bias as of --from, applied to every bar (default).
+    #   time_series -- each bar's effective bias resolved at its own close via a
+    #                  preloaded, priority-merged, binary-searched series (--time-series-bias).
+    bias_scope_priority = [f"{scope_symbol}/{scope_timeframe}" for scope_symbol, scope_timeframe in effective_bias_scopes(args.symbol, args.timeframe)]
     bias_lookup = None
     if args.time_series_bias:
         bias_mode = BIAS_MODE_TIME_SERIES
-        bias_series = load_market_bias_series("GLOBAL", "1h", db_path=bias_db_path)
+        bias_series = load_effective_market_bias_series(args.symbol, args.timeframe, db_path=bias_db_path)
         if not bias_series:
             logger.warning(
-                "No persisted Market Bias series found (symbol=GLOBAL timeframe=1h in %s); "
-                "time-series bias will fall back to Neutral for every bar, so no signal "
-                "candidates will be generated this run.",
-                bias_db_path,
+                "No persisted Market Bias series found for symbol=%s timeframe=%s (nor a GLOBAL "
+                "fallback) in %s; time-series bias will fall back to Neutral for every bar, so no "
+                "signal candidates will be generated this run.",
+                args.symbol, args.timeframe, bias_db_path,
             )
         bias_lookup = TimeSeriesBiasLookup(bias_series, neutral=dict(NEUTRAL_BIAS_PLACEHOLDER))
         # evaluate_backtest_bars still requires a bias_result argument; in
         # time-series mode bias_lookup supersedes it per bar, so pass a neutral
         # placeholder that is never actually consulted.
         bias_result = dict(NEUTRAL_BIAS_PLACEHOLDER)
+        # Issue #40: which scopes actually contributed a record this run, and
+        # whether GLOBAL was used as a fallback for at least part of the window.
+        scopes_used = sorted({f"{row.get('symbol')}/{row.get('timeframe')}" for row in bias_series})
+        bias_global_fallback = any(str(row.get("symbol")).upper() == GLOBAL_SCOPE_SYMBOL for row in bias_series)
+        bias_resolution = {
+            "mode": bias_mode,
+            "requested_symbol": args.symbol,
+            "requested_timeframe": args.timeframe,
+            "canonical_symbol": normalize_bias_symbol(args.symbol),
+            "scope_priority": bias_scope_priority,
+            "scopes_used": scopes_used,
+            "global_fallback": bias_global_fallback,
+        }
     else:
         bias_mode = BIAS_MODE_STATIC
-        bias_result = get_market_bias_as_of("GLOBAL", "1h", validation_start_iso, db_path=bias_db_path)
+        bias_result = get_effective_market_bias_as_of(
+            args.symbol, args.timeframe, validation_start_iso, db_path=bias_db_path
+        )
         if bias_result is None:
             logger.warning(
-                "No persisted Market Bias found at or before %s (symbol=GLOBAL timeframe=1h in %s); "
-                "using a neutral placeholder, so no signal candidates will be generated this run.",
-                args.from_time, bias_db_path,
+                "No persisted Market Bias found at or before %s for symbol=%s timeframe=%s (nor a "
+                "GLOBAL fallback) in %s; using a neutral placeholder, so no signal candidates will "
+                "be generated this run.",
+                args.from_time, args.symbol, args.timeframe, bias_db_path,
             )
             bias_result = dict(NEUTRAL_BIAS_PLACEHOLDER)
+            resolved_scope = None
+            bias_global_fallback = False
+        else:
+            resolved_scope = f"{bias_result.get('symbol')}/{bias_result.get('timeframe')}"
+            bias_global_fallback = str(bias_result.get("symbol")).upper() == GLOBAL_SCOPE_SYMBOL
+        bias_resolution = {
+            "mode": bias_mode,
+            "requested_symbol": args.symbol,
+            "requested_timeframe": args.timeframe,
+            "canonical_symbol": normalize_bias_symbol(args.symbol),
+            "scope_priority": bias_scope_priority,
+            "resolved_scope": resolved_scope,
+            "global_fallback": bias_global_fallback,
+        }
 
     confidence_threshold = (
         args.confidence_threshold if args.confidence_threshold is not None else warmup.DEFAULT_CONFIDENCE_THRESHOLD
@@ -570,6 +610,10 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             "no_reentry": args.no_reentry,
             "cooldown_minutes": args.cooldown_minutes,
             "bias_mode": bias_mode,
+            # Issue #40: record which symbol/timeframe bias this run requested,
+            # the scope fallback priority, and whether a GLOBAL fallback was used
+            # -- so a saved run is self-describing about per-symbol bias resolution.
+            "bias_resolution": bias_resolution,
             # Issue #39: the Market State entry filter for this run, sorted for a
             # stable record, or null when no filter was applied (the default).
             "allowed_market_states": (
@@ -734,6 +778,10 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
         "suppressed_reentry": suppressed_reentry,
         "suppressed_cooldown": suppressed_cooldown,
         "bias_mode": bias_mode,
+        # Issue #40: per-symbol bias resolution details for this run, and a quick
+        # boolean for whether GLOBAL was used as a fallback (mirrors config_json).
+        "bias_resolution": bias_resolution,
+        "bias_global_fallback": bias_resolution["global_fallback"],
         # Issue #39: how many candidates the Market State filter dropped (0 when
         # --allowed-market-states was not given), and the allow-list itself
         # (sorted, or None when no filter was applied).
@@ -767,6 +815,18 @@ def print_summary(summary: dict) -> None:
     print(f"Signals generated:   {summary['signals_generated']}")
     # Issue #38: bias mode + how many candidates the opt-in filters dropped.
     print(f"Bias mode:           {summary.get('bias_mode', BIAS_MODE_STATIC)}")
+    # Issue #40: which scope the Market Bias resolved to and whether GLOBAL was
+    # used as a fallback (per-symbol bias preferred when present).
+    bias_resolution = summary.get("bias_resolution") or {}
+    bias_scope = bias_resolution.get("resolved_scope") or (
+        ", ".join(bias_resolution.get("scopes_used", [])) or "none"
+    )
+    print(
+        f"Bias scope:          {bias_resolution.get('requested_symbol', summary.get('symbol'))}"
+        f"/{bias_resolution.get('requested_timeframe', summary.get('timeframe'))} "
+        f"-> {bias_scope}"
+        + (" (GLOBAL fallback)" if summary.get("bias_global_fallback") else "")
+    )
     # Issue #39: the Market State filter (if any) and its suppression count,
     # shown alongside #38's re-entry/cooldown counts.
     allowed_states = summary.get("allowed_market_states")

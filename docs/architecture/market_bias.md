@@ -167,10 +167,51 @@ Market Biasの評価結果は `news-feed-bot/market_bias_store.py` を通じてS
 
 - DB: `news-feed-bot/data/market_bias.sqlite3`(`MARKET_BIAS_DB_PATH` で上書き可能。相対パスは `news-feed-bot/` 基準)
 - テーブル: `market_bias`(`market_bias_id`, `evaluated_at`, `symbol`, `timeframe`, `market_bias`, `confidence`, `trend`, `risk`, `risk_confidence`, `volatility`, `volatility_confidence`, `reasons_json`, `risk_reasons_json`, `volatility_reasons_json`, `warnings_json`, `source_snapshot_id`)
-- レコードは `market_bias_models.create_market_bias_record()` が組み立てる。`symbol` は既定で `GLOBAL`(Market Biasは単一銘柄ではなく市場全体を見るクロスアセット判定のため)、`timeframe` は既定で `1h`(Chart Snapshot入力の代表時間足)。将来、銘柄別のMarket Biasに拡張する場合は呼び出し側で上書きできる。
+- レコードは `market_bias_models.create_market_bias_record()` が組み立てる。`symbol` は既定で `GLOBAL`(Market Biasは市場全体を見るクロスアセット判定のため)、`timeframe` は既定で `1h`(Chart Snapshot入力の代表時間足)。Issue #40 以降は銘柄別のMarket Biasも保存され、その場合は正規化した銘柄名(例 `USDJPY`)で上書きされる(下記「銘柄別Market BiasとGLOBALフォールバック」参照)。
 - 保存タイミング: `market_snapshot.build_market_snapshot_message()` がMarket Bias分類に成功した直後。`dry_run=True` のときはDBに一切書き込まない。
 - 参照: `market_bias_store.get_market_bias_as_of(symbol, timeframe, at)` は、指定時刻 `at` **以前**で最新のレコードを返す(未来のレコードを漏らさない、Backtestのlook-ahead防止のための設計)。DBやテーブルが存在しない場合、または該当レコードがない場合は例外を投げず `None` を返す。この関数は読み取り専用で、DBファイルを新規作成しない。
 - Paper Signal / Backtest からこのAPIを呼ぶ場合、`None` を「その期間はMarket Bias不明」として扱い、処理を継続する想定である。
+
+## 銘柄別Market BiasとGLOBALフォールバック(Issue #40)
+
+Issue #40 で、市場全体を見る `GLOBAL` Biasに加えて、**銘柄別**のMarket Biasを保存・参照できるようにした。`USDJPY` が Bull でも `XAUUSD` / `SPX` が同じ方向とは限らないため、対象銘柄のBiasがあればそれを優先し、なければ従来どおり `GLOBAL` にフォールバックする。既存の `GLOBAL` のみのDBはそのまま従来動作となる(後方互換)。
+
+### 銘柄表記の正規化
+
+`USDJPY`(Chart Snapshot / Chart DB)と `USD_JPY`(Backtest `--symbol`)、`XAU/USD` などの表記揺れは `market_bias_models.normalize_bias_symbol()` で1つの正規形(アンダースコア/スラッシュを除去した大文字、例 `USD_JPY` → `USDJPY`)へ統一する。銘柄別Biasはこの正規形で保存・参照する。`GLOBAL` は正規化しても `GLOBAL` のまま。
+
+### 参照優先順位(point-in-time)
+
+`market_bias_store.get_effective_market_bias_as_of(symbol, timeframe, at)` は、指定時刻 `at` 以前で以下の優先順位で最初に見つかったレコードを返す(`market_bias_models.effective_bias_scopes()` が生成、重複スコープは1回だけ検索)。
+
+1. `symbol` + `timeframe`
+2. `symbol` + `1h`(代表時間足)
+3. `GLOBAL` + `timeframe`
+4. `GLOBAL` + `1h`
+
+各スコープは `get_market_bias_as_of()` に委譲するため、`evaluated_at <= at`(未来を見ない)と同時刻の `market_bias_id DESC` タイブレークをそのまま継承する。戻り値はレコード自身の `symbol` / `timeframe` を保持するので、呼び出し側はどのスコープ(GLOBALフォールバックか否か)が採用されたか判別できる。DB/テーブル不在時は副作用なく `None`。
+
+### 時系列参照(GLOBALが銘柄別を上書きしない)
+
+`load_effective_market_bias_series(symbol, timeframe)` は、時系列Backtest向けに上記フォールバックを**各時点で**適用したマージ系列を返す。単純に銘柄別系列とGLOBAL系列を連結して `evaluated_at` で並べると、銘柄別Biasが有効になった後に保存された**新しいGLOBALレコードが銘柄別を上書き**してしまう。これを避けるため、各スコープの系列を一度だけ事前ロードし、全スコープの `evaluated_at` を区切り点として各時点の有効Biasを解決する。結果は「有効Biasが変化する点だけ」を含む最小系列で、`evaluated_at` が厳密増加するため、`runner.TimeSeriesBiasLookup` がそのまま二分探索で正しい有効Biasを引ける。
+
+- 銘柄別Biasがまだ無い期間だけ `GLOBAL` を使う
+- 一度銘柄別Biasが有効になったら、以降に保存された新しい `GLOBAL` では上書きされない
+- 銘柄別レコード間では直近の銘柄別Biasを継続利用
+- 未来情報は使わない
+
+### 銘柄別Biasの保存
+
+`market_snapshot.build_market_snapshot_message()` は、従来の `GLOBAL` 保存(`persist_market_bias()`、先に実行)に続けて `persist_symbol_market_biases()` を呼び、Chart Snapshotに含まれる各銘柄について銘柄別Biasを保存する。銘柄別Biasは `market_bias.classify_market_bias_for_symbol()` で計算し、**マクロ/クロスアセットのcore・Risk・Volatilityは共有しつつ、chart_dataを対象銘柄のみに絞る**ことで、他銘柄のchart trend / MACDが対象銘柄の方向性スコアへ混入しないようにする。`dry_run=True` では `GLOBAL`・銘柄別ともにDBへ書き込まない。保存は観測ログのみで、売買推奨やExecutionは行わない。
+
+### Backtest / Paper Signal からの利用
+
+- Backtest(`backtest/runner.py`)は、対象runの `--symbol` / `--timeframe` を使って有効Biasを解決する(以前の `GLOBAL` / `1h` 固定参照から変更)。
+  - static mode: `get_effective_market_bias_as_of(symbol, timeframe, --from)` を全バーへ適用。
+  - time-series mode(`--time-series-bias`): `load_effective_market_bias_series(symbol, timeframe)` を `TimeSeriesBiasLookup` に渡し、各バーの close 時点で有効Biasを解決。
+  - どちらも銘柄別があれば銘柄別、なければ `GLOBAL` フォールバック。Biasが一件も無ければ Neutral placeholder(候補生成なし)。
+  - `backtest_runs.config_json.bias_resolution` に、要求した symbol/timeframe・正規化名・スコープ優先順位・採用スコープ(または利用スコープ集合)・GLOBALフォールバック有無を記録し、summary/ログ(`Bias scope:` 行)でも確認できる。
+- Paper Signal(`paper-signal/signal_generator.py`)は live 実行時にBiasをin-memoryで計算する(DBは読まない)。詳細は [Paper Signal](paper_signal.md#銘柄別market-biasの適用issue-40)。
 
 ## Market Snapshotとの連携
 

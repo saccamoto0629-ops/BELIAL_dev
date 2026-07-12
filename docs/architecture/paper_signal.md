@@ -95,6 +95,15 @@ Signalの戦略的分類(Strategy / Method層)と、生成契機・入力元(Ale
 5. Bear の場合: `macd_state == "Bearish"` かつ `freshness == "Fresh"` かつ `bias_weight > 0` → `side = "short"`
 6. `freshness` が `"Weekend Closed"` / `"Market Closed"` / `"Stale"` のいずれかの場合はシグナルを生成しない(`"Fresh"` のみ候補にする)
 
+### 銘柄別Market Biasの適用(Issue #40)
+
+以前は1つの `GLOBAL` Market Bias を全 snapshot に一律適用していたため、`USDJPY` の Bull Bias が `XAUUSD` / `SPX` へも無条件に適用されていた。Issue #40 では **各 snapshot に、その `symbol` / `timeframe` に対応する Bias** を使う。
+
+- `run_once()` が `build_bias_by_scope()` で銘柄別Bias(`(正規化symbol, 1h)` ごと)+ `GLOBAL` フォールバックのマップ `bias_by_scope` を作り、`SignalContext` に載せる。
+- 各 snapshot について `signal_generator.resolve_scope_bias()` が [Market Bias の参照優先順位](market_bias.md#参照優先順位point-in-time)(symbol+timeframe → symbol+1h → GLOBAL+timeframe → GLOBAL+1h)で有効Biasを解決する。銘柄別があればそれ、なければ `GLOBAL`。
+- 銘柄別Biasは `GLOBAL` と同じ `classify_market_bias()` を、その銘柄のchart_dataだけに絞って呼ぶ(マクロ/Risk/Volatilityは共有、他銘柄のchart trend / MACDは混入させない)。`GLOBAL` のみの既存環境でも従来どおり候補生成できる。
+- `build_candidates()` / `generate_signal_candidates()` は**pure関数のまま**(SQLite / HTTP / Discord へアクセスしない)。BiasのDB lookupやin-memory計算は `run_once()` 側で完結し、pure関数には解決済みBiasを渡す。Backtestは1バーごとに解決済みの単一Biasを渡すため、pure・DB非依存のまま変更なし(既存の単一 `bias_result` を受け取るAPIも後方互換で残す)。
+
 ## 重複防止
 
 `paper-signal/paper_signal_store.has_recent_signal()` により、同一 `symbol` / `timeframe` / `side` の組み合わせで `PAPER_SIGNAL_DUPLICATE_WINDOW_MINUTES`(既定60分)以内に生成済みの場合はスキップする。

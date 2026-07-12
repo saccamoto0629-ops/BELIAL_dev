@@ -1911,3 +1911,171 @@ def test_print_summary_shows_all_when_no_state_filter(tmp_path, capsys):
     captured = capsys.readouterr()
 
     assert "Allowed states:      all" in captured.out
+
+
+# =============================================================================
+# Issue #40: per-symbol Market Bias resolution in the Backtest runner
+# =============================================================================
+
+
+def _seed_symbol_bias(db_path, *, symbol, evaluated_at, market_bias, timeframe="1h", bias_id=None):
+    """Seed one Market Bias record under an explicit symbol/timeframe scope."""
+    bias_store.save_market_bias(
+        {
+            "market_bias_id": bias_id or f"{symbol}-{market_bias}-{evaluated_at}",
+            "evaluated_at": evaluated_at,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "market_bias": market_bias,
+            "confidence": 0.8,
+            "trend": market_bias,
+        },
+        db_path=db_path,
+    )
+
+
+def test_static_mode_prefers_symbol_specific_bias_over_global(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)  # USDJPY uptrend -> Bullish MACD
+    start = collector.to_utc_iso_z(index[0])
+    # Symbol-specific Bull would generate long signals; GLOBAL Bear would not
+    # (a Bearish bias needs Bearish MACD, which the uptrend never has).
+    _seed_symbol_bias(bias_db, symbol="USDJPY", evaluated_at=start, market_bias="Bull")
+    _seed_symbol_bias(bias_db, symbol="GLOBAL", evaluated_at=start, market_bias="Bear")
+
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert summary["signals_generated"] > 0
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    assert all(s["bias"] == "Bull" for s in signals)  # USDJPY-specific bias was used
+    assert summary["bias_global_fallback"] is False
+    assert summary["bias_resolution"]["resolved_scope"] == "USDJPY/1h"
+
+
+def test_static_mode_falls_back_to_global_bias(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)
+    # Only a GLOBAL bias exists (pre-#40 shape): the run must still work.
+    seed_bull_bias(bias_db, evaluated_at=collector.to_utc_iso_z(index[0]))
+
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert summary["signals_generated"] > 0
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    assert all(s["bias"] == "Bull" for s in signals)
+    assert summary["bias_global_fallback"] is True
+    assert summary["bias_resolution"]["resolved_scope"] == "GLOBAL/1h"
+
+
+def test_static_mode_neutral_placeholder_when_no_bias_at_all(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    index = seed_chart_db(chart_db, n=100)  # no market_bias.sqlite3 seeded
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert summary["signals_generated"] == 0  # Neutral placeholder -> no candidates
+    assert summary["bias_global_fallback"] is False
+    assert summary["bias_resolution"]["resolved_scope"] is None
+    assert not (tmp_path / "market_bias.sqlite3").exists()  # read is side-effect-free
+
+
+def test_time_series_mode_uses_global_before_symbol_bias_then_symbol_after(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)  # USDJPY uptrend -> Bullish MACD
+    # GLOBAL is Neutral from the start (no candidate); USDJPY turns Bull only from
+    # bar95's close. So bars 90..94 use GLOBAL (Neutral -> nothing); bars 95..99
+    # use the symbol-specific Bull -> long.
+    _seed_symbol_bias(bias_db, symbol="GLOBAL", evaluated_at=collector.to_utc_iso_z(index[0]), market_bias="Neutral")
+    symbol_start = collector.to_utc_iso_z(index[95] + pd.Timedelta(hours=1))
+    _seed_symbol_bias(bias_db, symbol="USDJPY", evaluated_at=symbol_start, market_bias="Bull")
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        time_series_bias=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    assert summary["bias_mode"] == "time_series"
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    assert summary["signals_generated"] == 5
+    assert all(s["bias"] == "Bull" for s in signals)
+    assert all(s["signal_time"] >= index[95].isoformat() for s in signals)
+    assert summary["bias_global_fallback"] is True  # GLOBAL covered bars 90..94
+
+
+def test_time_series_mode_later_global_does_not_override_active_symbol_bias(tmp_path):
+    chart_db = tmp_path / "chart_data.sqlite3"
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = seed_chart_db(chart_db, n=100)  # USDJPY uptrend -> Bullish MACD throughout
+    # USDJPY Bull is effective from the very start; a *later* GLOBAL Bear must not
+    # take over -- if it did, bars after it would flip to Bear and (with Bullish
+    # MACD) stop generating, cutting the signal count below 10.
+    _seed_symbol_bias(bias_db, symbol="USDJPY", evaluated_at=collector.to_utc_iso_z(index[0]), market_bias="Bull")
+    later_global = collector.to_utc_iso_z(index[95] + pd.Timedelta(hours=1))
+    _seed_symbol_bias(bias_db, symbol="GLOBAL", evaluated_at=later_global, market_bias="Bear")
+
+    args = make_args(
+        tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat(),
+        time_series_bias=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    assert summary["signals_generated"] == 10  # all 10 validation bars stayed Bull
+    assert all(s["bias"] == "Bull" for s in signals)
+    assert summary["bias_global_fallback"] is False  # only the symbol scope was ever effective
+
+
+def test_time_series_mode_switches_symbol_bias_per_time(tmp_path):
+    # V-shape (MACD flips Bullish->Bearish). A *symbol-specific* bias series that
+    # is Bull early and Bear from the reversal produces both long and short
+    # signals in one run -- resolved point-in-time, from the symbol scope.
+    bias_db = tmp_path / "market_bias.sqlite3"
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    validation_index, first_bearish_close = _seed_vshape(tmp_path)
+    _seed_symbol_bias(bias_db, symbol="USDJPY", evaluated_at="2026-06-01T00:00:00Z", market_bias="Bull", bias_id="sym-bull")
+    _seed_symbol_bias(bias_db, symbol="USDJPY", evaluated_at=first_bearish_close, market_bias="Bear", bias_id="sym-bear")
+
+    args = make_args(
+        tmp_path, from_time=validation_index[0].isoformat(), to_time=validation_index[-1].isoformat(),
+        time_series_bias=True,
+    )
+    exit_code, summary = runner.run_backtest(args)
+
+    assert exit_code == runner.EXIT_OK
+    signals = store.list_backtest_signals(summary["run_id"], db_path=backtest_db)
+    directions = {s["direction"] for s in signals}
+    assert directions == {"long", "short"}
+    assert summary["bias_global_fallback"] is False  # symbol scope covered the whole window
+
+
+def test_bias_resolution_is_saved_to_config_json(tmp_path):
+    backtest_db = tmp_path / "backtest_results.sqlite3"
+    index = _seed_trend(tmp_path, step=0.05, market_bias="Bull")  # seeds GLOBAL bias
+    args = make_args(tmp_path, from_time=index[90].isoformat(), to_time=index[99].isoformat())
+
+    _, summary = runner.run_backtest(args)
+
+    run = store.get_backtest_run(summary["run_id"], db_path=backtest_db)
+    config = json.loads(run["config_json"])
+    resolution = config["bias_resolution"]
+    assert resolution["requested_symbol"] == "USD_JPY"
+    assert resolution["requested_timeframe"] == "1h"
+    assert resolution["canonical_symbol"] == "USDJPY"
+    assert resolution["scope_priority"] == ["USDJPY/1h", "GLOBAL/1h"]
+    assert resolution["global_fallback"] is True  # only a GLOBAL bias was seeded

@@ -518,3 +518,96 @@ def test_optional_calendar_and_fedwatch_run_only_when_enabled(monkeypatch):
     assert sources["calendar"][0]["event"] == "CPI"
     assert sources["fedwatch"]["hold_probability"] == 78.0
     assert calls == {"calendar": 1, "fedwatch": 1}
+
+
+# --- Issue #40: per-symbol Market Bias persistence ---------------------------
+
+
+def _fresh_chart_snapshot(symbol, **overrides):
+    snapshot = {
+        "symbol": symbol,
+        "timeframe": "1h",
+        "trend": "Bull",
+        "state": "Inside band",
+        "freshness": "Fresh",
+        "bias_weight": 1.0,
+        "macd_state": "Bullish",
+        "id": f"chart-{symbol}",
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def test_persist_symbol_market_biases_saves_one_record_per_symbol(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {"VIX": make_snapshot(30.0, 20.0)}
+    chart_snapshots = [_fresh_chart_snapshot("USDJPY"), _fresh_chart_snapshot("XAUUSD", trend="Bear", macd_state="Bearish")]
+
+    snap.persist_symbol_market_biases(market_data, None, {}, chart_snapshots, dry_run=False)
+
+    by_symbol = {r["symbol"]: r for r in saved}
+    assert set(by_symbol) == {"USDJPY", "XAUUSD"}
+    assert all(r["timeframe"] == "1h" for r in saved)
+    assert by_symbol["USDJPY"]["source_snapshot_id"] == "chart-USDJPY"
+    assert by_symbol["XAUUSD"]["source_snapshot_id"] == "chart-XAUUSD"
+
+
+def test_persist_symbol_market_biases_is_a_noop_in_dry_run(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+
+    snap.persist_symbol_market_biases({"VIX": make_snapshot(30.0, 20.0)}, None, {}, [_fresh_chart_snapshot("USDJPY")], dry_run=True)
+
+    assert saved == []
+
+
+def test_persist_symbol_market_biases_never_raises_when_save_fails(monkeypatch):
+    def boom(record):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(snap, "save_market_bias", boom)
+
+    # Must not raise: a persistence failure must never break the Discord message.
+    snap.persist_symbol_market_biases({"VIX": make_snapshot(30.0, 20.0)}, None, {}, [_fresh_chart_snapshot("USDJPY")], dry_run=False)
+
+
+def test_build_market_snapshot_message_saves_global_first_then_per_symbol(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {"VIX": make_snapshot(30.0, 20.0)}
+    chart_snapshots = [_fresh_chart_snapshot("USDJPY")]
+
+    snap.build_market_snapshot_message(market_data, None, {}, chart_snapshots=chart_snapshots)
+
+    # GLOBAL is always saved first (pre-#40 behaviour), then per-symbol records.
+    assert saved[0]["symbol"] == "GLOBAL"
+    assert {r["symbol"] for r in saved} == {"GLOBAL", "USDJPY"}
+
+
+def test_build_market_snapshot_message_dry_run_persists_nothing_per_symbol(monkeypatch):
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {"VIX": make_snapshot(30.0, 20.0)}
+
+    snap.build_market_snapshot_message(market_data, None, {}, chart_snapshots=[_fresh_chart_snapshot("USDJPY")], dry_run=True)
+
+    assert saved == []
+
+
+def test_per_symbol_bias_does_not_leak_other_symbols_chart(monkeypatch):
+    # USDJPY is Bull-charted, XAUUSD is Bear-charted. Each symbol's own bias must
+    # reflect only its own chart direction, not the other's.
+    saved = []
+    monkeypatch.setattr(snap, "save_market_bias", lambda record: saved.append(record) or record["market_bias_id"])
+    market_data = {}  # no macro core signals -> chart direction dominates
+    chart_snapshots = [
+        _fresh_chart_snapshot("USDJPY", trend="Bull", macd_state="Bullish"),
+        _fresh_chart_snapshot("XAUUSD", trend="Bear", macd_state="Bearish"),
+    ]
+
+    snap.persist_symbol_market_biases(market_data, None, {}, chart_snapshots, dry_run=False)
+
+    by_symbol = {r["symbol"]: r for r in saved}
+    assert by_symbol["USDJPY"]["market_bias"] == "Bull"
+    assert by_symbol["XAUUSD"]["market_bias"] == "Bear"

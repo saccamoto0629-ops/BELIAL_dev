@@ -6,6 +6,8 @@ call external APIs and it never makes trading recommendations.
 
 from typing import Literal, TypedDict, cast
 
+from market_bias_models import normalize_bias_symbol
+
 MarketBiasLabel = Literal["Bull", "Bear", "Neutral"]
 RiskLabel = Literal["Risk-On", "Risk-Off", "Neutral"]
 VolatilityLabel = Literal["Low", "Normal", "High"]
@@ -443,6 +445,46 @@ def classify_market_bias(
         "volatility_scores": volatility_scores,
         "volatility_reasons": volatility_reasons,
     }
+
+
+def _snapshot_symbol_matches(snapshot, symbol: str) -> bool:
+    snap_symbol = _snapshot_get(snapshot, "symbol")
+    return snap_symbol is not None and normalize_bias_symbol(snap_symbol) == normalize_bias_symbol(symbol)
+
+
+def classify_market_bias_for_symbol(
+    symbol: str,
+    market_data: dict | None = None,
+    fred_data: dict | None = None,
+    tv_data: dict | None = None,
+    *,
+    macd_signal: str | None = None,
+    chart_data=None,
+) -> MarketBiasResult:
+    """Classify a single-instrument Market Bias for ``symbol``.
+
+    Issue #40: a per-symbol bias must reuse shared market-environment inputs
+    (the cross-asset core signals -- VIX, S&P500, Nasdaq, ... -- plus the Risk
+    and Volatility axes) but must NOT let another instrument's chart trend/MACD
+    leak into this instrument's directional score. So ``chart_data`` is filtered
+    down to only the snapshots whose symbol matches ``symbol`` (normalized the
+    same way on both sides) before delegating to :func:`classify_market_bias`.
+
+    ``macd_signal`` (the M15 near-term auxiliary Trend nudge) is per-caller and
+    not attributed to any particular instrument here; callers building a
+    per-symbol bias should leave it None to avoid mixing it across symbols.
+
+    This is still observation-only classification: it never places an order,
+    sizes a position, or emits a trade recommendation.
+    """
+    own_chart = [snapshot for snapshot in (chart_data or []) if _snapshot_symbol_matches(snapshot, symbol)]
+    return classify_market_bias(
+        market_data,
+        fred_data,
+        tv_data,
+        macd_signal=macd_signal,
+        chart_data=own_chart,
+    )
 
 
 def format_market_bias_section(result: MarketBiasResult) -> str:

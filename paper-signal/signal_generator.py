@@ -33,6 +33,11 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from market_bias import classify_market_bias  # noqa: E402  (news-feed-bot)
+from market_bias_models import (  # noqa: E402  (news-feed-bot)
+    GLOBAL_SCOPE_SYMBOL,
+    effective_bias_scopes,
+    normalize_bias_symbol,
+)
 from market_snapshot import fetch_snapshot_sources  # noqa: E402  (news-feed-bot)
 
 import paper_signal_store as store  # noqa: E402
@@ -212,6 +217,53 @@ def build_candidates(
     return candidates
 
 
+def resolve_scope_bias(bias_by_scope: dict, symbol, timeframe) -> dict | None:
+    """Return the Market Bias for one snapshot's ``symbol``/``timeframe``, or None.
+
+    Issue #40: walks the same reference priority as the store's effective lookup
+    (symbol+timeframe, symbol+1h, GLOBAL+timeframe, GLOBAL+1h) over a
+    ``{(normalized_symbol, timeframe): bias_result}`` map, so a symbol-specific
+    bias wins and GLOBAL is the fallback. Pure dict lookups only -- no DB, no
+    network. Returns None when no scope in the map applies (the snapshot then
+    yields no candidate).
+    """
+    for scope in effective_bias_scopes(symbol, timeframe):
+        bias = bias_by_scope.get(scope)
+        if bias is not None:
+            return bias
+    return None
+
+
+def build_candidates_by_scope(
+    bias_by_scope: dict,
+    hourly_snapshots: list,
+    *,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> list[dict]:
+    """Per-symbol variant of build_candidates(): each snapshot uses its own bias.
+
+    Issue #40: instead of one Market Bias applied to every snapshot, resolve each
+    snapshot's bias by its symbol/timeframe (GLOBAL fallback) via
+    :func:`resolve_scope_bias`, then reuse the unchanged ``build_candidates``
+    rules for that single snapshot. So a Bull bias on USD_JPY never forces a
+    candidate on XAU_USD, and a symbol with a Neutral bias yields nothing even
+    when another symbol is Bull. Pure and side-effect-free, exactly like
+    ``build_candidates`` -- the resolved biases must already be in
+    ``bias_by_scope`` (no lookup happens here).
+    """
+    candidates: list[dict] = []
+    for snapshot in hourly_snapshots:
+        symbol = _snapshot_get(snapshot, "symbol")
+        timeframe = _snapshot_get(snapshot, "timeframe", REPRESENTATIVE_TIMEFRAME)
+        bias = resolve_scope_bias(bias_by_scope, symbol, timeframe)
+        if bias is None:
+            continue
+        candidates.extend(
+            build_candidates(bias, [snapshot], confidence_threshold=confidence_threshold)
+        )
+    return candidates
+
+
 def generate_signal_candidates(context: dict) -> list[dict]:
     """Return paper-signal candidates for *context*, with zero side effects.
 
@@ -219,11 +271,24 @@ def generate_signal_candidates(context: dict) -> list[dict]:
     Market Bias + Chart Snapshot data (see ``signal_models.SignalContext``).
     Never touches SQLite, Discord, HTTP, or paper_signal_store -- safe for
     Backtest to call directly, repeatedly, with no persistence.
+
+    Issue #40: when the context carries a ``bias_by_scope`` map, each snapshot is
+    matched to its own symbol/timeframe bias (GLOBAL fallback); otherwise the
+    single ``bias_result`` is applied to every snapshot, unchanged. Both paths
+    stay pure -- the biases are always pre-resolved by the caller.
     """
+    confidence_threshold = context.get("confidence_threshold", CONFIDENCE_THRESHOLD)
+    bias_by_scope = context.get("bias_by_scope")
+    if bias_by_scope:
+        return build_candidates_by_scope(
+            bias_by_scope,
+            context["hourly_snapshots"],
+            confidence_threshold=confidence_threshold,
+        )
     return build_candidates(
         context["bias_result"],
         context["hourly_snapshots"],
-        confidence_threshold=context.get("confidence_threshold", CONFIDENCE_THRESHOLD),
+        confidence_threshold=confidence_threshold,
     )
 
 
@@ -279,6 +344,49 @@ def post_discord_message(message: str, *, dry_run: bool = False, session=request
     response.raise_for_status()
 
 
+def build_bias_by_scope(
+    sources: dict,
+    hourly_snapshots: list,
+    global_bias: dict,
+) -> dict:
+    """Compute the per-symbol Market Bias map for one live Paper Signal run.
+
+    Issue #40: keyed by ``(normalized_symbol, 1h)`` for each charted instrument,
+    plus the ``(GLOBAL, 1h)`` fallback scope holding ``global_bias``. Each
+    per-symbol bias reuses the shared market/fred/tradingview inputs but sees
+    only its own chart trend/MACD (the snapshots are filtered down to that symbol
+    before classification), so one symbol's chart never biases another's
+    direction. This mirrors what Market Snapshot persists to the DB, but is
+    computed in-memory here (no DB lookup) so ``generate_signal_candidates`` stays
+    pure. The same module-level ``classify_market_bias`` used for the GLOBAL bias
+    is reused per symbol, keeping both scopes consistent.
+    """
+    market_data = sources.get("market")
+    fred_data = sources.get("fred")
+    tv_data = sources.get("tradingview")
+
+    bias_by_scope: dict = {(GLOBAL_SCOPE_SYMBOL, REPRESENTATIVE_TIMEFRAME): global_bias}
+    seen: set[str] = set()
+    for snapshot in hourly_snapshots:
+        raw_symbol = _snapshot_get(snapshot, "symbol")
+        if not raw_symbol:
+            continue
+        canonical = normalize_bias_symbol(raw_symbol)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        own_snapshots = [
+            snap for snap in hourly_snapshots if normalize_bias_symbol(_snapshot_get(snap, "symbol")) == canonical
+        ]
+        bias_by_scope[(canonical, REPRESENTATIVE_TIMEFRAME)] = classify_market_bias(
+            market_data,
+            fred_data,
+            tv_data,
+            chart_data=own_snapshots,
+        )
+    return bias_by_scope
+
+
 def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
     """Fetch Market Bias + 1h Chart Snapshot, then generate/store/notify new paper signals.
 
@@ -295,7 +403,16 @@ def run_once(*, dry_run: bool = False, db_path: Path = DB_PATH) -> list[dict]:
         chart_data=hourly_snapshots,
     )
 
-    context = create_signal_context(bias_result, hourly_snapshots, confidence_threshold=CONFIDENCE_THRESHOLD)
+    # Issue #40: resolve a per-symbol bias per snapshot (GLOBAL fallback). The DB
+    # is never consulted here -- biases are computed up front and handed to the
+    # pure candidate functions via the context's bias_by_scope map.
+    bias_by_scope = build_bias_by_scope(sources, hourly_snapshots, bias_result)
+    context = create_signal_context(
+        bias_result,
+        hourly_snapshots,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+        bias_by_scope=bias_by_scope,
+    )
     candidates = generate_signal_candidates(context)
     created: list[dict] = []
 

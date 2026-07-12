@@ -14,13 +14,80 @@ from datetime import UTC, datetime
 from typing import TypedDict
 
 # Market Bias (news-feed-bot/market_bias.py) classifies the overall market
-# regime from cross-asset data (VIX, S&P500, Nasdaq, ...), not a single
-# instrument. "GLOBAL" marks that market-wide scope; a future per-instrument
-# Market Bias could pass a real symbol instead. 1h matches the representative
-# chart timeframe already used for Market Bias's chart inputs (see
+# regime from cross-asset data (VIX, S&P500, Nasdaq, ...). "GLOBAL" marks that
+# market-wide scope; Issue #40 additionally persists per-instrument Market Bias
+# under a real symbol so a Backtest/Paper Signal for that instrument can prefer
+# it over the shared GLOBAL bias. 1h matches the representative chart timeframe
+# already used for Market Bias's chart inputs (see
 # paper-signal/signal_generator.py's REPRESENTATIVE_TIMEFRAME).
 DEFAULT_SCOPE_SYMBOL = "GLOBAL"
+# Alias used at the call sites (runner / signal_generator) that talk about the
+# "GLOBAL fallback" scope explicitly rather than "the default scope symbol".
+GLOBAL_SCOPE_SYMBOL = DEFAULT_SCOPE_SYMBOL
 REPRESENTATIVE_TIMEFRAME = "1h"
+
+
+def normalize_bias_symbol(symbol: str | None) -> str:
+    """Canonicalize a symbol for Market Bias scope storage and lookup.
+
+    Issue #40: Chart Snapshots, the Chart DB's ``candles`` table, and a
+    Backtest ``--symbol`` disagree on punctuation (``USD_JPY`` vs ``USDJPY``,
+    ``XAU/USD`` vs ``XAUUSD``). Per-symbol Market Bias is persisted and looked
+    up under one canonical form -- the underscore/slash-free upper-case key the
+    Chart DB + chart snapshots already use (``USD_JPY`` -> ``USDJPY``) -- so the
+    three layers agree on a single row. ``GLOBAL`` (no punctuation) maps to
+    itself, keeping the pre-#40 market-wide scope unchanged. An empty/None
+    symbol collapses to ``GLOBAL`` rather than an empty key.
+    """
+    if symbol is None:
+        return DEFAULT_SCOPE_SYMBOL
+    if not isinstance(symbol, str):
+        raise TypeError("Market Bias symbol must be a string or None")
+    normalized = symbol.strip().replace("_", "").replace("/", "").upper()
+    return normalized or DEFAULT_SCOPE_SYMBOL
+
+
+def normalize_bias_timeframe(timeframe: str) -> str:
+    """Return the canonical lower-case Market Bias timeframe key."""
+    if not isinstance(timeframe, str):
+        raise TypeError("Market Bias timeframe must be a string")
+    normalized = timeframe.strip().lower()
+    if not normalized:
+        raise ValueError("Market Bias timeframe must not be empty")
+    return normalized
+
+
+def effective_bias_scopes(symbol: str | None, timeframe: str) -> list[tuple[str, str]]:
+    """Return the ordered, de-duplicated ``(symbol, timeframe)`` fallback scopes.
+
+    Issue #40 reference priority for resolving a Market Bias:
+
+    1. requested ``symbol`` + ``timeframe``
+    2. requested ``symbol`` + ``1h`` (the representative timeframe)
+    3. ``GLOBAL`` + ``timeframe``
+    4. ``GLOBAL`` + ``1h``
+
+    The requested symbol is canonicalized via :func:`normalize_bias_symbol`, and
+    duplicate scopes are dropped while preserving priority order -- so a
+    ``timeframe == "1h"`` request collapses to ``[(symbol, 1h), (GLOBAL, 1h)]``
+    and a request already scoped to ``GLOBAL`` collapses to just the two GLOBAL
+    scopes (identical to pre-#40 behaviour, hence backward compatible).
+    """
+    canonical = normalize_bias_symbol(symbol)
+    timeframe = normalize_bias_timeframe(timeframe)
+    scopes: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for scope in (
+        (canonical, timeframe),
+        (canonical, REPRESENTATIVE_TIMEFRAME),
+        (DEFAULT_SCOPE_SYMBOL, timeframe),
+        (DEFAULT_SCOPE_SYMBOL, REPRESENTATIVE_TIMEFRAME),
+    ):
+        if scope in seen:
+            continue
+        seen.add(scope)
+        scopes.append(scope)
+    return scopes
 
 
 class MarketBiasRecord(TypedDict):
@@ -69,8 +136,8 @@ def create_market_bias_record(
     return {
         "market_bias_id": market_bias_id or new_market_bias_id(),
         "evaluated_at": evaluated_at or utc_now_iso(),
-        "symbol": symbol,
-        "timeframe": timeframe,
+        "symbol": normalize_bias_symbol(symbol),
+        "timeframe": normalize_bias_timeframe(timeframe),
         "market_bias": bias_result.get("market_bias", "Neutral"),
         "confidence": float(bias_result.get("confidence", 0.0) or 0.0),
         "trend": bias_result.get("trend", bias_result.get("market_bias", "Neutral")),
