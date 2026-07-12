@@ -341,6 +341,48 @@ python -m backtest run \
 バケットに入る。まず **フィルタなしで1本回して `by_market_state` の分布を見てから**許可リストを
 決める進め方を推奨する(フィルタ未指定でも全シグナルに state は記録されるため)。
 
+## 銘柄別 Market Bias の履歴backfill(Issue #40 の検証用)
+
+Issue #40 で Backtest は銘柄別 Market Bias(`symbol/1h`)を GLOBAL より優先して参照できるように
+なったが、**実際に効くのは Market Bias DB に銘柄別レコードが存在する場合だけ**である。Live の
+`market_snapshot` は「今」の bias しか記録せず過去を backfill しないため、過去1年を time-series で
+回すと銘柄別レコードが無く、`--time-series-bias` は GLOBAL にフォールバックする
+(summary の `Bias scope:` 行が `global_fallback=True` になる)。
+
+`backtest/backfill_symbol_bias.py` は、各銘柄自身のローソク足を再生して**銘柄別 bias の履歴系列**を
+再構築し、Market Bias DB へ書き込むオフラインツール(Paper-only、Discord/発注は一切なし)。
+
+```bash
+# 対象銘柄の銘柄別 bias 系列を Market Bias DB に backfill(既定で対象銘柄の既存行を消してから再構築)
+python -m backtest.backfill_symbol_bias \
+  --symbols USD_JPY,XAU_USD,SPX --timeframe 1h
+
+# まず分布だけ確認(DB非書き込み)。Bull/Bear/Neutral の内訳と書き込み予定件数を表示
+python -m backtest.backfill_symbol_bias \
+  --symbols USD_JPY,XAU_USD,SPX --timeframe 1h --dry-run
+```
+
+設計上の要点(結果解釈のため):
+
+- **方向性スコアは chart のみ。** Live が `classify_market_bias` に渡す cross-asset core signals
+  (VIX/S&P500/Nasdaq/US10Y/Dollar/Oil/TV 推奨...)は履歴値が保存されていないため再生不能。近似の
+  マクロ履歴を捏造せず `market_data=fred_data=tv_data=None` とし、各銘柄の方向性を**その銘柄自身の
+  chart trend + MACD だけ**から決める(これは #40 が分離する銘柄別軸そのもの。
+  `classify_market_bias_for_symbol` は元々 chart_data を対象銘柄に絞る)。分類器の evidence ルール上、
+  方向性 Bull は chart trend `Bull` かつ MACD `Bullish`(Bear は両方 bearish)が必要で、それ以外は
+  `Neutral`(=シグナル非生成の安全側)。
+- **point-in-time / 先読みなし。** 各バーは自身までの直近200本(Live の `load_candles(limit=200)` と
+  一致、指標が byte-identical)だけで、そのバーの close 時刻を `evaluation_time` として評価する。
+- **変化時のみ記録。** 連続する同一 bias は先頭1件に集約(time-series lookup は前値を持ち越すので
+  等価、DB を小さく保ち `evaluated_at` の区切りを意味のあるものにする)。
+- **冪等な再実行。** 決定論的 id を使い、書き込み前に対象 canonical symbol の既存行を削除する
+  (GLOBAL は絶対に触らない)。`--keep-existing` で削除を抑止できる。
+
+backfill 後に `--time-series-bias` で回すと、summary の `Bias scope:` に `XXXUSD/1h` が現れ
+(`global_fallback` は、GLOBAL しか無い期間が一部でもあれば True のまま)、`by_bias` に GLOBAL 固定
+では出なかった Bear(=下落局面での short)が現れる。これで #40 の「下落中の銘柄を売り、上昇中を買う」
+挙動を検証できる。
+
 ## Backtest結果の保存とEntry/Exitの扱い
 
 - validation期間の各バーで `warmup.evaluate_backtest_bars()` がPaper Signal候補を生成する
