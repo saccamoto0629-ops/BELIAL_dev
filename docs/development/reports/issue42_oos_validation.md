@@ -128,48 +128,55 @@ python -m backtest summary --run-id <RUN_ID> --format json --output reports/issu
 
 ### 6.1 学習側 Baseline（Run T）— 固定条件の学習側傾向の参考確認
 
-by_market_state（PnL / PF の符号だけでも可）:
+Run ID: `13fd4cf5506147a781e76089096e0196` / window 2025-08-01〜2026-03-30 / signals=420, WR=0.3643, PF=**1.1218**, PnL=+434.68, MaxDD=551.69
+
+by_market_state:
 
 | Market State | signals | win_rate | total_pnl | PF |
 |---|---|---|---|---|
-| trend_up | | | | |
-| squeeze | | | | |
-| volatile | | | | |
-| range | | | | |
-| trend_down | | | | |
+| trend_up | 172 | 0.4012 | +400.07 | 1.2859 |
+| squeeze | 39 | 0.4872 | +209.64 | **1.7533** |
+| volatile | 5 | 0.4000 | +12.92 | 1.4084 |
+| range | 66 | 0.3485 | +54.37 | 1.0987 |
+| trend_down | 138 | 0.2899 | -242.32 | 0.8149 |
 
-参考傾向: squeeze/volatile/trend_up が優位か → ( 是 / 否 )　※参考のみ。条件選定バイアスが残るため採否判定の主根拠にはしない
+参考傾向: squeeze/volatile/trend_up が優位か → **是**（3 state とも PF>1、trend_down のみ明確に負）。ただし range も学習側では PF 1.10 と僅かにプラス、volatile は 5 件と極小サンプル。※参考のみ。条件選定バイアスが残るため採否判定の主根拠にはしない。
 
 ### 6.2 検証側 Baseline vs Candidate（本比較）
 
+検証窓 2026-03-31〜2026-07-10。V-B Run ID `2890e6eb5bf24155b905447e2bc38b9e` / V-C Run ID `90867f178089487e80f7887abc56ae69`。
+
 | 指標 | Baseline (V-B) | Candidate (V-C) |
 |---|---|---|
-| Total Signals | | |
-| Win / Loss | | |
-| Win Rate | | |
-| Total PnL | | |
-| Average PnL | | |
-| **Profit Factor** | | |
-| **Max Drawdown** | | |
-| Suppressed (market-state) | 0 | |
+| Total Signals | 202 | 83 |
+| Win / Loss | 67 / 135 | 29 / 54 |
+| Win Rate | 0.3317 | 0.3494 |
+| Total PnL | -14.98 | +40.80 |
+| Average PnL | -0.0742 | +0.4915 |
+| **Profit Factor** | 0.9917 | **1.0549** |
+| **Max Drawdown** | 304.67 | **199.08** |
+| Suppressed (market-state) | 0 | 387 |
 
 by_bias（Bull / Bear 各行）:
 
 | | Baseline Bull | Baseline Bear | Candidate Bull | Candidate Bear |
 |---|---|---|---|---|
-| signals | | | | |
-| win_rate | | | | |
-| total_pnl | | | | |
+| signals | 70 | 132 | 62 | 21 |
+| win_rate | 0.2857 | 0.3561 | 0.3226 | 0.4286 |
+| total_pnl | -132.34 | +117.36 | -30.72 | +71.52 |
+| PF | 0.8062 | 1.1040 | 0.9468 | 1.4326 |
 
-by_market_state（Candidate は許可 3 state のみ残る想定）:
+by_market_state:
 
-| Market State | Baseline signals / PF | Candidate signals / PF |
+| Market State | Baseline signals / PF / PnL | Candidate signals / PF / PnL |
 |---|---|---|
-| trend_up | | |
-| squeeze | | |
-| volatile | | |
-| range | | （フィルタで除外＝0 想定） |
-| trend_down | | （フィルタで除外＝0 想定） |
+| trend_up | 49 / 0.9687 / -14.13 | 51 / 0.9129 / **-41.73** |
+| squeeze | 26 / 1.2160 / +47.48 | 32 / 1.3132 / **+82.52** |
+| volatile | 0（検証窓に該当バーなし） | 0（検証窓に該当バーなし） |
+| range | 28 / 0.4490 / **-170.02** | 除外（フィルタで 0） |
+| trend_down | 99 / 1.1463 / **+121.69** | 除外（フィルタで 0） |
+
+> 注: no-reentry は「常時1ポジション」制約のため、Candidate はフィルタで range/trend_down 候補を先に落とす（suppression 順: market_state→re-entry→cooldown）ことで、残る trend_up/squeeze により多くの約定枠が回る。よって Candidate の trend_up(51)/squeeze(32) は Baseline(49/26)より**増える**（単純な部分集合ではない）。
 
 ---
 
@@ -181,18 +188,47 @@ PF だけでなく取引数と Drawdown を必ず併せて見る（検証側は�
 - **保留**: 方向性は良い（PF 改善 or PF>1）が、取引数が少なすぎる／DD が悪化／改善が僅少で誤差範囲。→ 真の OOS（2026-07-11 以降）でのデータ蓄積後に再評価。
 - **棄却**: 検証側で `Candidate PF ≤ 1.0` または `Candidate PF < Baseline PF`（フィルタが held-out 期間ではエッジを毀損）。→ XAUUSD の Market State フィルタは頑健でないと結論。
 
-### 最終判定: （採用 / 保留 / 棄却）を記入
+### 評価
+
+**(A) 事前固定ルールの機械的判定 → 形式上は「採用」ライン到達。**
+検証側で `Candidate PF 1.0549 > Baseline PF 0.9917` かつ `PF > 1.0` かつ Max DD が悪化しない（304.67 → 199.08 と**改善**）かつ決済取引数 83 ≥ 30。§7 の採用条件を4つとも満たす。
+
+**(B) しかし by_market_state / by_bias を見ると、エッジは state レベルで汎化していない（規制レジームの反転）。**
+
+- **方向性 state が符号反転:** 学習側で trend_up は最大の稼ぎ頭（PF 1.29 / +400）、trend_down は最大の負け（PF 0.81 / -242）。検証側では**逆転**し、trend_up が負け（PF 0.91〜0.97 / -14〜-42）、除外したはずの trend_down が勝ち（PF 1.15 / **+121.69**）。
+- **バイアス方向も反転:** 学習側は Bull 優位（PF 1.30）・Bear 劣位（0.91）。検証側は Bear 優位（Candidate Bear PF 1.43 / +71.5）・Bull 劣位（0.95 / -30.7）。
+- **Candidate のプラスは squeeze 単独が牽引:** 検証側 Candidate の内訳は squeeze +82.52 に対し trend_up は **-41.73（足を引っ張っている）**、volatile は検証窓に0件（検証不能）。つまり「trend_up,squeeze,volatile」の3点セットのうち、検証側で機能したのは squeeze だけ。
+- **集計 PF が勝った主因は range 除外:** Baseline 最大の損失は range（-170.02）。Candidate はこれを除外して集計 PF を押し上げた。だが同時に検証側で勝っていた trend_down（+121.69）も捨てている。差し引き +40.80 は「squeeze の利益 ＋ range 回避」が「trend_down 放棄 ＋ trend_up の損」を上回った結果で、仮説（trend_up 系が効く）が当たったわけではない。
+
+**(C) 頑健と言えるのは squeeze と「range を避ける」ことのみ。** squeeze は学習側 PF 1.75 / 検証側 PF 1.22〜1.31 と両期間で一貫してプラス。range は両期間で最弱〜負け。一方 trend_up / trend_down / bias 方向は非定常（期間で反転）で、直近3.3ヶ月・squeeze 26〜32件という小サンプルも相まって、3点セット条件を「汎化した」とは言えない。
+
+### 推奨判定: **保留**（要ユーザー確定）
+
+事前ルールの集計指標は「採用」に触れるが、それは range 除外による集計効果と squeeze 単独の寄与によるもので、**固定条件「trend_up,squeeze,volatile」そのものの汎化は by_market_state/by_bias の反転により否定された**。よって「この3点セットを Live コンフィグへそのまま採用」は時期尚早と判断し、**保留**を推奨する。
+
+次アクション（保留時）:
+1. 頑健な核（**squeeze 中心、range 除外**）へ条件を絞った再検証を別 Issue で行う（例: `allowed_market_states=squeeze` 単独、あるいは range/trend_down 除外の効果分離）。※本 Issue のスコープ外＝条件再調整のため、必ず別 Issue として切る。
+2. **真の OOS**（2026-07-11 以降の forward データ蓄積後）で本手順書と同一固定条件で再評価する（§8）。
+3. 現時点で trend_up,squeeze,volatile を Live へロールアウトしない。
+
+### 最終判定: **保留**（trend_up,squeeze,volatile の3状態セットは採用保留）
 
 理由:
+- 今回は真の OOS ではなく retrospective validation であり、条件選定バイアスが残る。
+- 集計指標（PF・PnL・DD・取引数）は事前固定ルールの採用基準を満たしたが、by_market_state / by_bias で成績が学習側と検証側で反転しており、3状態セットの頑健性は確認できなかった（検証側の黒字は squeeze 単独＋range 除外が牽引で、trend_up はむしろ損、volatile は0件で検証不能）。
+- 現時点では Live ルールや銘柄別コンフィグへ反映しない。
 
 > **結論の前提（再掲）:** 本検証は**真の OOS ではなく、既存1年データの時間分割による retrospective validation** である。Candidate 条件（trend_up,squeeze,volatile）はフル1年の結果を見て選定されているため、**条件選定バイアスは残る**。検証側で良好な結果が出ても「真に汎化した」とは断定できず、あくまで頑健性の一材料。確定的な結論には 2026-07-11 以降の forward データによる真の OOS 検証（§8）が必要。
 
 ---
 
-## 8. 採用時のフォローアップ Issue 候補（採用の場合のみ定義）
+## 8. フォローアップ Issue 候補（判定＝保留を受けて）
 
-- 銘柄別コンフィグ（XAUUSD → 銘柄別 bias + `allowed_market_states=trend_up,squeeze,volatile`）を Live / paper-signal のエントリー制御へ反映する Issue。
-- 真の OOS 検証: 2026-07-11 以降の forward データを蓄積し、本手順書と同一固定条件で再評価する Issue。
+保留のため、trend_up,squeeze,volatile の Live / 銘柄別コンフィグ反映は**行わない**。代わりに以下を別 Issue として切る:
+
+1. **squeeze 中心の最小構成の再検証**: 頑健と確認できた核（squeeze・range 除外）へ条件を絞って retrospective で再評価する。候補: `allowed_market_states=squeeze` 単独、および range/trend_down 除外の効果分離。※条件再調整のため本 Issue のスコープ外＝必ず別 Issue。
+2. **真の OOS 検証**: 2026-07-11 以降の forward データが十分蓄積した時点で、本手順書と同一の固定条件（および 1. の絞り込み条件）で再評価する。
+3. （参考）方向性 state / bias 方向が学習・検証で反転した非定常性は XAUUSD 固有の可能性があり、必要なら USDJPY / SPX でも同様の反転が起きるかは別途（本 Issue スコープ外）。
 
 ## スコープ外（本 Issue では実施しない）
 
