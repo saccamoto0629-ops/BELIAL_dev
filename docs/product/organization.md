@@ -96,6 +96,6 @@ Pepperoni 自身は炎のエフェクトを出さないが、このペンだけ�
 
 ## 実装上の注意
 
-Pepperoni は将来的な **Execution** レイヤー(発注・約定・ポジション管理)を象徴するキャラクターである。Execution は Paper Execution(仮想約定・仮想ポジション管理、未実装)と Live Execution(Broker API による実注文、未実装)に分かれるが、Pepperoni がどちらを担うかは現時点では確定しない。現行スコープ(v1.4.0 時点)では、いずれの Execution も実装しない。
+Pepperoni は将来的な **Execution** レイヤー(発注・約定・ポジション管理)を象徴するキャラクターである。Execution は Paper Execution(仮想約定・仮想ポジション管理、未実装)と Live Execution(Broker API による実注文、未実装)に分かれるが、Pepperoni がどちらを担うかは現時点では確定しない。現行スコープ(v1.4系時点)では、いずれの Execution も実装しない。
 
 なお、過去データで仮説を遡及検証する Backtest は独立した検証基盤であり、Execution レイヤーそのものではない。

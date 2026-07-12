@@ -14,7 +14,7 @@
 | [Market Bias](market_bias.md) | Bull / Bear / Neutral 判定仕様と制約 |
 | [Paper Signal](paper_signal.md) | paper_only の仮説生成・保存・通知仕様 |
 | [Operations](../operations/operations.md) | 環境変数、dry-run、起動例、本番運用、手動確認コマンド |
-| [Roadmap](../product/roadmap.md) | v1.3.1以降、v1.5以降、systemd timer案、将来検討 |
+| [Roadmap](../product/roadmap.md) | v1.3.1以降、v1.4系(v1.4.1リリース候補)、本番常駐化(systemd)、v1.5以降、将来検討 |
 
 ## Documentation Rules
 

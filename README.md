@@ -2,7 +2,7 @@
 
 BELIAL は、ニュース・マーケットデータ・チャート指標を観測し、市場状態を分類し、`paper_only` の仮説を記録するローカル監視システムです。**自動エントリー、自動Exit、損切り、利確、Broker API 連携、実発注、売買推奨文言の生成は行いません。**
 
-現行の実装状況(v1.3系)と、v1.4で計画している Backtest 群の位置づけは [docs/product/roadmap.md](docs/product/roadmap.md) を参照してください。
+本ドキュメントは **v1.4.1 リリース候補**(タグ未作成)の状態を反映しています。v1.4.1 は、既存の `v1.4` タグ以降に入った修正・整理をまとめたパッチリリースです。v1.3系までの Observation / Classification / Alert / Paper Signal に加えて、過去データで仮説を遡及検証する Backtest(検証基盤)、Market State 局面別エントリー制御、銘柄別 Market Bias、XAUUSD squeeze breakout 戦略、Paper Signal の常駐サービス化と日次集計レポートを提供します。各機能の位置づけと非スコープは [docs/product/roadmap.md](docs/product/roadmap.md) を参照してください。
 
 ## ドキュメント
 
@@ -14,6 +14,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | [docs/architecture/](docs/architecture/README.md) | 全体構成、コンポーネント責務、DB設計、各モジュールの現行仕様 |
 | [docs/operations/](docs/operations/README.md) | 環境変数、起動手順、dry-run方針、systemd運用 |
 | [docs/development/](docs/development/README.md) | Issue / PR 運用ルール |
+| [v1.4.1 リリースノート](docs/development/reports/v1.4.1_release_notes.md) | リリース候補の変更内容、既知の制約、CI確認・タグ作成手順 |
 | [docs/testing/](docs/testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
 
 最初に読むべきドキュメント:
@@ -67,11 +68,16 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 
 `--dry-run` はコンソール出力のみで確認モードとして動作します。詳細は [Operations](docs/operations/operations.md) を参照してください。
 
-## v1.4 Backtest(準備中)
+## v1.4 Backtest / Paper Signal(実装済み / v1.4.1 リリース候補)
 
-v1.4 では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層の追加を計画しています。Issue #17〜#28 が対象範囲です。詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
+v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層(検証基盤)を追加しました。v1.4.1 は、`v1.4` タグ以降に入った以下の機能の修正・整理をまとめたパッチリリースです。Backtest は Paper Signal を過去データで遡及検証する **独立した Validation レイヤー**であり、発注・約定を行う Execution 層ではありません(Execution は現行スコープ外)。
 
-Backtest Engine を手元やEC2から実行するための Runner / CLI (`python -m backtest`) を追加済みです。実行方法・引数・終了コードは [docs/backtest.md](docs/backtest.md) を参照してください。
+- **Backtest Engine / Runner / CLI**(`python -m backtest`): 手元やEC2から実行可能。実行方法・引数・終了コードは [docs/backtest.md](docs/backtest.md) を参照。
+- **Market State 局面別エントリー制御**(`--allowed-market-states`)と**銘柄別 Market Bias**、時系列 Bias 参照・再エントリー抑制・cooldown。
+- **XAUUSD squeeze breakout 戦略**(`--strategy-profile xauusd_1h_squeeze_breakout_v1`)を paper-only Backtest に追加。
+- **Paper Signal の常駐サービス化**(`paper_signal_bot.py`)と**日次集計レポート**(`paper_signal_daily_report.py`, 読み取り専用)。
+
+詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
 
 ## 非スコープ(全レイヤー共通)
 
