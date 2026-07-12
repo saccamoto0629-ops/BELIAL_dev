@@ -179,6 +179,22 @@ python paper_signal_bot.py
 
 1周期の処理(`run_once`)と常駐ループ(`run_service`)は分離されており、`--once` は sleep せず1周期だけ実行する。`--dry-run` は SQLite保存・Discord送信・state更新・logfile作成など永続的副作用を一切行わず(console-only logger)、使用予定の入力・target candle timestamp・生成結果・no-signal・skip理由・重複判定のみをログ出力する。
 
+### Paper Signal 日次集計レポート(Issue #47)
+
+`paper_signal_daily_report.py` は保存済み Paper Signal を指定日1日分だけ集計し、symbol / timeframe / direction / market state / strategy 別件数と confidence 統計を出力する。**読み取り専用**で signal DB・Discord・broker/Execution API に副作用を出さない(`--output` 指定時のファイル書き込みのみ)。日付境界は設定タイムゾーン(`$PAPER_SIGNAL_REPORT_TIMEZONE` → `.env` → 既定 `Asia/Tokyo`)の現地0時〜翌0時を UTC 半開区間で判定する。
+
+```bash
+cd /opt/berial/paper-signal
+
+# 設定タイムゾーン基準の前日分を Markdown で保存(日次 cron/timer 想定)
+report_tz="${PAPER_SIGNAL_REPORT_TIMEZONE:-Asia/Tokyo}"
+report_date="$(TZ="$report_tz" date -d 'yesterday' +%F)"
+python paper_signal_daily_report.py --date "$report_date" --timezone "$report_tz" \
+    --format markdown --output "reports/paper_signal_${report_date}.md"
+```
+
+日次定期実行は、既存の `berial-chart-snapshot.timer` と同様に systemd の `OnCalendar=` timer(例: 毎日 JST 00:10 = `OnCalendar=*-*-* 15:10:00 UTC` を前日 `--date` 付きで起動)へ組み込める。レポート生成は読み取り専用なので、常駐サービスとは独立に任意タイミングで再実行してよい(冪等)。
+
 ## Paper Signal systemd(常駐サービス, Issue #41)
 
 `paper_signal_bot.py` を `macd_alert_bot.py` などと同様に systemd で常駐させる。SIGTERM / SIGINT を受けると現在の周期を終えて安全に停止し、`TimeoutStopSec` 内に終了しなければ systemd が SIGKILL する。多重起動・restart・競合が起きても、同一 `strategy_profile` / `symbol` / `timeframe` / target candle timestamp の Paper Signal は SQLite の UNIQUE 制約で重複保存・重複通知されない(`ps -aux | grep .py` での二重起動確認は従来どおり推奨)。

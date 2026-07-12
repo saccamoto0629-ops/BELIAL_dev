@@ -247,14 +247,26 @@ def test_new_and_migrated_db_have_identical_column_order(tmp_path):
     # status, then the four Issue #27 classification columns, then the Issue #41
     # target_candle_utc column, are the trailing columns in the documented final
     # order -- identical whether the DB was freshly created or ALTER-migrated.
-    assert new_order[-6:] == [
+    assert new_order[-7:] == [
         "status",
         "signal_type",
         "trigger_type",
         "alert_source",
         "strategy_profile",
         "target_candle_utc",
+        "market_state",
     ]
+
+
+def test_market_state_migration_keeps_legacy_rows_unknown(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    _create_legacy_db(db_path)
+
+    store.init_db(db_path)
+
+    assert "market_state" in _column_names(db_path)
+    rows = store.list_signals(db_path=db_path)
+    assert rows[0]["market_state"] is None
 
 
 # --- Issue #27 review Minor 1: NULL/empty backfill on a partial schema --------

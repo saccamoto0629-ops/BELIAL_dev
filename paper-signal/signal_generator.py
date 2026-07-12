@@ -472,6 +472,9 @@ def build_confirmed_candidate(
     if not candidates:
         return None, RESULT_NO_SIGNAL
     candidate = candidates[0]
+    # Descriptive provenance for Issue #47 reporting. It is attached only at
+    # the resident-service persistence boundary and never changes eligibility.
+    candidate["market_state"] = _snapshot_get(chart_snapshot, "market_state")
     candidate["target_candle_utc"] = target_candle
     return candidate, RESULT_SIGNAL
 

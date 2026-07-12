@@ -53,6 +53,7 @@ class PaperSignal(TypedDict):
     macd_state: str
     trend: str
     state: str
+    market_state: NotRequired[str | None]
     freshness: str
     reason: str
     signal_type: str
@@ -113,6 +114,7 @@ class SignalCandidate(TypedDict):
     macd_state: str
     trend: str
     state: str
+    market_state: NotRequired[str | None]
     freshness: str
     reason: str
     signal_type: str
@@ -181,6 +183,7 @@ def create_paper_signal(
         "macd_state": candidate["macd_state"],
         "trend": candidate["trend"],
         "state": candidate["state"],
+        "market_state": candidate.get("market_state"),
         "freshness": candidate["freshness"],
         "reason": candidate["reason"],
         "signal_type": candidate.get("signal_type", SIGNAL_TYPE_TREND_FOLLOW),

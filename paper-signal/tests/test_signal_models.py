@@ -38,6 +38,7 @@ def test_create_paper_signal_has_all_required_fields():
         "macd_state",
         "trend",
         "state",
+        "market_state",
         "freshness",
         "reason",
         "signal_type",

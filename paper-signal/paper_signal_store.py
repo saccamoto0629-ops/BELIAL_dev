@@ -69,6 +69,7 @@ def _migrate_add_classification_columns(connection: sqlite3.Connection) -> None:
 # this column keep ``target_candle_utc = NULL``; SQLite treats NULLs as distinct in
 # a UNIQUE index, so existing data is never rejected by the new constraint.
 TARGET_CANDLE_COLUMN = "target_candle_utc"
+MARKET_STATE_COLUMN = "market_state"
 
 
 def _migrate_add_target_candle_column(connection: sqlite3.Connection) -> None:
@@ -82,6 +83,13 @@ def _migrate_add_target_candle_column(connection: sqlite3.Connection) -> None:
     existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(paper_signals)")}
     if TARGET_CANDLE_COLUMN not in existing_columns:
         connection.execute(f"ALTER TABLE paper_signals ADD COLUMN {TARGET_CANDLE_COLUMN} TEXT")
+
+
+def _migrate_add_market_state_column(connection: sqlite3.Connection) -> None:
+    """Add nullable market_state without inventing values for legacy rows."""
+    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(paper_signals)")}
+    if MARKET_STATE_COLUMN not in existing_columns:
+        connection.execute(f"ALTER TABLE paper_signals ADD COLUMN {MARKET_STATE_COLUMN} TEXT")
 
 
 def _backfill_classification_defaults(connection: sqlite3.Connection) -> None:
@@ -125,7 +133,8 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
                 reason TEXT NOT NULL,
                 status TEXT NOT NULL,
                 {_classification_columns_ddl()},
-                {TARGET_CANDLE_COLUMN} TEXT
+                {TARGET_CANDLE_COLUMN} TEXT,
+                {MARKET_STATE_COLUMN} TEXT
             )
             """
         )
@@ -135,6 +144,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         # added last so fresh and ALTER-migrated DBs share one column order.
         _migrate_add_classification_columns(connection)
         _migrate_add_target_candle_column(connection)
+        _migrate_add_market_state_column(connection)
         _backfill_classification_defaults(connection)
         connection.execute(
             """
@@ -162,8 +172,9 @@ def save_signal(signal: dict, *, db_path: Path = DEFAULT_DB_PATH) -> None:
             INSERT OR REPLACE INTO paper_signals
             (signal_id, created_at_utc, symbol, timeframe, side, market_bias,
              confidence, macd_state, trend, state, freshness, reason,
-             signal_type, trigger_type, alert_source, strategy_profile, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             signal_type, trigger_type, alert_source, strategy_profile, status,
+             market_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal["signal_id"],
@@ -185,6 +196,7 @@ def save_signal(signal: dict, *, db_path: Path = DEFAULT_DB_PATH) -> None:
                 signal.get("alert_source", signal_models.ALERT_SOURCE_COMPOSITE),
                 signal.get("strategy_profile", signal_models.STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1),
                 signal["status"],
+                signal.get("market_state"),
             ),
         )
 
@@ -226,8 +238,8 @@ def save_signal_for_candle(
                 (signal_id, created_at_utc, symbol, timeframe, side, market_bias,
                  confidence, macd_state, trend, state, freshness, reason,
                  signal_type, trigger_type, alert_source, strategy_profile, status,
-                 {TARGET_CANDLE_COLUMN})
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 {TARGET_CANDLE_COLUMN}, {MARKET_STATE_COLUMN})
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -249,6 +261,7 @@ def save_signal_for_candle(
                     signal.get("strategy_profile", signal_models.STRATEGY_PROFILE_MARKET_BIAS_MACD_ALIGNMENT_V1),
                     signal["status"],
                     target_candle_utc,
+                    signal.get("market_state"),
                 ),
             )
         except sqlite3.IntegrityError:
@@ -314,6 +327,46 @@ def has_recent_signal(
             (symbol, timeframe, side, cutoff),
         ).fetchone()
     return row is not None
+
+
+def list_signals_in_range(
+    start_utc: str,
+    end_utc: str,
+    *,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> list[dict]:
+    """Return every Paper Signal whose ``created_at_utc`` is in ``[start_utc, end_utc)``.
+
+    Issue #47: the read side of the daily aggregation report. ``start_utc`` /
+    ``end_utc`` are ISO-8601 ``...Z`` UTC strings (the exact form every row's
+    ``created_at_utc`` is stored in, see :func:`signal_models.utc_now_iso`), so a
+    half-open ``>= start AND < end`` string comparison selects one whole report
+    day without ever double-counting a boundary candle. The caller computes those
+    bounds from the report date in the configured timezone.
+
+    Deliberately side-effect-free, mirroring :func:`signal_exists_for_candle`:
+    it never calls :func:`init_db`, so generating a report neither creates the DB
+    file nor runs a schema migration/backfill write. A missing DB or table -- or
+    any other read-time ``OperationalError`` -- yields an empty list, so a report
+    for a day before any signal was ever stored succeeds with zero rows instead of
+    raising. Rows come back newest-first (matching :func:`list_signals`).
+    """
+    if not db_path.exists():
+        return []
+    try:
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM paper_signals
+                WHERE created_at_utc >= ? AND created_at_utc < ?
+                ORDER BY created_at_utc DESC
+                """,
+                (start_utc, end_utc),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(row) for row in rows]
 
 
 def list_signals(*, db_path: Path = DEFAULT_DB_PATH, limit: int = 100) -> list[dict]:

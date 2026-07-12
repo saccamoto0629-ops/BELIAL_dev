@@ -37,7 +37,7 @@ Paper Execution も Live Execution も Paper Signal の外側の別レイヤー�
 | 入力 | 由来 | 説明 |
 |---|---|---|
 | `market_bias` / `confidence` | `news-feed-bot/market_bias.classify_market_bias()` | `Bull` / `Bear` / `Neutral` と 0.0〜1.0 の confidence |
-| Chart Snapshot(1h) | `fetch_snapshot_sources()["chart"]`(内部で `market-watch/chart_snapshot.py` を呼ぶ) | symbol / timeframe / trend / state / freshness / bias_weight / macd_state / rsi14 / rsi_state |
+| Chart Snapshot(1h) | `fetch_snapshot_sources()["chart"]`(内部で `market-watch/chart_snapshot.py` を呼ぶ) | symbol / timeframe / trend / state / market_state / freshness / bias_weight / macd_state / rsi14 / rsi_state |
 
 Paper Signal v1.4.0では、`rsi14` / `rsi_state` は記録・観測用の補助フィールドであり、候補生成ルールには使わない。
 

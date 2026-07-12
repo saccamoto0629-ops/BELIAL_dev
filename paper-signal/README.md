@@ -35,6 +35,28 @@ python paper_signal_bot.py
 
 `--once` を付けない場合は `PAPER_SIGNAL_CHECK_INTERVAL_SECONDS`(既定900秒)ごとにループします。1周期(`run_once`)と常駐ループ(`run_service`)は分離され、SIGTERM / SIGINT で安全に停止します。systemd 配備は [docs/operations/operations.md](../docs/operations/operations.md) と `scripts/systemd/berial-paper-signal.service` を参照。
 
+## 2.1 Daily report(日次集計, Issue #47)
+
+`paper_signal_daily_report.py` は、保存済み Paper Signal を **指定日の1日分**だけ集計し、symbol / timeframe / direction(long/short)/ market state / strategy 別の件数と confidence の平均・最小・最大を text または Markdown で出力します。**読み取り専用で永続副作用なし**: signal DB を書き換えず(存在しなければ作成もせず)、Discord 送信も broker/Execution API 呼び出しも一切しません(唯一の書き込みは `--output` 指定時のファイルのみ)。仮想約定・PnL・勝率などの Execution 系指標はスコープ外です。
+
+```powershell
+cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\paper-signal
+
+# 今日(設定タイムゾーン基準)のレポートを標準出力へ
+python paper_signal_daily_report.py
+
+# 特定日を Markdown でファイル出力
+python paper_signal_daily_report.py --date 2026-07-13 --format markdown --output reports/paper_signal_2026-07-13.md
+
+# 日付境界を別タイムゾーンで判定
+python paper_signal_daily_report.py --date 2026-07-13 --timezone UTC
+```
+
+- `--date`(既定: 設定タイムゾーンの今日, `YYYY-MM-DD`)/ `--timezone`(既定: `$PAPER_SIGNAL_REPORT_TIMEZONE` → `.env` → `Asia/Tokyo`)/ `--format text|markdown` / `--output` / `--db-path`。
+- 日付境界は**設定タイムゾーンの現地0時〜翌0時**を UTC に変換した半開区間 `[start, end)` で一貫して扱うため、`2026-07-13T15:00:00Z` の Signal は JST では翌日、UTC ではその日、と取り違えなく集計されます。
+- market state / strategy が NULL・空文字・`unknown` のものは欠落させず明示的に `unknown` バケットへ集計するので、各軸の合計は常に `Total Signals` と一致します。0件の日も例外終了せずレポートを生成します。
+- 日次定期実行への組み込みは [docs/operations/operations.md](../docs/operations/operations.md) を参照。
+
 ## 3. Signal generation rules
 
 1. Market Bias が `Bull` または `Bear` のときだけ候補にする(`Neutral` では生成しない)
@@ -51,7 +73,7 @@ python paper_signal_bot.py
 
 `paper-signal/data/paper_signals.sqlite3` にSQLiteで保存します(`paper_signal_store.py`)。レコードは以下を含みます。
 
-`signal_id` / `created_at_utc` / `symbol` / `timeframe` / `side` / `market_bias` / `confidence` / `macd_state` / `trend` / `state` / `freshness` / `reason` / `signal_type` / `trigger_type` / `alert_source` / `strategy_profile` / `status`(常に `paper_only`)/ `target_candle_utc`(Issue #41: 対象確定足のopen timestamp, UTC `...Z`)
+`signal_id` / `created_at_utc` / `symbol` / `timeframe` / `side` / `market_bias` / `confidence` / `macd_state` / `trend` / `state`(Bollinger状態) / `market_state`(Issue #47、旧行はNULL=`unknown`) / `freshness` / `reason` / `signal_type` / `trigger_type` / `alert_source` / `strategy_profile` / `status`(常に `paper_only`)/ `target_candle_utc`(Issue #41: 対象確定足のopen timestamp, UTC `...Z`)
 
 保存順は「候補生成 → SQLite保存 → 保存成功後にDiscord通知」で、通知失敗時も保存済みSignalは残します(`save_signal_for_candle()` は新規挿入時のみ通知)。既存DBには `init_db()` の冪等マイグレーションで `target_candle_utc` 列とUNIQUEインデックスを追加します(旧データは非破壊)。
 

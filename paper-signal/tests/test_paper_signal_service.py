@@ -80,6 +80,15 @@ def test_matching_bias_and_snapshot_generate_signal():
     assert candidate["target_candle_utc"] == CANDLE_TS
 
 
+def test_confirmed_candidate_carries_market_state_for_daily_reporting():
+    snapshot = make_chart_snapshot(market_state="squeeze")
+    candidate, result = sg.build_confirmed_candidate(
+        snapshot, make_bias(), make_provenance(snapshot), evaluation_time=EVAL_TIME
+    )
+    assert result == sg.RESULT_SIGNAL
+    assert candidate["market_state"] == "squeeze"
+
+
 # --- Input integrity: missing / mismatched inputs are normal skips -----------
 
 
