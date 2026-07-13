@@ -54,6 +54,7 @@ class ExecutionProfile:
     same_candle_priority: str = DEFAULT_SAME_CANDLE_PRIORITY
     fallback_stop_pct: float = 0.003
     risk_reward: float = 2.0
+    size: float = 1.0
     spread: float = 0.0
     slippage: float = 0.0
     commission: float = 0.0
@@ -67,6 +68,8 @@ class ExecutionProfile:
         for field_name in ("max_entry_delay_bars", "max_hold_bars"):
             if getattr(self, field_name) <= 0:
                 raise ValueError(f"{field_name} must be > 0, got {getattr(self, field_name)!r}")
+        if self.size <= 0:
+            raise ValueError(f"size must be > 0, got {self.size!r}")
         for field_name in ("fallback_stop_pct", "risk_reward"):
             if getattr(self, field_name) <= 0:
                 raise ValueError(f"{field_name} must be > 0, got {getattr(self, field_name)!r}")

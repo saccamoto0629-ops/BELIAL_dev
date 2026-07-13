@@ -14,7 +14,9 @@ sys.path.insert(0, str(BASE_DIR.parent / "market-watch"))
 
 import execution_runner as runner  # noqa: E402
 import execution_profile as profiles  # noqa: E402
+import position_models as models  # noqa: E402
 import position_store as store  # noqa: E402
+import chart_collector  # noqa: E402
 
 PROFILE = profiles.ExecutionProfile(max_entry_delay_bars=3, max_hold_bars=24, fallback_stop_pct=0.01, risk_reward=2.0)
 
@@ -68,7 +70,11 @@ def test_pending_open_close_in_one_cycle(tmp_path):
     pos = store.list_positions(db_path=db)[0]
     assert pos["state"] == "closed"
     assert pos["terminal_reason"] == "take_profit"
-    assert pos["pnl"] == pytest.approx(2.0)
+    assert pos["gross_pnl"] == pytest.approx(2.0)
+    assert pos["net_pnl"] == pytest.approx(2.0)
+    assert pos["pnl"] == pytest.approx(2.0)          # net alias
+    assert pos["r_multiple"] == pytest.approx(2.0)
+    assert pos["size"] == 1.0
     assert pos["entry_time_utc"] == "2026-07-06T13:00:00Z"   # next candle, not signal candle
 
 
@@ -223,3 +229,113 @@ def test_dry_run_creates_no_db_or_logs(tmp_path):
     assert res.pending_created == 1          # decision computed
     assert not db.exists()                   # but nothing persisted
     assert not (tmp_path / "logs").exists()  # console-only logging
+
+
+# --- Blocker: Chart DB read failure is NOT treated as "no candles" -----------
+
+def _seed_pending(db, signal_id="sig-1"):
+    profile = PROFILE
+    pos = models.create_pending_position(
+        signal_id=signal_id, symbol="USDJPY", timeframe="1h", side="long", strategy_profile="p",
+        profile=profile, signal_candle_utc="2026-07-06T12:00:00Z",
+        entry_deadline_utc="2026-07-06T13:00:00Z",  # already past at NOW -> would-expire if empty
+    )
+    store.create_position(pos, db_path=db)
+    return store.get_position(pos["position_id"], db_path=db)
+
+
+def _broken_chart_db(tmp_path):
+    """A real SQLite file that exists but has no `candles` table."""
+    path = tmp_path / "broken_chart.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    return path
+
+
+def test_missing_candles_table_does_not_expire_pending(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    seeded = _seed_pending(db)
+    before_updated = seeded["updated_at_utc"]
+
+    res = runner.run_once(
+        db_path=db, signals=[], load_candles=None, now_utc=pd.Timestamp("2026-07-06T20:00:00Z"),
+        profile=PROFILE, chart_db_path=_broken_chart_db(tmp_path), signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures >= 1                 # read failure counted, not success
+    pos = store.get_position(seeded["position_id"], db_path=db)
+    assert pos["state"] == "pending"         # NOT expired by an infra failure
+    assert pos["terminal_reason"] is None
+    assert pos["last_evaluated_candle_utc"] is None
+    assert pos["updated_at_utc"] == before_updated   # untouched
+
+
+def test_missing_chart_db_file_counts_as_failure(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)
+    res = runner.run_once(
+        db_path=db, signals=[], load_candles=None, now_utc=pd.Timestamp("2026-07-06T20:00:00Z"),
+        profile=PROFILE, chart_db_path=tmp_path / "does_not_exist.sqlite3", signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures >= 1
+
+
+def test_chart_read_failure_does_not_advance_open_watermark(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _seed_pending(db)
+    # move it to open with a known watermark
+    store.transition_to_open(
+        pos["position_id"], entry_price=100.0, entry_time_utc="2026-07-06T13:00:00Z",
+        stop_loss_price=99.0, take_profit_price=102.0, max_hold_deadline_utc="2026-07-07T13:00:00Z", db_path=db,
+    )
+    store.advance_watermark(pos["position_id"], expected_watermark=None, new_watermark="2026-07-06T14:00:00Z", db_path=db)
+    before = store.get_position(pos["position_id"], db_path=db)
+
+    res = runner.run_once(
+        db_path=db, signals=[], load_candles=None, now_utc=pd.Timestamp("2026-07-06T20:00:00Z"),
+        profile=PROFILE, chart_db_path=_broken_chart_db(tmp_path), signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures >= 1
+    after = store.get_position(pos["position_id"], db_path=db)
+    assert after["state"] == "open"
+    assert after["last_evaluated_candle_utc"] == before["last_evaluated_candle_utc"]
+    assert after["updated_at_utc"] == before["updated_at_utc"]
+
+
+def test_dry_run_chart_read_failure_not_success(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)
+    res = runner.run_once(
+        dry_run=True, db_path=db, signals=[], load_candles=None,
+        now_utc=pd.Timestamp("2026-07-06T20:00:00Z"), profile=PROFILE,
+        chart_db_path=_broken_chart_db(tmp_path), signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures >= 1   # a read error is never a dry-run "success"
+
+
+# --- strict chart read helper (real SQLite) ----------------------------------
+
+def test_strict_read_empty_on_valid_zero_rows(tmp_path):
+    chart = tmp_path / "chart.sqlite3"
+    with sqlite3.connect(chart) as conn:
+        conn.execute(
+            "CREATE TABLE candles (symbol TEXT, timeframe TEXT, timestamp TEXT, "
+            "open REAL, high REAL, low REAL, close REAL, volume REAL)"
+        )
+    df = chart_collector.load_candles_range_strict(chart, "USDJPY", "1h")
+    assert df.empty                         # valid table, no rows -> empty (success)
+
+
+def test_strict_read_raises_on_missing_file(tmp_path):
+    with pytest.raises(chart_collector.ChartReadError):
+        chart_collector.load_candles_range_strict(tmp_path / "nope.sqlite3", "USDJPY", "1h")
+
+
+def test_strict_read_raises_on_missing_table(tmp_path):
+    with pytest.raises(chart_collector.ChartReadError):
+        chart_collector.load_candles_range_strict(_broken_chart_db(tmp_path), "USDJPY", "1h")
+
+
+def test_lenient_load_candles_range_still_empty_on_error(tmp_path):
+    # the existing lenient contract is preserved for other callers (Backtest).
+    assert chart_collector.load_candles_range(tmp_path / "nope.sqlite3", "USDJPY", "1h").empty
+    assert chart_collector.load_candles_range(_broken_chart_db(tmp_path), "USDJPY", "1h").empty

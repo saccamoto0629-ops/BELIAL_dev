@@ -256,7 +256,7 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 本設計は `paper-execution/` に実装済み(Issue #50: データモデル・保存層、Issue #51: Open / Close 判定エンジン)。本設計との対応:
 
 - `position_models.py` — 状態(`pending` / `open` / `closed` / `expired` / `cancelled`)と `state × terminal_reason` の閉集合をアプリ層で検証。
-- `position_store.py` — 独立SQLite。`state` 集合・`state × terminal_reason` 閉集合・`same_candle_priority` 語彙・`signal_id` UNIQUE をDBの CHECK / UNIQUE 制約で担保。終端遷移は全て CAS(`WHERE state=...`)で、終端からの再遷移を拒否。close と watermark 前進は同一 UPDATE(watermark CAS で競合防止)。
-- `execution_profile.py` — 執行規則プロファイル(`(symbol, timeframe)` で解決、`strategy_profile` は解決キーにしない)。適用値は position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
-- `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。
-- `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用。
+- `position_store.py` — 独立SQLite。`state` 集合・`state × terminal_reason` 閉集合・`same_candle_priority` 語彙・`signal_id` UNIQUE をDBの CHECK / UNIQUE 制約で担保。終端遷移は全て CAS(`WHERE state=...`)で、終端からの再遷移を拒否。close と watermark 前進は同一 UPDATE(watermark CAS で競合防止)。legacy schema からの移行は `PRAGMA user_version` + **table rebuild**(CREATE→検証コピー→DROP→RENAME、1トランザクション・失敗時 rollback)で CHECK/UNIQUE/NOT NULL を実際に付与し、安全に変換できない legacy row は明示的に migration 失敗させる。
+- `execution_profile.py` — 執行規則プロファイル(`(symbol, timeframe)` で解決、`strategy_profile` は解決キーにしない)。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
+- `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。損益は `gross_pnl`(コスト前, raw価格)、`net_pnl`(entry/exit コスト各1回 + commission を控除)、`r_multiple`(net / (初期リスク×size)、初期リスク≤0 は None)を算出。`pnl` は `net_pnl` の後方互換エイリアス。
+- `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。Chart DB は **strict read**(`load_candles_range_strict`)で読み、DB破損・candles table欠損・OperationalError を空データ扱いせず cycle failure として計上し、該当 position は無変更のままにする(期限切れへ誤遷移しない)。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用(読取エラーも成功扱いしない)。

@@ -31,6 +31,7 @@ swallow a ``sqlite3.OperationalError`` on an existing file into an empty result
 
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import sys
@@ -68,7 +69,11 @@ _ALL_COLUMNS: tuple[str, ...] = (
     "max_hold_deadline_utc",
     "close_price",
     "close_time_utc",
+    "gross_pnl",
+    "net_pnl",
     "pnl",
+    "r_multiple",
+    "size",
     "max_entry_delay_bars",
     "max_hold_bars",
     "same_candle_priority",
@@ -82,16 +87,30 @@ _ALL_COLUMNS: tuple[str, ...] = (
     "updated_at_utc",
 )
 
-# Columns added idempotently to an older/partial table (Issue #50 backward compat).
-_MIGRATED_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("max_hold_deadline_utc", "TEXT"),
-    ("close_price", "REAL"),
-    ("close_time_utc", "TEXT"),
-    ("pnl", "REAL"),
-    ("last_evaluated_candle_utc", "TEXT"),
-)
+# Bumped whenever the physical schema/constraints change. Stored in the DB via
+# ``PRAGMA user_version`` and used as the fast-path "already current" marker; the
+# migration itself still inspects the real schema (PRAGMA table_info) rather than
+# trusting CREATE TABLE IF NOT EXISTS.
+CURRENT_SCHEMA_VERSION = 1
 
 REQUIRED_COLUMNS: frozenset[str] = frozenset(_ALL_COLUMNS)
+
+# Documented backfill defaults for columns a legacy row may lack (Issue #50/#51
+# migration). MISSING columns get these safe defaults; INVALID existing values
+# (bad state/side/reason, non-finite numbers, NULL identity) are never silently
+# rounded -- they fail the migration explicitly (see _migrate_legacy_row).
+_MIGRATION_DEFAULTS: dict[str, object] = {
+    "execution_profile": "default",
+    "size": 1.0,
+    "max_entry_delay_bars": 3,
+    "max_hold_bars": 24,
+    "same_candle_priority": "stop_loss",
+    "fallback_stop_pct": 0.003,
+    "risk_reward": 2.0,
+    "spread": 0.0,
+    "slippage": 0.0,
+    "commission": 0.0,
+}
 
 
 class PositionStoreError(RuntimeError):
@@ -100,6 +119,17 @@ class PositionStoreError(RuntimeError):
 
 class PositionSchemaError(PositionStoreError):
     """A pre-existing table is missing required columns."""
+
+
+class PositionMigrationError(PositionStoreError):
+    """A legacy schema could not be safely migrated to the current constrained one.
+
+    Raised (with a full rollback) when a legacy row cannot be converted without
+    guessing at invalid data -- an unknown ``state``/``side``, an invalid
+    ``state`` x ``terminal_reason`` combination, a non-finite number, a NULL in a
+    required identity column, or a duplicate ``signal_id``. The migration fails
+    loudly rather than silently rounding bad data to a "valid" value.
+    """
 
 
 class PositionNotFoundError(PositionStoreError):
@@ -157,73 +187,231 @@ def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
 
 
-def _ensure_column(connection: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
-    if column not in _table_columns(connection, table):
-        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+    ).fetchone()
+    return row is not None
 
 
-def _validate_schema(connection: sqlite3.Connection) -> None:
-    missing = REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE)
-    if missing:
-        raise PositionSchemaError(
-            f"{POSITIONS_TABLE} exists but is missing required columns: {sorted(missing)}. "
-            "Incompatible/incomplete pre-existing schema; migrate or recreate the database."
+def _create_table_sql(table_name: str) -> str:
+    """The full current schema (constraints included) for ``table_name``."""
+    return f"""
+        CREATE TABLE {table_name} (
+            position_id TEXT PRIMARY KEY,
+            signal_id TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            side TEXT NOT NULL,
+            strategy_profile TEXT NOT NULL,
+            execution_profile TEXT NOT NULL,
+            state TEXT NOT NULL CHECK ({_state_check_sql()}),
+            terminal_reason TEXT CHECK ({_terminal_reason_check_sql()}),
+            signal_candle_utc TEXT NOT NULL,
+            entry_deadline_utc TEXT NOT NULL,
+            entry_price REAL,
+            entry_time_utc TEXT,
+            stop_loss_price REAL,
+            take_profit_price REAL,
+            max_hold_deadline_utc TEXT,
+            close_price REAL,
+            close_time_utc TEXT,
+            gross_pnl REAL,
+            net_pnl REAL,
+            pnl REAL,
+            r_multiple REAL,
+            size REAL NOT NULL,
+            max_entry_delay_bars INTEGER NOT NULL,
+            max_hold_bars INTEGER NOT NULL,
+            same_candle_priority TEXT NOT NULL CHECK (same_candle_priority IN ('stop_loss', 'take_profit')),
+            fallback_stop_pct REAL NOT NULL,
+            risk_reward REAL NOT NULL,
+            spread REAL NOT NULL,
+            slippage REAL NOT NULL,
+            commission REAL NOT NULL,
+            last_evaluated_candle_utc TEXT,
+            created_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
         )
+    """
+
+
+def _create_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{POSITIONS_TABLE}_state "
+        f"ON {POSITIONS_TABLE} (state, symbol, timeframe)"
+    )
+
+
+def _schema_is_current(connection: sqlite3.Connection) -> bool:
+    """True only when the DB reports the current version AND has every column.
+
+    Deliberately checks the real schema (``PRAGMA user_version`` + ``PRAGMA
+    table_info``), never "the table exists" -- a constraint-less legacy table
+    reports ``user_version = 0`` and is rebuilt.
+    """
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version < CURRENT_SCHEMA_VERSION:
+        return False
+    return not (REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE))
 
 
 def init_db(db_path: Path | None = None) -> None:
-    """Create/upgrade the ``virtual_positions`` table (idempotent).
+    """Create, or migrate to, the current constrained ``virtual_positions`` schema.
 
-    Enforces, at the DB level: the known ``state`` set, the ``state`` x
-    ``terminal_reason`` closed set, the ``same_candle_priority`` vocabulary, and
-    ``signal_id`` uniqueness. Safe to call repeatedly.
+    - No table -> create it with all CHECK / UNIQUE / NOT NULL constraints and
+      stamp ``PRAGMA user_version``.
+    - Table present but not current (older ``user_version`` or missing columns) ->
+      rebuild it (a real table rebuild that actually ADDS the constraints; see
+      :func:`_migrate_rebuild`), inside one transaction with full rollback on any
+      failure, and fail loudly on legacy data that cannot be safely converted.
+    - Table already current -> no-op (indexes ensured).
+
+    Idempotent and safe to call repeatedly.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with _connect(db_path) as connection:
-        connection.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {POSITIONS_TABLE} (
-                position_id TEXT PRIMARY KEY,
-                signal_id TEXT NOT NULL UNIQUE,
-                symbol TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                side TEXT NOT NULL,
-                strategy_profile TEXT NOT NULL,
-                execution_profile TEXT NOT NULL,
-                state TEXT NOT NULL CHECK ({_state_check_sql()}),
-                terminal_reason TEXT CHECK ({_terminal_reason_check_sql()}),
-                signal_candle_utc TEXT NOT NULL,
-                entry_deadline_utc TEXT NOT NULL,
-                entry_price REAL,
-                entry_time_utc TEXT,
-                stop_loss_price REAL,
-                take_profit_price REAL,
-                max_hold_deadline_utc TEXT,
-                close_price REAL,
-                close_time_utc TEXT,
-                pnl REAL,
-                max_entry_delay_bars INTEGER NOT NULL,
-                max_hold_bars INTEGER NOT NULL,
-                same_candle_priority TEXT NOT NULL CHECK (same_candle_priority IN ('stop_loss', 'take_profit')),
-                fallback_stop_pct REAL NOT NULL,
-                risk_reward REAL NOT NULL,
-                spread REAL NOT NULL,
-                slippage REAL NOT NULL,
-                commission REAL NOT NULL,
-                last_evaluated_candle_utc TEXT,
-                created_at_utc TEXT NOT NULL,
-                updated_at_utc TEXT NOT NULL
+    # Autocommit mode (isolation_level=None) so DDL participates in the explicit
+    # BEGIN..COMMIT below -- otherwise sqlite3 can implicitly commit around DDL and
+    # break the rebuild's atomicity.
+    connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+    try:
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
+        if not _table_exists(connection, POSITIONS_TABLE):
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(_create_table_sql(POSITIONS_TABLE))
+                _create_indexes(connection)
+                connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return
+        if _schema_is_current(connection):
+            _create_indexes(connection)
+            return
+        _migrate_rebuild(connection)
+    finally:
+        connection.close()
+
+
+_MISSING = object()
+
+
+def _migrate_legacy_row(legacy: dict) -> dict:
+    """Convert one legacy row to the current schema, or fail explicitly.
+
+    MISSING columns are backfilled with documented defaults (see
+    ``_MIGRATION_DEFAULTS``); INVALID existing data is never silently rounded --
+    an unknown state/side, an invalid state x terminal_reason combination, or a
+    non-finite number raises :class:`PositionMigrationError`.
+    """
+    position_id = legacy.get("position_id")
+    signal_id = legacy.get("signal_id")
+    if not position_id or not signal_id:
+        raise PositionMigrationError("legacy row missing position_id/signal_id (cannot migrate)")
+
+    state = legacy.get("state")
+    if state not in models.KNOWN_STATES:
+        raise PositionMigrationError(f"legacy row {position_id!r} has unknown state {state!r}")
+    terminal_reason = legacy.get("terminal_reason")
+    try:
+        models.validate_state_reason(state, terminal_reason)
+    except ValueError as exc:
+        raise PositionMigrationError(f"legacy row {position_id!r}: {exc}") from exc
+
+    side = legacy.get("side")
+    if side not in models.KNOWN_SIDES and not (
+        state == models.STATE_CANCELLED and (side is None or side == "")
+    ):
+        raise PositionMigrationError(f"legacy row {position_id!r} has invalid side {side!r}")
+
+    def value(col):
+        if col in legacy and legacy[col] is not None:
+            return legacy[col]
+        return _MIGRATION_DEFAULTS.get(col)
+
+    record = {col: value(col) for col in _ALL_COLUMNS}
+    record["position_id"] = position_id
+    record["signal_id"] = signal_id
+    record["state"] = state
+    record["terminal_reason"] = terminal_reason
+    record["side"] = side if side is not None else ""
+    for text_col in ("symbol", "timeframe", "strategy_profile", "signal_candle_utc", "entry_deadline_utc"):
+        if record[text_col] is None:
+            record[text_col] = ""
+    now = models.utc_now_iso()
+    record["created_at_utc"] = record["created_at_utc"] or now
+    record["updated_at_utc"] = record["updated_at_utc"] or now
+    # Preserve the pnl == net_pnl invariant across the migration.
+    if record["net_pnl"] is None and record["pnl"] is not None:
+        record["net_pnl"] = record["pnl"]
+    record["pnl"] = record["net_pnl"]
+
+    for numeric_col in (
+        "entry_price", "stop_loss_price", "take_profit_price", "close_price",
+        "gross_pnl", "net_pnl", "pnl", "r_multiple", "size", "max_entry_delay_bars",
+        "max_hold_bars", "fallback_stop_pct", "risk_reward", "spread", "slippage", "commission",
+    ):
+        raw = record.get(numeric_col)
+        if raw is None:
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise PositionMigrationError(f"legacy row {position_id!r} has non-numeric {numeric_col}={raw!r}") from exc
+        if not math.isfinite(number):
+            raise PositionMigrationError(f"legacy row {position_id!r} has non-finite {numeric_col}={raw!r}")
+    return record
+
+
+def _migrate_rebuild(connection: sqlite3.Connection) -> None:
+    """Rebuild ``virtual_positions`` into the fully-constrained current schema.
+
+    A true table rebuild (CREATE new -> validated copy -> DROP old -> RENAME),
+    because ``CREATE TABLE IF NOT EXISTS`` / ``ALTER TABLE ADD COLUMN`` cannot add
+    CHECK / UNIQUE / NOT NULL to an existing table. All in one transaction; any
+    failure rolls the whole thing back, leaving the legacy table untouched.
+    """
+    temp_table = f"{POSITIONS_TABLE}__migrate_new"
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        legacy_columns = [row[1] for row in connection.execute(f"PRAGMA table_info({POSITIONS_TABLE})")]
+        legacy_rows = connection.execute(f"SELECT * FROM {POSITIONS_TABLE}").fetchall()
+        legacy_dicts = [dict(zip(legacy_columns, row)) for row in legacy_rows]
+
+        connection.execute(f"DROP TABLE IF EXISTS {temp_table}")
+        connection.execute(_create_table_sql(temp_table))
+        insert_sql = (
+            f"INSERT INTO {temp_table} ({', '.join(_ALL_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _ALL_COLUMNS)})"
+        )
+        for legacy in legacy_dicts:
+            migrated = _migrate_legacy_row(legacy)
+            try:
+                connection.execute(insert_sql, tuple(migrated.get(col) for col in _ALL_COLUMNS))
+            except sqlite3.IntegrityError as exc:
+                # e.g. duplicate signal_id, a CHECK the app-level validation didn't
+                # pre-catch, or a NULL in a NOT NULL column -- fail, don't guess.
+                raise PositionMigrationError(
+                    f"legacy row {legacy.get('position_id')!r} violates the new schema: {exc}"
+                ) from exc
+
+        migrated_count = connection.execute(f"SELECT COUNT(*) FROM {temp_table}").fetchone()[0]
+        if migrated_count != len(legacy_dicts):
+            raise PositionMigrationError(
+                f"row-count mismatch during migration: legacy={len(legacy_dicts)} migrated={migrated_count}"
             )
-            """
-        )
-        for column_name, column_type in _MIGRATED_COLUMNS:
-            _ensure_column(connection, POSITIONS_TABLE, column_name, column_type)
-        _validate_schema(connection)
-        connection.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{POSITIONS_TABLE}_state "
-            f"ON {POSITIONS_TABLE} (state, symbol, timeframe)"
-        )
+
+        connection.execute(f"DROP TABLE {POSITIONS_TABLE}")
+        connection.execute(f"ALTER TABLE {temp_table} RENAME TO {POSITIONS_TABLE}")
+        _create_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def _row_tuple(record: dict) -> tuple:
@@ -331,7 +519,9 @@ def close_open_position(
     close_price: float,
     close_time_utc: str,
     terminal_reason: str,
-    pnl: float,
+    gross_pnl: float,
+    net_pnl: float,
+    r_multiple: float | None,
     updated_at: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
@@ -351,17 +541,21 @@ def close_open_position(
     db_path = Path(db_path) if db_path is not None else position_db_path()
     init_db(db_path)
     now = updated_at or models.utc_now_iso()
+    # pnl is the back-compat alias of net_pnl (kept identical on purpose).
     with _connect(db_path) as connection:
         cursor = connection.execute(
             f"""
             UPDATE {POSITIONS_TABLE}
             SET state = ?, close_price = ?, close_time_utc = ?, terminal_reason = ?,
-                pnl = ?, last_evaluated_candle_utc = ?, updated_at_utc = ?
+                gross_pnl = ?, net_pnl = ?, pnl = ?, r_multiple = ?,
+                last_evaluated_candle_utc = ?, updated_at_utc = ?
             WHERE position_id = ? AND state = ? AND last_evaluated_candle_utc IS ?
             """,
             (
                 models.STATE_CLOSED, float(close_price), close_time_utc, terminal_reason,
-                float(pnl), new_watermark, now,
+                float(gross_pnl), float(net_pnl), float(net_pnl),
+                None if r_multiple is None else float(r_multiple),
+                new_watermark, now,
                 position_id, models.STATE_OPEN, expected_watermark,
             ),
         )

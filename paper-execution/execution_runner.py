@@ -152,6 +152,7 @@ def _profile_from_record(record: dict) -> "profiles.ExecutionProfile":
         same_candle_priority=record["same_candle_priority"],
         fallback_stop_pct=record["fallback_stop_pct"],
         risk_reward=record["risk_reward"],
+        size=record["size"],
         spread=record["spread"],
         slippage=record["slippage"],
         commission=record["commission"],
@@ -280,8 +281,8 @@ def _process_open(position: dict, candles: pd.DataFrame, *, dry_run: bool, db_pa
         side=position["side"], timeframe=position["timeframe"], entry_price=position["entry_price"],
         stop_loss_price=position["stop_loss_price"], take_profit_price=position["take_profit_price"],
         max_hold_deadline_utc=position["max_hold_deadline_utc"],
-        same_candle_priority=profile.same_candle_priority, spread=profile.spread,
-        slippage=profile.slippage, commission=profile.commission,
+        same_candle_priority=profile.same_candle_priority, size=profile.size,
+        spread=profile.spread, slippage=profile.slippage, commission=profile.commission,
     )
     result = engine.evaluate_close(view, to_eval)
     if result.new_watermark is None:
@@ -289,8 +290,9 @@ def _process_open(position: dict, candles: pd.DataFrame, *, dry_run: bool, db_pa
     if dry_run:
         if result.closed:
             logger.info(
-                "[DRY_RUN] would CLOSE %s reason=%s exit=%.5f pnl=%.5f",
-                position["position_id"], result.terminal_reason, result.close_price, result.pnl,
+                "[DRY_RUN] would CLOSE %s reason=%s exit=%.5f gross=%.5f net=%.5f",
+                position["position_id"], result.terminal_reason, result.close_price,
+                result.gross_pnl, result.net_pnl,
             )
             return "closed"
         return None
@@ -299,7 +301,8 @@ def _process_open(position: dict, candles: pd.DataFrame, *, dry_run: bool, db_pa
             store.close_open_position(
                 position["position_id"], expected_watermark=watermark, new_watermark=result.new_watermark,
                 close_price=result.close_price, close_time_utc=result.close_time_utc,
-                terminal_reason=result.terminal_reason, pnl=result.pnl, db_path=db_path,
+                terminal_reason=result.terminal_reason, gross_pnl=result.gross_pnl,
+                net_pnl=result.net_pnl, r_multiple=result.r_multiple, db_path=db_path,
             )
         except store.PositionConcurrentModificationError as exc:
             logger.info("Skip close for %s: %s", position["position_id"], exc)
@@ -345,16 +348,46 @@ def run_once(
 
     if load_candles is None:
         def load_candles(symbol: str, timeframe: str) -> pd.DataFrame:  # noqa: E306
-            return chart_collector.load_candles_range(chart_db_path, _chart_symbol(symbol), timeframe)
+            # STRICT read: a missing DB / candles table / OperationalError raises
+            # ChartReadError instead of masquerading as "no candles" (Blocker).
+            return chart_collector.load_candles_range_strict(chart_db_path, _chart_symbol(symbol), timeframe)
 
-    candle_cache: dict[tuple[str, str], pd.DataFrame] = {}
+    candle_cache: dict[tuple[str, str], object] = {}
+    chart_failures: set[tuple[str, str]] = set()
 
     def confirmed_candles(symbol: str, timeframe: str) -> pd.DataFrame:
         key = (symbol, timeframe)
-        if key not in candle_cache:
+        if key in candle_cache:
+            cached = candle_cache[key]
+            if isinstance(cached, Exception):
+                raise cached
+            return cached
+        try:
             raw = load_candles(symbol, timeframe)
-            candle_cache[key] = select_confirmed_candles(raw, timeframe=timeframe, evaluation_time=now)
-        return candle_cache[key]
+        except chart_collector.ChartReadError as exc:
+            candle_cache[key] = exc  # cache so we do not re-hit the broken DB per position
+            raise
+        confirmed = select_confirmed_candles(raw, timeframe=timeframe, evaluation_time=now)
+        candle_cache[key] = confirmed
+        return confirmed
+
+    def candles_or_skip(position: dict):
+        """Return (candles, True) or (None, False) if the Chart DB read failed.
+
+        A Chart read failure is counted (once per symbol/timeframe) as a cycle
+        failure and the position is SKIPPED -- its state / terminal_reason /
+        watermark / updated_at are left untouched (never wrongly expired)."""
+        key = (position["symbol"], position["timeframe"])
+        try:
+            return confirmed_candles(*key), True
+        except chart_collector.ChartReadError as exc:
+            if key not in chart_failures:
+                logger.error(
+                    "Paper Execution: Chart DB read failed for %s %s: %s -- affected positions left unchanged.",
+                    key[0], key[1], exc,
+                )
+                chart_failures.add(key)
+            return None, False
 
     result = CycleResult()
 
@@ -379,11 +412,11 @@ def run_once(
 
     # Phase 2: pending -> open / expired. (Dry-run reads never create the DB.)
     for position in _safe_list(store.list_positions_by_state, models.STATE_PENDING, db_path=db_path, result=result):
+        candles, ok = candles_or_skip(position)
+        if not ok:
+            continue
         try:
-            action = _process_pending(
-                position, confirmed_candles(position["symbol"], position["timeframe"]),
-                dry_run=dry_run, db_path=db_path, now_utc=now,
-            )
+            action = _process_pending(position, candles, dry_run=dry_run, db_path=db_path, now_utc=now)
         except Exception as exc:
             logger.error("Paper Execution: pending %s failed: %s", position["position_id"], exc)
             result.failures += 1
@@ -395,17 +428,21 @@ def run_once(
 
     # Phase 3: open -> closed / watermark advance.
     for position in _safe_list(store.list_positions_by_state, models.STATE_OPEN, db_path=db_path, result=result):
+        candles, ok = candles_or_skip(position)
+        if not ok:
+            continue
         try:
-            action = _process_open(
-                position, confirmed_candles(position["symbol"], position["timeframe"]),
-                dry_run=dry_run, db_path=db_path,
-            )
+            action = _process_open(position, candles, dry_run=dry_run, db_path=db_path)
         except Exception as exc:
             logger.error("Paper Execution: open %s failed: %s", position["position_id"], exc)
             result.failures += 1
             continue
         if action == "closed":
             result.closed += 1
+
+    # Chart read failures are cycle failures (one per affected symbol/timeframe),
+    # never silently treated as "no candles".
+    result.failures += len(chart_failures)
 
     logger.info(
         "Cycle done: pending=%d cancelled=%d opened=%d expired=%d closed=%d failures=%d",

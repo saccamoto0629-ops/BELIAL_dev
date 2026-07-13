@@ -94,14 +94,23 @@ class EntryOutcome:
 
 @dataclass(frozen=True)
 class CloseWalkResult:
-    """Result of walking confirmed candles for an open position's close."""
+    """Result of walking confirmed candles for an open position's close.
+
+    ``close_price`` is the effective (cost-adjusted) close fill. ``gross_pnl`` is
+    pre-cost ``(raw_close - raw_entry) * size`` (short: reversed); ``net_pnl``
+    subtracts entry cost, close cost, and commission -- each exactly once.
+    ``r_multiple`` is net_pnl / (initial risk * size), or ``None`` when the
+    initial risk ``|entry - stop|`` is non-positive/non-finite.
+    """
 
     closed: bool
     new_watermark: str | None
     close_price: float | None = None
     close_time_utc: str | None = None
     terminal_reason: str | None = None
-    pnl: float | None = None
+    gross_pnl: float | None = None
+    net_pnl: float | None = None
+    r_multiple: float | None = None
 
 
 def _iso_z(value) -> str:
@@ -220,6 +229,7 @@ class OpenPositionView:
     take_profit_price: float
     max_hold_deadline_utc: str
     same_candle_priority: str
+    size: float
     spread: float
     slippage: float
     commission: float
@@ -233,9 +243,37 @@ def _validate_columns(candles: pd.DataFrame) -> None:
         raise ValueError(f"candles is missing required column(s): {missing}.")
 
 
-def _pnl(side: str, entry_price: float, close_price: float, commission: float) -> float:
-    gross = (close_price - entry_price) if side == LONG else (entry_price - close_price)
-    return gross - commission
+def _compute_pnl(
+    position: "OpenPositionView", raw_close: float, effective_close: float
+) -> tuple[float, float, float | None]:
+    """Return (gross_pnl, net_pnl, r_multiple) with each cost applied exactly once.
+
+    ``position.entry_price`` is the *effective* (cost-adjusted) entry fill; the
+    *raw* entry is recovered from it by removing the one entry-side cost, so the
+    raw prices drive ``gross_pnl`` and the effective prices drive ``net_pnl`` --
+    spread/slippage are never double-counted (they are embedded in the effective
+    fills, not additionally subtracted from ``net_pnl``). ``commission`` is the
+    only cost subtracted explicitly. ``r_multiple`` is net-based per unit of
+    initial risk; ``None`` when that risk is non-positive/non-finite.
+    """
+    side = position.side
+    size = position.size
+    cost = position.spread + position.slippage
+    effective_entry = position.entry_price
+    raw_entry = effective_entry - cost if side == LONG else effective_entry + cost
+
+    if side == LONG:
+        gross_pnl = (raw_close - raw_entry) * size
+        net_pnl = (effective_close - effective_entry) * size - position.commission
+    else:
+        gross_pnl = (raw_entry - raw_close) * size
+        net_pnl = (effective_entry - effective_close) * size - position.commission
+
+    initial_risk = abs(effective_entry - position.stop_loss_price)
+    r_multiple = None
+    if initial_risk > 0 and size > 0:
+        r_multiple = net_pnl / (initial_risk * size)
+    return gross_pnl, net_pnl, r_multiple
 
 
 def evaluate_close(position: OpenPositionView, candles: pd.DataFrame) -> CloseWalkResult:
@@ -262,13 +300,16 @@ def evaluate_close(position: OpenPositionView, candles: pd.DataFrame) -> CloseWa
 
     def _close(raw_price: float, reason: str, timestamp) -> CloseWalkResult:
         effective = float(exec_model.adjust_close_price(raw_price, side))
+        gross_pnl, net_pnl, r_multiple = _compute_pnl(position, float(raw_price), effective)
         return CloseWalkResult(
             closed=True,
             new_watermark=_iso_z(timestamp),
             close_price=effective,
             close_time_utc=_iso_z(timestamp),
             terminal_reason=reason,
-            pnl=_pnl(side, position.entry_price, effective, position.commission),
+            gross_pnl=gross_pnl,
+            net_pnl=net_pnl,
+            r_multiple=r_multiple,
         )
 
     last_ts = None

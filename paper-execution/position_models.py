@@ -111,11 +111,15 @@ class VirtualPosition(TypedDict):
     stop_loss_price: float | None
     take_profit_price: float | None
     max_hold_deadline_utc: str | None
-    # --- exit (NULL until closed) ---
-    close_price: float | None
+    # --- exit / PnL (NULL until closed) ---
+    close_price: float | None      # effective (cost-adjusted) close fill
     close_time_utc: str | None
-    pnl: float | None
+    gross_pnl: float | None         # (raw_close - raw_entry) * size  [short: reversed], pre-cost
+    net_pnl: float | None           # gross_pnl - entry_cost - close_cost - fee (each applied once)
+    pnl: float | None               # back-compat alias of net_pnl (kept == net_pnl; see #49)
+    r_multiple: float | None        # net_pnl / (|entry - stop| * size); None when initial risk <= 0
     # --- execution profile snapshot (fixed at creation) ---
+    size: float
     max_entry_delay_bars: int
     max_hold_bars: int
     same_candle_priority: str
@@ -144,6 +148,7 @@ def _snapshot_fields(profile) -> dict:
     """Snapshot the execution-profile params that make a position self-contained."""
     return {
         "execution_profile": profile.name,
+        "size": float(profile.size),
         "max_entry_delay_bars": int(profile.max_entry_delay_bars),
         "max_hold_bars": int(profile.max_hold_bars),
         "same_candle_priority": profile.same_candle_priority,
@@ -187,7 +192,10 @@ def _base_record(
         "max_hold_deadline_utc": None,
         "close_price": None,
         "close_time_utc": None,
+        "gross_pnl": None,
+        "net_pnl": None,
         "pnl": None,
+        "r_multiple": None,
         "last_evaluated_candle_utc": None,
         "created_at_utc": now,
         "updated_at_utc": now,

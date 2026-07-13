@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      # The four component suites are run as separate pytest processes -- the
+      # The five component suites are run as separate pytest processes -- the
       # project has no root pytest config / conftest.py, and each test file
       # sets up its own sys.path. Separate steps keep component namespaces
       # isolated and make a failing component obvious from the step name.
