@@ -99,8 +99,10 @@ Paper Execution が保持する中心データは **仮想ポジション(paper 
 |---|---|
 | `closed` | `take_profit` / `stop_loss` / `max_holding_time` |
 | `expired` | `entry_timeout` |
-| `cancelled` | `invalid_input`(入力不整合)/ `manual`(運用上の取消)等、Entry前の無効化理由 |
+| `cancelled` | `invalid_input`(入力不整合。`status` が `"paper_only"` でない、必須項目の欠損等)/ `manual`(運用上の取消)。**v1 で許可するのはこの2値のみ** |
 | `pending` / `open`(非終端) | NULL |
+
+`terminal_reason` の語彙は上表で閉じた集合とする。値を追加する場合は本設計文書の更新を伴う(実装側で自由な文字列を書き込まない)。
 
 Backtest の `result_status` 語彙との対応は「closed + `take_profit` ≒ win」「closed + `stop_loss` ≒ loss」「closed + `max_holding_time` ≒ expired(Backtest語彙)」となるが、Paper Execution 側では **勝敗ラベルではなく事実(理由)を保存**し、win/loss は集計時に導出する。
 
@@ -158,13 +160,13 @@ Backtest の `result_status` 語彙との対応は「closed + `take_profit` ≒ 
 
 Close判定は **Entry足以降の確定足を時系列順に1本ずつ** 評価する(Entryは open 時点の約定なので、Entry足自身の high / low も判定対象に含む。Signal根拠足は含まない)。
 
-各確定足について、以下の順で判定する。
+各確定足について、以下の順で判定する。**いずれかのステップでCloseが成立した時点で `closed` へ遷移し、当該足の評価をそこで終了する(後続ステップへは進まない)。**
 
-1. **gap判定(足の open)**: 足の open が既に SL / TP を超えて始まっていないか(下記「gap open時の約定規則」)
-2. **intrabar判定(足の high / low)**:
+1. **gap判定(足の open)**: 足の open が既に SL / TP を超えて始まっていれば、下記「gap open時の約定規則」が定める価格と `terminal_reason` で `closed` へ遷移し、**その時点で当該足の評価を終了する**(同一足の intrabar 判定・最大保有時間判定は行わない)
+2. **intrabar判定(足の high / low)**: **gap判定でCloseしなかった場合のみ**行う
    - long: `low <= stop_loss_price` → SL到達、`high >= take_profit_price` → TP到達
    - short: `high >= stop_loss_price` → SL到達、`low <= take_profit_price` → TP到達
-3. **最大保有時間判定**: その足のclose時刻が `max_hold_deadline_utc` に達していれば、その足の **close価格** で `terminal_reason = max_holding_time` としてClose
+3. **最大保有時間判定**: **intrabar判定でもCloseしなかった場合のみ**行う。その足のclose時刻が `max_hold_deadline_utc` に達していれば、その足の **close価格** で `terminal_reason = max_holding_time` としてClose
 
 Close価格にも Entry と同じ不利方向コスト(long のClose: `価格 - spread - slippage`、short のClose: `価格 + spread + slippage`)を適用する。pnl は「有効Close価格 − 有効Entry価格」(short は符号反転)から commission を差し引いた値とする。
 
@@ -187,7 +189,7 @@ Close価格にも Entry と同じ不利方向コスト(long のClose: `価格 - 
 | 足の open が既に SL を超えて始まった | SL価格ではなく **その足の open 価格** で約定する(gapによる不利スリッページを隠さない)。`terminal_reason = stop_loss` |
 | 足の open が既に TP を超えて始まった | **TP価格** で約定する(gapによる有利な上振れは計上しない)。`terminal_reason = take_profit` |
 
-open は単一価格のため「openがSLとTPを同時に超える」ことは起こり得ない(SL < Entry < TP の関係が保たれる限り)。openによるgap判定の後、同一足の high / low による intrabar 判定を続けて行う。
+open は単一価格のため「openがSLとTPを同時に超える」ことは起こり得ない(SL < Entry < TP の関係が保たれる限り)。gapでSLまたはTPが成立した場合は、上表の価格と `terminal_reason` で `closed` へ遷移し、**その時点で当該足の評価を終了する**(同一足の high / low による intrabar 判定は行わない)。**gap非該当の場合のみ** intrabar 判定へ進み、intrabar でもCloseしなかった場合のみ最大保有時間判定へ進む(前節の判定順)。
 
 ## spread / slippage / 手数料の責務境界
 
