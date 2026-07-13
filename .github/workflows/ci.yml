@@ -57,3 +57,6 @@ jobs:
 
       - name: Run paper-signal tests
         run: python -m pytest paper-signal/tests -q
+
+      - name: Run paper-execution tests
+        run: python -m pytest paper-execution/tests -q
