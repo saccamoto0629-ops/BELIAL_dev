@@ -23,7 +23,7 @@ Market Snapshot(可視化)─ Market Bias(市場状態の分類)
 
 Paper Signal は、Market Bias が示す「市場の大まかな方向」と、Chart Snapshot が示す「チャート状態(1h)」を組み合わせて、シグナル仮説を記録するだけの層である。Paper Signal 自身は entry / exit を一切決めない。
 
-- **Paper Execution**: Paper Signal を入力として、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う将来レイヤー。v1.4 では**未実装**。
+- **Paper Execution**: Paper Signal を入力として、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う将来レイヤー。v1.4 では**未実装**(最小責務と状態遷移の設計は [Paper Execution(最小設計)](paper_execution.md) を参照。Issue #49)。
 - **Live Execution**: Broker API を利用した実注文・実約定・実ポジション管理の将来レイヤー。**未実装**。
 
 Paper Execution も Live Execution も Paper Signal の外側の別レイヤーであり、いずれも未実装。本章(Paper Signal)では扱わない。
