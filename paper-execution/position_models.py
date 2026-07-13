@@ -1,213 +1,258 @@
-"""Typed model + factory for Paper Execution *virtual positions* (Issue #50).
+r"""Virtual-position data model + state vocabulary for Paper Execution (Issue #49/#50).
 
 *** PAPER EXECUTION. NOT A LIVE ORDER / BROKER LAYER. ***
 
-Paper Execution consumes already-decided Paper Signals (paper-only
-hypotheses, see ``paper-signal/signal_models.py``) plus historical/updating
-candles, and manages a *virtual* position: a simulated Open, a simulated
-Close, and the resulting simulated PnL. It NEVER places a real order, calls a
-broker/Execution API, sizes a real lot, or connects to any exchange. Every
-record here is an observation-only simulation, one layer removed from Paper
-Signal and completely separate from a future Live Execution layer.
+Implements the concept model defined in ``docs/architecture/paper_execution.md``
+(Issue #49). A virtual position is an observation-only simulation of "if this
+Paper Signal had been executed under these fixed rules, what would have
+happened". It never places an order, calls a broker, or sizes a real lot.
 
-Responsibility boundary (kept deliberately narrow so Market Watch / Alert /
-Paper Signal logic never leaks in here, and Execution logic never flows back
-into them):
+State machine (Issue #49):
 
-- This module only *shapes and validates* a virtual-position record. It has
-  no SQLite, no candle walking, no Discord, and no entry/exit *decision*
-  logic -- those live in ``position_store.py`` (persistence) and
-  ``execution_engine.py`` (pure Open/Close judgement) respectively.
+    (none) --receive signal--> pending --entry fill--> open --SL/TP/max hold--> closed
+                                 |  \--entry timeout------------------------> expired
+                                 \----invalid/manual------------------------> cancelled
 
-Vocabulary (all strings are constrained to the module-level constants below,
-never free-typed at call sites -- mirroring how ``signal_models.py`` pins its
-status/classification strings in one place):
-
-- ``status``       -- ``open`` while the position is live, ``closed`` once an
-                      exit fired. There is no third state in this minimal model.
-- ``side``         -- ``long`` / ``short`` (copied from the Paper Signal).
-- ``close_reason`` -- why the position closed. The three implemented reasons are
-                      kept byte-identical to the Backtest Exit vocabulary
-                      (``paper-signal/exit_policy.py``) so a Paper Execution
-                      close reads exactly like the equivalent Backtest exit:
-                      ``stop_loss`` / ``take_profit`` / ``time_expired``.
+- ``pending`` / ``open`` are non-terminal; ``closed`` / ``expired`` / ``cancelled``
+  are terminal and are NEVER left again (no re-open, no re-close). The store
+  enforces this with CAS UPDATEs; this module pins the *vocabulary* and its
+  ``state`` x ``terminal_reason`` closed set, validated at the application layer
+  (and again by DB CHECK constraints in ``position_store``).
+- ``terminal_reason`` is NULL for non-terminal states and always set for terminal
+  states, restricted to the closed set below. "Close" (``closed``) is reserved for
+  a *virtual fill*; a position that never entered ends ``expired``/``cancelled``,
+  so ``state`` alone tells you whether a position was ever held.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, TypedDict
 
-# --- status -----------------------------------------------------------------
-STATUS_OPEN = "open"
-STATUS_CLOSED = "closed"
-KNOWN_STATUSES: frozenset[str] = frozenset({STATUS_OPEN, STATUS_CLOSED})
+# --- states -----------------------------------------------------------------
+STATE_PENDING = "pending"
+STATE_OPEN = "open"
+STATE_CLOSED = "closed"
+STATE_EXPIRED = "expired"
+STATE_CANCELLED = "cancelled"
+
+KNOWN_STATES: frozenset[str] = frozenset(
+    {STATE_PENDING, STATE_OPEN, STATE_CLOSED, STATE_EXPIRED, STATE_CANCELLED}
+)
+NON_TERMINAL_STATES: frozenset[str] = frozenset({STATE_PENDING, STATE_OPEN})
+TERMINAL_STATES: frozenset[str] = frozenset({STATE_CLOSED, STATE_EXPIRED, STATE_CANCELLED})
+
+# --- terminal reasons (closed set, Issue #49) -------------------------------
+REASON_TAKE_PROFIT = "take_profit"
+REASON_STOP_LOSS = "stop_loss"
+REASON_MAX_HOLDING_TIME = "max_holding_time"
+REASON_ENTRY_TIMEOUT = "entry_timeout"
+REASON_INVALID_INPUT = "invalid_input"
+REASON_MANUAL = "manual"
+
+# The authoritative state x terminal_reason closed set (Issue #49). The store's
+# DB CHECK constraint mirrors this exactly.
+STATE_TERMINAL_REASONS: dict[str, frozenset[str]] = {
+    STATE_CLOSED: frozenset({REASON_TAKE_PROFIT, REASON_STOP_LOSS, REASON_MAX_HOLDING_TIME}),
+    STATE_EXPIRED: frozenset({REASON_ENTRY_TIMEOUT}),
+    STATE_CANCELLED: frozenset({REASON_INVALID_INPUT, REASON_MANUAL}),
+}
 
 # --- side -------------------------------------------------------------------
 SIDE_LONG = "long"
 SIDE_SHORT = "short"
 KNOWN_SIDES: frozenset[str] = frozenset({SIDE_LONG, SIDE_SHORT})
 
-# --- close_reason -----------------------------------------------------------
-# Intentionally string-equal to paper-signal/exit_policy.py's REASON_* values
-# so a Paper Execution close and the equivalent Backtest exit share one
-# vocabulary. They are duplicated here -- not imported -- to keep this
-# dependency-light model free of a cross-package import into paper-signal; a
-# unit test asserts the two vocabularies stay in agreement.
-CLOSE_REASON_STOP_LOSS = "stop_loss"
-CLOSE_REASON_TAKE_PROFIT = "take_profit"
-CLOSE_REASON_TIME_EXPIRED = "time_expired"
-KNOWN_CLOSE_REASONS: frozenset[str] = frozenset(
-    {CLOSE_REASON_STOP_LOSS, CLOSE_REASON_TAKE_PROFIT, CLOSE_REASON_TIME_EXPIRED}
-)
-
 DEFAULT_SIZE = 1.0
 
 Side = Literal["long", "short"]
 
 
+def validate_state_reason(state: str, terminal_reason: str | None) -> None:
+    """Raise ValueError unless ``(state, terminal_reason)`` is in the Issue #49 closed set."""
+    if state not in KNOWN_STATES:
+        raise ValueError(f"unknown state {state!r}; known: {sorted(KNOWN_STATES)}")
+    if state in NON_TERMINAL_STATES:
+        if terminal_reason is not None:
+            raise ValueError(f"non-terminal state {state!r} must have terminal_reason=None")
+        return
+    allowed = STATE_TERMINAL_REASONS[state]
+    if terminal_reason not in allowed:
+        raise ValueError(
+            f"terminal state {state!r} requires terminal_reason in {sorted(allowed)}, "
+            f"got {terminal_reason!r}"
+        )
+
+
 class VirtualPosition(TypedDict):
-    """One simulated Paper Execution position.
+    """One virtual position row (Issue #49 concept model made physical).
 
-    ``paper_signal_id`` links the position back to the Paper Signal that
-    justified it (Issue #50 traceability); it is also the idempotency key --
-    the store enforces one virtual position per Paper Signal via a UNIQUE
-    index, so re-processing the same signal can never open a second position.
-
-    Prices are the *executed* (Execution-Model-corrected) fills produced by
-    ``execution_engine.py`` -- see that module and ``execution_runner.py`` for
-    exactly where spread/slippage is applied (once at entry, once at a
-    non-take-profit exit; a take-profit fills at the fixed target and is never
-    re-corrected). ``stop_loss`` / ``take_profit`` are the fixed levels the
-    Open decision pinned relative to the executed entry.
-
-    All exit / PnL fields are ``None`` while ``status == "open"`` and are filled
-    atomically at Close.
+    Prices are the *effective* (cost-adjusted) fills; ``spread``/``slippage``/
+    ``commission`` snapshot the actual amounts applied so the record is fully
+    reproducible even after the live execution profile changes. Entry fields are
+    NULL in ``pending``; exit/PnL fields are NULL until ``closed``.
     """
 
     position_id: str
-    paper_signal_id: str
-    strategy_profile: str
+    signal_id: str
     symbol: str
     timeframe: str
     side: str
-    status: str
-    # --- entry ---
-    entry_price: float
-    size: float
-    stop_loss: float | None
-    take_profit: float | None
-    opened_at: str
-    # --- exit (None until closed) ---
-    exit_price: float | None
-    closed_at: str | None
-    close_reason: str | None
-    # --- PnL / cost decomposition (None until closed) ---
-    gross_pnl: float | None
-    net_pnl: float | None
-    spread_cost: float | None
-    slippage_cost: float | None
-    fee_cost: float | None
-    r_multiple: float | None
-    # --- provenance / bookkeeping ---
-    entry_signal_time: NotRequired[str | None]
-    created_at: str
-    updated_at: str
-
-
-# --- event history ----------------------------------------------------------
-EVENT_OPENED = "opened"
-EVENT_CLOSED = "closed"
-KNOWN_EVENT_TYPES: frozenset[str] = frozenset({EVENT_OPENED, EVENT_CLOSED})
-
-
-class PositionEvent(TypedDict):
-    """One append-only state-change record for a virtual position (Issue #50).
-
-    Written in the SAME transaction as the position create/close it describes,
-    so the position row and its history can never diverge. ``(position_id,
-    event_type)`` is UNIQUE, giving history-level idempotency (one ``opened``
-    and at most one ``closed`` per position).
-    """
-
-    event_id: str
-    position_id: str
-    event_type: str
-    event_time: str
-    price: float | None
-    reason: str | None
-    created_at: str
+    strategy_profile: str        # record-only, from the Paper Signal
+    execution_profile: str       # Paper Execution owned (profile name)
+    state: str
+    terminal_reason: str | None
+    signal_candle_utc: str       # the signal's target_candle_utc (root candle open)
+    entry_deadline_utc: str      # signal candle close + max_entry_delay
+    # --- entry (NULL until open) ---
+    entry_price: float | None
+    entry_time_utc: str | None
+    stop_loss_price: float | None
+    take_profit_price: float | None
+    max_hold_deadline_utc: str | None
+    # --- exit (NULL until closed) ---
+    close_price: float | None
+    close_time_utc: str | None
+    pnl: float | None
+    # --- execution profile snapshot (fixed at creation) ---
+    max_entry_delay_bars: int
+    max_hold_bars: int
+    same_candle_priority: str
+    fallback_stop_pct: float
+    risk_reward: float
+    spread: float
+    slippage: float
+    commission: float
+    # --- close-evaluation watermark (NULL until first evaluated) ---
+    last_evaluated_candle_utc: str | None
+    # --- bookkeeping ---
+    created_at_utc: str
+    updated_at_utc: str
 
 
 def new_position_id() -> str:
     return uuid.uuid4().hex
 
 
-def new_event_id() -> str:
-    return uuid.uuid4().hex
-
-
 def utc_now_iso() -> str:
-    """Return a UTC ISO-8601 timestamp like ``2026-07-05T12:00:00Z``.
-
-    Byte-identical in shape to ``signal_models.utc_now_iso`` /
-    ``backtest_models.utc_now_iso`` so timestamps sort and compare uniformly
-    across the three layers.
-    """
+    """Return a UTC ISO-8601 timestamp like ``2026-07-05T12:00:00Z``."""
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def create_virtual_position(
+def _snapshot_fields(profile) -> dict:
+    """Snapshot the execution-profile params that make a position self-contained."""
+    return {
+        "execution_profile": profile.name,
+        "max_entry_delay_bars": int(profile.max_entry_delay_bars),
+        "max_hold_bars": int(profile.max_hold_bars),
+        "same_candle_priority": profile.same_candle_priority,
+        "fallback_stop_pct": float(profile.fallback_stop_pct),
+        "risk_reward": float(profile.risk_reward),
+        "spread": float(profile.spread),
+        "slippage": float(profile.slippage),
+        "commission": float(profile.commission),
+    }
+
+
+def _base_record(
     *,
-    paper_signal_id: str,
-    strategy_profile: str,
+    signal_id: str,
     symbol: str,
     timeframe: str,
     side: str,
-    entry_price: float,
-    opened_at: str,
-    size: float = DEFAULT_SIZE,
-    stop_loss: float | None = None,
-    take_profit: float | None = None,
-    entry_signal_time: str | None = None,
-    position_id: str | None = None,
-    created_at: str | None = None,
+    strategy_profile: str,
+    profile,
+    signal_candle_utc: str,
+    entry_deadline_utc: str,
+    position_id: str | None,
+    created_at: str | None,
 ) -> VirtualPosition:
-    """Build an ``open`` VirtualPosition record.
-
-    Only shapes/validates the record -- it does not persist anything and makes
-    no entry/exit *decision* (that is ``execution_engine.decide_open``'s job).
-    ``side`` is validated against ``KNOWN_SIDES`` so a malformed side can never
-    reach storage or the price-comparison logic. The record starts with every
-    exit / PnL field ``None`` and ``status == "open"``.
-    """
-    if side not in KNOWN_SIDES:
-        raise ValueError(f"side must be one of {sorted(KNOWN_SIDES)}, got {side!r}")
     now = created_at or utc_now_iso()
-    return {
+    record: VirtualPosition = {
         "position_id": position_id or new_position_id(),
-        "paper_signal_id": paper_signal_id,
-        "strategy_profile": strategy_profile,
+        "signal_id": signal_id,
         "symbol": symbol,
         "timeframe": timeframe,
         "side": side,
-        "status": STATUS_OPEN,
-        "entry_price": float(entry_price),
-        "size": float(size),
-        "stop_loss": None if stop_loss is None else float(stop_loss),
-        "take_profit": None if take_profit is None else float(take_profit),
-        "opened_at": opened_at,
-        "exit_price": None,
-        "closed_at": None,
-        "close_reason": None,
-        "gross_pnl": None,
-        "net_pnl": None,
-        "spread_cost": None,
-        "slippage_cost": None,
-        "fee_cost": None,
-        "r_multiple": None,
-        "entry_signal_time": entry_signal_time,
-        "created_at": now,
-        "updated_at": now,
+        "strategy_profile": strategy_profile,
+        "state": STATE_PENDING,
+        "terminal_reason": None,
+        "signal_candle_utc": signal_candle_utc,
+        "entry_deadline_utc": entry_deadline_utc,
+        "entry_price": None,
+        "entry_time_utc": None,
+        "stop_loss_price": None,
+        "take_profit_price": None,
+        "max_hold_deadline_utc": None,
+        "close_price": None,
+        "close_time_utc": None,
+        "pnl": None,
+        "last_evaluated_candle_utc": None,
+        "created_at_utc": now,
+        "updated_at_utc": now,
     }
+    record.update(_snapshot_fields(profile))  # type: ignore[typeddict-item]
+    return record
+
+
+def create_pending_position(
+    *,
+    signal_id: str,
+    symbol: str,
+    timeframe: str,
+    side: str,
+    strategy_profile: str,
+    profile,
+    signal_candle_utc: str,
+    entry_deadline_utc: str,
+    position_id: str | None = None,
+    created_at: str | None = None,
+) -> VirtualPosition:
+    """Build a ``pending`` virtual position from an accepted Paper Signal.
+
+    Issue #49: a received signal is stored as ``pending`` (NOT opened) with the
+    entry deadline and execution-profile snapshot recorded up front. ``side`` is
+    validated here so a malformed side never reaches the price logic.
+    """
+    if side not in KNOWN_SIDES:
+        raise ValueError(f"side must be one of {sorted(KNOWN_SIDES)}, got {side!r}")
+    return _base_record(
+        signal_id=signal_id, symbol=symbol, timeframe=timeframe, side=side,
+        strategy_profile=strategy_profile, profile=profile,
+        signal_candle_utc=signal_candle_utc, entry_deadline_utc=entry_deadline_utc,
+        position_id=position_id, created_at=created_at,
+    )
+
+
+def create_cancelled_position(
+    *,
+    signal_id: str,
+    symbol: str,
+    timeframe: str,
+    side: str,
+    strategy_profile: str,
+    profile,
+    signal_candle_utc: str,
+    entry_deadline_utc: str,
+    terminal_reason: str = REASON_INVALID_INPUT,
+    position_id: str | None = None,
+    created_at: str | None = None,
+) -> VirtualPosition:
+    """Build a terminal ``cancelled`` position for an invalid/withdrawn signal.
+
+    Issue #49: an invalid signal is not silently skipped -- it is RECORDED as
+    ``cancelled`` (``invalid_input`` or ``manual``). ``side``/``symbol``/
+    ``timeframe`` may be blank when the input was malformed; they are coerced to
+    ``""`` rather than validated, since the whole point is to record the reject.
+    """
+    validate_state_reason(STATE_CANCELLED, terminal_reason)
+    record = _base_record(
+        signal_id=signal_id, symbol=symbol or "", timeframe=timeframe or "", side=side or "",
+        strategy_profile=strategy_profile or "", profile=profile,
+        signal_candle_utc=signal_candle_utc or "", entry_deadline_utc=entry_deadline_utc or "",
+        position_id=position_id, created_at=created_at,
+    )
+    record["state"] = STATE_CANCELLED
+    record["terminal_reason"] = terminal_reason
+    return record

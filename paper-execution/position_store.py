@@ -1,40 +1,32 @@
-"""SQLite storage for Paper Execution virtual positions (Issue #50).
+"""SQLite storage for Paper Execution virtual positions (Issue #49/#50).
 
 *** PAPER EXECUTION. NOT A LIVE ORDER / BROKER LAYER. ***
 
-Kept in its own DB file (``paper-execution/data/paper_positions.sqlite3``),
-deliberately separate from ``paper-signal/paper_signal_store.py``'s
-``paper_signals`` table and from ``backtest/backtest_store.py``'s Backtest DB:
+Independent DB file (``paper-execution/data/paper_positions.sqlite3``), separate
+from the Paper Signal and Backtest DBs, so standing up Paper Execution never
+requires touching them.
 
-- ``paper_signals``          -- live paper_only *hypotheses* (Paper Signal layer)
-- ``backtest_*``             -- historical *replay* results (validation layer)
-- ``virtual_positions`` here -- simulated Paper Execution *positions* + PnL
+Guarantees implemented here (Issue #49):
 
-Because it is a separate file, standing up Paper Execution can never require
-deleting, migrating, or otherwise touching the existing ``paper_signals`` DB
-(Issue #50: "既存DBを削除しなくても起動・migrationできる"). The link to a
-Paper Signal is stored as a plain ``paper_signal_id`` TEXT reference (no
-cross-file foreign key is possible, and none is needed).
+- **State x terminal_reason closed set** is enforced by a DB CHECK constraint
+  (mirroring ``position_models.STATE_TERMINAL_REASONS``) AND validated at the
+  application layer before every write -- both layers, on purpose.
+- **No re-transition from a terminal state**: every transition is a
+  compare-and-set (CAS) UPDATE guarded on the *expected source state*
+  (``WHERE state = 'pending'`` / ``'open'``). A terminal row matches zero rows,
+  so it can never be re-opened or re-closed.
+- **Open idempotency**: ``signal_id`` is UNIQUE and ``create_position`` uses
+  ``INSERT ... ON CONFLICT(signal_id) DO NOTHING`` -- a second import of the same
+  signal is a no-op, never a duplicate position.
+- **Watermark CAS**: closing/advancing a position guards on the *expected
+  current watermark* (``last_evaluated_candle_utc IS :expected``), so two
+  concurrent evaluators of the same open position cannot both transition it --
+  the loser matches zero rows.
 
-Idempotency is guaranteed at BOTH layers, on purpose:
-
-- Open   -- a UNIQUE index on ``paper_signal_id`` makes "one virtual position
-            per Paper Signal" a *database-level* invariant; ``create_position``
-            uses a plain INSERT, so a duplicate Open raises
-            ``sqlite3.IntegrityError`` rather than creating a second row. The
-            runner ALSO probes ``get_position_by_signal`` first (a
-            *repository-level* guard) so a re-run is a quiet skip, not an error.
-- Close  -- ``close_position`` updates ``WHERE status = 'open'``; a second Close
-            matches zero rows and raises ``PositionAlreadyClosedError`` (a
-            repository/DB-level guard). A UNIQUE ``(position_id, event_type)``
-            index on the history table is the belt-and-braces DB guarantee that
-            a duplicate ``closed`` event can never be recorded either.
-
-Every mutating operation writes the position row and its matching history event
-inside ONE transaction (one ``sqlite3`` connection ``with`` block), so a failure
-part-way through leaves no half-updated state. Read helpers never create the DB
-file (mirroring ``paper_signal_store.signal_exists_for_candle``), so a dry-run
-that only reads has no persistent side effect.
+Read helpers never create the DB file (dry-run safe) and deliberately do NOT
+swallow a ``sqlite3.OperationalError`` on an existing file into an empty result
+(Issue #49 runner contract: a real read failure must surface, not masquerade as
+"no data"). Only a *missing* DB file returns the empty/None default.
 """
 
 from __future__ import annotations
@@ -47,55 +39,59 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 DEFAULT_DB_PATH = BASE_DIR / "data" / "paper_positions.sqlite3"
-
-# Tolerate transient SQLite locks under concurrent writers, matching
-# paper_signal_store's BUSY_TIMEOUT_SECONDS convention.
 BUSY_TIMEOUT_SECONDS = 30
 
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-import position_models as models  # noqa: E402  (canonical status/side/event vocabulary)
+import position_models as models  # noqa: E402
 
 POSITIONS_TABLE = "virtual_positions"
-EVENTS_TABLE = "position_events"
 
-# Core columns are declared in CREATE TABLE; every NULLable exit / PnL /
-# provenance column is (also) added idempotently via _ensure_column(), so a
-# ``virtual_positions`` table created by an older/partial schema upgrades in
-# place instead of forcing a DB rebuild (Issue #50 backward compatibility).
-_MIGRATED_POSITION_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("exit_price", "REAL"),
-    ("closed_at", "TEXT"),
-    ("close_reason", "TEXT"),
-    ("gross_pnl", "REAL"),
-    ("net_pnl", "REAL"),
-    ("spread_cost", "REAL"),
-    ("slippage_cost", "REAL"),
-    ("fee_cost", "REAL"),
-    ("r_multiple", "REAL"),
-    ("entry_signal_time", "TEXT"),
+# Column order used by both the INSERT and the row tuple builder.
+_ALL_COLUMNS: tuple[str, ...] = (
+    "position_id",
+    "signal_id",
+    "symbol",
+    "timeframe",
+    "side",
+    "strategy_profile",
+    "execution_profile",
+    "state",
+    "terminal_reason",
+    "signal_candle_utc",
+    "entry_deadline_utc",
+    "entry_price",
+    "entry_time_utc",
+    "stop_loss_price",
+    "take_profit_price",
+    "max_hold_deadline_utc",
+    "close_price",
+    "close_time_utc",
+    "pnl",
+    "max_entry_delay_bars",
+    "max_hold_bars",
+    "same_candle_priority",
+    "fallback_stop_pct",
+    "risk_reward",
+    "spread",
+    "slippage",
+    "commission",
+    "last_evaluated_candle_utc",
+    "created_at_utc",
+    "updated_at_utc",
 )
 
-REQUIRED_POSITION_COLUMNS: frozenset[str] = frozenset(
-    {
-        "position_id",
-        "paper_signal_id",
-        "strategy_profile",
-        "symbol",
-        "timeframe",
-        "side",
-        "status",
-        "entry_price",
-        "size",
-        "stop_loss",
-        "take_profit",
-        "opened_at",
-        "created_at",
-        "updated_at",
-    }
-    | {name for name, _type in _MIGRATED_POSITION_COLUMNS}
+# Columns added idempotently to an older/partial table (Issue #50 backward compat).
+_MIGRATED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("max_hold_deadline_utc", "TEXT"),
+    ("close_price", "REAL"),
+    ("close_time_utc", "TEXT"),
+    ("pnl", "REAL"),
+    ("last_evaluated_candle_utc", "TEXT"),
 )
+
+REQUIRED_COLUMNS: frozenset[str] = frozenset(_ALL_COLUMNS)
 
 
 class PositionStoreError(RuntimeError):
@@ -103,15 +99,31 @@ class PositionStoreError(RuntimeError):
 
 
 class PositionSchemaError(PositionStoreError):
-    """A pre-existing table exists but is missing required columns."""
+    """A pre-existing table is missing required columns."""
 
 
 class PositionNotFoundError(PositionStoreError):
     """No virtual position exists for the given id."""
 
 
-class PositionAlreadyClosedError(PositionStoreError):
-    """A Close was attempted on a position that is not ``open`` (double Close)."""
+class PositionConcurrentModificationError(PositionStoreError):
+    """A guarded (CAS) transition matched zero rows: the source state / watermark
+    changed under us (already transitioned, or a concurrent evaluator won)."""
+
+
+def _state_check_sql() -> str:
+    states = "', '".join(sorted(models.KNOWN_STATES))
+    return f"state IN ('{states}')"
+
+
+def _terminal_reason_check_sql() -> str:
+    """Build the state x terminal_reason CHECK from the model's closed set."""
+    non_terminal = "', '".join(sorted(models.NON_TERMINAL_STATES))
+    clauses = [f"(state IN ('{non_terminal}') AND terminal_reason IS NULL)"]
+    for state in sorted(models.STATE_TERMINAL_REASONS):
+        reasons = "', '".join(sorted(models.STATE_TERMINAL_REASONS[state]))
+        clauses.append(f"(state = '{state}' AND terminal_reason IN ('{reasons}'))")
+    return " OR ".join(clauses)
 
 
 def load_env_file(path: Path = ENV_FILE) -> dict[str, str]:
@@ -130,17 +142,13 @@ def load_env_file(path: Path = ENV_FILE) -> dict[str, str]:
 
 def position_db_path(env_values: dict[str, str] | None = None) -> Path:
     values = env_values if env_values is not None else load_env_file()
-    raw_path = (
-        os.getenv("PAPER_POSITION_DB_PATH") or values.get("PAPER_POSITION_DB_PATH") or str(DEFAULT_DB_PATH)
-    ).strip()
-    path = Path(raw_path)
+    raw = (os.getenv("PAPER_POSITION_DB_PATH") or values.get("PAPER_POSITION_DB_PATH") or str(DEFAULT_DB_PATH)).strip()
+    path = Path(raw)
     return path if path.is_absolute() else BASE_DIR / path
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS)
-    # Enforce the events -> positions foreign key (SQLite ignores it otherwise).
-    connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
     return connection
 
@@ -149,33 +157,26 @@ def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
 
 
-def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
-    """Add a nullable column to an existing table if it isn't there yet.
-
-    Lets a ``virtual_positions`` table created before a column existed upgrade
-    in place: existing rows keep working (the new column reads NULL for them)
-    and no bespoke migration script is needed. Idempotent.
-    """
-    if column_name not in _table_columns(connection, table_name):
-        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    if column not in _table_columns(connection, table):
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
-    missing = REQUIRED_POSITION_COLUMNS - _table_columns(connection, POSITIONS_TABLE)
+    missing = REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE)
     if missing:
         raise PositionSchemaError(
-            f"{POSITIONS_TABLE} table exists but is missing required columns: {sorted(missing)}. "
-            "This looks like an incompatible or incomplete pre-existing schema; migrate or recreate the database."
+            f"{POSITIONS_TABLE} exists but is missing required columns: {sorted(missing)}. "
+            "Incompatible/incomplete pre-existing schema; migrate or recreate the database."
         )
 
 
 def init_db(db_path: Path | None = None) -> None:
-    """Create the ``virtual_positions`` / ``position_events`` tables + indexes.
+    """Create/upgrade the ``virtual_positions`` table (idempotent).
 
-    Uses ``CREATE TABLE IF NOT EXISTS`` / ``CREATE INDEX IF NOT EXISTS`` and
-    idempotent ``_ensure_column`` migrations throughout, so calling it
-    repeatedly -- on a fresh DB, or on one left by an older/partial schema -- is
-    always safe and never destroys data.
+    Enforces, at the DB level: the known ``state`` set, the ``state`` x
+    ``terminal_reason`` closed set, the ``same_candle_priority`` vocabulary, and
+    ``signal_id`` uniqueness. Safe to call repeatedly.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,176 +185,91 @@ def init_db(db_path: Path | None = None) -> None:
             f"""
             CREATE TABLE IF NOT EXISTS {POSITIONS_TABLE} (
                 position_id TEXT PRIMARY KEY,
-                paper_signal_id TEXT NOT NULL,
-                strategy_profile TEXT NOT NULL,
+                signal_id TEXT NOT NULL UNIQUE,
                 symbol TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
                 side TEXT NOT NULL,
-                status TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                size REAL NOT NULL,
-                stop_loss REAL,
-                take_profit REAL,
-                opened_at TEXT NOT NULL,
-                exit_price REAL,
-                closed_at TEXT,
-                close_reason TEXT,
-                gross_pnl REAL,
-                net_pnl REAL,
-                spread_cost REAL,
-                slippage_cost REAL,
-                fee_cost REAL,
-                r_multiple REAL,
-                entry_signal_time TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                strategy_profile TEXT NOT NULL,
+                execution_profile TEXT NOT NULL,
+                state TEXT NOT NULL CHECK ({_state_check_sql()}),
+                terminal_reason TEXT CHECK ({_terminal_reason_check_sql()}),
+                signal_candle_utc TEXT NOT NULL,
+                entry_deadline_utc TEXT NOT NULL,
+                entry_price REAL,
+                entry_time_utc TEXT,
+                stop_loss_price REAL,
+                take_profit_price REAL,
+                max_hold_deadline_utc TEXT,
+                close_price REAL,
+                close_time_utc TEXT,
+                pnl REAL,
+                max_entry_delay_bars INTEGER NOT NULL,
+                max_hold_bars INTEGER NOT NULL,
+                same_candle_priority TEXT NOT NULL CHECK (same_candle_priority IN ('stop_loss', 'take_profit')),
+                fallback_stop_pct REAL NOT NULL,
+                risk_reward REAL NOT NULL,
+                spread REAL NOT NULL,
+                slippage REAL NOT NULL,
+                commission REAL NOT NULL,
+                last_evaluated_candle_utc TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
             )
             """
         )
-        connection.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
-                event_id TEXT PRIMARY KEY,
-                position_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                event_time TEXT NOT NULL,
-                price REAL,
-                reason TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (position_id) REFERENCES {POSITIONS_TABLE}(position_id)
-            )
-            """
-        )
-
-        # Upgrade a legacy/partial positions table in place (no-op on a fresh DB).
-        for column_name, column_type in _MIGRATED_POSITION_COLUMNS:
+        for column_name, column_type in _MIGRATED_COLUMNS:
             _ensure_column(connection, POSITIONS_TABLE, column_name, column_type)
-
         _validate_schema(connection)
-
-        # Open idempotency: one virtual position per Paper Signal (DB-level).
         connection.execute(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{POSITIONS_TABLE}_signal_unique "
-            f"ON {POSITIONS_TABLE} (paper_signal_id)"
-        )
-        connection.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{POSITIONS_TABLE}_status "
-            f"ON {POSITIONS_TABLE} (status, symbol, timeframe)"
-        )
-        # History idempotency: one 'opened' and at most one 'closed' per position.
-        connection.execute(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{EVENTS_TABLE}_unique "
-            f"ON {EVENTS_TABLE} (position_id, event_type)"
-        )
-        connection.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{EVENTS_TABLE}_position ON {EVENTS_TABLE} (position_id)"
+            f"CREATE INDEX IF NOT EXISTS idx_{POSITIONS_TABLE}_state "
+            f"ON {POSITIONS_TABLE} (state, symbol, timeframe)"
         )
 
 
-_INSERT_POSITION_SQL = f"""
-    INSERT INTO {POSITIONS_TABLE}
-    (position_id, paper_signal_id, strategy_profile, symbol, timeframe, side, status,
-     entry_price, size, stop_loss, take_profit, opened_at,
-     exit_price, closed_at, close_reason,
-     gross_pnl, net_pnl, spread_cost, slippage_cost, fee_cost, r_multiple,
-     entry_signal_time, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
-
-_INSERT_EVENT_SQL = f"""
-    INSERT INTO {EVENTS_TABLE}
-    (event_id, position_id, event_type, event_time, price, reason, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-"""
+def _row_tuple(record: dict) -> tuple:
+    return tuple(record.get(column) for column in _ALL_COLUMNS)
 
 
-def _position_row(record: dict) -> tuple:
-    return (
-        record["position_id"],
-        record["paper_signal_id"],
-        record["strategy_profile"],
-        record["symbol"],
-        record["timeframe"],
-        record["side"],
-        record["status"],
-        record["entry_price"],
-        record["size"],
-        record.get("stop_loss"),
-        record.get("take_profit"),
-        record["opened_at"],
-        record.get("exit_price"),
-        record.get("closed_at"),
-        record.get("close_reason"),
-        record.get("gross_pnl"),
-        record.get("net_pnl"),
-        record.get("spread_cost"),
-        record.get("slippage_cost"),
-        record.get("fee_cost"),
-        record.get("r_multiple"),
-        record.get("entry_signal_time"),
-        record["created_at"],
-        record["updated_at"],
-    )
+_INSERT_SQL = (
+    f"INSERT INTO {POSITIONS_TABLE} ({', '.join(_ALL_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _ALL_COLUMNS)}) "
+    "ON CONFLICT(signal_id) DO NOTHING"
+)
 
 
-def create_position(position: dict, *, db_path: Path | None = None) -> str:
-    """Insert one ``open`` virtual position AND its ``opened`` event, atomically.
+def create_position(record: dict, *, db_path: Path | None = None) -> bool:
+    """Insert a ``pending`` (or terminal ``cancelled``) position, idempotently.
 
-    Both rows are written in a single transaction, so a failure on either leaves
-    neither behind. Raises ``sqlite3.IntegrityError`` when ``position_id`` already
-    exists OR when ``paper_signal_id`` is already tied to a position (the UNIQUE
-    index that makes Open idempotent). Callers that want a quiet re-run should
-    probe :func:`get_position_by_signal` first.
+    Returns True if a row was inserted, False if a position for this ``signal_id``
+    already existed (``ON CONFLICT DO NOTHING`` -- the Issue #49 "1 signal = 1
+    position" rule). Validates the ``state`` x ``terminal_reason`` combination at
+    the application layer before writing (the DB CHECK is the second guard).
     """
+    models.validate_state_reason(record["state"], record.get("terminal_reason"))
     db_path = Path(db_path) if db_path is not None else position_db_path()
     init_db(db_path)
-    opened_event = _opened_event_row(position)
     with _connect(db_path) as connection:
-        connection.execute(_INSERT_POSITION_SQL, _position_row(position))
-        connection.execute(_INSERT_EVENT_SQL, opened_event)
-    return position["position_id"]
+        cursor = connection.execute(_INSERT_SQL, _row_tuple(record))
+    return cursor.rowcount > 0
 
 
-def _opened_event_row(position: dict) -> tuple:
-    return (
-        models.new_event_id(),
-        position["position_id"],
-        models.EVENT_OPENED,
-        position.get("entry_signal_time") or position["opened_at"],
-        position["entry_price"],
-        None,
-        position["created_at"],
-    )
-
-
-def close_position(
+def transition_to_open(
     position_id: str,
     *,
-    exit_price: float,
-    closed_at: str,
-    close_reason: str,
-    gross_pnl: float,
-    net_pnl: float,
-    spread_cost: float | None = None,
-    slippage_cost: float | None = None,
-    fee_cost: float | None = None,
-    r_multiple: float | None = None,
-    event_time: str | None = None,
+    entry_price: float,
+    entry_time_utc: str,
+    stop_loss_price: float,
+    take_profit_price: float,
+    max_hold_deadline_utc: str,
     updated_at: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
-    """Close an ``open`` position, writing all exit + PnL fields at once.
+    """Atomically move ``pending -> open``, pinning the entry fields (CAS on state).
 
-    In one transaction: (1) UPDATE the position's status / exit_price / closed_at
-    / close_reason / PnL columns ``WHERE status = 'open'``; (2) INSERT the
-    ``closed`` history event. The ``WHERE status = 'open'`` guard is the
-    double-Close protection: a second Close matches zero rows and raises
-    :class:`PositionAlreadyClosedError` (a missing id raises
-    :class:`PositionNotFoundError`). A non-``open`` position is therefore never
-    re-updated. Returns the closed position row.
+    Guarded by ``WHERE state = 'pending'`` so a position that already opened,
+    expired, or was cancelled matches zero rows and raises
+    :class:`PositionConcurrentModificationError` -- never a second Open.
     """
-    if close_reason not in models.KNOWN_CLOSE_REASONS:
-        raise ValueError(f"close_reason must be one of {sorted(models.KNOWN_CLOSE_REASONS)}, got {close_reason!r}")
     db_path = Path(db_path) if db_path is not None else position_db_path()
     init_db(db_path)
     now = updated_at or models.utc_now_iso()
@@ -361,81 +277,161 @@ def close_position(
         cursor = connection.execute(
             f"""
             UPDATE {POSITIONS_TABLE}
-            SET status = ?, exit_price = ?, closed_at = ?, close_reason = ?,
-                gross_pnl = ?, net_pnl = ?, spread_cost = ?, slippage_cost = ?,
-                fee_cost = ?, r_multiple = ?, updated_at = ?
-            WHERE position_id = ? AND status = ?
+            SET state = ?, entry_price = ?, entry_time_utc = ?, stop_loss_price = ?,
+                take_profit_price = ?, max_hold_deadline_utc = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ?
             """,
             (
-                models.STATUS_CLOSED,
-                float(exit_price),
-                closed_at,
-                close_reason,
-                float(gross_pnl),
-                float(net_pnl),
-                spread_cost,
-                slippage_cost,
-                fee_cost,
-                r_multiple,
-                now,
-                position_id,
-                models.STATUS_OPEN,
+                models.STATE_OPEN, float(entry_price), entry_time_utc, float(stop_loss_price),
+                float(take_profit_price), max_hold_deadline_utc, now,
+                position_id, models.STATE_PENDING,
             ),
         )
-        if cursor.rowcount == 0:
-            # Nothing was updated: either the id is unknown, or it is already
-            # closed. Distinguish the two so callers get a precise error. The
-            # SELECT runs inside the same (still-open) transaction; raising then
-            # triggers a rollback of the no-op UPDATE.
-            row = connection.execute(
-                f"SELECT status FROM {POSITIONS_TABLE} WHERE position_id = ?", (position_id,)
-            ).fetchone()
-            if row is None:
-                raise PositionNotFoundError(f"no virtual position with id {position_id!r}")
-            raise PositionAlreadyClosedError(
-                f"position {position_id!r} is already {row[0]!r}; refusing to re-close"
-            )
-        connection.execute(
-            _INSERT_EVENT_SQL,
+        _require_cas(connection, cursor, position_id, expected_state=models.STATE_PENDING)
+    return _require_get(position_id, db_path=db_path)
+
+
+def transition_pending_terminal(
+    position_id: str,
+    *,
+    state: str,
+    terminal_reason: str,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """Atomically move ``pending -> expired|cancelled`` (CAS on state).
+
+    Used for entry timeout (``expired``/``entry_timeout``) and manual/late
+    cancellation (``cancelled``). Validated against the closed set first.
+    """
+    if state not in (models.STATE_EXPIRED, models.STATE_CANCELLED):
+        raise ValueError(f"transition_pending_terminal only handles expired/cancelled, got {state!r}")
+    models.validate_state_reason(state, terminal_reason)
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    with _connect(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {POSITIONS_TABLE}
+            SET state = ?, terminal_reason = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ?
+            """,
+            (state, terminal_reason, now, position_id, models.STATE_PENDING),
+        )
+        _require_cas(connection, cursor, position_id, expected_state=models.STATE_PENDING)
+    return _require_get(position_id, db_path=db_path)
+
+
+def close_open_position(
+    position_id: str,
+    *,
+    expected_watermark: str | None,
+    new_watermark: str,
+    close_price: float,
+    close_time_utc: str,
+    terminal_reason: str,
+    pnl: float,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """Atomically move ``open -> closed`` AND advance the watermark, in one UPDATE.
+
+    CAS-guarded on BOTH ``state = 'open'`` and ``last_evaluated_candle_utc IS
+    :expected_watermark``: if the position already closed, or a concurrent
+    evaluator advanced the watermark first, zero rows match and this raises
+    :class:`PositionConcurrentModificationError`. The state change and the
+    watermark advance commit together (never a half-applied close).
+    """
+    if terminal_reason not in models.STATE_TERMINAL_REASONS[models.STATE_CLOSED]:
+        raise ValueError(
+            f"close terminal_reason must be in {sorted(models.STATE_TERMINAL_REASONS[models.STATE_CLOSED])}, "
+            f"got {terminal_reason!r}"
+        )
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    with _connect(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {POSITIONS_TABLE}
+            SET state = ?, close_price = ?, close_time_utc = ?, terminal_reason = ?,
+                pnl = ?, last_evaluated_candle_utc = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ? AND last_evaluated_candle_utc IS ?
+            """,
             (
-                models.new_event_id(),
-                position_id,
-                models.EVENT_CLOSED,
-                event_time or closed_at,
-                float(exit_price),
-                close_reason,
-                now,
+                models.STATE_CLOSED, float(close_price), close_time_utc, terminal_reason,
+                float(pnl), new_watermark, now,
+                position_id, models.STATE_OPEN, expected_watermark,
             ),
         )
-    closed = get_position(position_id, db_path=db_path)
-    assert closed is not None  # just updated it in this process
-    return closed
+        _require_cas(connection, cursor, position_id, expected_state=models.STATE_OPEN)
+    return _require_get(position_id, db_path=db_path)
 
 
-# --- read helpers (never create the DB file: dry-run / report safe) ----------
+def advance_watermark(
+    position_id: str,
+    *,
+    expected_watermark: str | None,
+    new_watermark: str,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Advance an open position's evaluated-candle watermark (CAS, no close).
+
+    Guarded on ``state = 'open'`` and the expected current watermark. Returns
+    True on success, False when the CAS matched zero rows (another evaluator
+    advanced/closed it first) -- a benign no-op the caller can ignore.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    with _connect(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {POSITIONS_TABLE}
+            SET last_evaluated_candle_utc = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ? AND last_evaluated_candle_utc IS ?
+            """,
+            (new_watermark, now, position_id, models.STATE_OPEN, expected_watermark),
+        )
+    return cursor.rowcount > 0
+
+
+def _require_cas(connection, cursor, position_id: str, *, expected_state: str) -> None:
+    if cursor.rowcount != 0:
+        return
+    row = connection.execute(
+        f"SELECT state FROM {POSITIONS_TABLE} WHERE position_id = ?", (position_id,)
+    ).fetchone()
+    if row is None:
+        raise PositionNotFoundError(f"no virtual position with id {position_id!r}")
+    raise PositionConcurrentModificationError(
+        f"position {position_id!r} is {row[0]!r}, not {expected_state!r} (or watermark changed); "
+        "refusing to re-transition"
+    )
+
+
+# --- read helpers -----------------------------------------------------------
+# Missing DB file -> empty/None (dry-run safe). An OperationalError on an
+# EXISTING file is NOT swallowed -- it propagates so the runner can fail loudly.
 
 
 def _read_one(db_path: Path, sql: str, params: tuple) -> dict | None:
     if not db_path.exists():
         return None
-    try:
-        with sqlite3.connect(db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            row = connection.execute(sql, params).fetchone()
-    except sqlite3.OperationalError:
-        return None
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(sql, params).fetchone()
     return dict(row) if row is not None else None
 
 
 def _read_many(db_path: Path, sql: str, params: tuple) -> list[dict]:
     if not db_path.exists():
         return []
-    try:
-        with sqlite3.connect(db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(sql, params).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -444,48 +440,29 @@ def get_position(position_id: str, *, db_path: Path | None = None) -> dict | Non
     return _read_one(db_path, f"SELECT * FROM {POSITIONS_TABLE} WHERE position_id = ?", (position_id,))
 
 
-def get_position_by_signal(paper_signal_id: str, *, db_path: Path | None = None) -> dict | None:
-    """Return the virtual position tied to ``paper_signal_id``, or None.
+def _require_get(position_id: str, *, db_path: Path) -> dict:
+    row = get_position(position_id, db_path=db_path)
+    if row is None:
+        raise PositionNotFoundError(f"no virtual position with id {position_id!r}")
+    return row
 
-    The repository-level Open idempotency probe: the runner calls this before
-    attempting an Open, so a re-run of the same Paper Signal is a quiet skip.
-    Read-only -- never creates the DB (dry-run safe).
-    """
+
+def get_position_by_signal(signal_id: str, *, db_path: Path | None = None) -> dict | None:
     db_path = Path(db_path) if db_path is not None else position_db_path()
-    return _read_one(
-        db_path, f"SELECT * FROM {POSITIONS_TABLE} WHERE paper_signal_id = ?", (paper_signal_id,)
-    )
+    return _read_one(db_path, f"SELECT * FROM {POSITIONS_TABLE} WHERE signal_id = ?", (signal_id,))
 
 
-def list_open_positions(
-    *, symbol: str | None = None, timeframe: str | None = None, db_path: Path | None = None
-) -> list[dict]:
-    """Return every ``open`` position (optionally filtered by symbol/timeframe)."""
+def list_positions_by_state(state: str, *, db_path: Path | None = None) -> list[dict]:
     db_path = Path(db_path) if db_path is not None else position_db_path()
-    clauses = ["status = ?"]
-    params: list = [models.STATUS_OPEN]
-    if symbol is not None:
-        clauses.append("symbol = ?")
-        params.append(symbol)
-    if timeframe is not None:
-        clauses.append("timeframe = ?")
-        params.append(timeframe)
-    where = " AND ".join(clauses)
     return _read_many(
-        db_path, f"SELECT * FROM {POSITIONS_TABLE} WHERE {where} ORDER BY opened_at ASC", tuple(params)
+        db_path,
+        f"SELECT * FROM {POSITIONS_TABLE} WHERE state = ? ORDER BY created_at_utc ASC",
+        (state,),
     )
 
 
 def list_positions(*, db_path: Path | None = None, limit: int = 1000) -> list[dict]:
     db_path = Path(db_path) if db_path is not None else position_db_path()
     return _read_many(
-        db_path, f"SELECT * FROM {POSITIONS_TABLE} ORDER BY created_at DESC LIMIT ?", (limit,)
-    )
-
-
-def list_events(position_id: str, *, db_path: Path | None = None) -> list[dict]:
-    """Return a position's state-change history, oldest first. Read-only."""
-    db_path = Path(db_path) if db_path is not None else position_db_path()
-    return _read_many(
-        db_path, f"SELECT * FROM {EVENTS_TABLE} WHERE position_id = ? ORDER BY created_at ASC, event_type ASC", (position_id,)
+        db_path, f"SELECT * FROM {POSITIONS_TABLE} ORDER BY created_at_utc DESC LIMIT ?", (limit,)
     )

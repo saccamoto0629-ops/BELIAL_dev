@@ -250,3 +250,13 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 - Broker API 連携・実注文
 - ロット計算・資金管理・複数ポジションのポートフォリオ制御
 - 指値 / 逆指値Entry、トレーリングストップ、部分決済
+
+## 実装状況(後続 Issue #50 / #51)
+
+本設計は `paper-execution/` に実装済み(Issue #50: データモデル・保存層、Issue #51: Open / Close 判定エンジン)。本設計との対応:
+
+- `position_models.py` — 状態(`pending` / `open` / `closed` / `expired` / `cancelled`)と `state × terminal_reason` の閉集合をアプリ層で検証。
+- `position_store.py` — 独立SQLite。`state` 集合・`state × terminal_reason` 閉集合・`same_candle_priority` 語彙・`signal_id` UNIQUE をDBの CHECK / UNIQUE 制約で担保。終端遷移は全て CAS(`WHERE state=...`)で、終端からの再遷移を拒否。close と watermark 前進は同一 UPDATE(watermark CAS で競合防止)。
+- `execution_profile.py` — 執行規則プロファイル(`(symbol, timeframe)` で解決、`strategy_profile` は解決キーにしない)。適用値は position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
+- `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。
+- `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用。

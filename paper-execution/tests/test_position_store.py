@@ -1,4 +1,4 @@
-"""Issue #50: virtual-position repository, migration, transactions, idempotency."""
+"""Issue #49/#50: store -- CHECK constraints, CAS transitions, watermark, migration."""
 
 import pathlib
 import sqlite3
@@ -11,227 +11,244 @@ sys.path.insert(0, str(BASE_DIR))
 
 import position_models as models  # noqa: E402
 import position_store as store  # noqa: E402
+import execution_profile as profiles  # noqa: E402
+
+PROFILE = profiles.ExecutionProfile(fallback_stop_pct=0.01, risk_reward=2.0)
 
 
-def _make_position(**overrides):
+def _pending(signal_id="sig-1", **over):
     base = dict(
-        paper_signal_id="sig-1",
-        strategy_profile="market_bias_macd_alignment_v1",
-        symbol="USDJPY",
-        timeframe="1h",
-        side="long",
-        entry_price=150.0,
-        opened_at="2026-07-05T12:00:00Z",
-        stop_loss=149.5,
-        take_profit=151.0,
+        signal_id=signal_id, symbol="USDJPY", timeframe="1h", side="long",
+        strategy_profile="p", profile=PROFILE,
+        signal_candle_utc="2026-07-06T12:00:00Z", entry_deadline_utc="2026-07-06T16:00:00Z",
     )
-    base.update(overrides)
-    return models.create_virtual_position(**base)
+    base.update(over)
+    return models.create_pending_position(**base)
 
 
-def test_create_then_get_roundtrip(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position()
-    store.create_position(pos, db_path=db)
-
-    fetched = store.get_position(pos["position_id"], db_path=db)
-    assert fetched is not None
-    assert fetched["paper_signal_id"] == "sig-1"
-    assert fetched["status"] == "open"
-    assert fetched["entry_price"] == 150.0
+def _open_it(db, pos):
+    return store.transition_to_open(
+        pos["position_id"], entry_price=100.0, entry_time_utc="2026-07-06T13:00:00Z",
+        stop_loss_price=99.0, take_profit_price=102.0, max_hold_deadline_utc="2026-07-07T13:00:00Z",
+        db_path=db,
+    )
 
 
-def test_get_open_and_list_open_positions(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    store.create_position(_make_position(paper_signal_id="a"), db_path=db)
-    store.create_position(_make_position(paper_signal_id="b", symbol="XAUUSD"), db_path=db)
+# --- create / idempotency ----------------------------------------------------
 
-    all_open = store.list_open_positions(db_path=db)
-    assert len(all_open) == 2
-    xau = store.list_open_positions(symbol="XAUUSD", db_path=db)
-    assert len(xau) == 1 and xau[0]["symbol"] == "XAUUSD"
+def test_create_and_get(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
+    assert store.create_position(pos, db_path=db) is True
+    got = store.get_position(pos["position_id"], db_path=db)
+    assert got["state"] == "pending"
+    assert store.get_position_by_signal("sig-1", db_path=db)["position_id"] == pos["position_id"]
 
 
-def test_paper_signal_relation_and_duplicate_open_blocked(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position(paper_signal_id="sig-42")
-    store.create_position(pos, db_path=db)
-
-    by_signal = store.get_position_by_signal("sig-42", db_path=db)
-    assert by_signal is not None and by_signal["position_id"] == pos["position_id"]
-
-    # UNIQUE(paper_signal_id): a second position for the same signal is refused.
-    with pytest.raises(sqlite3.IntegrityError):
-        store.create_position(_make_position(paper_signal_id="sig-42"), db_path=db)
+def test_create_is_idempotent_on_signal_id(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    assert store.create_position(_pending(signal_id="dup"), db_path=db) is True
+    # second create for the same signal_id is a no-op (ON CONFLICT DO NOTHING)
+    assert store.create_position(_pending(signal_id="dup"), db_path=db) is False
     assert len(store.list_positions(db_path=db)) == 1
 
 
-def test_close_persists_all_exit_fields(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position()
-    store.create_position(pos, db_path=db)
+# --- transitions -------------------------------------------------------------
 
-    closed = store.close_position(
-        pos["position_id"],
-        exit_price=151.0,
-        closed_at="2026-07-05T15:00:00Z",
-        close_reason="take_profit",
-        gross_pnl=1.0,
-        net_pnl=0.9,
-        spread_cost=0.05,
-        slippage_cost=0.0,
-        fee_cost=0.1,
-        r_multiple=2.0,
-        db_path=db,
+def test_pending_to_open(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
+    store.create_position(pos, db_path=db)
+    opened = _open_it(db, pos)
+    assert opened["state"] == "open"
+    assert opened["entry_price"] == 100.0
+    assert opened["stop_loss_price"] == 99.0
+
+
+def test_pending_to_expired(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
+    store.create_position(pos, db_path=db)
+    out = store.transition_pending_terminal(
+        pos["position_id"], state="expired", terminal_reason="entry_timeout", db_path=db
     )
-    assert closed["status"] == "closed"
-    assert closed["exit_price"] == 151.0
-    assert closed["closed_at"] == "2026-07-05T15:00:00Z"
-    assert closed["close_reason"] == "take_profit"
-    assert closed["gross_pnl"] == 1.0
-    assert closed["net_pnl"] == 0.9
-    assert closed["r_multiple"] == 2.0
-    # no longer listed as open
-    assert store.list_open_positions(db_path=db) == []
+    assert out["state"] == "expired" and out["terminal_reason"] == "entry_timeout"
 
 
-def test_double_close_is_refused(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position()
+def test_pending_to_cancelled(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
     store.create_position(pos, db_path=db)
-    store.close_position(
-        pos["position_id"], exit_price=151.0, closed_at="t", close_reason="take_profit",
-        gross_pnl=1.0, net_pnl=1.0, db_path=db,
+    out = store.transition_pending_terminal(
+        pos["position_id"], state="cancelled", terminal_reason="manual", db_path=db
     )
-    with pytest.raises(store.PositionAlreadyClosedError):
-        store.close_position(
-            pos["position_id"], exit_price=140.0, closed_at="t2", close_reason="stop_loss",
-            gross_pnl=-10.0, net_pnl=-10.0, db_path=db,
-        )
-    # the original close is intact -- a refused re-close never mutated the row
-    again = store.get_position(pos["position_id"], db_path=db)
-    assert again["exit_price"] == 151.0 and again["close_reason"] == "take_profit"
+    assert out["state"] == "cancelled" and out["terminal_reason"] == "manual"
 
 
-def test_close_unknown_position_raises_not_found(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    store.init_db(db)
-    with pytest.raises(store.PositionNotFoundError):
-        store.close_position(
-            "nope", exit_price=1.0, closed_at="t", close_reason="stop_loss",
-            gross_pnl=0.0, net_pnl=0.0, db_path=db,
-        )
-
-
-def test_close_rejects_unknown_reason(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position()
+def test_open_to_closed(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
     store.create_position(pos, db_path=db)
-    with pytest.raises(ValueError):
-        store.close_position(
-            pos["position_id"], exit_price=1.0, closed_at="t", close_reason="liquidation",
-            gross_pnl=0.0, net_pnl=0.0, db_path=db,
-        )
-
-
-def test_events_history_records_open_and_close(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position()
-    store.create_position(pos, db_path=db)
-    events_after_open = store.list_events(pos["position_id"], db_path=db)
-    assert [e["event_type"] for e in events_after_open] == ["opened"]
-
-    store.close_position(
-        pos["position_id"], exit_price=151.0, closed_at="2026-07-05T15:00:00Z",
-        close_reason="take_profit", gross_pnl=1.0, net_pnl=1.0, db_path=db,
+    _open_it(db, pos)
+    closed = store.close_open_position(
+        pos["position_id"], expected_watermark=None, new_watermark="2026-07-06T14:00:00Z",
+        close_price=102.0, close_time_utc="2026-07-06T14:00:00Z", terminal_reason="take_profit",
+        pnl=2.0, db_path=db,
     )
-    events = store.list_events(pos["position_id"], db_path=db)
-    assert sorted(e["event_type"] for e in events) == ["closed", "opened"]
+    assert closed["state"] == "closed"
+    assert closed["close_price"] == 102.0
+    assert closed["terminal_reason"] == "take_profit"
+    assert closed["last_evaluated_candle_utc"] == "2026-07-06T14:00:00Z"
 
 
-def test_init_db_is_idempotent_and_preserves_data(tmp_path):
-    db = tmp_path / "pos.sqlite3"
-    pos = _make_position()
+# --- terminal re-transition rejected -----------------------------------------
+
+def test_reopen_terminal_rejected(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
     store.create_position(pos, db_path=db)
-    # Running init_db again must not raise or drop the existing row.
-    store.init_db(db)
-    store.init_db(db)
-    assert store.get_position(pos["position_id"], db_path=db) is not None
+    store.transition_pending_terminal(pos["position_id"], state="expired", terminal_reason="entry_timeout", db_path=db)
+    # an expired position can never be opened
+    with pytest.raises(store.PositionConcurrentModificationError):
+        _open_it(db, pos)
 
 
-def test_legacy_partial_schema_is_migrated_in_place(tmp_path):
-    """A positions table created before the cost columns existed upgrades in place."""
-    db = tmp_path / "pos.sqlite3"
-    # Simulate an older schema: core columns only, none of the migrated
-    # exit/PnL/provenance columns, and one pre-existing row.
+def test_double_close_rejected(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
+    store.create_position(pos, db_path=db)
+    _open_it(db, pos)
+    store.close_open_position(
+        pos["position_id"], expected_watermark=None, new_watermark="2026-07-06T14:00:00Z",
+        close_price=102.0, close_time_utc="t", terminal_reason="take_profit", pnl=2.0, db_path=db,
+    )
+    with pytest.raises(store.PositionConcurrentModificationError):
+        store.close_open_position(
+            pos["position_id"], expected_watermark="2026-07-06T14:00:00Z", new_watermark="2026-07-06T15:00:00Z",
+            close_price=90.0, close_time_utc="t2", terminal_reason="stop_loss", pnl=-10.0, db_path=db,
+        )
+
+
+# --- DB CHECK constraint (state x terminal_reason) ---------------------------
+
+def _raw_insert(db, **over):
+    pos = _pending(**{k: v for k, v in over.items() if k in ("signal_id",)})
+    pos.update({k: v for k, v in over.items() if k not in ("signal_id",)})
+    store.init_db(db)
+    cols = store._ALL_COLUMNS
     with sqlite3.connect(db) as conn:
+        conn.execute(
+            f"INSERT INTO {store.POSITIONS_TABLE} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+            tuple(pos.get(c) for c in cols),
+        )
+
+
+def test_db_check_rejects_invalid_state_reason(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    # state=open with a terminal_reason violates the CHECK constraint
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_insert(db, signal_id="x", state="open", terminal_reason="stop_loss")
+
+
+def test_db_check_rejects_unknown_state(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_insert(db, signal_id="y", state="frozen", terminal_reason=None)
+
+
+# --- watermark CAS / concurrency --------------------------------------------
+
+def test_advance_watermark_cas(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
+    store.create_position(pos, db_path=db)
+    _open_it(db, pos)
+    assert store.advance_watermark(pos["position_id"], expected_watermark=None, new_watermark="c1", db_path=db) is True
+    # a stale expected watermark (None again) now matches zero rows
+    assert store.advance_watermark(pos["position_id"], expected_watermark=None, new_watermark="c2", db_path=db) is False
+    assert store.get_position(pos["position_id"], db_path=db)["last_evaluated_candle_utc"] == "c1"
+
+
+def test_concurrent_close_only_one_wins(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    pos = _pending()
+    store.create_position(pos, db_path=db)
+    _open_it(db, pos)
+    # two evaluators both read watermark=None; the first close wins, the second
+    # (stale expected watermark + now-closed state) matches zero rows -> raises.
+    store.close_open_position(
+        pos["position_id"], expected_watermark=None, new_watermark="cA",
+        close_price=102.0, close_time_utc="t", terminal_reason="take_profit", pnl=2.0, db_path=db,
+    )
+    with pytest.raises(store.PositionConcurrentModificationError):
+        store.close_open_position(
+            pos["position_id"], expected_watermark=None, new_watermark="cB",
+            close_price=99.0, close_time_utc="t", terminal_reason="stop_loss", pnl=-1.0, db_path=db,
+        )
+
+
+# --- migration / backward compat --------------------------------------------
+
+def test_legacy_partial_schema_migrated(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    with sqlite3.connect(db) as conn:
+        # older schema: core columns only, missing the migrated exit/watermark cols
         conn.execute(
             f"""
             CREATE TABLE {store.POSITIONS_TABLE} (
                 position_id TEXT PRIMARY KEY,
-                paper_signal_id TEXT NOT NULL,
-                strategy_profile TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                side TEXT NOT NULL,
-                status TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                size REAL NOT NULL,
-                stop_loss REAL,
-                take_profit REAL,
-                opened_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                signal_id TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL, timeframe TEXT NOT NULL, side TEXT NOT NULL,
+                strategy_profile TEXT NOT NULL, execution_profile TEXT NOT NULL,
+                state TEXT NOT NULL, terminal_reason TEXT,
+                signal_candle_utc TEXT NOT NULL, entry_deadline_utc TEXT NOT NULL,
+                entry_price REAL, entry_time_utc TEXT, stop_loss_price REAL, take_profit_price REAL,
+                max_entry_delay_bars INTEGER NOT NULL, max_hold_bars INTEGER NOT NULL,
+                same_candle_priority TEXT NOT NULL, fallback_stop_pct REAL NOT NULL, risk_reward REAL NOT NULL,
+                spread REAL NOT NULL, slippage REAL NOT NULL, commission REAL NOT NULL,
+                created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
             )
             """
         )
         conn.execute(
-            f"INSERT INTO {store.POSITIONS_TABLE} "
-            "(position_id, paper_signal_id, strategy_profile, symbol, timeframe, side, status, "
-            " entry_price, size, stop_loss, take_profit, opened_at, created_at, updated_at) "
-            "VALUES ('old-1','sig-old','p','USDJPY','1h','long','open',150.0,1.0,149.5,151.0,'t','t','t')"
+            f"INSERT INTO {store.POSITIONS_TABLE} (position_id, signal_id, symbol, timeframe, side, "
+            "strategy_profile, execution_profile, state, terminal_reason, signal_candle_utc, entry_deadline_utc, "
+            "max_entry_delay_bars, max_hold_bars, same_candle_priority, fallback_stop_pct, risk_reward, "
+            "spread, slippage, commission, created_at_utc, updated_at_utc) VALUES "
+            "('old-1','s-old','USDJPY','1h','long','p','default','pending',NULL,'2026-07-06T12:00:00Z',"
+            "'2026-07-06T16:00:00Z',3,24,'stop_loss',0.003,2.0,0,0,0,'t','t')"
         )
+    store.init_db(db)  # must add the missing columns without dropping the row
+    got = store.get_position("old-1", db_path=db)
+    assert got is not None
+    assert got["pnl"] is None and got["last_evaluated_candle_utc"] is None
+    assert got["state"] == "pending"
 
-    # init_db must add the missing columns without touching the legacy row.
+
+def test_init_db_idempotent(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    store.create_position(_pending(), db_path=db)
     store.init_db(db)
-    migrated = store.get_position("old-1", db_path=db)
-    assert migrated is not None
-    assert migrated["net_pnl"] is None          # newly added, NULL for the legacy row
-    assert migrated["entry_signal_time"] is None
-    assert migrated["entry_price"] == 150.0      # legacy data intact
-
-    # and the migrated DB is fully functional (create + close still work).
-    store.close_position(
-        "old-1", exit_price=151.0, closed_at="t2", close_reason="take_profit",
-        gross_pnl=1.0, net_pnl=1.0, db_path=db,
-    )
-    assert store.get_position("old-1", db_path=db)["status"] == "closed"
-
-
-def test_create_position_transaction_rolls_back_on_event_failure(tmp_path, monkeypatch):
-    """If the opened-event insert fails, the position insert is rolled back too."""
-    db = tmp_path / "pos.sqlite3"
-    # Force every opened-event to reuse one event_id, so the SECOND create's
-    # event INSERT violates the event PK *after* its position INSERT succeeded.
-    monkeypatch.setattr(models, "new_event_id", lambda: "fixed-event-id")
-
-    store.create_position(_make_position(paper_signal_id="a"), db_path=db)  # commits fine
-
-    second = _make_position(paper_signal_id="b")
-    with pytest.raises(sqlite3.IntegrityError):
-        store.create_position(second, db_path=db)
-
-    # The second position must NOT exist -- the whole transaction rolled back.
-    assert store.get_position(second["position_id"], db_path=db) is None
+    store.init_db(db)
     assert len(store.list_positions(db_path=db)) == 1
 
 
-def test_reads_never_create_the_db(tmp_path):
-    """Dry-run safety: read helpers never create the DB file."""
-    db = tmp_path / "does_not_exist.sqlite3"
+# --- read helpers: dry-run safe, but do NOT swallow OperationalError ----------
+
+def test_reads_do_not_create_db(tmp_path):
+    db = tmp_path / "absent.sqlite3"
     assert store.get_position("x", db_path=db) is None
     assert store.get_position_by_signal("x", db_path=db) is None
-    assert store.list_open_positions(db_path=db) == []
+    assert store.list_positions_by_state("open", db_path=db) == []
     assert store.list_positions(db_path=db) == []
-    assert store.list_events("x", db_path=db) == []
     assert not db.exists()
+
+
+def test_read_does_not_swallow_operational_error(tmp_path):
+    db = tmp_path / "broken.sqlite3"
+    # file exists but the table is missing -> a real OperationalError must surface,
+    # not be turned into an empty list (Issue #49 runner contract).
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    with pytest.raises(sqlite3.OperationalError):
+        store.list_positions_by_state("open", db_path=db)
