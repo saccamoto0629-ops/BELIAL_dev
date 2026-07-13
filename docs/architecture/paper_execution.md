@@ -53,11 +53,21 @@ Paper Execution(本書・設計のみ)
 | `symbol` / `timeframe` | 判定に使うローソク足系列の特定 |
 | `side`(`long` / `short`) | 仮想ポジションの方向 |
 | `target_candle_utc` | Signal根拠となった確定足の open timestamp。Entry足の決定基準 |
-| `strategy_profile` | 適用する Entry / Close パラメータプロファイルの解決キー |
 | `status` | `"paper_only"` であることの確認(それ以外は受理しない) |
-| `market_bias` / `confidence` / `signal_type` / `trigger_type` / `alert_source` ほか | 記録用の引き継ぎのみ。執行判断には使わない |
+| `market_bias` / `confidence` / `signal_type` / `trigger_type` / `alert_source` / `strategy_profile` ほか | 記録用の引き継ぎのみ。執行判断には使わない |
 
 Paper Signal は entry / exit を一切決めない(既存設計の不変条件)ため、**Entry価格・SL・TP・保有期限はレコードに含まれない。これらの導出はすべて Paper Execution の責務**である。
+
+Paper Signal の分類4フィールド(`signal_type` / `trigger_type` / `alert_source` / `strategy_profile`)は、[Paper Signal の既存定義](paper_signal.md#分類フィールドissue-27)どおり **記録用であり、entry / exit 判断には一切用いない**。この不変条件は Paper Execution でも維持する: `strategy_profile` は Signal生成戦略の識別子として記録用に引き継ぐだけで、**執行規則(SL / TP・期限・優先順位・コスト)の解決には使わない**。執行規則は Paper Execution 自身が所有する `execution_profile`(次節)で解決する。**Paper Signal 側の既存フィールドの変更・追加は不要**である。
+
+## execution_profile(実行規則プロファイル)
+
+Signal生成戦略を示す `strategy_profile`(Paper Signal 所有・記録用)と、執行規則を示す **`execution_profile`(Paper Execution 所有)** を明確に分離する。
+
+- **定義するパラメータ**: SL / TP導出規則(`fallback_stop_pct` × `risk_reward`)、Entry有効期限(`max_entry_delay`)、最大保有時間(`max_holding_time`)、曖昧足の優先順位(`same_candle_priority`)、コスト(`spread` / `slippage` / `commission`)。すなわち本書の Entry / Close / 約定規則の可変パラメータはすべて execution_profile に属する。
+- **解決規則**: Paper Execution 自身の設定が持つ `(symbol, timeframe)` → execution_profile の明示的なマッピングで解決し、該当がなければ既定プロファイルへフォールバックする。**Signal の分類フィールド(`strategy_profile` を含む)は解決キーに使わない。**
+- **記録**: 適用した execution_profile 名と、その時点のパラメータ実額(コスト等)を仮想ポジションレコードへ記録し、後から設定を変えても既存レコードの再現性が壊れないようにする。
+- **将来拡張(参考)**: Signal生成戦略ごとに執行規則を変えたくなった場合、マッピングキーへ `strategy_profile` を加える拡張が考えられる。ただしその場合は「分類フィールドは判断に用いない」という Paper Signal 側の責務定義の更新が必要になるため、本設計では採用せず、採否は後続Issueで改めて判断する。
 
 このほかに、判定用のローソク足を Chart DB(`market-watch/data/chart_data.sqlite3` の `candles`)から **読み取り専用** で参照する。使用するのは Issue #41 と同じ規律に従う **確定足のみ**(`T + timeframe <= 評価時刻` を満たす足。`market-watch/freshness.py` の共有ルールを再利用)。未確定足で Entry / Close を判定することはない。
 
@@ -69,19 +79,30 @@ Paper Execution が保持する中心データは **仮想ポジション(paper 
 |---|---|
 | `position_id` | 仮想ポジションの一意ID |
 | `signal_id` | 元 Paper Signal への参照(UNIQUE。1 Signal = 高々1ポジション) |
-| `symbol` / `timeframe` / `side` / `strategy_profile` | Signal から引き継ぐ |
+| `symbol` / `timeframe` / `side` | Signal から引き継ぐ |
+| `strategy_profile` | Signal から**記録用**に引き継ぐ(Signal生成戦略の識別子。執行判断には使わない) |
+| `execution_profile` | 適用した実行規則プロファイル名(Paper Execution 所有。前節) |
 | `state` | `pending` / `open` / `closed` / `expired` / `cancelled`(下記) |
 | `entry_price` | 仮想Entry約定価格(コスト調整後)。`pending` 以前は NULL |
 | `entry_time_utc` | Entry足の open timestamp(UTC ISO-8601 `...Z`。時刻規約は Paper Signal と共通) |
 | `stop_loss_price` / `take_profit_price` | Entry時に確定する仮想SL / TP水準。実注文ではなく判定用のマーカー |
 | `max_hold_deadline_utc` | 最大保有時間による強制Close期限(Entry時に確定) |
 | `close_price` / `close_time_utc` | 仮想Close約定価格(コスト調整後)と時刻。未Closeは NULL |
-| `close_reason` | `take_profit` / `stop_loss` / `max_holding_time`(+ 終端理由 `entry_timeout` / `cancelled_*`) |
+| `terminal_reason` | 終端状態に至った理由。**終端状態では必ず値を持ち、非終端状態では NULL**。取り得る値は state ごとに固定する(下記) |
 | `pnl` | 決済済みのみ。`side` に応じた符号付き価格差(コスト込み)。未決済は NULL(0扱いで捏造しない — Backtest summary と同方針) |
 | `spread` / `slippage` / `commission` | この約定に適用したコスト実額(再現性のため適用値を記録) |
 | `created_at_utc` / `updated_at_utc` | 監査用 |
 
-状態(`state`)はライフサイクル、`close_reason` は Close の内訳であり、両者を混同しない。Backtest の `result_status` 語彙との対応は「closed + `take_profit` ≒ win」「closed + `stop_loss` ≒ loss」「closed + `max_holding_time` ≒ expired(Backtest語彙)」となるが、Paper Execution 側では **勝敗ラベルではなく事実(理由)を保存**し、win/loss は集計時に導出する。
+状態(`state`)はライフサイクル、`terminal_reason` は終端に至った理由であり、両者を混同しない。「Close」という語は仮想決済(`closed`)にのみ使い、Entryせず終了した `expired` / `cancelled` の理由を「close_reason」と呼ぶ名称の不整合を避けるため、終端理由は **`terminal_reason` に統一**する。state と terminal_reason の許容組み合わせは以下に固定する。
+
+| state | 許容する `terminal_reason` |
+|---|---|
+| `closed` | `take_profit` / `stop_loss` / `max_holding_time` |
+| `expired` | `entry_timeout` |
+| `cancelled` | `invalid_input`(入力不整合)/ `manual`(運用上の取消)等、Entry前の無効化理由 |
+| `pending` / `open`(非終端) | NULL |
+
+Backtest の `result_status` 語彙との対応は「closed + `take_profit` ≒ win」「closed + `stop_loss` ≒ loss」「closed + `max_holding_time` ≒ expired(Backtest語彙)」となるが、Paper Execution 側では **勝敗ラベルではなく事実(理由)を保存**し、win/loss は集計時に導出する。
 
 ## 状態一覧と状態遷移
 
@@ -91,12 +112,14 @@ Paper Execution が保持する中心データは **仮想ポジション(paper 
 |---|---|---|
 | `pending` | Signal を受理済みで、仮想Entryの約定待ち | |
 | `open` | 仮想Entry約定済み。Close判定の対象 | |
-| `closed` | SL / TP / 最大保有時間のいずれかで仮想決済済み(`close_reason` に理由を保持) | ✅ |
+| `closed` | SL / TP / 最大保有時間のいずれかで仮想決済済み | ✅ |
 | `expired` | Entryできないまま有効期限切れ(ポジションを持たずに終了。pnl なし) | ✅ |
 | `cancelled` | Entry前に取消(入力不整合の検出、Signal の status 異常等。pnl なし) | ✅ |
 
+終端状態はいずれも、その状態に至った理由を `terminal_reason` に保持する(前節の state × terminal_reason 対応表)。
+
 - `closed` / `expired` / `cancelled` は終端状態であり、**終端状態からの遷移は存在しない**(再openしない)。
-- 「openのまま期限切れ」は `expired` ではなく **`closed` + `close_reason = max_holding_time`** とする。`expired` は「一度もEntryしなかった」場合に限定し、ポジションを持ったか否かを state だけで判別できるようにする。
+- 「openのまま期限切れ」は `expired` ではなく **`closed` + `terminal_reason = max_holding_time`** とする。`expired` は「一度もEntryしなかった」場合に限定し、ポジションを持ったか否かを state だけで判別できるようにする。
 - `rejected` 相当(受理前の重複Signal skip)は状態を作らない。冪等性チェックで弾かれた Signal はポジション自体を生成しない(下記「冪等性」)。
 
 ### 状態遷移表
@@ -119,7 +142,8 @@ Paper Execution が保持する中心データは **仮想ポジション(paper 
        ┌─────────┐    └──────▶┌───────────┐    ┌──────────┐
        │ expired │            │ cancelled │    │  closed  │
        └─────────┘            └───────────┘    └──────────┘
-       (終端)                 (終端)           (終端, close_reason保持)
+       (終端)                 (終端)           (終端)
+        いずれの終端状態も terminal_reason を保持する
 ```
 
 ## Entry価格の決定規則
@@ -127,8 +151,8 @@ Paper Execution が保持する中心データは **仮想ポジション(paper 
 1. **Entry足**: `target_candle_utc + timeframe`(= Signal根拠足のclose時刻)以降で **最初に存在する確定足** を Entry足とする。Signal根拠足自身では Entry しない(根拠足のclose価格で入る Backtest の既知の lookahead 制約を、Paper Execution では最初から採らない)。
 2. **Entry価格(raw)**: Entry足の **open 価格**。成行相当であり、指値・逆指値のEntryは本設計では扱わない。
 3. **Entry価格(有効)**: raw open に対し、不利方向へ spread + slippage を加算した値(long: `open + spread + slippage`、short: `open - spread - slippage`。`backtest/execution_model.py` と同じ固定・不利方向モデル)。
-4. **Entry有効期限**: Entry足の open 時刻が `target_candle_utc + timeframe` から `max_entry_delay`(既定: **timeframe × 3本分**。strategy_profile 単位で調整可能なパラメータとする)を超える場合、Entryせず `expired` とする。週末・休場明けの持ち越しEntry(金曜のSignalで月曜openに入る等)は既定では行わない。
-5. **SL / TP水準の確定**: Entry約定と同時に、有効Entry価格を基準として strategy_profile が解決するルール(初期実装は `exit_policy.py` の `fixed_rr` と同じ `fallback_stop_pct` × `risk_reward` 方式)で `stop_loss_price` / `take_profit_price` を確定し、以後変更しない(トレーリングは非スコープ)。`max_hold_deadline_utc` も同時に確定する。
+4. **Entry有効期限**: Entry足の open 時刻が `target_candle_utc + timeframe` から `max_entry_delay`(既定: **timeframe × 3本分**。execution_profile 単位で調整可能なパラメータとする)を超える場合、Entryせず `expired`(`terminal_reason = entry_timeout`)とする。週末・休場明けの持ち越しEntry(金曜のSignalで月曜openに入る等)は既定では行わない。
+5. **SL / TP水準の確定**: Entry約定と同時に、有効Entry価格を基準として execution_profile が定義するルール(初期実装は `exit_policy.py` の `fixed_rr` と同じ `fallback_stop_pct` × `risk_reward` 方式)で `stop_loss_price` / `take_profit_price` を確定し、以後変更しない(トレーリングは非スコープ)。`max_hold_deadline_utc` も同時に確定する。
 
 ## Close規則(SL / TP / 最大保有時間)
 
@@ -140,7 +164,7 @@ Close判定は **Entry足以降の確定足を時系列順に1本ずつ** 評価
 2. **intrabar判定(足の high / low)**:
    - long: `low <= stop_loss_price` → SL到達、`high >= take_profit_price` → TP到達
    - short: `high >= stop_loss_price` → SL到達、`low <= take_profit_price` → TP到達
-3. **最大保有時間判定**: その足のclose時刻が `max_hold_deadline_utc` に達していれば、その足の **close価格** で `close_reason = max_holding_time` としてClose
+3. **最大保有時間判定**: その足のclose時刻が `max_hold_deadline_utc` に達していれば、その足の **close価格** で `terminal_reason = max_holding_time` としてClose
 
 Close価格にも Entry と同じ不利方向コスト(long のClose: `価格 - spread - slippage`、short のClose: `価格 + spread + slippage`)を適用する。pnl は「有効Close価格 − 有効Entry価格」(short は符号反転)から commission を差し引いた値とする。
 
@@ -151,7 +175,7 @@ Close価格にも Entry と同じ不利方向コスト(long のClose: `価格 - 
 1本の確定足の high / low が SL と TP の両方に届いた場合、足内の到達順序は OHLC からは復元できない。この曖昧足の扱いは:
 
 - 設定 `same_candle_priority`(`stop_loss` / `take_profit`)で明示的に決める。**既定は `stop_loss`(保守側 = 成績を過大評価しない)**。
-- ハードコードせず strategy_profile / 設定として持ち、記録に残す。`paper-signal/exit_policy.py` の `same_candle_priority`(既定 `stop_loss`)と同じ語彙・同じ既定値を用い、Backtest との突合を可能にする。
+- ハードコードせず execution_profile の設定として持ち、記録に残す。`paper-signal/exit_policy.py` の `same_candle_priority`(既定 `stop_loss`)と同じ語彙・同じ既定値を用い、Backtest との突合を可能にする。
 
 ### gap open時のEntry / SL / TP約定規則
 
@@ -160,8 +184,8 @@ Close価格にも Entry と同じ不利方向コスト(long のClose: `価格 - 
 | ケース | 約定規則 |
 |---|---|
 | Entry(成行相当) | gapの有無にかかわらず Entry足の open で約定する(gap自体による補正はしない。コストは通常どおり不利方向へ加算)。ただし Entry有効期限を超えた場合は `expired`(前述) |
-| 足の open が既に SL を超えて始まった | SL価格ではなく **その足の open 価格** で約定する(gapによる不利スリッページを隠さない)。`close_reason = stop_loss` |
-| 足の open が既に TP を超えて始まった | **TP価格** で約定する(gapによる有利な上振れは計上しない)。`close_reason = take_profit` |
+| 足の open が既に SL を超えて始まった | SL価格ではなく **その足の open 価格** で約定する(gapによる不利スリッページを隠さない)。`terminal_reason = stop_loss` |
+| 足の open が既に TP を超えて始まった | **TP価格** で約定する(gapによる有利な上振れは計上しない)。`terminal_reason = take_profit` |
 
 open は単一価格のため「openがSLとTPを同時に超える」ことは起こり得ない(SL < Entry < TP の関係が保たれる限り)。openによるgap判定の後、同一足の high / low による intrabar 判定を続けて行う。
 
@@ -174,7 +198,7 @@ open は単一価格のため「openがSLとTPを同時に超える」ことは�
 | 手数料(commission) | Paper Execution | v1 では **既定 0.0 の固定額** としてフィールドのみ確保する(pnl から減算)。ロット・約定金額比例の手数料はロット計算が非スコープのため導入しない |
 
 - **Paper Signal はコストに一切関与しない**(Signal レコードにコスト情報を持たせない)。コスト反映後の約定価格・pnl を持つのは Paper Execution だけである。
-- 設定値は strategy_profile / 設定ファイル側に置き、適用した実額を仮想ポジションレコードへ記録する(後から設定を変えても既存レコードの再現性が壊れないようにする)。
+- 設定値は execution_profile 側に置き、適用した実額を仮想ポジションレコードへ記録する(後から設定を変えても既存レコードの再現性が壊れないようにする)。
 - Backtest 側の `--spread` / `--slippage` は Backtest run のシミュレーション用パラメータであり、Paper Execution の設定とは独立に管理する(同じ値を与えれば同じ調整式で比較できる、という関係に留める)。
 
 ## 冪等性(再実行・重複Signal)
