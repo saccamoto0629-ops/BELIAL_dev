@@ -63,7 +63,7 @@ Execution variants (Future)
 | Classification | 市場状態を分類する | 実装済み: `market-watch/indicators.py`, `market_bias.py` |
 | Alert | 事実を通知する | 実装済み: `macd_alert_bot.py`, `ma_alert_bot.py`, `bollinger_alert_bot.py`, `rsi_alert_bot.py` |
 | Hypothesis (Paper Signal) | paper_only の仮説を生成・保存する。entry / exit は判断しない | 実装済み: `paper-signal/signal_generator.py` |
-| Paper Execution | Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う | 未実装(次フェーズ) |
+| Paper Execution | Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う | 未実装(次フェーズ)。最小設計は [Paper Execution](../architecture/paper_execution.md)(Issue #49) |
 | Live Execution | Broker API による実注文・実約定・実ポジション管理 | 未実装(将来) |
 
 Backtest はこの直列フローには含まれない独立した **Validation レイヤー(検証基盤)** であり、過去のローソク足で Paper Signal や将来の Execution 設計を遡及検証する。`backtest/execution_model.py` の spread / slippage / fill は Backtest 内部のシミュレーションモデルであって、Paper Execution レイヤーの実装ではない。

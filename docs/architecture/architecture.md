@@ -38,7 +38,7 @@ Execution は **Paper Execution**(仮想約定・仮想ポジション管理・E
 |---|---|---|
 | Alert | 事実を検知して通知する | 実装済み(MACD cross, MA touch, Bollinger upper_break, RSI14 overbought/oversold) |
 | Strategy / Method | Alert の情報をどう解釈するか判断する | 実装済み(Paper Signal のルールベース候補生成) |
-| Paper Execution | Paper Signal を入力に、仮想約定・仮想ポジション管理・Exit・損益計算を行う | 未実装(次フェーズ) |
+| Paper Execution | Paper Signal を入力に、仮想約定・仮想ポジション管理・Exit・損益計算を行う | 未実装(次フェーズ)。最小設計は [Paper Execution](paper_execution.md)(Issue #49) |
 | Live Execution | Broker API による実際の注文・約定・ポジション管理 | 未実装(将来) |
 
 Alert は売買判断をしない。Strategy / Method は複数の観測情報を文脈化する。Paper Execution / Live Execution はいずれも現行実装に含めない。
@@ -95,5 +95,6 @@ BELIAL はコンポーネントごとに独立したSQLiteファイルを持つ�
 - [Market Watch](market_watch.md)
 - [Market Bias](market_bias.md)
 - [Paper Signal](paper_signal.md)
+- [Paper Execution(最小設計)](paper_execution.md)
 - [Operations](../operations/operations.md)
 - [Roadmap(v1.4 Backtest)](../product/roadmap.md)

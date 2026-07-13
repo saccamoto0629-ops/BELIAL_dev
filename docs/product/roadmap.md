@@ -98,7 +98,7 @@ WantedBy=timers.target
 timer + oneshot 方式の実際のunit配置・有効化はv1.5以降の検討事項とする。
 ## v1.5以降の検討(次フェーズ候補)
 
-- **Paper Execution 最小設計**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。まず最小スコープの設計から着手する。実注文・Broker API 連携・ロット計算は含めない。
+- **Paper Execution 最小設計**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・ロット計算は含めない。→ Issue #49 で最小責務・状態遷移・約定規則の設計文書を作成済み([Paper Execution(最小設計)](../architecture/paper_execution.md))。実装(データモデル・保存層 / Open・Close判定エンジン)は後続Issueで管理。
 - **Strategy 定義の外部化**: 現在コードに埋め込まれているエントリー/Exit条件・戦略プロファイル(例: `xauusd_1h_squeeze_breakout_v1`)を、設定/定義ファイルとして外部化し、コード変更なしに戦略を追加・切替できるようにする。
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
