@@ -9,7 +9,7 @@ BELIAL軍団の眷属は、炎・辛味・スパイスをモチーフとした�
 | 名前 | 役割 | ステータス |
 |---|---|---|
 | Berial | 軍団長 / 市場監視・戦略立案 | 実装中 |
-| Pepperoni | 将来の Execution(エントリー執行)担当 | 構想追加(未実装) |
+| Pepperoni | 将来の Live Execution(Broker API による実発注・エントリー執行)担当 | 構想追加(Live Execution は未実装。仮想約定の Paper Execution は `paper-execution/` に実装済み) |
 | Jalapeño | ブレイクアウト・モメンタム担当 | 未定 |
 | Habanero | 高リスク戦略・危険相場担当 | 未定 |
 | Tabasco | Discord通知・アラート担当 | 未定 |
@@ -32,7 +32,7 @@ Pepperoni は、Berial から渡された市場判断をもとに、エントリ
 
 裁量判断は苦手だが、命令を忠実かつ高速に実行することを得意とする。市場判断そのものは Berial が担当し、Pepperoni は「いつ、どの条件で、どの注文を出すか」を実装上の責務として受け持つ。
 
-Execution 層は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価)と **Live Execution**(Broker API による実注文・実約定)に分かれるが、どちらも未実装であり、Pepperoni がそのどちらを(あるいは両方を)担うかは現時点では確定しない。いずれの場合も、過去データで仮説を検証する Backtest(検証基盤)とは別レイヤーである。
+Execution 層は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定。**未実装**)に分かれる。仮想position の pending / open / closed / expired / cancelled 管理、仮想 Open / Close 判定、Paper Signal からの仮想執行はすでに実装されている。Pepperoni が象徴するのは Broker API による実発注(Live Execution)であり、これは未実装である。いずれの場合も、過去データで仮説を検証する Backtest(検証基盤)とは別レイヤーである。
 
 ## Pepperoni の責務
 
@@ -96,6 +96,6 @@ Pepperoni 自身は炎のエフェクトを出さないが、このペンだけ�
 
 ## 実装上の注意
 
-Pepperoni は将来的な **Execution** レイヤー(発注・約定・ポジション管理)を象徴するキャラクターである。Execution は Paper Execution(仮想約定・仮想ポジション管理、未実装)と Live Execution(Broker API による実注文、未実装)に分かれるが、Pepperoni がどちらを担うかは現時点では確定しない。現行スコープ(v1.4系時点)では、いずれの Execution も実装しない。
+Pepperoni は将来的な **Live Execution** レイヤー(Broker API による実発注・実約定・実ポジション管理)を象徴するキャラクターである。Execution は Paper Execution(仮想約定・仮想ポジション管理。**実装済み** = `paper-execution/`)と Live Execution(Broker API による実注文。**未実装**)に分かれる。仮想執行(Paper Execution)はすでに実装され、Pepperoni が象徴する実発注(Live Execution)は現行スコープ(v1.4系時点)では実装しない。
 
 なお、過去データで仮説を遡及検証する Backtest は独立した検証基盤であり、Execution レイヤーそのものではない。

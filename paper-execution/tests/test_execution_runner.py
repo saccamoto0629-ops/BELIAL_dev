@@ -492,3 +492,60 @@ def test_dry_run_missing_db_not_created(tmp_path):
     )
     assert res.failures == 0
     assert not db.exists()
+
+
+# --- Major: invalid (non-SQLite) position DB is handled, never leaked ---------
+
+def _write_invalid(db, kind):
+    if kind == "bytes":
+        db.write_bytes(bytes(range(256)) * 8)
+    elif kind == "text":
+        db.write_text("this is a text file, not a database\n" * 20)
+    elif kind == "corrupt_header":
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE t (x)")
+        data = bytearray(db.read_bytes())
+        data[0:16] = b"XXXXXXXXXXXXXXXX"
+        db.write_bytes(bytes(data))
+
+
+def _run_invalid(db, tmp_path, *, dry_run):
+    return runner.run_once(
+        dry_run=dry_run, db_path=db, signals=[], load_candles=_loader(_candles([(1, 1, 1, 1)])),
+        now_utc=NOW, profile=PROFILE, chart_db_path=tmp_path / "c.sqlite3", signal_db_path=tmp_path / "s.sqlite3",
+    )
+
+
+@pytest.mark.parametrize("kind", ["bytes", "text", "corrupt_header"])
+def test_dry_run_invalid_db_fails_without_touching_file(tmp_path, kind, monkeypatch):
+    db = tmp_path / "bad.sqlite3"
+    _write_invalid(db, kind)
+    before, mt, sz = db.read_bytes(), db.stat().st_mtime_ns, db.stat().st_size
+
+    # spy: position read + migration helpers must NOT be called in dry-run.
+    read_calls, init_calls = [], []
+    monkeypatch.setattr(store, "list_positions_by_state", lambda *a, **k: read_calls.append(a) or [])
+    monkeypatch.setattr(store, "init_db", lambda *a, **k: init_calls.append(a))
+    monkeypatch.setattr(store, "ensure_schema_migrated", lambda *a, **k: init_calls.append(a))
+
+    res = _run_invalid(db, tmp_path, dry_run=True)   # must not raise
+    assert res.failures == 1
+    assert read_calls == [] and init_calls == []
+    assert db.read_bytes() == before and db.stat().st_mtime_ns == mt and db.stat().st_size == sz
+
+
+@pytest.mark.parametrize("kind", ["bytes", "text", "corrupt_header"])
+def test_non_dry_run_invalid_db_fails_without_overwrite(tmp_path, kind):
+    db = tmp_path / "bad.sqlite3"
+    _write_invalid(db, kind)
+    before = db.read_bytes()
+    res = _run_invalid(db, tmp_path, dry_run=False)   # must not raise
+    assert res.failures == 1
+    assert db.read_bytes() == before   # not overwritten / not recreated as fresh DB
+
+
+def test_invalid_db_cli_exit_non_zero(tmp_path):
+    db = tmp_path / "bad.sqlite3"
+    _write_invalid(db, "bytes")
+    assert runner.run_service(once=True, dry_run=True, db_path=db, profile=PROFILE) == runner.EXIT_FAILURE
+    assert runner.run_service(once=True, dry_run=False, db_path=db, profile=PROFILE) == runner.EXIT_FAILURE

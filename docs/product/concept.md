@@ -33,7 +33,7 @@ BELIAL は、ニュース、マーケットデータ、チャート指標を観�
 - 実発注
 - 売買推奨文言の生成
 
-上記は **Paper Execution**(Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う未実装レイヤー)と **Live Execution**(Broker API による実注文・実約定の未実装レイヤー)が担う領域であり、いずれも現行スコープ外である。なお Backtest は過去データで仮説を遡及検証する独立した検証基盤であり、`backtest/execution_model.py` の spread / slippage / fill は Backtest 内部のシミュレーションモデルにすぎない(Paper Execution レイヤーの実装ではない)。
+上記は実売買(自動売買)に踏み込む領域であり、**Live Execution**(Broker API による実注文・実約定。**未実装**)の担当として現行スコープ外である。なお、仮想約定・仮想ポジション管理・仮想Exit・仮想損益(「もしこの仮説どおり執行していたら」のシミュレーション)は **Paper Execution**(`paper-execution/`)として**実装済み**だが、これは仮想レコードのみを生成し、**実発注・Broker API 連携・ロット計算・売買推奨文言の生成は含まない**。Backtest は過去データで仮説を遡及検証する独立した検証基盤であり、`backtest/execution_model.py` の spread / slippage / fill は Backtest 内部のシミュレーションモデルにすぎない(Paper Execution レイヤーの実装ではない)。
 
 ## 設計思想
 

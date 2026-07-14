@@ -332,7 +332,7 @@ def run_once(
 
     db_path = Path(db_path) if db_path is not None else store.position_db_path()
     default_profile = profile or profiles.DEFAULT_PROFILE
-    now = parse_timestamp_utc(now_utc) if now_utc is not None else parse_timestamp_utc(pd.Timestamp.utcnow())
+    now = parse_timestamp_utc(now_utc) if now_utc is not None else parse_timestamp_utc(pd.Timestamp.now("UTC"))
 
     if signal_db_path is None:
         import paper_signal_store as signal_store  # noqa: E402  (paper-signal)
@@ -397,7 +397,15 @@ def run_once(
     # -- proceed for missing/current, but refuse to read a legacy/invalid DB (and
     # never write to migrate it).
     if dry_run:
-        status = store.get_schema_status(db_path)
+        # Read-only probe only (no write). Defensive try/except: even if the probe
+        # ever raised an unexpected SQLite error, the failure is counted here (one
+        # schema-probe failure), never leaked out of run_once.
+        try:
+            status = store.get_schema_status(db_path)
+        except Exception as exc:
+            logger.error("Paper Execution [DRY_RUN]: schema probe failed (%s) -- aborting cycle.", exc)
+            result.failures += 1
+            return result
         if status not in (store.SCHEMA_STATUS_MISSING, store.SCHEMA_STATUS_CURRENT):
             logger.error(
                 "Paper Execution [DRY_RUN]: position DB schema is %r -- migration required. "

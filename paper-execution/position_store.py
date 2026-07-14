@@ -430,21 +430,45 @@ def get_schema_status(db_path: Path | None = None) -> str:
     """Return the position DB's schema status WITHOUT writing anything.
 
     One of ``missing`` / ``current`` / ``legacy`` / ``invalid``. Read-only: never
-    creates the DB file, never migrates, never touches ``mtime`` -- safe to call
-    on a dry run. ``validate_schema_read_only`` is an alias for callers that want
-    the intent spelled out.
+    creates the DB file, never migrates, never touches ``mtime``/size -- safe on a
+    dry run. ``validate_schema_read_only`` is an alias for callers that want the
+    intent spelled out.
+
+    Classification:
+      * ``missing``  -- no file yet.
+      * ``invalid``  -- the file exists but is NOT a usable SQLite database (a
+                        non-SQLite byte stream, a corrupt header, an unreadable
+                        schema). This is detected by catching ``sqlite3.DatabaseError``
+                        -- which ``file is not a database`` raises, and of which
+                        ``sqlite3.OperationalError`` (missing table etc.) is a
+                        subclass, so both are covered. We deliberately catch this
+                        narrow SQLite family (NOT the whole ``sqlite3.Error``, and
+                        NOT ``ProgrammingError``/``Exception``), so a genuine
+                        programming bug still surfaces rather than being masked as
+                        ``invalid``.
+      * ``legacy``   -- a valid SQLite DB, but our table is absent (needs creating)
+                        or present at an older version / missing columns (needs a
+                        rebuild migration). A normal (non-dry) run resolves this.
+      * ``current``  -- our table present at the current version with every column.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
     if not db_path.exists():
         return SCHEMA_STATUS_MISSING
     try:
-        with sqlite3.connect(db_path) as connection:
-            if not _table_exists(connection, POSITIONS_TABLE):
-                return SCHEMA_STATUS_INVALID
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            columns = _table_columns(connection, POSITIONS_TABLE)
-    except sqlite3.OperationalError:
+        connection = sqlite3.connect(db_path)
+    except sqlite3.DatabaseError:
         return SCHEMA_STATUS_INVALID
+    try:
+        # Reading sqlite_master forces SQLite to validate the file header; a
+        # non-SQLite/corrupt file raises sqlite3.DatabaseError here.
+        if not _table_exists(connection, POSITIONS_TABLE):
+            return SCHEMA_STATUS_LEGACY  # valid SQLite, our table not created yet
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = _table_columns(connection, POSITIONS_TABLE)
+    except sqlite3.DatabaseError:
+        return SCHEMA_STATUS_INVALID
+    finally:
+        connection.close()  # close() never commits -- no write, mtime/size unchanged
     if version >= CURRENT_SCHEMA_VERSION and not (REQUIRED_COLUMNS - columns):
         return SCHEMA_STATUS_CURRENT
     return SCHEMA_STATUS_LEGACY
@@ -465,6 +489,14 @@ def ensure_schema_migrated(db_path: Path | None = None) -> None:
     so this never leaves a partial migration behind.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
+    # Refuse an invalid (non-SQLite / corrupt) file BEFORE init_db so we never
+    # overwrite it or recreate it as a fresh DB -- "not a SQLite file" is a hard
+    # error, not a fresh-DB case.
+    if get_schema_status(db_path) == SCHEMA_STATUS_INVALID:
+        raise PositionSchemaError(
+            f"position DB at {db_path} is not a valid SQLite positions DB (corrupt / not a database); "
+            "refusing to overwrite or recreate it"
+        )
     init_db(db_path)
     status = get_schema_status(db_path)
     if status != SCHEMA_STATUS_CURRENT:

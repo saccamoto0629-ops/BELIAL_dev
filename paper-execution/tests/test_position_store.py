@@ -320,3 +320,68 @@ def test_migration_fails_on_duplicate_signal(tmp_path):
     with pytest.raises(store.PositionMigrationError):
         store.init_db(db)
     assert _user_version(db) == 0   # rolled back
+
+
+# --- get_schema_status classification (incl. invalid non-SQLite files) -------
+
+def _corrupt_sqlite_header(db):
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE t (x)")
+    data = bytearray(db.read_bytes())
+    data[0:16] = b"XXXXXXXXXXXXXXXX"   # smash the "SQLite format 3\0" magic
+    db.write_bytes(bytes(data))
+
+
+def test_schema_status_missing(tmp_path):
+    assert store.get_schema_status(tmp_path / "nope.sqlite3") == store.SCHEMA_STATUS_MISSING
+
+
+def test_schema_status_current(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    store.init_db(db)
+    assert store.get_schema_status(db) == store.SCHEMA_STATUS_CURRENT
+
+
+def test_schema_status_legacy(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _make_legacy(db, columns=_LEGACY_COLUMNS, rows=[_valid_legacy_row()])
+    assert store.get_schema_status(db) == store.SCHEMA_STATUS_LEGACY
+
+
+def test_schema_status_valid_sqlite_without_our_table_is_legacy(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    # a real SQLite DB missing our table just needs init -> legacy, NOT invalid
+    assert store.get_schema_status(db) == store.SCHEMA_STATUS_LEGACY
+
+
+@pytest.mark.parametrize("make", [
+    lambda p: p.write_bytes(bytes(range(256)) * 8),                       # arbitrary bytes
+    lambda p: p.write_text("just some text, definitely not a database\n" * 20),  # text file
+    _corrupt_sqlite_header,                                               # broken SQLite header
+])
+def test_schema_status_invalid_for_non_sqlite_files(tmp_path, make):
+    db = tmp_path / "bad.sqlite3"
+    if make is _corrupt_sqlite_header:
+        _corrupt_sqlite_header(db)
+    else:
+        make(db)
+    assert store.get_schema_status(db) == store.SCHEMA_STATUS_INVALID
+
+
+def test_get_schema_status_does_not_modify_invalid_file(tmp_path):
+    db = tmp_path / "bad.sqlite3"
+    db.write_bytes(b"not a database \x00\x01\x02" * 16)
+    before, mt, sz = db.read_bytes(), db.stat().st_mtime_ns, db.stat().st_size
+    assert store.get_schema_status(db) == store.SCHEMA_STATUS_INVALID
+    assert db.read_bytes() == before and db.stat().st_mtime_ns == mt and db.stat().st_size == sz
+
+
+def test_ensure_schema_migrated_refuses_invalid_without_overwrite(tmp_path):
+    db = tmp_path / "bad.sqlite3"
+    db.write_bytes(b"not a database \x00\x01\x02" * 16)
+    before = db.read_bytes()
+    with pytest.raises(store.PositionSchemaError):
+        store.ensure_schema_migrated(db)
+    assert db.read_bytes() == before   # never overwritten / recreated
