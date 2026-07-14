@@ -98,7 +98,7 @@ exit:                       # 必須 object(§8)
 | `timeframes` | list[str] | ✅ | — | 非空。Chart DB の値と一致(例 `1h`)。 |
 | `allowed_market_states` | list[str] \| null | | `null` | `null`=フィルタ無し。各要素 ∈ `KNOWN_MARKET_STATES`(§6)。 |
 | `entry.handler` | str | ✅ | — | 登録済み handler キー(§7)。 |
-| `entry.params` | object | | `{}` | handler 固有。generic loader からは不透明、handler が検証(§7)。 |
+| `entry.params` | object | | `{}` | handler 固有。値はスカラ / スカラ平坦リストのみ(ネスト・NaN 不可, §7)。意味は handler が検証。 |
 | `entry.reentry` | enum | | `overlap` | `{overlap, single_position, new_setup}`(§7)。 |
 | `entry.cooldown_bars` | int ≥ 0 | | `0` | 決済後 N 本抑制。0=無効(§7)。 |
 | `risk.stop_loss.type` | enum | ✅ | — | `{trigger_bar_extreme, fixed_pct}`(§8)。 |
@@ -106,9 +106,10 @@ exit:                       # 必須 object(§8)
 | `risk.take_profit.type` | enum | ✅ | — | `{r_multiple}`(§8)。 |
 | `risk.take_profit.r` | float > 0 | 条件付 | — | `type=r_multiple` のとき必須。 |
 | `exit.max_holding_bars` | int > 0 | ✅ | — | time exit の本数(§8)。 |
-| `exit.same_candle_priority` | enum | | `stop_loss` | `{stop_loss, take_profit}`(§8)。 |
+| `exit.same_candle_priority` | enum | | `stop_loss` | スキーマ enum は `{stop_loss, take_profit}` だが handler 契約で制限。squeeze は `stop_loss` のみ(§4.1, §8)。 |
 
 > **`entry.params` を除き、既知オブジェクト配下の未知キーは拒否する**(fail-closed, §3)。
+> フィールドの **値**が選択 handler の capability に反する場合も validation error(§4.1)。
 
 ---
 
@@ -149,6 +150,35 @@ exit:                       # 必須 object(§8)
 - `id` と `handler` は **別概念**:`id` は定義ファイルの同一性、`handler` はコードとの結合点。
   複数の定義(別 `id`)が同一 `handler` を params 違いで指してよい。
 
+### 4.1 handler 対応フィールド契約(capability descriptor)
+
+各 handler は Python 側に **capability descriptor**(対応フィールドと許容値の宣言)を持つ(Issue #53 で実装)。
+Validator は定義を descriptor と突合し、**非対応フィールド、または対応するが許容しない値を検出したら
+`StrategyDefinitionError`** とする。**「無視して読み飛ばす」ことはしない**(Loader が受理したのに実行時に
+無視される「死に設定」を構造的に禁止する)。handler が「対応するが単一固定値のみ」のフィールドは、
+**その固定値または省略のみ許容**し、他値はエラー。
+
+現時点で唯一の実装済み handler は `squeeze_breakout`(現 `backtest/squeeze_breakout.py`)。
+その capability を **確定契約**とする。`trend_follow` は将来 handler 化する際に確定する **参考列**
+(現状は paper-signal 候補経路であり handler ではない)。
+
+| フィールド | `squeeze_breakout`(確定) | `trend_follow`(参考・将来確定) |
+|---|---|---|
+| `entry.params.squeeze_state` | ✅ 対応(既定 `squeeze`) | ✕ 非対応 |
+| `entry.params.require_episode_release` | ✅ 対応 | ✕ 非対応 |
+| `entry.params.breakout` | ✅ 対応(`bollinger_close` のみ) | ✕ 非対応 |
+| `allowed_market_states` | ✕ **非対応 → `null` 必須**(自前 episode state machine) | ✅ 対応 |
+| `entry.reentry` | `new_setup` のみ(構造的に単一ポジション) | `overlap` / `single_position` |
+| `entry.cooldown_bars` | `0` のみ | 任意(≥ 0) |
+| `risk.stop_loss.type` | `trigger_bar_extreme` のみ | `fixed_pct` |
+| `risk.take_profit.type` | `r_multiple` のみ | `r_multiple` |
+| `exit.max_holding_bars` | ✅ 対応(int > 0) | ✅ 対応 |
+| `exit.same_candle_priority` | **`stop_loss` のみ**(§8 参照) | `stop_loss` / `take_profit` |
+
+> 例:`handler: squeeze_breakout` に対し `allowed_market_states: [trend_up]`、
+> `same_candle_priority: take_profit`、`cooldown_bars: 60`、`reentry: overlap` はいずれも
+> **validation error**。squeeze の descriptor が許容しないため(死に設定にならない)。
+
 ---
 
 ## 5. symbols / timeframes
@@ -160,7 +190,52 @@ exit:                       # 必須 object(§8)
 - 意味論:**この定義が「適用可能」な symbol/timeframe の宣言**であり、runner を多重ループさせる指示ではない。
   runner は従来どおり 1 回の `--symbol`/`--timeframe` を取り、Loader/runner は
   「要求された symbol/timeframe がリストに含まれるか」を検証に使う(Issue #53)。含まれない組合せは
-  使用時エラー。**複数 symbol の同時 run は別 Issue**(§11)。
+  使用時エラー。**複数 symbol の同時 run は別 Issue**(本 Issue のスコープ外)。
+
+---
+
+## 5.1 ロード単位 / runtime 配置 / CLI 接続 / 後方互換(#53 実装契約)
+
+Loader / Validation の実装方式を左右するため、以下を **本 Issue で確定**する(§12 に残さない)。
+
+### ロード単位
+
+- **1 ファイル = 1 Strategy 定義**。1 ファイルに複数 Strategy を書く multi-document YAML は不可
+  (§1 の「複数ドキュメント不可」と一致)。
+- ディレクトリ指定時は **配下の `*.yaml` を全て読み、`id` を key とする registry** に載せる。
+  ロードは登録段階で全ファイルを検証し、**1 件でも invalid、または `id` 重複があれば registry 構築
+  全体を失敗**させる(部分ロードしない=再現性のため)。
+
+### runtime 配置(既定)
+
+- **既定ディレクトリ: `backtest/strategies/`**(リポジトリルート相対)。環境変数
+  `STRATEGY_DEFINITIONS_DIR` で上書き可(既存 `*_DB_PATH` 群と同じ上書き idiom)。
+- 拡張子は `.yaml`(`.yml` も許容)。`data/` のように `.gitignore` はしない(定義は成果物)。
+- 本 Issue のサンプルは **参照用として `docs/architecture/examples/` に置く**(Loader 未実装で非読込)。
+  #53 で実際にロードされる定義ファイルを `backtest/strategies/` へ置く(移行 Issue で squeeze を配置)。
+
+### CLI 接続
+
+- **単一ファイル指定とディレクトリ+id 選択の両方を用意**する(排他)。
+  - `--strategy-file <PATH>`:1 ファイルを直接ロードして使う(アドホック検証用。ディレクトリ走査なし)。
+  - `--strategy <ID>`:既定ディレクトリ(または `STRATEGY_DEFINITIONS_DIR`)を registry 化し、
+    `id == <ID>` を選ぶ。未存在 id はエラー。
+- 両者は排他。両方指定はエラー。
+
+### ファイル未指定時の後方互換
+
+- `--strategy-file` / `--strategy` の **いずれも未指定なら、外部定義機構は一切起動しない**。
+  現行の `--strategy-profile`(enum、既定 `trend_follow`)の挙動を **完全維持**する。
+  ディレクトリの走査も PyYAML の import も行わない。
+- したがって外部 Strategy 定義は **完全な opt-in**。既存の全呼び出し・全テストは変更なしで従来どおり動く。
+- `--strategy(-file)` と旧 `--strategy-profile` の同時指定はエラー(どちらが有効か曖昧にしない)。
+
+### cooldown_bars の接続範囲(#53)
+
+- **#53 では Loader が `cooldown_bars` を内部型へ載せるところまで**実装し、**runner へは接続しない
+  (未使用)**。理由:唯一の実装済み handler `squeeze_breakout` は capability 契約上 `cooldown_bars=0`
+  固定(§4.1)であり、runner 接続は不要。非ゼロ cooldown を要する handler を追加する時点で、
+  runner 側の接続(分換算 or runner の bars 対応化)を別途行う。これにより #53 のスコープを確定させる。
 
 ---
 
@@ -169,11 +244,12 @@ exit:                       # 必須 object(§8)
 - 各要素は `market-watch/market_state.py:KNOWN_MARKET_STATES`
   (`trend_up` / `trend_down` / `range` / `volatile` / `squeeze` / `unknown`)のいずれか。範囲外はエラー。
 - `null`(既定)= フィルタ無し。既存 CLI `--allowed-market-states` と同じ意味論を宣言化したもの。
-- **handler 依存の適用**:squeeze_breakout handler は **自前の squeeze episode state machine** を持ち、
-  現行 runner でも market-state ゲートを使わない(`--allowed-market-states` は trend_follow 経路専用)。
-  よって **squeeze のサンプルでは `null`**。この「どの handler がこのフィルタを尊重するか」は
-  handler 実装の契約(Issue #53 でドキュメント化)。定義スキーマとしては全 handler 共通に持てるが、
-  適用可否は handler が決める。
+- **handler 対応契約(§4.1)で判定**:squeeze_breakout handler は **自前の squeeze episode state
+  machine** を持ち、market-state ゲートを使わない(`--allowed-market-states` は trend_follow 経路専用)。
+  よって squeeze の capability descriptor では `allowed_market_states` は **非対応 = `null` 必須**とし、
+  **非 null を指定したら validation error**(死に設定にしない)。サンプルは `null`。
+  スキーマ上は全 handler 共通に持てるフィールドだが、実際に尊重するかは §4.1 の contract で決まり、
+  非対応 handler との組合せはエラーになる(黙って無視しない)。
 
 ---
 
@@ -191,14 +267,24 @@ entry:
 ```
 
 - **`handler`**:§4。
-- **`params`**:handler 固有の **宣言的スカラ / リスト値のみ**。generic loader は中身を検証せず、
-  **handler が自分の params を検証**する(型・範囲・必須)。これが唯一の未知キー許容ゾーン(§3)。
-  **式・条件文字列・コード片は入れない**(過剰な DSL 化の回避)。
+- **`params`**:handler 固有の **宣言的値のみ**。generic loader は構造(下記の型規則)だけ検証し、
+  **各 key の意味・範囲・必須は handler の capability descriptor(§4.1)が検証**する。これが唯一の
+  未知 key 許容ゾーン(§3)。**式・条件文字列・コード片は入れない**(過剰な DSL 化の回避)。
   - squeeze_breakout の場合、BB 期間(20)・±2σ・squeeze lookback(20)・下位 10% は
     **indicators / market_state が所有する共通定義**であり、Strategy 固有の自由度ではない。
     よって params には「どの state を準備に使うか」「解除足だけ評価するか」「break の種類」といった
     **handler が明示的に読む宣言フラグ**のみを置き、指標定数そのものは持たせない
     (持たせると指標計算の外部化=責務越境になる)。
+  - **許可する値型(schema v1、generic loader が強制):**
+    - スカラ: `str` / `int` / `float` / `bool` / `null`。
+    - **スカラの平坦リスト** `list[scalar]`。
+    - **ネスト不可**:dict(mapping)、list of dict、多重 list は schema v1 では **拒否**
+      (`StrategyDefinitionError`)。構造化 params が必要になれば schema_version を上げて拡張する。
+    - key は **文字列のみ**。空 params(`{}`)または省略は許容(default `{}`)。
+    - `null` は明示的に許容(値の欠如)。ただし handler が必須とする key が `null`/欠落なら
+      handler validation error。
+    - **`NaN` / `Infinity` / `-Infinity`(YAML の `.nan` / `.inf` 含む)は禁止**=`StrategyDefinitionError`。
+      config_json は NaN を出さない方針(既存 `report.render_json` は `allow_nan=False`)と整合。
 - **`reentry`**:
   - `overlap`(既定)= 重なり許容(現行 runner 既定)。
   - `single_position` = グローバル単一ポジション(現行 `--no-reentry` 相当)。
@@ -207,7 +293,8 @@ entry:
 - **`cooldown_bars`**:決済足から N 本は新規 entry を抑制。**単位は「分」ではなく「本(bars)」**。
   採用理由:Strategy 固有量は timeframe 相対で表すのが自然で、`max_holding_bars` と単位が揃う。
   不採用(分):現行 runner は `--cooldown-minutes`(壁時計分)だが、これは実行時フラグの都合であり、
-  Strategy の宣言としては bars が適切。**Loader が bars → runner 表現へ変換**する(§10)。squeeze は `0`。
+  Strategy の宣言としては bars が適切。**#53 では Loader が内部型へ載せるのみで runner へは接続しない**
+  (§5.1 の接続範囲)。squeeze は capability 契約上 `0` 固定。
 
 ---
 
@@ -239,9 +326,15 @@ exit:
 - **`max_holding_bars`**:int > 0。time exit は「Entry 後この本数目の確定足 close」。
   その足でも **gap → SL/TP を先に評価**し、いずれも不成立のときだけ time exit(判定順序は Python)。
   squeeze は `24`(XAUUSD 1h の 24 時間相当、欠損は実在の次 24 本で数える)。
-- **`same_candle_priority`**:同一足で SL/TP 双方到達時どちらを優先するか。`stop_loss`(既定, 保守的)/
-  `take_profit`。squeeze は `stop_loss`。語彙は `exit_policy.py` /
+- **`same_candle_priority`**:同一足で SL/TP 双方到達時どちらを優先するか。スキーマ上の enum は
+  `{stop_loss, take_profit}`(既定 `stop_loss`, 保守的)。語彙は `exit_policy.py` /
   `paper-execution/execution_profile.py` と同一文字列(層をまたいで突合可能にするため)。
+  - **squeeze_breakout は `stop_loss` のみ対応**(§4.1)。現行 `evaluate_squeeze_exit()` は同一足到達時に
+    **無条件で stop_loss 優先**で、priority を受け取る引数を持たない。よって
+    `handler: squeeze_breakout` に対し **`same_candle_priority: take_profit` は validation error**
+    とし、`stop_loss` または省略(default `stop_loss`)のみ許容する。これにより「Loader は受理したが
+    実行時に無視される」死に設定を防ぐ。`take_profit` を実際に選べるのは、それを読む handler が
+    追加された時だけ(その handler の descriptor が対応値に含める)。
 
 ---
 
@@ -328,7 +421,8 @@ class ExitSpec:
 - **`to_config()` は JSON-serializable な plain dict** を返し、`backtest_runs.config_json` の既存
   `strategy_profile` 近傍へそのまま格納できる(現行 `_run_squeeze_breakout` が `strategy_profile` /
   `risk_reward` / `time_exit_bars` / `same_candle_priority` を config へ書いているのと同型)。
-- `cooldown_bars`(本)→ runner の内部表現への変換は Loader/runner 統合時(Issue #53)に行う。
+- `cooldown_bars`(本)は `EntrySpec` に載せるが、**#53 では runner へ接続しない(未使用)**。
+  runner 接続は cooldown を使う handler を足す時点で別途行う(§5.1)。
 
 ---
 
@@ -349,6 +443,9 @@ Loader は **専用例外 `StrategyDefinitionError(ValueError)`** を送出す�
 | id 重複(集合内) | **ロード全体を失敗**。両ファイルパスを表示。 |
 | 未登録 handler | エラー(登録済み一覧を表示)。 |
 | 条件付き必須の欠落(`r_multiple` に `r` 無し 等) | エラー。 |
+| handler 非対応フィールド / 非許容値(例:squeeze に `same_candle_priority: take_profit`、非 null `allowed_market_states`) | **validation error**(§4.1)。無視しない。 |
+| `entry.params` の型違反(ネスト dict、多重 list、NaN/Inf) | エラー(§7)。 |
+| `--strategy-file` と `--strategy` の同時指定 / 旧 `--strategy-profile` との併用 | 使用エラー(§5.1)。 |
 
 - **fail-fast**:最初のエラーで停止し 1 件を報告する(既存バリデータと同挙動)。複数エラーの集約は
   任意改善であり必須ではない。
@@ -357,18 +454,30 @@ Loader は **専用例外 `StrategyDefinitionError(ValueError)`** を送出す�
 
 ---
 
-## 12. 残した判断事項(Issue #53 以降で確定)
+## 12. 本 Issue で確定した事項 / 意図的に後続へ残す事項
 
-本文書は #53 で判断を再発生させない範囲を確定したが、**実装設計に委ねる点**を明示する。
+### 本 Issue(#52)で確定済み(#53 で再判断しない)
 
-1. **Strategy 定義ファイルの配置ディレクトリ**と探索方法(単一ファイル指定 / ディレクトリ走査)。
-   本文書のサンプルは `docs/architecture/examples/` に置く参照用で、runtime の配置は #53 が決める。
-2. **`cooldown_bars`(本)→ 既存 runner の `--cooldown-minutes`(分)** の橋渡し実装(timeframe から
-   分換算するか、runner 側を bars 対応にするか)。
-3. **Paper Execution `ExecutionProfile` との統合**:`risk_reward` / `max_hold_bars` /
-   `same_candle_priority` の source of truth をどちらへ寄せるか(§9)。移行 Issue の判断。
-4. **CLI との接続**:現行 `--strategy-profile`(enum)を Strategy 定義ファイル指定へ拡張する方法、
-   および既存の module 定数(`squeeze_breakout.RISK_REWARD` 等)との移行整合(既存 Strategy の
-   移行自体は本 Issue の非スコープ)。
-5. 複数 handler が `allowed_market_states` / `reentry` / `same_candle_priority` をどこまで尊重するかの
-   handler 別契約表(#53 で handler 実装と同時に確定)。
+- ファイル形式(YAML / `safe_load`)、schema_version・互換性方針、全スキーマ項目と必須/default、
+  未知キー・型不正・範囲外・未対応 version・id 重複・未登録 handler のエラー方針(§1–§11)。
+- **ロード単位 = 1 ファイル 1 Strategy、ディレクトリ走査で id registry 化、部分ロード禁止**(§5.1)。
+- **runtime 既定配置 = `backtest/strategies/`(`STRATEGY_DEFINITIONS_DIR` で上書き)**(§5.1)。
+- **CLI 接続 = `--strategy-file <path>`(単一) / `--strategy <id>`(ディレクトリ+選択)、排他**(§5.1)。
+- **ファイル未指定時の後方互換 = 外部機構を起動せず現行 `--strategy-profile` を完全維持(opt-in)**(§5.1)。
+- **handler 別対応フィールド一覧(capability descriptor)と、非対応フィールド/非許容値は validation
+  error(無視しない)**(§4.1)。`same_candle_priority` の squeeze 実装矛盾もこれで解消(§8)。
+- **`entry.params` の許可型(スカラ/平坦リスト、ネスト・NaN 不可、null 可)**(§7)。
+- **`cooldown_bars` は #53 で Loader が内部型へ載せるのみ・runner 未接続**(§5.1)。
+
+### 意図的に後続 Issue(移行 Issue)へ残す事項 — #53 の Loader/Validation 実装には不要
+
+以下は Loader / Validation の実装方式を左右しないため本 Issue では確定しない。
+
+1. **Paper Execution `ExecutionProfile` との統合**:`risk_reward` / `max_hold_bars` /
+   `same_candle_priority` の最終 source of truth をどちらへ寄せるか(§9)。本 Issue のスコープは
+   Backtest の Strategy 外部化であり、Paper Execution 層の再編は別 Issue。現時点の境界(Strategy 定義=
+   intrinsic な宣言、コストは常に実行環境側)は確定済みで、#53 の実装はこれに依存しない。
+2. **既存 `squeeze_breakout` の外部定義への移行**(module 定数 `RISK_REWARD` 等の置換)。本 Issue の
+   明示的非スコープ。移行 Issue で行う。
+3. **cooldown を実際に使う handler を追加する際の runner 接続**(bars→runner 表現の橋渡し)。
+   その handler を足す Issue で行う(§5.1)。
