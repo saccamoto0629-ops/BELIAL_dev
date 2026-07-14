@@ -18,9 +18,11 @@ run_idのstdout表示・summary表示・Discord非送信はIssue #33/#23の実�
 (Market Bias)のみで、書き込むのは既存の Backtest DB(`backtest_runs` / `backtest_signals`)のみ
 (`summary` サブコマンドで `--output` を指定した場合のみ、指定したファイルにも書き込む)。
 
-> Issue #52(設計): Strategy ごとの可変設定を外部ファイルへ切り出すためのスキーマ・エラー方針は
-> [docs/architecture/strategy_definition.md](architecture/strategy_definition.md) を参照。Loader /
-> Validation は未実装(後続 Issue #53)で、現状の `--strategy-profile` の挙動は変わらない。
+> Issue #52(設計)/ Issue #53(実装): Strategy ごとの可変設定を外部 YAML ファイルへ切り出すための
+> スキーマ・エラー方針は [docs/architecture/strategy_definition.md](architecture/strategy_definition.md)
+> を参照。Issue #53 で Loader / Validation / CLI 接続(`--strategy-file` / `--strategy`)を実装した
+> (下記「外部 Strategy 定義による実行」)。外部定義は**完全な opt-in** で、未指定時の
+> `--strategy-profile` の挙動は一切変わらない。
 
 ## 事前準備(データの前提)
 
@@ -141,6 +143,8 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | `--cooldown-minutes` | | Issue #38: 任意のポジションが時刻 `C` で決済した後、`C + N分` 未満に発生した新規候補を抑制する。long/shortやsignal type単位ではなくグローバル。**0.0以上のみ**(既定0.0=無効=Issue #38以前の挙動)。`--no-reentry` とは独立したフラグで、両方指定も可能。 |
 | `--time-series-bias` | | Issue #38: Market Bias を run全体に固定適用せず、各バーのclose時刻ごとに `evaluated_at <= close` の最新biasをpoint-in-timeで参照する(未来のbiasは混入しない。対象バーより前にbiasが無ければNeutral)。既定は無効(static bias=Issue #38以前の挙動、下記「Market Bias の参照」を参照)。詳細は下記「時系列 Market Bias」を参照。 |
 | `--allowed-market-states` | | Issue #39: 各候補を、そのバーの Market State がこの許可リストに含まれる場合のみ採用する(カンマ区切り。有効値: `trend_up` / `trend_down` / `range` / `volatile` / `squeeze` / `unknown`)。全バーの Market State は指定有無に関わらず常に判定・記録され、このフラグは「どの候補を保存シグナルにするか」だけをゲートする。未指定(既定)=state フィルタなし(Issue #39以前の挙動、全候補が対象)。不正・空・未知の state 名は終了コード2。詳細は下記「Market State によるエントリー制御」を参照。 |
+| `--strategy-file` | | Issue #53: 外部 Strategy 定義 YAML ファイルを1つ直接ロードして実行する(ディレクトリ走査なし)。`--strategy` / 明示的な `--strategy-profile` とは排他(併用は終了コード2)。定義が invalid な場合は実行開始前に終了コード2(DB作成等の副作用なし)。詳細は下記「外部 Strategy 定義による実行」。 |
+| `--strategy` | | Issue #53: Strategy 定義ディレクトリ(既定 `backtest/strategies/`、`STRATEGY_DEFINITIONS_DIR` で上書き)配下の全 `*.yaml` / `*.yml` を validation して id registry を構築し、`id` が一致する定義を実行する。1ファイルでも invalid・id 重複があればロード全体が失敗(部分ロードなし)。未存在 id は登録済み id 一覧付きの終了コード2。`--strategy-file` / 明示的な `--strategy-profile` とは排他。 |
 | `--run-name` | | 既定は `<symbol>_<timeframe>_<from>_<to>`。 |
 | `--strategy-name` | | 既定は `paper_signal_generator`(=Paper Signal Generatorの既存ルールをそのまま再生していることを示す)。`backtest_runs.strategy_name` に保存されるラベルのみで、指定してもシグナル生成ロジック自体は変わらない。 |
 
@@ -158,8 +162,76 @@ python -m backtest summary --run-id <RUN_ID> --format markdown --output reports/
 | コード | 意味 |
 |---|---|
 | `0` | 実行成功(シグナル0件でも成功)。 |
-| `2` | 引数エラー(必須引数の欠落、`--from`/`--to` のパース失敗、`--to` が `--from` より前、`--warmup-bars` が1未満、`--confidence-threshold` が0.0〜1.0の範囲外、`--spread`/`--slippage`/`--cooldown-minutes` が負、`--allowed-market-states` が空/未知の state 名など)。argparse自体の使用エラーも同じ2を返す。 |
+| `2` | 引数エラー(必須引数の欠落、`--from`/`--to` のパース失敗、`--to` が `--from` より前、`--warmup-bars` が1未満、`--confidence-threshold` が0.0〜1.0の範囲外、`--spread`/`--slippage`/`--cooldown-minutes` が負、`--allowed-market-states` が空/未知の state 名など)。argparse自体の使用エラーも同じ2を返す。Issue #53: `--strategy-file`/`--strategy` の併用・明示的 `--strategy-profile` との併用、外部 Strategy 定義の validation 失敗、未存在 strategy id、定義が宣言しない `--symbol`/`--timeframe` の要求も終了コード2(いずれも DB 作成・run 登録前に失敗する)。 |
 | `3` | データ不足(`run`: 該当 symbol/timeframe のローソク足が1件もない、またはvalidation期間内に該当する足が1件もない。`summary`: 指定した `--run-id` が `backtest_runs` に存在しない)。 |
+
+## 外部 Strategy 定義による実行(Issue #53)
+
+Issue #52 で確定したスキーマ([docs/architecture/strategy_definition.md](architecture/strategy_definition.md))
+の Loader / Validation / CLI 接続の実装。Strategy ごとの**宣言的な可変設定だけ**を YAML(1 Strategy =
+1 ファイル、`yaml.safe_load()` のみ)で外部化する。条件式・指標計算・Trigger 判定・entry/exit の
+約定判定順序は従来どおり Python 側(`squeeze_breakout.py` / `market_state.py` 等)に残り、
+spread / slippage / fee も Strategy 定義には置かない(run 単位の `--spread`/`--slippage` のまま)。
+
+### 配置と指定方法
+
+- 既定ディレクトリ: **`backtest/strategies/`**(環境変数 `STRATEGY_DEFINITIONS_DIR` で上書き可)。
+  対象拡張子は `.yaml` / `.yml`(非再帰、ファイル名ソート順の決定的走査)。
+- 参照用サンプル: [docs/architecture/examples/strategy_squeeze_breakout_v1.yaml](architecture/examples/strategy_squeeze_breakout_v1.yaml)。
+  **既存 `squeeze_breakout` の外部定義への移行(既定ディレクトリへの配置)は後続 Issue** で、
+  現時点で `backtest/strategies/` に定義ファイルは無い。
+
+```bash
+# 単一ファイルを直接指定(アドホック検証用)
+python -m backtest run \
+  --symbol XAU_USD --timeframe 1h \
+  --from 2026-06-01T00:00:00 --to 2026-06-30T23:59:59 \
+  --strategy-file my_strategy.yaml
+
+# 定義ディレクトリを全件validationし、idで選択
+STRATEGY_DEFINITIONS_DIR=/path/to/strategies \
+python -m backtest run \
+  --symbol XAU_USD --timeframe 1h \
+  --from 2026-06-01T00:00:00 --to 2026-06-30T23:59:59 \
+  --strategy xauusd_1h_squeeze_breakout_v1
+```
+
+### 排他関係と後方互換
+
+- `--strategy-file` と `--strategy` は排他(併用は終了コード2)。
+- どちらかと明示的な `--strategy-profile` の併用も終了コード2(どちらが有効か曖昧にしない)。
+- **どちらも未指定なら外部定義機構は一切起動しない**: PyYAML の import も定義ディレクトリの走査も
+  行わず、従来の `--strategy-profile`(既定 `trend_follow`)の挙動を完全維持する。したがって定義
+  ディレクトリに不正なファイルがあっても、外部 Strategy を使わない既存実行には一切影響しない。
+
+### validation と実行反映
+
+定義は実行開始前に全項目 validation され(必須・型・default・enum・範囲・未知キーの fail-closed 拒否・
+NaN/Infinity 拒否・未登録 handler・handler capability との突合)、失敗時は DB 作成・run 登録などの
+副作用を一切発生させず、ファイルパス+フィールドパス付きのエラーで終了コード2を返す。
+
+```
+error: invalid strategy definition: [file: my_strategy.yaml; strategy id: my_squeeze_v1;
+field: exit.max_holding_bars] must be an int > 0, got 0 (int)
+```
+
+受理された定義の全フィールドは実行へ反映される(「読み込まれるが無視される設定」は存在しない):
+
+- `risk.take_profit.r` / `exit.max_holding_bars` → squeeze_breakout の `risk_reward` / `time_exit_bars`
+  として実行に渡る(実行パラメータ)。
+- `symbols` / `timeframes` → 要求した `--symbol`/`--timeframe` が宣言に含まれない場合は終了コード2
+  (適合検証)。
+- `entry.handler` / `entry.params` / `entry.reentry` / `entry.cooldown_bars` /
+  `risk.stop_loss.type` / `risk.take_profit.type` / `exit.same_candle_priority` /
+  `allowed_market_states` → handler の capability descriptor が実装挙動と一致する値のみ受理する
+  固定値契約(squeeze_breakout は `new_setup` / `0` / `trigger_bar_extreme` / `r_multiple` /
+  `stop_loss` / `null` のみ。他値は validation error)。descriptor と実装の一致はテストで固定。
+- `schema_version` / `id` / `name` / `description` → 正規化済み定義全体が
+  `backtest_runs.config_json` の `strategy_definition` に記録され、`strategy_profile`
+  (config・保存シグナル・summary 表示)には定義の `id` が入る(メタデータ)。
+
+handler registry は Python コードが所有し、外部ファイルは登録済み handler 名(現行は
+`squeeze_breakout` のみ)を選ぶだけで、callable や module path を注入することはできない。
 
 ## warm-up期間とvalidation期間の分離
 
@@ -559,6 +631,13 @@ python -m pytest backtest/tests -q
 - `backtest/tests/test_report.py`(Issue #23で新規追加、レンダリング/ファイル保存の単体テスト)
 - `backtest/tests/test_backtest_models.py`(Issue #23で `apply_exit_policy_result()` の
   pnl計算テストを追記。既存テストの内容は変更していない)
+- `backtest/tests/test_strategy_definition.py`(Issue #53で新規追加。外部 Strategy 定義の
+  Loader / schema validation / handler capability / ディレクトリ registry の単体テストと、
+  「capability descriptor の許容値 == squeeze_breakout の実装挙動」を固定する一致テスト)
+- `backtest/tests/test_strategy_runner.py`(Issue #53で新規追加。`--strategy-file` / `--strategy` の
+  CLI 接続、排他関係、validation 失敗時の副作用ゼロ、YAML の take profit R / max holding bars が
+  実行結果へ反映されること、外部定義 run と既存 `--strategy-profile` run の同値性、
+  外部機構が opt-in であること(PyYAML 非 import)の統合・回帰テスト)
 - Issue #39で `test_warmup.py`(各バーの Market State 判定と point-in-time / off-by-one 回帰)・
   `test_runner.py`(`--allowed-market-states` のパース/フィルタ/相互排他カウンタ/config・summary記録)・
   `test_backtest_store.py`(market_state 列の in-place migration と round-trip)・
