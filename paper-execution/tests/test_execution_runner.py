@@ -339,3 +339,156 @@ def test_lenient_load_candles_range_still_empty_on_error(tmp_path):
     # the existing lenient contract is preserved for other callers (Backtest).
     assert chart_collector.load_candles_range(tmp_path / "nope.sqlite3", "USDJPY", "1h").empty
     assert chart_collector.load_candles_range(_broken_chart_db(tmp_path), "USDJPY", "1h").empty
+
+
+# --- Major: runner settles migration BEFORE reading any position -------------
+
+_LEGACY_COLUMNS = [c for c in store._ALL_COLUMNS if c not in ("size", "gross_pnl", "net_pnl", "r_multiple")]
+_TEXT_COLS = {
+    "position_id", "signal_id", "symbol", "timeframe", "side", "strategy_profile", "execution_profile",
+    "state", "terminal_reason", "signal_candle_utc", "entry_deadline_utc", "entry_time_utc",
+    "max_hold_deadline_utc", "close_time_utc", "same_candle_priority", "last_evaluated_candle_utc",
+    "created_at_utc", "updated_at_utc",
+}
+
+
+def _seed_legacy_db(db, row):
+    """Create a constraint-less legacy positions table (no size/gross/net/r, user_version 0)."""
+    def typ(c):
+        return "TEXT" if c in _TEXT_COLS else ("INTEGER" if c in ("max_entry_delay_bars", "max_hold_bars") else "REAL")
+    with sqlite3.connect(db) as conn:
+        conn.execute(f"CREATE TABLE {store.POSITIONS_TABLE} ({', '.join(f'{c} {typ(c)}' for c in _LEGACY_COLUMNS)})")
+        conn.execute("PRAGMA user_version = 0")
+        cols = [c for c in _LEGACY_COLUMNS if c in row]
+        conn.execute(
+            f"INSERT INTO {store.POSITIONS_TABLE} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+            tuple(row[c] for c in cols),
+        )
+
+
+def _legacy_row(**over):
+    row = dict(
+        position_id="old-1", signal_id="s-old", symbol="USDJPY", timeframe="1h", side="long",
+        strategy_profile="p", execution_profile="default", state="pending", terminal_reason=None,
+        signal_candle_utc="2026-07-06T12:00:00Z", entry_deadline_utc="2026-07-06T18:00:00Z",
+        max_entry_delay_bars=3, max_hold_bars=24, same_candle_priority="stop_loss",
+        fallback_stop_pct=0.01, risk_reward=2.0, spread=0.0, slippage=0.0, commission=0.0,
+        created_at_utc="2026-07-06T12:00:00Z", updated_at_utc="2026-07-06T12:00:00Z",
+    )
+    row.update(over)
+    return row
+
+
+def _uv(db):
+    with sqlite3.connect(db) as conn:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _has_size(db):
+    with sqlite3.connect(db) as conn:
+        return "size" in {r[1] for r in conn.execute(f"PRAGMA table_info({store.POSITIONS_TABLE})")}
+
+
+# ----- non-dry-run -----
+
+def test_fresh_db_absent_then_runner_creates_and_runs(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    res = _run(db, [], _candles([(1, 1, 1, 1)]), NOW)
+    assert res.failures == 0
+    assert db.exists() and _uv(db) == store.CURRENT_SCHEMA_VERSION
+
+
+def test_legacy_db_no_signal_migrates_then_evaluates(tmp_path):
+    # THE reported bug: legacy DB + existing pending + no new signal -> must migrate
+    # up front, then read the pending as the new model (size present) and evaluate.
+    db = tmp_path / "p.sqlite3"
+    _seed_legacy_db(db, _legacy_row())
+    assert _uv(db) == 0 and not _has_size(db)
+
+    candles = _candles([(50, 51, 49, 50), (100.0, 100.2, 99.9, 100.1), (100.5, 102.5, 100.1, 101.0)])
+    res = _run(db, [], candles, NOW)   # no new signals
+
+    assert res.failures == 0
+    assert _uv(db) == store.CURRENT_SCHEMA_VERSION and _has_size(db)
+    pos = store.get_position("old-1", db_path=db)
+    assert pos["size"] == 1.0
+    assert pos["state"] == "closed"          # migrated pending was opened+closed on the candles
+    assert pos["gross_pnl"] == pytest.approx(2.0)
+
+
+def test_legacy_db_open_position_migrates_and_closes(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_legacy_db(db, _legacy_row(
+        state="open", entry_price=100.0, entry_time_utc="2026-07-06T13:00:00Z",
+        stop_loss_price=99.0, take_profit_price=102.0, max_hold_deadline_utc="2026-07-07T13:00:00Z",
+    ))
+    candles = _candles([(50, 51, 49, 50), (100.0, 100.1, 99.9, 100.0), (100.5, 102.5, 100.1, 101.0)])
+    res = _run(db, [], candles, NOW)
+    assert res.failures == 0
+    pos = store.get_position("old-1", db_path=db)
+    assert pos["state"] == "closed" and pos["size"] == 1.0
+    assert pos["net_pnl"] == pytest.approx(2.0)
+
+
+def test_migration_failure_aborts_before_position_read(tmp_path, monkeypatch):
+    db = tmp_path / "p.sqlite3"
+    calls = []
+    monkeypatch.setattr(store, "ensure_schema_migrated",
+                        lambda *a, **k: (_ for _ in ()).throw(store.PositionMigrationError("boom")))
+    monkeypatch.setattr(store, "list_positions_by_state",
+                        lambda *a, **k: calls.append(a) or [])
+    res = _run(db, [], _candles([(1, 1, 1, 1)]), NOW)
+    assert res.failures >= 1
+    assert calls == []   # positions were never listed after a failed migration
+
+
+def test_migration_failure_leaves_legacy_db_unchanged(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_legacy_db(db, _legacy_row(state="bogus"))   # invalid legacy row -> migration fails
+    res = _run(db, [], _candles([(1, 1, 1, 1)]), NOW)
+    assert res.failures >= 1
+    assert _uv(db) == 0 and not _has_size(db)   # rolled back / untouched
+
+
+# ----- dry-run -----
+
+def test_dry_run_current_schema_no_write(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)                       # creates a CURRENT-schema DB
+    before_mtime = db.stat().st_mtime_ns
+    before_uv = _uv(db)
+    candles = _candles([(50, 51, 49, 50), (100.0, 100.2, 99.9, 100.1), (100.5, 102.5, 100.1, 101.0)])
+    res = runner.run_once(
+        dry_run=True, db_path=db, signals=[], load_candles=_loader(candles), now_utc=NOW,
+        profile=PROFILE, chart_db_path=tmp_path / "c.sqlite3", signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures == 0
+    assert db.stat().st_mtime_ns == before_mtime and _uv(db) == before_uv
+    assert store.list_positions(db_path=db)[0]["state"] == "pending"   # no transition
+
+
+def test_dry_run_legacy_schema_reports_migration_required_and_does_not_touch_db(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_legacy_db(db, _legacy_row())
+    before_mtime = db.stat().st_mtime_ns
+    candles = _candles([(50, 51, 49, 50), (100.0, 100.2, 99.9, 100.1), (100.5, 102.5, 100.1, 101.0)])
+    res = runner.run_once(
+        dry_run=True, db_path=db, signals=[], load_candles=_loader(candles), now_utc=NOW,
+        profile=PROFILE, chart_db_path=tmp_path / "c.sqlite3", signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures >= 1                          # "migration required"
+    assert _uv(db) == 0 and not _has_size(db)         # no migration
+    assert db.stat().st_mtime_ns == before_mtime      # mtime unchanged
+    with sqlite3.connect(db) as conn:                 # legacy row untouched
+        row = conn.execute(f"SELECT state, updated_at_utc FROM {store.POSITIONS_TABLE} WHERE position_id='old-1'").fetchone()
+    assert row == ("pending", "2026-07-06T12:00:00Z")
+
+
+def test_dry_run_missing_db_not_created(tmp_path):
+    db = tmp_path / "absent.sqlite3"
+    res = runner.run_once(
+        dry_run=True, db_path=db, signals=[_signal()], load_candles=_loader(_candles([(1, 1, 1, 1)])),
+        now_utc=NOW, profile=PROFILE, chart_db_path=tmp_path / "c.sqlite3", signal_db_path=tmp_path / "s.sqlite3",
+    )
+    assert res.failures == 0
+    assert not db.exists()

@@ -414,6 +414,65 @@ def _migrate_rebuild(connection: sqlite3.Connection) -> None:
         raise
 
 
+# --- schema status / startup gate (Issue #49 runner contract) ----------------
+#
+# The runner MUST settle migration up front, before reading any position, so a
+# legacy DB is never read as the new model. These give it an explicit,
+# non-implicit way to do that: a READ-ONLY status probe (for dry-run) and a
+# WRITE migrate-and-verify (for a normal run).
+SCHEMA_STATUS_MISSING = "missing"    # no DB file yet
+SCHEMA_STATUS_CURRENT = "current"    # table present, current version + all columns
+SCHEMA_STATUS_LEGACY = "legacy"      # table present but older/incomplete -> needs migration
+SCHEMA_STATUS_INVALID = "invalid"    # file present but not a usable positions DB
+
+
+def get_schema_status(db_path: Path | None = None) -> str:
+    """Return the position DB's schema status WITHOUT writing anything.
+
+    One of ``missing`` / ``current`` / ``legacy`` / ``invalid``. Read-only: never
+    creates the DB file, never migrates, never touches ``mtime`` -- safe to call
+    on a dry run. ``validate_schema_read_only`` is an alias for callers that want
+    the intent spelled out.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    if not db_path.exists():
+        return SCHEMA_STATUS_MISSING
+    try:
+        with sqlite3.connect(db_path) as connection:
+            if not _table_exists(connection, POSITIONS_TABLE):
+                return SCHEMA_STATUS_INVALID
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = _table_columns(connection, POSITIONS_TABLE)
+    except sqlite3.OperationalError:
+        return SCHEMA_STATUS_INVALID
+    if version >= CURRENT_SCHEMA_VERSION and not (REQUIRED_COLUMNS - columns):
+        return SCHEMA_STATUS_CURRENT
+    return SCHEMA_STATUS_LEGACY
+
+
+# Explicit alias: dry-run schema validation is a READ-ONLY status probe.
+validate_schema_read_only = get_schema_status
+
+
+def ensure_schema_migrated(db_path: Path | None = None) -> None:
+    """Fresh-create or migrate the DB, then VERIFY the result is current.
+
+    The write path the runner calls once at cycle start (non-dry-run) before any
+    position read. Runs :func:`init_db` (create/rebuild) and then re-checks the
+    real schema; if it is not ``current`` afterwards, raises
+    :class:`PositionSchemaError` so the caller can abort the cycle rather than
+    read a half-migrated table. ``init_db`` itself rolls back a failed rebuild,
+    so this never leaves a partial migration behind.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    status = get_schema_status(db_path)
+    if status != SCHEMA_STATUS_CURRENT:
+        raise PositionSchemaError(
+            f"position DB schema is {status!r} after migration at {db_path}; refusing to proceed"
+        )
+
+
 def _row_tuple(record: dict) -> tuple:
     return tuple(record.get(column) for column in _ALL_COLUMNS)
 

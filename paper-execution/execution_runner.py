@@ -391,6 +391,32 @@ def run_once(
 
     result = CycleResult()
 
+    # --- Schema gate: settle migration BEFORE reading any position -----------
+    # A legacy DB must never be read as the new model. Normal run: migrate + verify
+    # up front (abort the cycle on failure). Dry-run: a READ-ONLY status probe only
+    # -- proceed for missing/current, but refuse to read a legacy/invalid DB (and
+    # never write to migrate it).
+    if dry_run:
+        status = store.get_schema_status(db_path)
+        if status not in (store.SCHEMA_STATUS_MISSING, store.SCHEMA_STATUS_CURRENT):
+            logger.error(
+                "Paper Execution [DRY_RUN]: position DB schema is %r -- migration required. "
+                "Not reading positions, not modifying the DB.", status,
+            )
+            result.failures += 1
+            return result
+    else:
+        try:
+            store.ensure_schema_migrated(db_path)
+        except Exception as exc:
+            # Migration failed (or verification did): do NOT read positions, do NOT
+            # start evaluation. init_db already rolled back any partial rebuild.
+            logger.error(
+                "Paper Execution: schema migration failed (%s) -- aborting cycle before any position read.", exc,
+            )
+            result.failures += 1
+            return result
+
     # Phase 1: signals -> pending / cancelled.
     try:
         signal_rows = signals if signals is not None else read_paper_signals(signal_db_path)

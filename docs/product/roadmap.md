@@ -98,11 +98,11 @@ WantedBy=timers.target
 timer + oneshot 方式の実際のunit配置・有効化はv1.5以降の検討事項とする。
 ## v1.5以降の検討(次フェーズ候補)
 
-- **Paper Execution 最小設計**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・ロット計算は含めない。→ Issue #49 で最小責務・状態遷移・約定規則の設計文書を作成済み([Paper Execution(最小設計)](../architecture/paper_execution.md))。実装(データモデル・保存層 / Open・Close判定エンジン)は後続Issueで管理。
+- **Paper Execution(実装済み)**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・自動売買・ロット計算は含めない。Issue #49 で最小責務・状態遷移・約定規則を設計([Paper Execution](../architecture/paper_execution.md))、Issue #50 / #51 でデータモデル・保存層および Open / Close 判定エンジンを **`paper-execution/` に実装済み**。Broker API による **Live Execution** は引き続き未実装。
 - **Strategy 定義の外部化**: 現在コードに埋め込まれているエントリー/Exit条件・戦略プロファイル(例: `xauusd_1h_squeeze_breakout_v1`)を、設定/定義ファイルとして外部化し、コード変更なしに戦略を追加・切替できるようにする。
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
 - Entry Bot / Pepperoni(まだ設計しない)
 
-これらはv1.5以降の検討事項であり、v1.4系では実装しない。上記のうち **Paper Execution 最小設計** と **Strategy 定義の外部化** を v1.4.1 直後に着手する次フェーズ候補として記録する(実装は別Issueで管理)。
+これらはv1.5以降の検討事項である。上記のうち **Paper Execution**(仮想約定・仮想ポジション管理)は Issue #49 / #50 / #51 で **実装済み**(`paper-execution/`)。Broker API による実注文・自動売買(Live Execution)は引き続き未実装。**Strategy 定義の外部化** は次フェーズ候補として残る。

@@ -32,16 +32,16 @@ Paper Signal
 
 ## Alert / Strategy / Execution の責務分離
 
-Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う未実装レイヤー)と **Live Execution**(Broker API による実注文・実約定の未実装レイヤー)に分かれる。どちらも v1.4 では未実装である。
+Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定の**未実装**レイヤー)に分かれる。Paper Execution は仮想レコードのみを生成し、Broker API 連携・実注文・自動売買は含まない(それらは Live Execution の責務で未実装)。
 
 | Layer | Responsibility | Status |
 |---|---|---|
 | Alert | 事実を検知して通知する | 実装済み(MACD cross, MA touch, Bollinger upper_break, RSI14 overbought/oversold) |
 | Strategy / Method | Alert の情報をどう解釈するか判断する | 実装済み(Paper Signal のルールベース候補生成) |
-| Paper Execution | Paper Signal を入力に、仮想約定・仮想ポジション管理・Exit・損益計算を行う | 未実装(次フェーズ)。最小設計は [Paper Execution](paper_execution.md)(Issue #49) |
+| Paper Execution | Paper Signal を入力に、仮想約定・仮想ポジション管理・Exit・損益計算を行う | **実装済み**(`paper-execution/`)。設計 [Paper Execution](paper_execution.md)(Issue #49)、実装 Issue #50 / #51。Broker API・実注文は含まない |
 | Live Execution | Broker API による実際の注文・約定・ポジション管理 | 未実装(将来) |
 
-Alert は売買判断をしない。Strategy / Method は複数の観測情報を文脈化する。Paper Execution / Live Execution はいずれも現行実装に含めない。
+Alert は売買判断をしない。Strategy / Method は複数の観測情報を文脈化する。Paper Execution は実装済み(`paper-execution/`、仮想約定のみ)だが、Live Execution(Broker API 実注文)は現行実装に含めない。
 
 Backtest はこの責務分離の直列フローには含まれない独立した **Validation レイヤー(検証基盤)** であり、過去データで Paper Signal や将来の Execution 設計を遡及検証する。`backtest/execution_model.py` の spread / slippage / fill は Backtest 内部のシミュレーションモデルであって、Paper Execution レイヤーの実装ではない(詳細は [Backtest](../backtest.md))。
 
@@ -53,7 +53,7 @@ Backtest はこの責務分離の直列フローには含まれない独立し�
 | Classification | (Alert以前の入力) | `indicators.py`, `market_bias.py` |
 | Alert | Alert | `macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` |
 | Hypothesis | Strategy / Method に相当する仮説生成(Paper Signal)の実装 | `paper-signal/signal_generator.py`(実装済み) |
-| Execution | Paper Execution | 未実装(次フェーズ) |
+| Execution | Paper Execution | 実装済み(`paper-execution/`。仮想約定のみ、Broker API・実注文は未実装) |
 | Execution | Live Execution | 未実装(将来) |
 
 ## データ連携概要

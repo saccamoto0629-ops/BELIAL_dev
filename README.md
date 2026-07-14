@@ -30,6 +30,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | `news-feed-bot/` | RSSニュース監視、Market Snapshot、Market Bias分類 | [news-feed-bot/README.md](news-feed-bot/README.md) |
 | `market-watch/` | ローソク足取得、指標計算、Chart Snapshot、イベントAlert | [market-watch/README.md](market-watch/README.md) |
 | `paper-signal/` | Market Bias + Chart Snapshot から `paper_only` 仮説を生成 | [paper-signal/README.md](paper-signal/README.md) |
+| `paper-execution/` | Paper Signal を入力に仮想ポジションを Open / Close し仮想損益を記録(仮想約定のみ。Broker API・実注文なし) | [Paper Execution 設計](docs/architecture/paper_execution.md) |
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 
@@ -41,7 +42,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | Classification | 市場状態を分類する | `market-watch/indicators.py`, `news-feed-bot/market_bias.py` |
 | Alert | 事実を検知して通知する(売買判断はしない) | `market-watch/macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` |
 | Hypothesis (Paper Signal) | `paper_only` の仮説を生成・保存する | `paper-signal/signal_generator.py` |
-| Execution | 執行層の総称。**Paper Execution**(仮想約定・仮想ポジション管理・仮想Exit・仮想損益)と **Live Execution**(実注文・約定確認・ポジション管理・Exit)に分かれる | **現行スコープ外**(いずれも未実装) |
+| Execution | 執行層の総称。**Paper Execution**(仮想約定・仮想ポジション管理・仮想Exit・仮想損益)と **Live Execution**(実注文・約定確認・ポジション管理・Exit)に分かれる | **Paper Execution は実装済み**(`paper-execution/`。仮想約定のみ)。**Live Execution**(Broker API・実注文・自動売買)は**未実装** |
 
 詳細は [Concept のレイヤー分離](docs/product/concept.md#レイヤー分離)、Alert層の記述粒度は [Architecture の責務分離](docs/architecture/architecture.md#alert--strategy--execution-の責務分離) を参照してください。
 
@@ -54,6 +55,7 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 | Chart DB | `market-watch/data/chart_data.sqlite3` | `market-watch/` | ローソク足(UTC保存)、Chart Snapshot、Alert のメタデータ |
 | Paper Signal DB | `paper-signal/data/paper_signals.sqlite3` | `paper-signal/` | `paper_only` シグナル記録 |
 | Market Bias DB | `news-feed-bot/data/market_bias.sqlite3` | `news-feed-bot/` | Market Bias(trend/risk/volatility)の評価履歴。Backtest からの時点参照用 |
+| Paper Position DB | `paper-execution/data/paper_positions.sqlite3` | `paper-execution/` | Paper Execution の仮想ポジション(状態・仮想損益)。上書きは `PAPER_POSITION_DB_PATH` |
 
 いずれも `data/` はGit管理しません。詳細スキーマは [Architecture](docs/architecture/architecture.md)、[Market Watch](docs/architecture/market_watch.md)、[Market Bias](docs/architecture/market_bias.md)、[Paper Signal](docs/architecture/paper_signal.md) を参照してください。
 
@@ -104,6 +106,7 @@ python -m pip install -r requirements.txt
 cp news-feed-bot/.env.example news-feed-bot/.env
 cp market-watch/.env.example market-watch/.env
 cp paper-signal/.env.example paper-signal/.env
+cp paper-execution/.env.example paper-execution/.env   # PAPER_POSITION_DB_PATH (任意)
 ```
 
 実際のWebhook URL、API key、tokenは `.env` にのみ置き、Gitにコミットしません。起動コマンドの詳細は各コンポーネントのREADME、または [Operations](docs/operations/operations.md) を参照してください。
