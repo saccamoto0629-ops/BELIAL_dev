@@ -180,12 +180,45 @@ def test_validator_never_mutates_the_input_mapping():
     assert data == snapshot
 
 
-def test_two_loads_share_no_mutable_state(tmp_path):
+def test_validated_definition_is_deeply_immutable(tmp_path):
+    # The typed representation is the "validated" boundary: NOTHING under
+    # StrategyDefinition may be modifiable afterwards, or validation could be
+    # bypassed by mutating the object the runner later reads its execution
+    # values from.
+    definition = sd.load_strategy_definition(write_yaml(tmp_path, base_definition()))
+    with pytest.raises(TypeError):
+        definition.entry.params["squeeze_state"] = "invalid"
+    with pytest.raises(TypeError):
+        definition.entry.params["new_param"] = 1
+    with pytest.raises(TypeError):
+        definition.risk.take_profit["r"] = float("nan")
+    with pytest.raises(TypeError):
+        definition.risk.stop_loss["type"] = "fixed_pct"
+    import dataclasses
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        definition.id = "other_id"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        definition.exit.max_holding_bars = 0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        definition.entry.cooldown_bars = 5
+    # ...and the runner still reads the same values, untouched.
+    assert definition.risk.take_profit["r"] == 2.0
+    assert definition.entry.params["squeeze_state"] == "squeeze"
+
+
+def test_only_to_config_hands_out_mutable_copies(tmp_path):
     path = write_yaml(tmp_path, base_definition())
     first = sd.load_strategy_definition(path)
     second = sd.load_strategy_definition(path)
-    first.entry.params["squeeze_state"] = "tampered"
+    config = first.to_config()
+    config["entry"]["params"]["squeeze_state"] = "tampered"  # mutable copy: allowed
+    config["risk"]["take_profit"]["r"] = 99.0
+    # ...but neither load is affected, and loads share no state.
+    assert first.entry.params["squeeze_state"] == "squeeze"
     assert second.entry.params["squeeze_state"] == "squeeze"
+    assert first.risk.take_profit["r"] == 2.0
+    assert first.to_config()["risk"]["take_profit"]["r"] == 2.0
 
 
 def test_to_config_is_json_serializable_and_returns_fresh_dicts():
@@ -195,7 +228,8 @@ def test_to_config_is_json_serializable_and_returns_fresh_dicts():
     assert parsed["id"] == "test_squeeze_v1"
     assert parsed["risk"]["take_profit"] == {"type": "r_multiple", "r": 2.0}
     assert parsed["exit"] == {"max_holding_bars": 24, "same_candle_priority": "stop_loss"}
-    # mutating the returned config never reaches the frozen definition
+    # the returned config is an ordinary mutable dict tree; mutating it never
+    # reaches the (immutable) definition
     config["entry"]["params"]["squeeze_state"] = "tampered"
     assert definition.entry.params["squeeze_state"] == "squeeze"
     assert definition.to_config()["entry"]["params"]["squeeze_state"] == "squeeze"

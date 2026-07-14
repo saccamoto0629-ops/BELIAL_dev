@@ -17,7 +17,11 @@ Key properties (all from the Issue #52 design, not re-decided here):
   scalar immediately; the input mapping is never mutated.
 - Defaults are resolved *here* and stored on the typed, frozen result, so
   downstream logic never depends on "unspecified means some hardcoded
-  constant". Every load builds fresh containers (no shared mutable defaults).
+  constant". Every load builds fresh containers (no shared mutable defaults),
+  and the result is *deeply* immutable: params / stop_loss / take_profit are
+  read-only mappings (list values stored as tuples), so the "validated"
+  guarantee cannot be broken by mutating the object after the fact. Only
+  ``to_config()`` produces mutable (fresh, JSON-compatible) copies.
 - Unknown keys are rejected fail-closed everywhere except inside
   ``entry.params`` structurally -- and even there, the selected handler's
   capability descriptor then rejects params it does not support, so a setting
@@ -43,6 +47,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 import yaml
@@ -147,15 +152,21 @@ class StrategyDefinitionError(ValueError):
 @dataclass(frozen=True)
 class EntrySpec:
     handler: str
-    params: dict  # resolved (handler defaults filled), fresh dict per definition
+    # Resolved params (handler defaults filled). Deeply immutable: a read-only
+    # mapping whose list values were converted to tuples at build time, so the
+    # "validated" guarantee cannot be broken after the fact -- use
+    # StrategyDefinition.to_config() for a mutable JSON-compatible copy.
+    params: Mapping
     reentry: str  # one of KNOWN_REENTRY_MODES
     cooldown_bars: int
 
 
 @dataclass(frozen=True)
 class RiskSpec:
-    stop_loss: dict  # {"type": ...} (+ "pct" for fixed_pct)
-    take_profit: dict  # {"type": "r_multiple", "r": <float>}
+    # Both are read-only mappings (scalar values only), immutable after
+    # validation just like EntrySpec.params.
+    stop_loss: Mapping  # {"type": ...} (+ "pct" for fixed_pct)
+    take_profit: Mapping  # {"type": "r_multiple", "r": <float>}
 
 
 @dataclass(frozen=True)
@@ -217,8 +228,12 @@ class StrategyDefinition:
 
 
 def _copy_params(params: Mapping) -> dict:
-    """Copy a validated params mapping (values are scalars or flat lists)."""
-    return {key: (list(value) if isinstance(value, list) else value) for key, value in params.items()}
+    """Fresh mutable JSON-compatible copy of an immutable params mapping.
+
+    The stored params hold tuples for list-valued params (deep immutability);
+    the JSON form converts them back to lists.
+    """
+    return {key: (list(value) if isinstance(value, tuple) else value) for key, value in params.items()}
 
 
 # --- handler registry + capability descriptors (docs §4 / §4.1) ----------------
@@ -515,7 +530,7 @@ def _check_param_scalar(value, field: str, fail) -> None:
         )
 
 
-def _validate_entry_params(entry_raw: Mapping, capability: HandlerCapability, fail) -> dict:
+def _validate_entry_params(entry_raw: Mapping, capability: HandlerCapability, fail) -> Mapping:
     value = entry_raw.get("params", _MISSING)
     if value is _MISSING:
         provided: Mapping = {}
@@ -559,17 +574,19 @@ def _validate_entry_params(entry_raw: Mapping, capability: HandlerCapability, fa
     for key, spec in supported.items():
         item = provided.get(key, _MISSING)
         if item is _MISSING or item is None:
-            resolved[key] = spec.default
-            continue
-        if not _strict_in(item, spec.allowed_values):
+            item = spec.default
+        elif not _strict_in(item, spec.allowed_values):
             fail(
                 f"entry.params.{key}",
                 f"handler {capability.name!r} only allows "
                 f"{', '.join(map(repr, spec.allowed_values))} for this param, "
                 f"got {item!r} ({_type_name(item)})",
             )
-        resolved[key] = list(item) if isinstance(item, list) else item
-    return resolved
+        # Deep immutability: list values become tuples; the read-only proxy
+        # below prevents key-level mutation. Only to_config() hands out
+        # mutable copies, so a validated definition can never drift.
+        resolved[key] = tuple(item) if isinstance(item, list) else item
+    return MappingProxyType(resolved)
 
 
 def _validate_reentry(entry_raw: Mapping, capability: HandlerCapability, fail) -> str:
@@ -648,7 +665,7 @@ def _positive_finite_number(mapping: Mapping, key: str, field: str, fail) -> flo
     return parsed
 
 
-def _validate_stop_loss(risk_raw: Mapping, capability: HandlerCapability, fail) -> dict:
+def _validate_stop_loss(risk_raw: Mapping, capability: HandlerCapability, fail) -> Mapping:
     stop_raw = _required_mapping(risk_raw, "stop_loss", fail, known_keys=KNOWN_STOP_LOSS_KEYS)
     type_value = stop_raw.get("type", _MISSING)
     if type_value is _MISSING:
@@ -676,10 +693,10 @@ def _validate_stop_loss(risk_raw: Mapping, capability: HandlerCapability, fail) 
             f"handler {capability.name!r} only supports "
             f"{', '.join(sorted(capability.allowed_stop_loss_types))}, got {type_value!r}",
         )
-    return stop_loss
+    return MappingProxyType(stop_loss)
 
 
-def _validate_take_profit(risk_raw: Mapping, capability: HandlerCapability, fail) -> dict:
+def _validate_take_profit(risk_raw: Mapping, capability: HandlerCapability, fail) -> Mapping:
     tp_raw = _required_mapping(risk_raw, "take_profit", fail, known_keys=KNOWN_TAKE_PROFIT_KEYS)
     type_value = tp_raw.get("type", _MISSING)
     if type_value is _MISSING:
@@ -701,7 +718,7 @@ def _validate_take_profit(risk_raw: Mapping, capability: HandlerCapability, fail
             f"handler {capability.name!r} only supports "
             f"{', '.join(sorted(capability.allowed_take_profit_types))}, got {type_value!r}",
         )
-    return take_profit
+    return MappingProxyType(take_profit)
 
 
 def _validate_max_holding_bars(exit_raw: Mapping, fail) -> int:
