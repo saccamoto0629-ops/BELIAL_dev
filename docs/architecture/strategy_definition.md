@@ -179,6 +179,10 @@ Validator は定義を descriptor と突合し、**非対応フィールド、�
 > `same_candle_priority: take_profit`、`cooldown_bars: 60`、`reentry: overlap` はいずれも
 > **validation error**。squeeze の descriptor が許容しないため(死に設定にならない)。
 
+**受理段階の validation と実行挙動の一致**:descriptor が単一固定値のみ許容するフィールドは、
+その許容値を **handler の実際の実行挙動と一致**させる(§5.2 カテゴリ③)。これにより「受理されたが
+実行時に無視される」死に設定を、受理段階(§4.1)と実行段階(§5.2)の両方で排除する。
+
 ---
 
 ## 5. symbols / timeframes
@@ -230,12 +234,81 @@ Loader / Validation の実装方式を左右するため、以下を **本 Issue
 - したがって外部 Strategy 定義は **完全な opt-in**。既存の全呼び出し・全テストは変更なしで従来どおり動く。
 - `--strategy(-file)` と旧 `--strategy-profile` の同時指定はエラー(どちらが有効か曖昧にしない)。
 
-### cooldown_bars の接続範囲(#53)
+---
 
-- **#53 では Loader が `cooldown_bars` を内部型へ載せるところまで**実装し、**runner へは接続しない
-  (未使用)**。理由:唯一の実装済み handler `squeeze_breakout` は capability 契約上 `cooldown_bars=0`
-  固定(§4.1)であり、runner 接続は不要。非ゼロ cooldown を要する handler を追加する時点で、
-  runner 側の接続(分換算 or runner の bars 対応化)を別途行う。これにより #53 のスコープを確定させる。
+## 5.2 外部定義の実行接続と実行契約(#53, 案A)
+
+**#53 は「ロード + validation」で終わらず、選択された外部定義を実際の Backtest 実行へ接続する**
+ところまでを責務に含む(案A)。これにより「Loader が受理したが実行結果に反映されない死に設定」を
+**別レイヤー(実行時)でも**排除する。
+
+> 前提:実行接続は **外部定義を明示選択したとき(`--strategy-file` / `--strategy`)だけ**起動する。
+> 未指定時は現行 `--strategy-profile` 経路を完全維持(§5.1)。既存 module 定数
+> (`squeeze_breakout.RISK_REWARD` 等)は **非選択パスの既定値**として残り、選択パスの固定値契約
+> (下記カテゴリ③)の **参照実装**にもなる。既存 Strategy の default 移行(module 定数の撤去)は
+> 引き続き後続 移行 Issue の範囲。
+
+### 受理フィールドの実行反映(4 カテゴリ)
+
+受理された全フィールドは必ず次の①〜④のいずれかに属す。**「受理されるが実行のどこにも反映されない」
+フィールドは存在しない**。
+
+**① 実行パラメータ(可変。handler へ値を渡す)**
+
+現行 `evaluate_squeeze_breakout_signals()` は既に `risk_reward` / `time_exit_bars` を引数に取る
+(`_run_squeeze_breakout` が現状は渡さず module 定数へ fallback しているだけ)。#53 は選択時にこれらへ
+外部定義の値を渡す。
+
+| 外部フィールド | 実行接続先(squeeze_breakout) |
+|---|---|
+| `risk.take_profit.r` | `evaluate_squeeze_breakout_signals(risk_reward=<r>)` |
+| `exit.max_holding_bars` | `evaluate_squeeze_breakout_signals(time_exit_bars=<max_holding_bars>)` |
+
+**② 適合検証(実行対象の妥当性)**
+
+| 外部フィールド | 実行時の使われ方 |
+|---|---|
+| `symbols` | 要求 `--symbol` がリストに含まれること。不一致は使用エラー(`EXIT_USAGE_ERROR`) |
+| `timeframes` | 要求 `--timeframe` がリストに含まれること。不一致は使用エラー |
+
+**③ 固定値契約(handler 実装挙動と一致必須。許容値=実装値のみ)**
+
+descriptor が単一固定値のみ許容し(§4.1)、**その許容値は handler が実際に実装している挙動と必ず一致**
+させる。よって実装と異なる値は validation error になり、死に設定にならない。値を runtime へ「渡す」の
+ではなく、**定義値と実装挙動の一致を保証**することで反映を担保する。
+
+| 外部フィールド(固定値) | 一致対象の実装挙動 |
+|---|---|
+| `entry.handler = squeeze_breakout` | registry 解決 → `squeeze_breakout` 経路を選択 |
+| `risk.stop_loss.type = trigger_bar_extreme` | Trigger 足 low/high から stop 算出(`squeeze_breakout.py`) |
+| `risk.take_profit.type = r_multiple` | Execution Model 適用後 Entry から `r × risk` |
+| `entry.reentry = new_setup` | 新 episode まで再 arm しない state machine |
+| `exit.same_candle_priority = stop_loss` | `evaluate_squeeze_exit()` の無条件 SL 優先 |
+| `entry.cooldown_bars = 0` | squeeze は時間 cooldown を適用しない(実装挙動と一致。0=無適用のため runner へ別途渡す必要がない) |
+| `entry.params.squeeze_state = squeeze` | `SQUEEZE_STATE` |
+| `entry.params.require_episode_release = true` | episode 解除足のみ評価 |
+| `entry.params.breakout = bollinger_close` | BB 終値 break(ヒゲ到達不可) |
+| `allowed_market_states = null` | squeeze は market-state ゲート非対応(§6) |
+
+**④ メタデータ(記録。strategy ロジックには影響しないが config_json / summary へ反映)**
+
+| 外部フィールド | 反映先 |
+|---|---|
+| `schema_version` / `id` / `name` / `description` | `backtest_runs.config_json`(strategy 識別)/ summary 出力 |
+
+### handler 実行契約の一致保証(テスト)
+
+カテゴリ③の「descriptor 許容値 == handler 実装挙動」は **テストで固定**する(#53)。例:
+descriptor の `same_candle_priority` 許容集合が `{stop_loss}` であることと、`evaluate_squeeze_exit()` が
+同一足 SL/TP 双方到達時に stop_loss を返すことを同一テストで突合する。descriptor と実装が乖離したら
+handler 側のバグとして検出される。これにより capability validation(受理段階)と実行挙動が恒久的に一致する。
+
+### cooldown_bars(補足)
+
+`cooldown_bars` は squeeze では固定値契約(0 のみ、カテゴリ③)。0 は「cooldown 無適用」で、squeeze
+実行経路は元々 cooldown を適用しないため、**runner へ値を渡さなくても定義と実行が一致**する。非ゼロ
+cooldown を許容する handler を追加する時点で、その handler の実行接続(bars→runner 表現)を併せて実装する
+(その handler の descriptor が非ゼロを許容し、かつ実行接続を持つ、という③の一致保証で縛る)。
 
 ---
 
@@ -293,8 +366,8 @@ entry:
 - **`cooldown_bars`**:決済足から N 本は新規 entry を抑制。**単位は「分」ではなく「本(bars)」**。
   採用理由:Strategy 固有量は timeframe 相対で表すのが自然で、`max_holding_bars` と単位が揃う。
   不採用(分):現行 runner は `--cooldown-minutes`(壁時計分)だが、これは実行時フラグの都合であり、
-  Strategy の宣言としては bars が適切。**#53 では Loader が内部型へ載せるのみで runner へは接続しない**
-  (§5.1 の接続範囲)。squeeze は capability 契約上 `0` 固定。
+  Strategy の宣言としては bars が適切。squeeze は capability 契約上 `0` 固定で、0=cooldown 無適用は
+  squeeze の実行挙動と一致するため runner へ値を渡す必要がない(§5.2 カテゴリ③・cooldown_bars 補足)。
 
 ---
 
@@ -421,8 +494,8 @@ class ExitSpec:
 - **`to_config()` は JSON-serializable な plain dict** を返し、`backtest_runs.config_json` の既存
   `strategy_profile` 近傍へそのまま格納できる(現行 `_run_squeeze_breakout` が `strategy_profile` /
   `risk_reward` / `time_exit_bars` / `same_candle_priority` を config へ書いているのと同型)。
-- `cooldown_bars`(本)は `EntrySpec` に載せるが、**#53 では runner へ接続しない(未使用)**。
-  runner 接続は cooldown を使う handler を足す時点で別途行う(§5.1)。
+- `cooldown_bars`(本)は `EntrySpec` に載せる。squeeze では固定値 `0`(=cooldown 無適用)で実行挙動と
+  一致するため runner へ値を渡さない(§5.2)。非ゼロ cooldown を許容する handler 追加時に実行接続する。
 
 ---
 
@@ -464,10 +537,12 @@ Loader は **専用例外 `StrategyDefinitionError(ValueError)`** を送出す�
 - **runtime 既定配置 = `backtest/strategies/`(`STRATEGY_DEFINITIONS_DIR` で上書き)**(§5.1)。
 - **CLI 接続 = `--strategy-file <path>`(単一) / `--strategy <id>`(ディレクトリ+選択)、排他**(§5.1)。
 - **ファイル未指定時の後方互換 = 外部機構を起動せず現行 `--strategy-profile` を完全維持(opt-in)**(§5.1)。
-- **handler 別対応フィールド一覧(capability descriptor)と、非対応フィールド/非許容値は validation
-  error(無視しない)**(§4.1)。`same_candle_priority` の squeeze 実装矛盾もこれで解消(§8)。
+- **#53 は実行接続まで含む(案A)**:選択された外部定義の全受理フィールドが ①実行パラメータ /
+  ②適合検証 / ③固定値契約 / ④メタデータ のいずれかで実行へ反映され、**死に設定ゼロ**(§5.2)。
+  squeeze の可変フィールドは `risk.take_profit.r`→`risk_reward`、`exit.max_holding_bars`→`time_exit_bars`。
+- **handler 別対応フィールド一覧(capability descriptor)+ 非対応/非許容値は validation error、
+  かつ固定値許容値は handler 実行挙動と一致(テストで固定)**(§4.1, §5.2)。
 - **`entry.params` の許可型(スカラ/平坦リスト、ネスト・NaN 不可、null 可)**(§7)。
-- **`cooldown_bars` は #53 で Loader が内部型へ載せるのみ・runner 未接続**(§5.1)。
 
 ### 意図的に後続 Issue(移行 Issue)へ残す事項 — #53 の Loader/Validation 実装には不要
 
@@ -477,7 +552,9 @@ Loader は **専用例外 `StrategyDefinitionError(ValueError)`** を送出す�
    `same_candle_priority` の最終 source of truth をどちらへ寄せるか(§9)。本 Issue のスコープは
    Backtest の Strategy 外部化であり、Paper Execution 層の再編は別 Issue。現時点の境界(Strategy 定義=
    intrinsic な宣言、コストは常に実行環境側)は確定済みで、#53 の実装はこれに依存しない。
-2. **既存 `squeeze_breakout` の外部定義への移行**(module 定数 `RISK_REWARD` 等の置換)。本 Issue の
-   明示的非スコープ。移行 Issue で行う。
+2. **既存 `squeeze_breakout` の default パスの移行**(非選択時の module 定数 `RISK_REWARD` /
+   `TIME_EXIT_BARS` を撤去し、既定でも外部定義から解決するようにする)。#53 は **選択時のみ**外部定義を
+   実行接続し、非選択パスは module 定数のまま完全維持する(§5.2 前提)。default パスの撤去・置換は
+   移行 Issue で行う(本 Issue の明示的非スコープ)。
 3. **cooldown を実際に使う handler を追加する際の runner 接続**(bars→runner 表現の橋渡し)。
-   その handler を足す Issue で行う(§5.1)。
+   その handler を足す Issue で行う(§5.2)。
