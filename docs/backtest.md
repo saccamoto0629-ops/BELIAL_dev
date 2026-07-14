@@ -18,6 +18,10 @@ run_idのstdout表示・summary表示・Discord非送信はIssue #33/#23の実�
 (Market Bias)のみで、書き込むのは既存の Backtest DB(`backtest_runs` / `backtest_signals`)のみ
 (`summary` サブコマンドで `--output` を指定した場合のみ、指定したファイルにも書き込む)。
 
+> Issue #52(設計): Strategy ごとの可変設定を外部ファイルへ切り出すためのスキーマ・エラー方針は
+> [docs/architecture/strategy_definition.md](architecture/strategy_definition.md) を参照。Loader /
+> Validation は未実装(後続 Issue #53)で、現状の `--strategy-profile` の挙動は変わらない。
+
 ## 事前準備(データの前提)
 
 Runnerは何もデータを取得しない。実行前に、別コンポーネントが以下を**既に永続化済み**である必要がある。

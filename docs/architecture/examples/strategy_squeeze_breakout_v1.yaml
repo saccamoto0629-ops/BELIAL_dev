@@ -1,0 +1,49 @@
+# =============================================================================
+# Strategy 定義サンプル(Issue #52 設計成果物)
+#
+# *** 参照用サンプル。Loader は未実装(Issue #53)であり、このファイルは
+#     どのコードからも読み込まれない。既存 Strategy の移行でもない。 ***
+#
+# 仕様: docs/architecture/strategy_definition.md
+# 表現対象: 既存の backtest/squeeze_breakout.py(XAUUSD 1h squeeze breakout, 案A)
+#   - 固定パラメータの出典は docs/development/reports/issue43_squeeze_breakout_strategy.md
+# =============================================================================
+
+schema_version: 1
+
+id: xauusd_1h_squeeze_breakout_v1        # 一意。config 上の Strategy 同一性(既存 STRATEGY_PROFILE と一致)
+name: "XAUUSD 1h Squeeze Breakout v1"
+description: >
+  連続する Market State squeeze を 1 episode とし、その解除足(最初の非 squeeze 確定足)の
+  終値が Bollinger band を越えたら entry する paper-only Backtest 戦略(案A)。
+  Bias / MACD は使わない。指標計算・Trigger 判定・約定判定ロジックは Python 側に残す。
+
+# 適用可能な symbol / timeframe(CLI 表記。canonical 化は Python 側の責務)
+symbols: [XAU_USD]
+timeframes: [1h]
+
+# squeeze_breakout handler は自前の squeeze episode state machine を持ち、
+# market-state ゲートを使わないため null(= フィルタ無し)。詳細は仕様書 §6。
+allowed_market_states: null
+
+entry:
+  handler: squeeze_breakout              # 登録済み handler キー(コードが所有)
+  params:                                # handler が読む宣言フラグのみ。式・コードは置かない
+    squeeze_state: squeeze               # episode の準備状態ラベル
+    require_episode_release: true        # 連続 squeeze 解除足(最初の非 squeeze 足)だけを評価
+    breakout: bollinger_close            # BB 終値 break(ヒゲ到達は Trigger にしない)
+    # 注: BB 期間(20)/±2σ / squeeze lookback(20)/ 下位10% は indicators / market_state が
+    #     所有する共通定義であり Strategy 固有の自由度ではないため params に持たせない(仕様書 §7)。
+  reentry: new_setup                     # 新しい squeeze episode まで再 arm しない(構造的に単一ポジション)
+  cooldown_bars: 0                       # 時間 cooldown は置かない(new_setup 規則がより強いため)
+
+risk:
+  stop_loss:
+    type: trigger_bar_extreme            # long=Trigger足low / short=Trigger足high(価格算出は Python)
+  take_profit:
+    type: r_multiple
+    r: 2.0                               # Execution Model 適用後 Entry から有利方向へ 2R
+
+exit:
+  max_holding_bars: 24                   # Entry 後 24 本目の close で time exit(gap→SL/TP を先に評価)
+  same_candle_priority: stop_loss        # 同一足 SL/TP 双方到達時は保守的に SL 優先

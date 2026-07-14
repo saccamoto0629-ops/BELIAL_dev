@@ -13,6 +13,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | [docs/product/](docs/product/README.md) | 目的、現行スコープ、非スコープ、責務レイヤー、Roadmap |
 | [docs/architecture/](docs/architecture/README.md) | 全体構成、コンポーネント責務、DB設計、各モジュールの現行仕様 |
 | [docs/operations/](docs/operations/README.md) | 環境変数、起動手順、dry-run方針、systemd運用 |
+| [Strategy 定義仕様](docs/architecture/strategy_definition.md) | Strategy ごとの可変設定を外部ファイルへ切り出すためのスキーマ・エラー方針(Issue #52 設計) |
 | [docs/development/](docs/development/README.md) | Issue / PR 運用ルール |
 | [v1.4.1 リリースノート](docs/development/reports/v1.4.1_release_notes.md) | リリース候補の変更内容、既知の制約、CI確認・タグ作成手順 |
 | [docs/testing/](docs/testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
