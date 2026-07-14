@@ -14,7 +14,11 @@ Issue #52 の **設計成果物**。Strategy ごとの可変設定を外部フ�
 - 実注文 / Paper Execution / Live Execution
 
 サンプル定義: [`examples/strategy_squeeze_breakout_v1.yaml`](examples/strategy_squeeze_breakout_v1.yaml)
-(**Loader 未実装のため、どのコードからも読み込まれない参照用サンプル**)。
+(参照用サンプル。Loader / Validation / CLI 接続は **Issue #53 で実装済み**
+(`backtest/strategy_definition.py`、`--strategy-file` / `--strategy`、使用方法は
+[docs/backtest.md](../backtest.md))だが、このサンプルは runtime 既定ディレクトリ
+`backtest/strategies/` には未配置で、既定では読み込まれない。既存 Strategy の外部定義への
+移行=配置は後続 Issue)。
 
 ---
 

@@ -385,10 +385,36 @@ def parse_args(argv=None) -> argparse.Namespace:
         "which candidates become saved signals. Unspecified (the default) means no state "
         "filter -- pre-#39 behaviour, every candidate is eligible.",
     )
+    # Issue #53: opt-in external Strategy definitions (docs/architecture/
+    # strategy_definition.md). Mutually exclusive with each other, and with an
+    # explicit --strategy-profile (checked after parsing, below). When neither
+    # is given, the external-definition machinery is never started: no PyYAML
+    # import, no strategy-directory scan -- the --strategy-profile path is
+    # preserved byte-for-byte.
+    strategy_source = run_parser.add_mutually_exclusive_group()
+    strategy_source.add_argument(
+        "--strategy-file",
+        default=None,
+        metavar="PATH",
+        help="Issue #53: load ONE external Strategy definition YAML file (see "
+        "docs/architecture/strategy_definition.md) and run it. No directory scan. "
+        "Mutually exclusive with --strategy and --strategy-profile.",
+    )
+    strategy_source.add_argument(
+        "--strategy",
+        default=None,
+        metavar="ID",
+        help="Issue #53: validate every Strategy definition in backtest/strategies/ "
+        "(override with STRATEGY_DEFINITIONS_DIR) and run the definition whose id "
+        "matches. Mutually exclusive with --strategy-file and --strategy-profile.",
+    )
     run_parser.add_argument(
         "--strategy-profile",
         choices=KNOWN_STRATEGY_PROFILES,
-        default=DEFAULT_STRATEGY_PROFILE,
+        # None means "not given"; resolved to DEFAULT_STRATEGY_PROFILE after
+        # parsing so an explicit value can be detected for the Issue #53
+        # exclusivity check without changing the effective default.
+        default=None,
         help="Issue #44: which strategy this run replays. "
         f"{STRATEGY_PROFILE_TREND_FOLLOW!r} (the default) keeps the existing paper-signal "
         "candidate path (Market Bias + MACD alignment) unchanged. "
@@ -428,7 +454,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         "Parent directories are created automatically; an existing file is overwritten.",
     )
 
-    return parser.parse_args(_normalize_argv(argv))
+    args = parser.parse_args(_normalize_argv(argv))
+    if args.command == "run":
+        # Issue #53: --strategy-file/--strategy select an external definition;
+        # combining either with an explicit --strategy-profile would leave it
+        # ambiguous which strategy is in effect, so it is a usage error (the
+        # --strategy-file vs --strategy pair is already rejected by argparse's
+        # mutually exclusive group).
+        strategy_profile_given = args.strategy_profile is not None
+        if args.strategy_profile is None:
+            args.strategy_profile = DEFAULT_STRATEGY_PROFILE
+        if strategy_profile_given and (args.strategy_file or args.strategy):
+            parser.error(
+                "--strategy-file/--strategy cannot be combined with --strategy-profile: "
+                "choose either an external Strategy definition or a built-in profile"
+            )
+    return args
 
 
 def _chart_symbol(symbol: str) -> str:
@@ -501,6 +542,7 @@ def _run_squeeze_breakout(
     warmup_insufficient: bool,
     validation_start: pd.Timestamp,
     validation_end: pd.Timestamp,
+    definition=None,
 ) -> tuple[int, dict | None]:
     """Issue #44: run the XAUUSD 1h squeeze-episode breakout strategy A.
 
@@ -512,10 +554,56 @@ def _run_squeeze_breakout(
     backtest_runs / backtest_signals shape as the trend_follow path, with the
     squeeze signal_type / trigger_type / strategy_profile on every row so the
     two strategies are never confused in storage or summaries.
+
+    Issue #53: when ``definition`` (a validated strategy_definition.
+    StrategyDefinition selecting the squeeze_breakout handler) is given, its
+    variable fields drive the run -- ``risk.take_profit.r`` -> risk_reward,
+    ``exit.max_holding_bars`` -> time_exit_bars, its id labels every saved
+    row, and its full normalized form is recorded in config_json. All of its
+    remaining fields are fixed-value contracts already validated to match this
+    handler's actual behaviour (docs §5.2), so nothing accepted is ignored.
+    When ``definition`` is None, the pre-#53 --strategy-profile behaviour is
+    preserved unchanged (module-constant defaults).
     """
+    if definition is not None:
+        strategy_profile = definition.id
+        risk_reward = float(definition.risk.take_profit["r"])
+        time_exit_bars = definition.exit.max_holding_bars
+        same_candle_priority = definition.exit.same_candle_priority
+    else:
+        strategy_profile = squeeze_breakout.STRATEGY_PROFILE
+        risk_reward = squeeze_breakout.RISK_REWARD
+        time_exit_bars = squeeze_breakout.TIME_EXIT_BARS
+        same_candle_priority = exit_policy.SAME_CANDLE_PRIORITY_STOP_LOSS
+
     # Issue #26: the same virtual-fill model the trend_follow path uses. Defaults
     # (spread=slippage=0.0) leave raw prices unchanged.
     exec_model = execution.ExecutionModel(spread=args.spread, slippage=args.slippage)
+
+    config = {
+        "warmup_bars": args.warmup_bars,
+        "chart_db_path": str(chart_db_path),
+        "execution_model": exec_model.to_config(),
+        # Issue #44: the fixed, pre-committed strategy parameters (Issue #43:
+        # not tuned on Issue #42 PnL). Recorded so a saved run is fully
+        # reproducible from its config alone.
+        "strategy_profile": strategy_profile,
+        "signal_type": squeeze_breakout.SIGNAL_TYPE,
+        "trigger_type": squeeze_breakout.TRIGGER_TYPE,
+        "risk_reward": risk_reward,
+        "time_exit_bars": time_exit_bars,
+        "same_candle_priority": same_candle_priority,
+        # The episode state machine enforces a single position and a
+        # new-episode-before-re-entry rule; there is no time-based cooldown.
+        "no_reentry": True,
+        "cooldown_minutes": 0.0,
+    }
+    if definition is not None:
+        # Issue #53: the full normalized external definition (defaults
+        # resolved, JSON-compatible) so a saved run reproduces the exact
+        # strategy configuration -- including its metadata (schema_version /
+        # id / name / description) -- from config_json alone.
+        config["strategy_definition"] = definition.to_config()
 
     run_record = models.create_backtest_run_record(
         run_name=args.run_name or _default_run_name(args.symbol, args.timeframe, args.from_time, args.to_time),
@@ -525,24 +613,7 @@ def _run_squeeze_breakout(
         to_time=args.to_time,
         strategy_name=args.strategy_name,
         exit_policy=squeeze_breakout.EXIT_POLICY_LABEL,
-        config={
-            "warmup_bars": args.warmup_bars,
-            "chart_db_path": str(chart_db_path),
-            "execution_model": exec_model.to_config(),
-            # Issue #44: the fixed, pre-committed strategy parameters (Issue #43:
-            # not tuned on Issue #42 PnL). Recorded so a saved run is fully
-            # reproducible from its config alone.
-            "strategy_profile": squeeze_breakout.STRATEGY_PROFILE,
-            "signal_type": squeeze_breakout.SIGNAL_TYPE,
-            "trigger_type": squeeze_breakout.TRIGGER_TYPE,
-            "risk_reward": squeeze_breakout.RISK_REWARD,
-            "time_exit_bars": squeeze_breakout.TIME_EXIT_BARS,
-            "same_candle_priority": exit_policy.SAME_CANDLE_PRIORITY_STOP_LOSS,
-            # The episode state machine enforces a single position and a
-            # new-episode-before-re-entry rule; there is no time-based cooldown.
-            "no_reentry": True,
-            "cooldown_minutes": 0.0,
-        },
+        config=config,
     )
     store.save_backtest_run(run_record, db_path=backtest_db_path)
 
@@ -554,6 +625,11 @@ def _run_squeeze_breakout(
         timeframe=args.timeframe,
         warmup_bars=args.warmup_bars,
         exec_model=exec_model,
+        # Issue #53 (docs §5.2 ①): the two variable squeeze fields. On the
+        # non-definition path these equal the module constants, so passing
+        # them explicitly changes nothing for --strategy-profile runs.
+        risk_reward=risk_reward,
+        time_exit_bars=time_exit_bars,
     )
 
     signal_records: list[dict] = []
@@ -586,7 +662,9 @@ def _run_squeeze_breakout(
             signal_type=squeeze_breakout.SIGNAL_TYPE,
             trigger_type=squeeze_breakout.TRIGGER_TYPE,
             alert_source=squeeze_breakout.ALERT_SOURCE,
-            strategy_profile=squeeze_breakout.STRATEGY_PROFILE,
+            # Issue #53: an external definition stamps its own id; the
+            # --strategy-profile path keeps the module constant (same value).
+            strategy_profile=strategy_profile,
             reasons=None,
             entry_price=signal.entry_price,
             # Issue #44: unlike the trend_follow path (which falls back to a %
@@ -615,7 +693,10 @@ def _run_squeeze_breakout(
         "timeframe": args.timeframe,
         "from_time": args.from_time,
         "to_time": args.to_time,
-        "strategy_profile": squeeze_breakout.STRATEGY_PROFILE,
+        "strategy_profile": strategy_profile,
+        # Issue #53: the normalized external definition (None on the
+        # --strategy-profile path), mirroring config_json.
+        "strategy_definition": config.get("strategy_definition"),
         "warmup_bars_available": len(warmup_frame),
         "warmup_bars_required": args.warmup_bars,
         "warmup_insufficient": warmup_insufficient,
@@ -638,6 +719,66 @@ def _run_squeeze_breakout(
     return EXIT_OK, summary
 
 
+# Issue #53: execution binding for the handler registry. An external Strategy
+# definition can only name a handler that is BOTH declared in
+# strategy_definition.HANDLER_REGISTRY (capability validation) and bound here
+# to an actual runner (execution). A test pins the two key sets to be equal so
+# a handler can never be accepted by validation without an execution path.
+# Keys are literals (not strategy_definition constants) so importing this
+# module never imports strategy_definition/PyYAML on the default path.
+EXTERNAL_STRATEGY_HANDLER_RUNNERS = {
+    "squeeze_breakout": _run_squeeze_breakout,
+}
+
+
+def _resolve_external_strategy(args: argparse.Namespace):
+    """Issue #53: load + validate the opted-in external Strategy definition.
+
+    Returns ``(exit_code, definition)``: ``(EXIT_OK, StrategyDefinition)`` on
+    success, ``(EXIT_USAGE_ERROR, None)`` with a message on stderr otherwise.
+    Called before any DB file is opened or created, so a validation failure has
+    zero side effects. Never called when neither --strategy-file nor --strategy
+    was given (the import below is the only place PyYAML enters the runner).
+    """
+    import strategy_definition as strategy_definitions  # local: opt-in only
+
+    try:
+        if args.strategy_file:
+            definition = strategy_definitions.load_strategy_definition(args.strategy_file)
+        else:
+            registry = strategy_definitions.load_strategy_registry()
+            definition = registry.get(args.strategy)
+            if definition is None:
+                available = ", ".join(sorted(registry)) or "(none)"
+                print(
+                    f"error: unknown strategy id {args.strategy!r} in "
+                    f"{strategy_definitions.strategy_definitions_dir()}; available ids: {available}",
+                    file=sys.stderr,
+                )
+                return EXIT_USAGE_ERROR, None
+    except strategy_definitions.StrategyDefinitionError as exc:
+        print(f"error: invalid strategy definition: {exc}", file=sys.stderr)
+        return EXIT_USAGE_ERROR, None
+
+    # docs §5.2 ②: the definition declares which symbol/timeframe it applies
+    # to; a run requesting anything else is a usage error, not a silent run.
+    if args.symbol not in definition.symbols:
+        print(
+            f"error: --symbol {args.symbol!r} is not declared by strategy {definition.id!r} "
+            f"(symbols: {', '.join(definition.symbols)})",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE_ERROR, None
+    if args.timeframe not in definition.timeframes:
+        print(
+            f"error: --timeframe {args.timeframe!r} is not declared by strategy {definition.id!r} "
+            f"(timeframes: {', '.join(definition.timeframes)})",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE_ERROR, None
+    return EXIT_OK, definition
+
+
 def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
     """Run one backtest per CLI args. Returns (exit_code, summary_dict_or_None)."""
     try:
@@ -654,6 +795,16 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
     if validation_end < validation_start:
         print("error: --to must not be before --from", file=sys.stderr)
         return EXIT_USAGE_ERROR, None
+
+    # Issue #53: resolve the external Strategy definition (opt-in) BEFORE any
+    # DB path is opened/created, so an invalid definition fails with zero side
+    # effects. When neither flag is given, definition stays None and nothing
+    # external (PyYAML import, strategy-directory scan) ever runs.
+    definition = None
+    if args.strategy_file or args.strategy:
+        exit_code, definition = _resolve_external_strategy(args)
+        if definition is None:
+            return exit_code, None
 
     chart_db_path = Path(args.db_path) if args.db_path else chart_collector.chart_db_path()
     backtest_db_path = Path(args.backtest_db_path) if args.backtest_db_path else store.backtest_db_path()
@@ -682,6 +833,25 @@ def run_backtest(args: argparse.Namespace) -> tuple[int, dict | None]:
             "Warm-up allocation is insufficient: have %s candles before %s, need %s. "
             "Every validation bar will be skipped with reason=%s.",
             len(warmup_frame), args.from_time, args.warmup_bars, warmup.REASON_WARMUP_INSUFFICIENT,
+        )
+
+    # Issue #53: an external definition routes to its handler's registered
+    # runner (currently only squeeze_breakout). All of its accepted fields are
+    # either passed to the runner, already validated fixed-value contracts, or
+    # recorded metadata -- nothing accepted is ignored (docs §5.2).
+    if definition is not None:
+        handler_runner = EXTERNAL_STRATEGY_HANDLER_RUNNERS[definition.entry.handler]
+        return handler_runner(
+            args,
+            candles=candles,
+            chart_db_path=chart_db_path,
+            backtest_db_path=backtest_db_path,
+            warmup_frame=warmup_frame,
+            validation_frame=validation_frame,
+            warmup_insufficient=warmup_insufficient,
+            validation_start=validation_start,
+            validation_end=validation_end,
+            definition=definition,
         )
 
     # Issue #44: the squeeze-breakout profile has its own Trigger generation,

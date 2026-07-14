@@ -78,6 +78,7 @@ v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続
 - **Backtest Engine / Runner / CLI**(`python -m backtest`): 手元やEC2から実行可能。実行方法・引数・終了コードは [docs/backtest.md](docs/backtest.md) を参照。
 - **Market State 局面別エントリー制御**(`--allowed-market-states`)と**銘柄別 Market Bias**、時系列 Bias 参照・再エントリー抑制・cooldown。
 - **XAUUSD squeeze breakout 戦略**(`--strategy-profile xauusd_1h_squeeze_breakout_v1`)を paper-only Backtest に追加。
+- **外部 Strategy 定義(YAML)の Loader / Validation**(Issue #53): Strategy ごとの可変設定を YAML で外部化し、`--strategy-file <path>`(単一ファイル)または `--strategy <id>`(`backtest/strategies/` ディレクトリ、`STRATEGY_DEFINITIONS_DIR` で上書き可)で opt-in 実行。両者および既存 `--strategy-profile` とは排他で、**未指定時は従来動作を完全維持**する。不正な定義は実行開始前に副作用なしのvalidation errorになる。スキーマは [Strategy 定義仕様](docs/architecture/strategy_definition.md)、使用方法は [docs/backtest.md](docs/backtest.md) を参照(既存 Strategy の外部定義への移行は後続 Issue)。
 - **Paper Signal の常駐サービス化**(`paper_signal_bot.py`)と**日次集計レポート**(`paper_signal_daily_report.py`, 読み取り専用)。
 
 詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
