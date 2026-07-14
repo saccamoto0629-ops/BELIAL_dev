@@ -17,16 +17,16 @@ Market Snapshot(可視化)─ Market Bias(市場状態の分類)
                                          │
                                          └─ Paper Signal Generator(paper-signal/, 本章)
                                                   │
-                                                  ├─ Paper Execution(次フェーズ・未実装)
+                                                  ├─ Paper Execution(実装済み・仮想約定のみ)
                                                   └─ Live Execution(将来・未実装)
 ```
 
 Paper Signal は、Market Bias が示す「市場の大まかな方向」と、Chart Snapshot が示す「チャート状態(1h)」を組み合わせて、シグナル仮説を記録するだけの層である。Paper Signal 自身は entry / exit を一切決めない。
 
-- **Paper Execution**: Paper Signal を入力として、時間進行に沿って仮想約定・仮想ポジション管理・Exit・損益計算を行う将来レイヤー。v1.4 では**未実装**(最小責務と状態遷移の設計は [Paper Execution(最小設計)](paper_execution.md) を参照。Issue #49)。
+- **Paper Execution**: Paper Signal を入力として、時間進行に沿って仮想約定・仮想ポジション管理・Exit・仮想損益を行うレイヤー。**実装済み**(`paper-execution/`。設計は [Paper Execution(最小設計)](paper_execution.md) の Issue #49、実装は Issue #50 / #51)。仮想レコードのみで、Broker API・実注文は含まない。
 - **Live Execution**: Broker API を利用した実注文・実約定・実ポジション管理の将来レイヤー。**未実装**。
 
-Paper Execution も Live Execution も Paper Signal の外側の別レイヤーであり、いずれも未実装。本章(Paper Signal)では扱わない。
+Paper Execution(実装済み)も Live Execution(Broker API 実注文・未実装)も Paper Signal の外側の別レイヤーであり、本章(Paper Signal)では扱わない。
 
 なお、生成済みの Paper Signal を過去のローソク足で遡及検証する **Backtest** は、この執行フローとは独立した検証基盤(Validation)である。Backtest 内部の Exit 判定(`paper-signal/exit_policy.py`)や仮想約定モデル(`backtest/execution_model.py` の spread / slippage / fill)は検証用のシミュレーションであって、Paper Execution レイヤーの実装ではない(詳細は [Backtest](../backtest.md))。
 
@@ -149,6 +149,6 @@ Paper Signal Generator は、以下を**実装しない**。
 - 利確・損切り(stop-loss / take-profit)判断
 - エントリー実行
 
-これらの entry / exit / 発注は Paper Signal の外側の執行層(**Paper Execution** / **Live Execution**)の責務であり、いずれも未実装である。Paper Signal Generator 自身は entry / exit をいっさい決めない。なお TP / SL の評価は Backtest(検証基盤)が過去データ上で遡及的に行うが、これは検証用シミュレーションであって Paper Execution レイヤーの実装ではない。
+これらの entry / exit / 発注は Paper Signal の外側の執行層の責務である。仮想の entry / exit・仮想ポジション・仮想損益は **Paper Execution**(実装済み、`paper-execution/`)が担い、Broker API による実発注は **Live Execution**(未実装)の責務である。Paper Signal Generator 自身は entry / exit をいっさい決めない。なお TP / SL の評価は Backtest(検証基盤)が過去データ上で遡及的に行うが、これは検証用シミュレーションであって Paper Execution レイヤーの実装ではない。
 
 `paper-signal/signal_generator.py` のソースコードは、broker APIのimportや発注関数呼び出しが存在しないことをテスト(`test_module_source_has_no_broker_api_integration`)で検証する。生成されるレコードの各フィールド値にも、order / lot / leverage / stop-loss / take-profit 等の語が含まれないことを検証する。

@@ -340,7 +340,19 @@ def load_candles(db_path: Path, symbol: str, timeframe: str, *, limit: int = 200
     return frame.set_index("timestamp")
 
 
-def load_candles_range(
+class ChartReadError(RuntimeError):
+    """A Chart DB read failed for an infrastructure reason, not "no candles".
+
+    Raised by :func:`load_candles_range_strict` when the DB file is missing, the
+    ``candles`` table is absent, the schema is incompatible, or SQLite raises an
+    ``OperationalError`` (corruption/lock/etc.). This is deliberately DISTINCT
+    from "the table read fine but matched zero rows" (an empty DataFrame), so a
+    caller such as Paper Execution can refuse to treat a read failure as "no
+    data" (which would wrongly expire pending positions).
+    """
+
+
+def load_candles_range_strict(
     db_path: Path,
     symbol: str,
     timeframe: str,
@@ -348,22 +360,16 @@ def load_candles_range(
     start: str | None = None,
     end: str | None = None,
 ) -> pd.DataFrame:
-    """Load every stored candle for symbol/timeframe within an optional [start, end] bound.
+    """Strict variant of :func:`load_candles_range`: raise on any read failure.
 
-    Unlike load_candles() (most-recent-N rows), this returns a full
-    historical slice, oldest first -- for Backtest, which replays a
-    specific date range rather than "the latest N bars". Read-only: never
-    creates the DB file/table as a side effect (unlike load_candles(),
-    which calls init_db()).
-
-    ``start``/``end`` are compared as strings against the stored
-    ``timestamp`` column, so callers must pass the same canonical
-    ``to_utc_iso_z()``-formatted form the candles were saved with (naive
-    or differently-formatted bounds can silently mis-compare against the
-    zero-padded, "Z"-suffixed stored strings).
+    Returns an empty DataFrame ONLY when the ``candles`` table read succeeds but
+    matched no rows. A missing DB file, a missing ``candles`` table, an
+    incompatible schema, or any ``sqlite3.OperationalError`` raises
+    :class:`ChartReadError` instead of silently returning empty. Read-only:
+    never creates the DB file/table.
     """
     if not db_path.exists():
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        raise ChartReadError(f"Chart DB file not found: {db_path}")
 
     clauses = ["symbol = ?", "timeframe = ?"]
     params: list = [symbol.upper(), timeframe]
@@ -381,8 +387,9 @@ def load_candles_range(
     try:
         with sqlite3.connect(db_path) as connection:
             rows = connection.execute(query, params).fetchall()
-    except sqlite3.OperationalError:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    except sqlite3.OperationalError as exc:
+        # Missing "candles" table, incompatible schema, corruption, lock, etc.
+        raise ChartReadError(f"failed to read candles from {db_path}: {exc}") from exc
 
     if not rows:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
@@ -390,6 +397,39 @@ def load_candles_range(
     frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     return frame.set_index("timestamp")
+
+
+def load_candles_range(
+    db_path: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    """Load every stored candle for symbol/timeframe within an optional [start, end] bound.
+
+    Unlike load_candles() (most-recent-N rows), this returns a full
+    historical slice, oldest first -- for Backtest, which replays a
+    specific date range rather than "the latest N bars". Read-only: never
+    creates the DB file/table as a side effect (unlike load_candles(),
+    which calls init_db()).
+
+    Lenient by contract: a missing DB file / table or any read error yields an
+    empty DataFrame (existing callers -- e.g. Backtest -- rely on this). Callers
+    that must distinguish a read failure from a genuine zero-row read should use
+    :func:`load_candles_range_strict`, which raises :class:`ChartReadError`.
+
+    ``start``/``end`` are compared as strings against the stored
+    ``timestamp`` column, so callers must pass the same canonical
+    ``to_utc_iso_z()``-formatted form the candles were saved with (naive
+    or differently-formatted bounds can silently mis-compare against the
+    zero-padded, "Z"-suffixed stored strings).
+    """
+    try:
+        return load_candles_range_strict(db_path, symbol, timeframe, start=start, end=end)
+    except ChartReadError:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
 
 def insert_chart_snapshot(

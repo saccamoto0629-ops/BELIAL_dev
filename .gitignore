@@ -12,6 +12,7 @@ market-watch/state/
 market-watch/macd_alert_state.json
 market-watch/data/
 paper-signal/data/
+paper-execution/data/
 backtest/data/
 **/*.json.tmp
 .pytest_cache/

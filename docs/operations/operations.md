@@ -35,6 +35,7 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `ENABLE_ECONOMIC_CALENDAR` | `false` | Economic Calendar optional Providerを有効化 |
 | `CHART_DB_PATH` | `market-watch/data/chart_data.sqlite3` | Chart DBのパス上書き(`market-watch/chart_collector.py`) |
 | `MARKET_BIAS_DB_PATH` | `news-feed-bot/data/market_bias.sqlite3` | Market Bias DBのパス上書き。Backtestから別プロセスで参照する場合に使う(`news-feed-bot/market_bias_store.py`) |
+| `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む。dry-run では作成・migration せず読み取り専用のスキーマ確認のみ行う |
 
 注意: `news-feed-bot/` のニュース投稿では、現行コードで使用している実変数名は `NEWS_WEBHOOK_URL` である。`DISCORD_WEBHOOK_URL` はニュース投稿用の設定名ではない。一方、`market-watch/` のイベント通知では旧設定との互換性のため、`BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り `DISCORD_WEBHOOK_URL` をlegacy fallbackとして扱う。
 
