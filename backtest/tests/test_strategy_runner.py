@@ -393,12 +393,14 @@ def test_timeframe_not_declared_by_the_definition_is_a_usage_error(tmp_path, cap
 
 
 def test_capability_violations_from_yaml_are_pre_run_usage_errors(tmp_path, capsys):
-    # allowed_market_states / nonzero cooldown / overlap reentry are all
-    # accepted by the generic schema but rejected by squeeze's capability
-    # descriptor -- each must fail before the run starts (never run-and-ignore).
+    # Nonzero cooldown / overlap reentry / take_profit priority and an unknown
+    # market state are accepted nowhere -- each must fail before the run starts
+    # (never run-and-ignore). allowed_market_states with KNOWN states is
+    # accepted since Issue #63 (see the market-state gate section below).
     index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
     variants = [
-        ({"allowed_market_states": ["trend_up"]}, "does not support a market-state gate"),
+        ({"allowed_market_states": ["sideways"]}, "unknown market state 'sideways'"),
+        ({"allowed_market_states": []}, "empty list"),
         ({"entry": {"handler": "squeeze_breakout", "reentry": "new_setup", "cooldown_bars": 5}},
          "only supports cooldown_bars in [0]"),
         ({"entry": {"handler": "squeeze_breakout", "reentry": "overlap"}}, "only supports"),
@@ -499,6 +501,142 @@ def test_external_run_reentry_new_setup_yields_one_signal_per_episode(tmp_path):
     _index, (exit_code, summary) = _run_external(tmp_path, bars=bars)
     assert exit_code == runner.EXIT_OK
     assert summary["signals_generated"] == 2
+
+
+# =============================================================================
+# Issue #63: allowed_market_states from YAML gates the squeeze Trigger bar
+# =============================================================================
+
+# BREAKOUT_BARS' Trigger bar (index 94) classifies as Market State "trend_up"
+# (verified in exploration), so a gate listing trend_up admits the entry and a
+# gate listing only "range" blocks it.
+
+
+def test_allowed_market_states_from_yaml_blocks_the_entry_and_changes_the_result(tmp_path):
+    # Same bars, same code -- a YAML-only change flips the run from 1 trade to
+    # 0 trades, so the gate demonstrably reaches execution, not just validation.
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+
+    baseline_path = write_strategy(tmp_path, name="baseline.yaml", id="ext_squeeze_base")
+    args = make_args(tmp_path, index, strategy_file=str(baseline_path),
+                     backtest_db_path=tmp_path / "baseline.sqlite3")
+    exit_code, baseline_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert baseline_summary["signals_generated"] == 1
+    assert baseline_summary["allowed_market_states"] is None
+    assert baseline_summary["suppressed_market_state"] == 0
+
+    gated_path = write_strategy(tmp_path, name="gated.yaml", id="ext_squeeze_gated",
+                                allowed_market_states=["range"])
+    args = make_args(tmp_path, index, strategy_file=str(gated_path),
+                     backtest_db_path=tmp_path / "gated.sqlite3")
+    exit_code, gated_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert gated_summary["signals_generated"] == 0
+    assert gated_summary["allowed_market_states"] == ["range"]
+    assert gated_summary["suppressed_market_state"] >= 1
+
+    # The effective gate is recorded for reproducibility: both in the run's
+    # flat config key and inside the normalized definition.
+    config = json.loads(
+        store.get_backtest_run(gated_summary["run_id"], db_path=tmp_path / "gated.sqlite3")["config_json"]
+    )
+    assert config["allowed_market_states"] == ["range"]
+    assert config["strategy_definition"]["allowed_market_states"] == ["range"]
+
+
+def test_allowed_market_states_from_yaml_admits_a_listed_state_identically(tmp_path):
+    # A gate that includes the Trigger bar's state must reproduce the ungated
+    # run exactly -- same signal, same prices, same exit.
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+
+    baseline_path = write_strategy(tmp_path, name="baseline.yaml", id="ext_squeeze_base")
+    args = make_args(tmp_path, index, strategy_file=str(baseline_path),
+                     backtest_db_path=tmp_path / "baseline.sqlite3")
+    _exit_code, baseline_summary = runner.run_backtest(args)
+
+    allowed_path = write_strategy(tmp_path, name="allowed.yaml", id="ext_squeeze_base",
+                                  allowed_market_states=["trend_up", "range"])
+    args = make_args(tmp_path, index, strategy_file=str(allowed_path),
+                     backtest_db_path=tmp_path / "allowed.sqlite3")
+    exit_code, allowed_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert allowed_summary["signals_generated"] == 1
+    assert allowed_summary["allowed_market_states"] == ["range", "trend_up"]  # sorted
+    assert allowed_summary["suppressed_market_state"] == 0
+
+    baseline_signal = store.list_backtest_signals(
+        baseline_summary["run_id"], db_path=tmp_path / "baseline.sqlite3", limit=10)[0]
+    allowed_signal = store.list_backtest_signals(
+        allowed_summary["run_id"], db_path=tmp_path / "allowed.sqlite3", limit=10)[0]
+    for field in ("signal_time", "direction", "entry_price", "invalidation_price",
+                  "take_profit_price", "close_price", "closed_at", "close_reason",
+                  "result_status", "pnl", "market_state"):
+        assert allowed_signal[field] == baseline_signal[field], field
+    assert allowed_signal["market_state"] == "trend_up"
+
+
+def test_unknown_market_state_in_yaml_fails_before_the_run_with_no_side_effects(tmp_path, capsys):
+    strategy_path = write_strategy(tmp_path, allowed_market_states=["trend_up", "sideways"])
+    chart_db = tmp_path / "never_created_chart.sqlite3"
+    backtest_db = tmp_path / "never_created_results.sqlite3"
+    args = runner.parse_args([
+        "--symbol", "XAU_USD", "--timeframe", "1h",
+        "--from", "2026-06-01T00:00:00", "--to", "2026-06-02T00:00:00",
+        "--db-path", str(chart_db),
+        "--backtest-db-path", str(backtest_db),
+        "--market-bias-db-path", str(tmp_path / "market_bias.sqlite3"),
+        "--strategy-file", str(strategy_path),
+    ])
+    exit_code, summary = runner.run_backtest(args)
+    captured = capsys.readouterr()
+    assert exit_code == runner.EXIT_USAGE_ERROR
+    assert summary is None
+    assert "allowed_market_states[1]" in captured.err
+    assert "'sideways'" in captured.err
+    assert not chart_db.exists()
+    assert not backtest_db.exists()
+
+
+def test_cli_allowed_market_states_flag_never_applies_to_a_squeeze_run(tmp_path):
+    # --allowed-market-states stays a trend_follow-path flag (its help says
+    # so): an external squeeze definition with a null gate keeps running
+    # unrestricted even when the CLI flag names a state the Trigger bar
+    # doesn't have. Only the YAML field gates squeeze entries.
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+    strategy_path = write_strategy(tmp_path)  # allowed_market_states omitted -> null
+    args = make_args(tmp_path, index, strategy_file=str(strategy_path),
+                     allowed_market_states="range")
+    exit_code, summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert summary["signals_generated"] == 1
+    assert summary["allowed_market_states"] is None
+    assert summary["suppressed_market_state"] == 0
+
+
+def test_yaml_market_state_gate_never_leaks_into_the_builtin_profile_path(tmp_path):
+    # An external run whose gate suppressed the entry, then the built-in
+    # --strategy-profile path: still ungated, still 1 signal, null in config.
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+    gated_path = write_strategy(tmp_path, name="gated.yaml", id="ext_squeeze_gated",
+                                allowed_market_states=["range"])
+    args = make_args(tmp_path, index, strategy_file=str(gated_path),
+                     backtest_db_path=tmp_path / "gated.sqlite3")
+    exit_code, gated_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert gated_summary["signals_generated"] == 0
+
+    profile_db = tmp_path / "profile.sqlite3"
+    args = make_args(tmp_path, index, strategy_profile=sb.STRATEGY_PROFILE,
+                     backtest_db_path=profile_db)
+    exit_code, profile_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert profile_summary["signals_generated"] == 1
+    assert profile_summary["allowed_market_states"] is None
+    config = json.loads(
+        store.get_backtest_run(profile_summary["run_id"], db_path=profile_db)["config_json"]
+    )
+    assert config["allowed_market_states"] is None
 
 
 # =============================================================================

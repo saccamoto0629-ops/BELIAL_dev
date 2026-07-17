@@ -243,10 +243,13 @@ def test_run_config_records_the_same_effective_settings_on_both_paths(tmp_path):
     )
     for key in ("strategy_profile", "signal_type", "trigger_type", "risk_reward",
                 "time_exit_bars", "same_candle_priority", "no_reentry", "cooldown_minutes",
-                "warmup_bars", "execution_model", "squeeze_lookback", "squeeze_percentile"):
+                "warmup_bars", "execution_model", "squeeze_lookback", "squeeze_percentile",
+                "allowed_market_states"):
         assert external_config[key] == profile_config[key], key
     assert external_config["squeeze_lookback"] == market_state.DEFAULT_SQUEEZE_LOOKBACK
     assert external_config["squeeze_percentile"] == market_state.DEFAULT_SQUEEZE_PERCENTILE
+    # Issue #63: the shipped null gate records as null on both paths.
+    assert external_config["allowed_market_states"] is None
     # Only the new path additionally records the normalized definition.
     assert "strategy_definition" not in profile_config
     assert external_config["strategy_definition"]["id"] == sb.STRATEGY_PROFILE

@@ -174,7 +174,7 @@ Validator は定義を descriptor と突合し、**非対応フィールド、�
 | `entry.params.breakout` | ✅ 対応(`bollinger_close` のみ) | ✕ 非対応 |
 | `entry.params.squeeze_lookback` | ✅ 対応(**可変** int >= 1、既定 20 = `market_state.DEFAULT_SQUEEZE_LOOKBACK`) | ✕ 非対応 |
 | `entry.params.squeeze_percentile` | ✅ 対応(**可変** number 0 < x <= 1、既定 0.10 = `market_state.DEFAULT_SQUEEZE_PERCENTILE`) | ✕ 非対応 |
-| `allowed_market_states` | ✕ **非対応 → `null` 必須**(自前 episode state machine) | ✅ 対応 |
+| `allowed_market_states` | ✅ 対応(**可変**、Issue #63。Trigger 足の Market State ゲート。`null` = フィルタ無し) | ✅ 対応 |
 | `entry.reentry` | `new_setup` のみ(構造的に単一ポジション) | `overlap` / `single_position` |
 | `entry.cooldown_bars` | `0` のみ | 任意(≥ 0) |
 | `risk.stop_loss.type` | `trigger_bar_extreme` のみ | `fixed_pct` |
@@ -182,9 +182,10 @@ Validator は定義を descriptor と突合し、**非対応フィールド、�
 | `exit.max_holding_bars` | ✅ 対応(int > 0) | ✅ 対応 |
 | `exit.same_candle_priority` | **`stop_loss` のみ**(§8 参照) | `stop_loss` / `take_profit` |
 
-> 例:`handler: squeeze_breakout` に対し `allowed_market_states: [trend_up]`、
-> `same_candle_priority: take_profit`、`cooldown_bars: 60`、`reentry: overlap` はいずれも
-> **validation error**。squeeze の descriptor が許容しないため(死に設定にならない)。
+> 例:`handler: squeeze_breakout` に対し `same_candle_priority: take_profit`、
+> `cooldown_bars: 60`、`reentry: overlap` はいずれも **validation error**。squeeze の
+> descriptor が許容しないため(死に設定にならない)。`allowed_market_states: [trend_up]` は
+> Issue #63 以降有効(§6)。
 
 **受理段階の validation と実行挙動の一致**:descriptor が単一固定値のみ許容するフィールドは、
 その許容値を **handler の実際の実行挙動と一致**させる(§5.2 カテゴリ③)。これにより「受理されたが
@@ -273,6 +274,7 @@ Loader / Validation の実装方式を左右するため、以下を **本 Issue
 | `exit.max_holding_bars` | `evaluate_squeeze_breakout_signals(time_exit_bars=<max_holding_bars>)` |
 | `entry.params.squeeze_lookback` | `evaluate_squeeze_breakout_signals(squeeze_lookback=...)` → `classify_market_state(squeeze_lookback=...)`(PR #62 で可変化) |
 | `entry.params.squeeze_percentile` | `evaluate_squeeze_breakout_signals(squeeze_percentile=...)` → `classify_market_state(squeeze_percentile=...)`(同上) |
+| `allowed_market_states` | `evaluate_squeeze_breakout_signals(allowed_market_states=...)`(Issue #63 で可変化。Trigger 足の Market State ゲート、§6。`null` = ゲート無し) |
 
 **② 適合検証(実行対象の妥当性)**
 
@@ -298,7 +300,9 @@ descriptor が単一固定値のみ許容し(§4.1)、**その許容値は handl
 | `entry.params.squeeze_state = squeeze` | `SQUEEZE_STATE` |
 | `entry.params.require_episode_release = true` | episode 解除足のみ評価 |
 | `entry.params.breakout = bollinger_close` | BB 終値 break(ヒゲ到達不可) |
-| `allowed_market_states = null` | squeeze は market-state ゲート非対応(§6) |
+
+(`allowed_market_states` は Issue #63 でカテゴリ③からカテゴリ①へ移動:固定値契約ではなく
+実行パラメータとして handler へ渡される。§6 参照。)
 
 **④ メタデータ(記録。strategy ロジックには影響しないが config_json / summary へ反映)**
 
@@ -326,12 +330,30 @@ cooldown を許容する handler を追加する時点で、その handler の�
 
 - 各要素は `market-watch/market_state.py:KNOWN_MARKET_STATES`
   (`trend_up` / `trend_down` / `range` / `volatile` / `squeeze` / `unknown`)のいずれか。範囲外はエラー。
+  重複要素はエラーにせず集合へ collapse する(CLI `--allowed-market-states` パーサと同じ契約)。
+  空リストは validation error(「全不許可」は dead config。フィルタ無しは `null` で表す)。
 - `null`(既定)= フィルタ無し。既存 CLI `--allowed-market-states` と同じ意味論を宣言化したもの。
-- **handler 対応契約(§4.1)で判定**:squeeze_breakout handler は **自前の squeeze episode state
-  machine** を持ち、market-state ゲートを使わない(`--allowed-market-states` は trend_follow 経路専用)。
-  よって squeeze の capability descriptor では `allowed_market_states` は **非対応 = `null` 必須**とし、
-  **非 null を指定したら validation error**(死に設定にしない)。サンプルは `null`。
-  スキーマ上は全 handler 共通に持てるフィールドだが、実際に尊重するかは §4.1 の contract で決まり、
+  `null` 時の実行結果は Issue #63 以前(PR #62 時点)と**完全一致**する。
+- **squeeze_breakout での実行意味論(Issue #63 で可変化)**:
+  - 判定タイミングは **breakout trigger が成立した足(episode 解除足)そのもの**。squeeze episode
+    形成中の各足には適用しない。判定に使う値は trigger 足自身を最新行として
+    `classify_market_state()` が返した label(保存される `signal.market_state` と同一値)。
+  - trigger 足の state が許可リストに**含まれる** → 従来どおり entry(null 時と同一の約定)。
+  - **含まれない** → entry を生成せず、position も開かず、**episode は消費されない**(armed のまま
+    残る)。同一 episode 内の後続足が再び trigger を成立させ、その足の state が許可されていれば
+    entry できる。trigger が成立しなかった非 squeeze 足が episode を消費する規則は従来のまま
+    (ゲートは「trigger が成立したのに state 不許可」の場合のみ消費を保留する)。
+  - `unknown` は特別扱いしない:一状態としてリストに明示した場合のみ許可される(Issue #39 の
+    runner 契約と同じ membership 比較。正規化・文字列変換の新設は行わない)。
+  - trigger 足は定義上 squeeze 以外の state に分類されるため、リスト中の `squeeze` 要素が
+    一致することはない(schema 上は有効だが、その要素は実行上マッチしない)。
+  - 実効値は `backtest_runs.config_json` の `allowed_market_states`(ソート済み)と
+    `strategy_definition.allowed_market_states` の両方に記録され、summary は抑制件数
+    (`suppressed_market_state`)を報告する。
+- CLI `--allowed-market-states` フラグは従来どおり trend_follow 経路専用で、squeeze 実行
+  (外部定義・`--strategy-profile` とも)には適用されない。squeeze のゲートは外部定義の
+  この宣言フィールドのみが駆動する。
+- スキーマ上は全 handler 共通に持てるフィールドだが、実際に尊重するかは §4.1 の contract で決まり、
   非対応 handler との組合せはエラーになる(黙って無視しない)。
 
 ---
@@ -529,7 +551,7 @@ Loader は **専用例外 `StrategyDefinitionError(ValueError)`** を送出す�
 | id 重複(集合内) | **ロード全体を失敗**。両ファイルパスを表示。 |
 | 未登録 handler | エラー(登録済み一覧を表示)。 |
 | 条件付き必須の欠落(`r_multiple` に `r` 無し 等) | エラー。 |
-| handler 非対応フィールド / 非許容値(例:squeeze に `same_candle_priority: take_profit`、非 null `allowed_market_states`) | **validation error**(§4.1)。無視しない。 |
+| handler 非対応フィールド / 非許容値(例:squeeze に `same_candle_priority: take_profit`) | **validation error**(§4.1)。無視しない。 |
 | `entry.params` の型違反(ネスト dict、多重 list、NaN/Inf) | エラー(§7)。 |
 | `--strategy-file` と `--strategy` の同時指定 / 旧 `--strategy-profile` との併用 | 使用エラー(§5.1)。 |
 

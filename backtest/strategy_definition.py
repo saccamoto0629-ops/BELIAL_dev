@@ -314,9 +314,11 @@ HANDLER_REGISTRY: dict[str, HandlerCapability] = {
                 default=DEFAULT_SQUEEZE_PERCENTILE, number_gt=0.0, number_max=1.0
             ),
         },
-        # squeeze_breakout runs its own squeeze-episode state machine and never
-        # consults the market-state gate: allowed_market_states must be null.
-        supports_market_state_gate=False,
+        # Issue #63: squeeze_breakout consults the market-state gate on the
+        # Trigger bar (the episode-release bar whose close fired the breakout);
+        # a disallowed state adopts no entry and leaves the episode armed.
+        # null (the default) = no gate, byte-identical to the pre-#63 runs.
+        supports_market_state_gate=True,
         allowed_reentry_modes=frozenset({REENTRY_NEW_SETUP}),
         allowed_cooldown_bars=frozenset({0}),
         allowed_stop_loss_types=frozenset({STOP_LOSS_TRIGGER_BAR_EXTREME}),

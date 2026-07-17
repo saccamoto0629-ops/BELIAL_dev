@@ -276,6 +276,8 @@ def evaluate_squeeze_breakout_signals(
     risk_reward: float = RISK_REWARD,
     squeeze_lookback: int = DEFAULT_SQUEEZE_LOOKBACK,
     squeeze_percentile: float = DEFAULT_SQUEEZE_PERCENTILE,
+    allowed_market_states: frozenset[str] | None = None,
+    stats: dict | None = None,
 ) -> list[SqueezeBreakoutSignal]:
     """Run the squeeze-episode breakout state machine over *candles*.
 
@@ -297,6 +299,23 @@ def evaluate_squeeze_breakout_signals(
     squeeze-episode *detection window*; the episode state transition, trigger
     condition, and fill judgement stay fixed here. Defaults are market_state's
     own, so omitting them is byte-identical to the pre-#54 behaviour.
+
+    ``allowed_market_states`` (Issue #63) is the market-state entry gate: when
+    not None, an entry is adopted only if the *Trigger bar's* classified state
+    (the same ``classify_market_state()`` label persisted as
+    ``SqueezeBreakoutSignal.market_state`` -- ``unknown`` included, exactly the
+    Issue #39 ``--allowed-market-states`` vocabulary) is a member of the set.
+    The gate is evaluated only on a bar whose close actually fired the
+    breakout trigger, never on the squeeze bars forming the episode. A
+    disallowed Trigger bar produces no entry, opens no position, and does NOT
+    consume the episode: it stays armed, so a later bar of the same episode
+    that fires the trigger again in an allowed state can still enter. The
+    episode is consumed as before by the first non-squeeze bar that does not
+    fire a trigger at all, or by an adopted entry. ``None`` (the default) means
+    no gate: byte-identical to the pre-#63 behaviour.
+
+    ``stats``, when given a dict, receives the gate's suppression count under
+    ``"suppressed_market_state"`` (how many fired triggers the gate dropped).
     """
     if exec_model is None:
         import execution_model as execution
@@ -369,7 +388,10 @@ def evaluate_squeeze_breakout_signals(
         # confirmed-ready bar was squeeze (episode_active could only have been
         # set by a squeeze bar and would have been cleared by any earlier
         # non-squeeze ready bar), so state[t-1] == squeeze holds.
-        episode_active = False  # episode is consumed whether or not it triggers.
+        # The episode is consumed here whether or not it triggers -- with one
+        # Issue #63 exception below: a fired trigger whose bar state the
+        # market-state gate disallows re-arms the episode instead.
+        episode_active = False
 
         in_validation = timestamp in validation_index
         if not in_validation:
@@ -384,6 +406,19 @@ def evaluate_squeeze_breakout_signals(
         short_trigger = close_t <= bb_lower
         # XOR: no break, or (degenerate data) both sides -> no entry.
         if long_trigger == short_trigger:
+            continue
+
+        # Issue #63: the market-state gate applies to the bar the trigger just
+        # fired on (this bar's own classified state -- the value persisted as
+        # signal.market_state). A disallowed state is neither an entry nor a
+        # consumed episode: re-arm it, so a later trigger bar of the same
+        # episode can still enter in an allowed state. Bars that never fire a
+        # trigger are untouched by the gate (the episode was already consumed
+        # above, exactly as without a gate).
+        if allowed_market_states is not None and state not in allowed_market_states:
+            if stats is not None:
+                stats["suppressed_market_state"] = stats.get("suppressed_market_state", 0) + 1
+            episode_active = True
             continue
 
         direction = LONG if long_trigger else SHORT

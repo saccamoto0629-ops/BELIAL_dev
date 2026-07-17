@@ -236,11 +236,15 @@ field: exit.max_holding_bars] must be an int > 0, got 0 (int)
   `config_json` の `squeeze_lookback` / `squeeze_percentile` に記録される。
 - `symbols` / `timeframes` → 要求した `--symbol`/`--timeframe` が宣言に含まれない場合は終了コード2
   (適合検証)。
+- `allowed_market_states` → Issue #63 で可変化した実行パラメータ。非 null リスト指定時、
+  breakout trigger が成立した足(episode 解除足)自身の Market State がリストに含まれる場合のみ
+  entry する(`evaluate_squeeze_breakout_signals()` へ渡される)。`null`(既定)= ゲート無しで、
+  実行結果は PR #62 以前と完全一致。詳細は下記「squeeze_breakout の Market State ゲート」。
 - `entry.handler` / `entry.params` / `entry.reentry` / `entry.cooldown_bars` /
-  `risk.stop_loss.type` / `risk.take_profit.type` / `exit.same_candle_priority` /
-  `allowed_market_states` → handler の capability descriptor が実装挙動と一致する値のみ受理する
+  `risk.stop_loss.type` / `risk.take_profit.type` / `exit.same_candle_priority`
+  → handler の capability descriptor が実装挙動と一致する値のみ受理する
   固定値契約(squeeze_breakout は `new_setup` / `0` / `trigger_bar_extreme` / `r_multiple` /
-  `stop_loss` / `null` のみ。他値は validation error)。descriptor と実装の一致はテストで固定。
+  `stop_loss` のみ。他値は validation error)。descriptor と実装の一致はテストで固定。
 - `schema_version` / `id` / `name` / `description` → 正規化済み定義全体が
   `backtest_runs.config_json` の `strategy_definition` に記録され、`strategy_profile`
   (config・保存シグナル・summary 表示)には定義の `id` が入る(メタデータ)。
@@ -257,16 +261,17 @@ handler registry は Python コードが所有し、外部ファイルは登録�
 - **外部化されたのは設定値のみ**: strategy identity(`id`/`name`/`description`)、対象
   `symbols`/`timeframes`、`risk.take_profit.r`(→ `risk_reward`)、`exit.max_holding_bars`
   (→ `time_exit_bars`)、squeeze 検出窓の `entry.params.squeeze_lookback` /
-  `squeeze_percentile`(→ `classify_market_state()`、PR #62 で可変化)、および handler
-  固定値契約(`reentry=new_setup` / `cooldown_bars=0` / `stop_loss.type=trigger_bar_extreme` /
-  `same_candle_priority=stop_loss` / `allowed_market_states=null` / `entry.params` の宣言フラグ)。
-- **固定値契約として残る項目とその理由**: `allowed_market_states=null`(squeeze は自前の episode
-  state machine を持ち market-state ゲート非対応)、`cooldown_bars=0` / `reentry=new_setup`
+  `squeeze_percentile`(→ `classify_market_state()`、PR #62 で可変化)、Trigger 足の
+  Market State ゲート `allowed_market_states`(Issue #63 で可変化。既定 `null` = ゲート無し)、
+  および handler 固定値契約(`reentry=new_setup` / `cooldown_bars=0` /
+  `stop_loss.type=trigger_bar_extreme` / `same_candle_priority=stop_loss` /
+  `entry.params` の宣言フラグ)。
+- **固定値契約として残る項目とその理由**: `cooldown_bars=0` / `reentry=new_setup`
   (単一ポジションと再エントリー抑制は state machine が構造的に保証。時間 cooldown の実行接続は
   存在しない)、`stop_loss.type=trigger_bar_extreme` / `same_candle_priority=stop_loss`
   (Trigger 足 SL と同一足 SL 優先は約定判定順序=future-leakage 契約と一体)。これらを可変化する
-  ことは既存 Python 状態機械・約定契約の変更を意味するため、本移行では行わず、他値は
-  validation error とする(受理して無視する「死に設定」にはしない)。
+  ことは既存 Python 状態機械・約定契約の変更を意味するため、Issue #63 でも行わず(後続対応)、
+  他値は validation error とする(受理して無視する「死に設定」にはしない)。
 - **Python 側に残る条件ロジック**(定義ファイルへは移せない): squeeze episode の状態遷移、
   BB 終値 break の条件判定、long/short 方向決定、Trigger 足 low/high の SL、risk からの target
   算出、gap Stop → gap TP → intrabar SL/TP → time exit の判定順序、同一足 SL 優先、
@@ -283,6 +288,35 @@ handler registry は Python コードが所有し、外部ファイルは登録�
   **完全一致**する(`backtest/tests/test_squeeze_breakout_migration.py` で固定。定義の `id` を
   旧 `STRATEGY_PROFILE` と同一にしているため、保存行の `strategy_profile` も一致する)。
 - 新しい Strategy 定義の追加手順は [backtest/strategies/README.md](../backtest/strategies/README.md) を参照。
+
+### squeeze_breakout の Market State ゲート(Issue #63)
+
+外部 Strategy 定義の `allowed_market_states` は、Issue #63 で squeeze_breakout の実行へ接続された
+(GitHub Issue #63 の第1段階。reentry / cooldown / stop loss / same-candle priority の可変化は
+後続対応であり、引き続き固定値契約)。
+
+- **評価する足**: squeeze episode 形成中の各足ではなく、**breakout trigger が成立した足
+  (episode 解除足)そのもの**。判定に使う値はその足を最新行として `classify_market_state()` が
+  返した label で、保存される `backtest_signals.market_state` と同一値。
+- **`null` の意味**: ゲート無し。旧 default(shipped YAML の `allowed_market_states: null`)では
+  PR #62 以前と実行結果が**完全一致**する(`test_squeeze_breakout_migration.py` で固定)。
+- **`unknown` / NULL の扱い**: `unknown` は KNOWN_MARKET_STATES の一状態で、特別扱いしない。
+  リストに明示した場合のみ許可される(Issue #39 の `--allowed-market-states` と同じ membership
+  比較。独自の正規化・文字列変換は行わない)。squeeze 経路の Market State は各 Trigger 足で
+  point-in-time に分類されるため DB の NULL を読むことはない(NULL は Issue #39 の
+  by_market_state 集計上の扱いのまま)。
+- **episode state machine との関係**: 許可されない trigger 足は entry を生成せず、position も
+  開かず、**episode を消費しない**(armed のまま残る)。同一 episode 内の後続足で再び trigger が
+  成立し、その足の state が許可されていれば entry する。trigger が成立しなかった非 squeeze 足が
+  episode を消費する規則、および entry 成立時に episode が消費される規則は従来のまま。
+  suppression の件数は summary の `suppressed_market_state` に報告される。
+- **記録**: 実効値は `backtest_runs.config_json` の `allowed_market_states`(ソート済み、
+  ゲート無しは null)と `strategy_definition.allowed_market_states` の両方に記録され、
+  再現可能性を維持する。
+- **経路分離**: CLI `--allowed-market-states` フラグは従来どおり trend_follow 経路専用で、
+  squeeze 実行(外部定義・`--strategy-profile` とも)には適用されない。built-in
+  `--strategy-profile xauusd_1h_squeeze_breakout_v1` 経路は常にゲート無し(config には
+  `allowed_market_states: null` が記録される)。trend_follow 等他経路の挙動は変わらない。
 
 ## warm-up期間とvalidation期間の分離
 
@@ -460,6 +494,9 @@ python -m backtest run \
 - 許可リストは summary の `Allowed states:` 行(未指定時は `all`)と `backtest_runs.config_json` の
   `allowed_market_states`(ソート済みリスト、未指定時は null)に記録される。抑制件数は summary の
   `Suppressed: market-state=...` に出る。
+- この CLI フラグが適用されるのは trend_follow 経路のみ。squeeze_breakout の Market State 制御は
+  外部 Strategy 定義の `allowed_market_states`(Issue #63)で宣言する
+  (上記「squeeze_breakout の Market State ゲート」参照)。
 
 ### 局面別の成績確認(`by_market_state`)
 

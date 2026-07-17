@@ -316,6 +316,129 @@ def test_new_squeeze_episode_allows_a_second_entry():
     assert signals[1].exit_result.status == exit_policy.STATUS_WIN
 
 
+def _force_state_at(monkeypatch, timestamp, state):
+    """Wrap classify_market_state so the bar at *timestamp* classifies as *state*.
+
+    Every other bar keeps its real classification, so episode formation (the
+    squeeze bars) is untouched -- only the Trigger bar's label is controlled.
+    """
+    real = sb.classify_market_state
+
+    def fake(indicators, **kwargs):
+        if indicators.index[-1] == timestamp:
+            return {"market_state": state, "confidence": 0.5, "reasons": ["forced by test"]}
+        return real(indicators, **kwargs)
+
+    monkeypatch.setattr(sb, "classify_market_state", fake)
+
+
+# =============================================================================
+# Issue #63: allowed_market_states gate on the Trigger bar
+# =============================================================================
+
+# Bars 94 AND 95 both close beyond the upper band (verified in exploration), and
+# both classify as Market State "trend_up" -- so a gate that re-arms the episode
+# on bar 94 gets a second live Trigger on bar 95.
+GATE_BARS = _prefix() + [(2009, 2010, 2005, 2010), (2011, 2021, 2011, 2015)]
+
+
+def _gated_signals(bars, allowed=None, stats=None):
+    frame = _frame(bars)
+    return frame, sb.evaluate_squeeze_breakout_signals(
+        frame,
+        frame.index[TRIGGER_INDEX],
+        frame.index[-1],
+        symbol="XAU_USD",
+        timeframe="1h",
+        allowed_market_states=allowed,
+        stats=stats,
+    )
+
+
+def test_gate_none_is_identical_to_not_passing_the_parameter():
+    # allowed_market_states=None (the default) must be byte-identical to the
+    # pre-#63 call: same signals, and the stats dict reports zero suppression.
+    stats: dict = {}
+    _frame_, default_signals = _run_signals(GATE_BARS)
+    _frame_, none_signals = _gated_signals(GATE_BARS, allowed=None, stats=stats)
+    assert none_signals == default_signals
+    assert len(none_signals) == 1
+    assert stats.get("suppressed_market_state", 0) == 0
+
+
+def test_gate_allows_entry_when_the_trigger_bar_state_is_listed():
+    _frame_, default_signals = _run_signals(GATE_BARS)
+    _frame_, gated_signals = _gated_signals(GATE_BARS, allowed=frozenset({"trend_up", "range"}))
+    assert gated_signals == default_signals  # every field identical, incl. exit
+    assert gated_signals[0].market_state == "trend_up"
+
+
+def test_gate_blocks_entry_when_the_trigger_bar_state_is_not_listed():
+    # Both trigger bars (94 and 95) classify trend_up: with only "range"
+    # allowed, no entry is generated at all -- and the suppression count of 2
+    # proves the episode stayed armed after bar 94 (bar 95 was evaluated as a
+    # live Trigger again, not skipped as a consumed episode).
+    stats: dict = {}
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"range"}), stats=stats)
+    assert signals == []
+    assert stats["suppressed_market_state"] == 2
+
+
+def test_gate_disallowed_trigger_keeps_the_episode_armed_for_a_later_bar(monkeypatch):
+    # Force bar 94's state to "volatile" (bar 95 keeps its real "trend_up").
+    # Gate {"trend_up"}: bar 94's fired trigger is suppressed WITHOUT consuming
+    # the episode, so bar 95's trigger enters -- at bar 95's own close/low.
+    frame = _frame(GATE_BARS)
+    _force_state_at(monkeypatch, frame.index[TRIGGER_INDEX], "volatile")
+
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"trend_up"}))
+    assert len(signals) == 1
+    assert signals[0].signal_time == frame.index[TRIGGER_INDEX + 1].isoformat()
+    assert signals[0].entry_price == 2015.0  # bar 95 close
+    assert signals[0].stop_price == 2011.0  # bar 95 low
+    assert signals[0].market_state == "trend_up"
+
+    # Same forced states WITHOUT a gate: the old default still enters on the
+    # first release bar (94) -- the gate machinery changes nothing when off.
+    _frame_, ungated = _run_signals(GATE_BARS)
+    assert len(ungated) == 1
+    assert ungated[0].signal_time == frame.index[TRIGGER_INDEX].isoformat()
+    assert ungated[0].market_state == "volatile"
+
+
+def test_gate_treats_unknown_as_a_state_that_must_be_explicitly_listed(monkeypatch):
+    # Issue #39 contract: "unknown" is one of KNOWN_MARKET_STATES, allowed only
+    # when listed -- there is no special-casing or normalization of it.
+    frame = _frame(GATE_BARS)
+    _force_state_at(monkeypatch, frame.index[TRIGGER_INDEX], "unknown")
+
+    # unknown NOT in the allow-list: bar 94 is suppressed (episode stays
+    # armed), bar 95's real trend_up enters.
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"trend_up"}))
+    assert len(signals) == 1
+    assert signals[0].signal_time == frame.index[TRIGGER_INDEX + 1].isoformat()
+
+    # unknown explicitly listed: bar 94 enters and records the unknown label.
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"unknown"}))
+    assert len(signals) == 1
+    assert signals[0].signal_time == frame.index[TRIGGER_INDEX].isoformat()
+    assert signals[0].market_state == "unknown"
+
+
+def test_gate_release_bar_without_a_trigger_still_consumes_the_episode():
+    # The gate defers episode consumption ONLY for a bar whose trigger actually
+    # fired. A wick-only release bar (no close-break) consumes the episode
+    # exactly as before, gated or not -- the later breakout bar has no armed
+    # episode left and cannot enter.
+    bars = _prefix() + [(2000.0, 2005.1, 1999.0, 2000.1), (2011, 2021, 2011, 2015)]
+    stats: dict = {}
+    _frame_, ungated = _run_signals(bars)
+    _frame_, gated = _gated_signals(bars, allowed=frozenset({"trend_up"}), stats=stats)
+    assert ungated == []
+    assert gated == []
+    assert stats.get("suppressed_market_state", 0) == 0
+
+
 def test_episode_ending_in_warmup_is_consumed_not_emitted():
     # Validation starts *after* the breakout bar, so the episode that ends at
     # the breakout is consumed during warm-up and never emitted -- and no stale

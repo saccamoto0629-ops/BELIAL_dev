@@ -25,8 +25,10 @@ description: >
 symbols: [XAU_USD]
 timeframes: [1h]
 
-# squeeze_breakout handler は自前の squeeze episode state machine を持ち、
-# market-state ゲートを使わないため null(= フィルタ無し)。詳細は仕様書 §6。
+# Market State ゲート(Issue #63 で可変化)。null(既定)= フィルタ無し。非 null リストを
+# 指定すると、breakout trigger が成立した足(episode 解除足)自身の Market State が
+# リストに含まれる場合のみ entry する。不許可の trigger 足は entry せず episode は
+# armed のまま残る(同一 episode 内の後続 trigger 足で再評価される)。詳細は仕様書 §6。
 allowed_market_states: null
 
 entry:
