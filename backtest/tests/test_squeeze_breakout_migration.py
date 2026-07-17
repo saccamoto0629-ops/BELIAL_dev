@@ -44,6 +44,7 @@ import backtest_store as store  # noqa: E402
 import exit_policy  # noqa: E402
 import warmup  # noqa: E402
 import chart_collector as collector  # noqa: E402  (market-watch)
+import market_state  # noqa: E402  (market-watch)
 from candle_fixtures import seed_chart_db, seed_bull_bias  # noqa: E402
 
 # Reuse Issue #53's synthetic squeeze fixture helpers (not tests) so both
@@ -98,6 +99,8 @@ def test_shipped_definition_validates_and_equals_the_builtin_defaults():
         "squeeze_state": sb.SQUEEZE_STATE,
         "require_episode_release": True,
         "breakout": "bollinger_close",
+        "squeeze_lookback": market_state.DEFAULT_SQUEEZE_LOOKBACK,
+        "squeeze_percentile": market_state.DEFAULT_SQUEEZE_PERCENTILE,
     }
 
     assert dict(definition.risk.stop_loss) == {"type": sd.STOP_LOSS_TRIGGER_BAR_EXTREME}
@@ -240,8 +243,10 @@ def test_run_config_records_the_same_effective_settings_on_both_paths(tmp_path):
     )
     for key in ("strategy_profile", "signal_type", "trigger_type", "risk_reward",
                 "time_exit_bars", "same_candle_priority", "no_reentry", "cooldown_minutes",
-                "warmup_bars", "execution_model"):
+                "warmup_bars", "execution_model", "squeeze_lookback", "squeeze_percentile"):
         assert external_config[key] == profile_config[key], key
+    assert external_config["squeeze_lookback"] == market_state.DEFAULT_SQUEEZE_LOOKBACK
+    assert external_config["squeeze_percentile"] == market_state.DEFAULT_SQUEEZE_PERCENTILE
     # Only the new path additionally records the normalized definition.
     assert "strategy_definition" not in profile_config
     assert external_config["strategy_definition"]["id"] == sb.STRATEGY_PROFILE
@@ -296,6 +301,110 @@ def test_warmup_bars_cli_still_gates_the_external_definition_run(tmp_path):
     assert exit_code == runner.EXIT_OK
     assert summary["signals_generated"] == 0
     assert summary["warmup_insufficient"] is True
+
+
+# =============================================================================
+# PR #62: squeeze_lookback / squeeze_percentile are YAML-variable execution
+# parameters -- a definition-only change alters episode/trigger/entry results
+# =============================================================================
+
+
+def _entry_with_params(params: dict) -> dict:
+    return {"handler": "squeeze_breakout", "reentry": "new_setup", "params": params}
+
+
+def test_squeeze_percentile_from_yaml_changes_episode_formation(tmp_path):
+    # Default percentile (0.10): the flat bars form one episode whose release
+    # bar triggers -> 1 signal. percentile=1.0 keeps EVERY ready bar
+    # classified squeeze (its bandwidth is trivially within the lowest 100%
+    # of its own trailing window), so the episode never releases -> 0
+    # signals. Same bars, same code, different YAML.
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+
+    args = make_args(tmp_path, index, strategy_file=str(SHIPPED_DEFINITION_PATH),
+                     backtest_db_path=tmp_path / "default.sqlite3")
+    exit_code, default_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert default_summary["signals_generated"] == 1
+
+    strategy_path = write_strategy(
+        tmp_path, id="ext_squeeze_p100",
+        entry=_entry_with_params({"squeeze_percentile": 1.0}),
+    )
+    args = make_args(tmp_path, index, strategy_file=str(strategy_path),
+                     backtest_db_path=tmp_path / "p100.sqlite3")
+    exit_code, p100_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert p100_summary["signals_generated"] == 0
+    config = json.loads(
+        store.get_backtest_run(p100_summary["run_id"], db_path=tmp_path / "p100.sqlite3")["config_json"]
+    )
+    assert config["squeeze_percentile"] == 1.0
+    assert config["strategy_definition"]["entry"]["params"]["squeeze_percentile"] == 1.0
+
+
+def test_squeeze_lookback_from_yaml_changes_episode_formation(tmp_path):
+    # lookback=500 can never fill its trailing window inside the fixture, so
+    # no bar classifies squeeze -> no episode -> 0 signals (vs 1 by default).
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+    strategy_path = write_strategy(
+        tmp_path, id="ext_squeeze_lb500",
+        entry=_entry_with_params({"squeeze_lookback": 500}),
+    )
+    args = make_args(tmp_path, index, strategy_file=str(strategy_path))
+    exit_code, summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert summary["signals_generated"] == 0
+    config = json.loads(
+        store.get_backtest_run(summary["run_id"], db_path=tmp_path / "backtest_results.sqlite3")["config_json"]
+    )
+    assert config["squeeze_lookback"] == 500
+
+
+@pytest.mark.parametrize(
+    "params, expected_field",
+    [
+        ({"squeeze_lookback": 0}, "entry.params.squeeze_lookback"),
+        ({"squeeze_lookback": 2.5}, "entry.params.squeeze_lookback"),
+        ({"squeeze_percentile": 0.0}, "entry.params.squeeze_percentile"),
+        ({"squeeze_percentile": 1.5}, "entry.params.squeeze_percentile"),
+    ],
+)
+def test_invalid_squeeze_window_values_fail_validation_before_the_run(tmp_path, capsys, params, expected_field):
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+    strategy_path = write_strategy(tmp_path, entry=_entry_with_params(params))
+    args = make_args(tmp_path, index, strategy_file=str(strategy_path))
+    exit_code, summary = runner.run_backtest(args)
+    captured = capsys.readouterr()
+    assert exit_code == runner.EXIT_USAGE_ERROR
+    assert summary is None
+    assert expected_field in captured.err
+    assert not (tmp_path / "backtest_results.sqlite3").exists()  # zero side effects
+
+
+def test_squeeze_window_settings_never_leak_into_the_builtin_profile_path(tmp_path):
+    # After an external run that suppressed every episode (percentile=1.0),
+    # the built-in --strategy-profile path still classifies with the
+    # market_state defaults and produces its 1 signal.
+    index = _seed_squeeze_chart_db(tmp_path / "chart_data.sqlite3", BREAKOUT_BARS)
+    strategy_path = write_strategy(
+        tmp_path, id="ext_squeeze_p100",
+        entry=_entry_with_params({"squeeze_percentile": 1.0}),
+    )
+    args = make_args(tmp_path, index, strategy_file=str(strategy_path),
+                     backtest_db_path=tmp_path / "external.sqlite3")
+    exit_code, summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert summary["signals_generated"] == 0
+
+    profile_db = tmp_path / "profile.sqlite3"
+    args = make_args(tmp_path, index, strategy_profile=sb.STRATEGY_PROFILE, backtest_db_path=profile_db)
+    exit_code, profile_summary = runner.run_backtest(args)
+    assert exit_code == runner.EXIT_OK
+    assert profile_summary["signals_generated"] == 1
+    config = json.loads(store.get_backtest_run(profile_summary["run_id"], db_path=profile_db)["config_json"])
+    assert config["squeeze_lookback"] == market_state.DEFAULT_SQUEEZE_LOOKBACK
+    assert config["squeeze_percentile"] == market_state.DEFAULT_SQUEEZE_PERCENTILE
 
 
 # =============================================================================

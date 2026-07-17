@@ -228,6 +228,12 @@ field: exit.max_holding_bars] must be an int > 0, got 0 (int)
 
 - `risk.take_profit.r` / `exit.max_holding_bars` → squeeze_breakout の `risk_reward` / `time_exit_bars`
   として実行に渡る(実行パラメータ)。
+- `entry.params.squeeze_lookback`(int >= 1、既定 20)/ `entry.params.squeeze_percentile`
+  (0 < x <= 1、既定 0.10)→ squeeze episode 検出窓として
+  `evaluate_squeeze_breakout_signals()` 経由で `classify_market_state()` へ渡る
+  (PR #62 で可変化した実行パラメータ。既定は `market_state` の module 定数と同一で、
+  省略時は旧経路・Live 分類と byte-identical。範囲外は validation error)。実効値は両経路とも
+  `config_json` の `squeeze_lookback` / `squeeze_percentile` に記録される。
 - `symbols` / `timeframes` → 要求した `--symbol`/`--timeframe` が宣言に含まれない場合は終了コード2
   (適合検証)。
 - `entry.handler` / `entry.params` / `entry.reentry` / `entry.cooldown_bars` /
@@ -250,9 +256,17 @@ handler registry は Python コードが所有し、外部ファイルは登録�
 
 - **外部化されたのは設定値のみ**: strategy identity(`id`/`name`/`description`)、対象
   `symbols`/`timeframes`、`risk.take_profit.r`(→ `risk_reward`)、`exit.max_holding_bars`
-  (→ `time_exit_bars`)、および handler 固定値契約(`reentry=new_setup` / `cooldown_bars=0` /
-  `stop_loss.type=trigger_bar_extreme` / `same_candle_priority=stop_loss` /
-  `allowed_market_states=null` / `entry.params` の宣言フラグ)。
+  (→ `time_exit_bars`)、squeeze 検出窓の `entry.params.squeeze_lookback` /
+  `squeeze_percentile`(→ `classify_market_state()`、PR #62 で可変化)、および handler
+  固定値契約(`reentry=new_setup` / `cooldown_bars=0` / `stop_loss.type=trigger_bar_extreme` /
+  `same_candle_priority=stop_loss` / `allowed_market_states=null` / `entry.params` の宣言フラグ)。
+- **固定値契約として残る項目とその理由**: `allowed_market_states=null`(squeeze は自前の episode
+  state machine を持ち market-state ゲート非対応)、`cooldown_bars=0` / `reentry=new_setup`
+  (単一ポジションと再エントリー抑制は state machine が構造的に保証。時間 cooldown の実行接続は
+  存在しない)、`stop_loss.type=trigger_bar_extreme` / `same_candle_priority=stop_loss`
+  (Trigger 足 SL と同一足 SL 優先は約定判定順序=future-leakage 契約と一体)。これらを可変化する
+  ことは既存 Python 状態機械・約定契約の変更を意味するため、本移行では行わず、他値は
+  validation error とする(受理して無視する「死に設定」にはしない)。
 - **Python 側に残る条件ロジック**(定義ファイルへは移せない): squeeze episode の状態遷移、
   BB 終値 break の条件判定、long/short 方向決定、Trigger 足 low/high の SL、risk からの target
   算出、gap Stop → gap TP → intrabar SL/TP → time exit の判定順序、同一足 SL 優先、

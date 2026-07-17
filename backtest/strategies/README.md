@@ -27,7 +27,8 @@ python -m backtest run \
 
 1. 既存の [xauusd_1h_squeeze_breakout_v1.yaml](xauusd_1h_squeeze_breakout_v1.yaml) をコピーし、
    `id`(`^[a-z0-9_]+$`、ディレクトリ内で一意)/ `name` / 可変設定
-   (`risk.take_profit.r`、`exit.max_holding_bars` 等)を書き換える。
+   (`risk.take_profit.r`、`exit.max_holding_bars`、`entry.params.squeeze_lookback`(int >= 1)、
+   `entry.params.squeeze_percentile`(0 < x <= 1)等)を書き換える。
    スキーマの全項目・型・default・許容範囲は
    [docs/architecture/strategy_definition.md §2](../../docs/architecture/strategy_definition.md) を参照。
 2. `entry.handler` は登録済み handler(現行は `squeeze_breakout` のみ)から選ぶ。

@@ -60,7 +60,11 @@ for _dir in (BASE_DIR, MARKET_WATCH_DIR):
     if str(_dir) not in sys.path:
         sys.path.insert(0, str(_dir))
 
-from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch: the one source of state names)
+from market_state import (  # noqa: E402  (market-watch: the one source of state names + squeeze defaults)
+    DEFAULT_SQUEEZE_LOOKBACK,
+    DEFAULT_SQUEEZE_PERCENTILE,
+    KNOWN_MARKET_STATES,
+)
 
 # --- schema contract (docs/architecture/strategy_definition.md) ---------------
 
@@ -243,12 +247,22 @@ def _copy_params(params: Mapping) -> dict:
 class HandlerParamSpec:
     """One handler-owned ``entry.params`` key: its allowed values and default.
 
-    Schema v1 handlers only declare exhaustively-enumerable param values
-    (squeeze_breakout's params are all fixed-value contracts, docs §5.2 ③).
+    Exactly one contract form applies per param:
+
+    - ``allowed_values`` (a tuple): exhaustively-enumerable fixed-value
+      contract (docs §5.2 ③) -- any other value is a validation error.
+    - ``allowed_values is None``: a range-validated numeric contract (PR #62
+      review: squeeze_lookback / squeeze_percentile become variable execution
+      parameters, docs §5.2 ①). ``int_min`` requires a strict int >=
+      ``int_min``; otherwise ``number_gt`` / ``number_max`` require a finite
+      number with ``number_gt < value <= number_max``.
     """
 
-    allowed_values: tuple
     default: object
+    allowed_values: tuple | None = None
+    int_min: int | None = None
+    number_gt: float | None = None
+    number_max: float | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +304,15 @@ HANDLER_REGISTRY: dict[str, HandlerCapability] = {
             # Bollinger *close* break (a wick-only poke is never a Trigger);
             # matches squeeze_breakout.TRIGGER_TYPE ("bollinger_close_break").
             "breakout": HandlerParamSpec(allowed_values=("bollinger_close",), default="bollinger_close"),
+            # PR #62 review (Issue #54): the squeeze-episode detection window
+            # and percentile become variable execution parameters, passed
+            # explicitly to classify_market_state(). Defaults come from
+            # market_state so an omitted value is byte-identical to the
+            # pre-migration behaviour (and to the live classifier).
+            "squeeze_lookback": HandlerParamSpec(default=DEFAULT_SQUEEZE_LOOKBACK, int_min=1),
+            "squeeze_percentile": HandlerParamSpec(
+                default=DEFAULT_SQUEEZE_PERCENTILE, number_gt=0.0, number_max=1.0
+            ),
         },
         # squeeze_breakout runs its own squeeze-episode state machine and never
         # consults the market-state gate: allowed_market_states must be null.
@@ -575,18 +598,49 @@ def _validate_entry_params(entry_raw: Mapping, capability: HandlerCapability, fa
         item = provided.get(key, _MISSING)
         if item is _MISSING or item is None:
             item = spec.default
-        elif not _strict_in(item, spec.allowed_values):
-            fail(
-                f"entry.params.{key}",
-                f"handler {capability.name!r} only allows "
-                f"{', '.join(map(repr, spec.allowed_values))} for this param, "
-                f"got {item!r} ({_type_name(item)})",
-            )
+        else:
+            _check_param_contract(item, spec, capability, key, fail)
         # Deep immutability: list values become tuples; the read-only proxy
         # below prevents key-level mutation. Only to_config() hands out
         # mutable copies, so a validated definition can never drift.
         resolved[key] = tuple(item) if isinstance(item, list) else item
     return MappingProxyType(resolved)
+
+
+def _check_param_contract(value, spec: HandlerParamSpec, capability: HandlerCapability, key: str, fail) -> None:
+    """Enforce one handler param's contract: enumerable values or a numeric range.
+
+    Structural rules (scalar-only, no NaN/Infinity) already ran; this is the
+    handler-capability layer. Bool is never accepted where a number is
+    required (True == 1 in Python, same strictness as _strict_in).
+    """
+    field = f"entry.params.{key}"
+    if spec.allowed_values is not None:
+        if not _strict_in(value, spec.allowed_values):
+            fail(
+                field,
+                f"handler {capability.name!r} only allows "
+                f"{', '.join(map(repr, spec.allowed_values))} for this param, "
+                f"got {value!r} ({_type_name(value)})",
+            )
+        return
+    if spec.int_min is not None:
+        if not _is_strict_int(value) or value < spec.int_min:
+            fail(
+                field,
+                f"handler {capability.name!r} requires an int >= {spec.int_min} "
+                f"for this param, got {value!r} ({_type_name(value)})",
+            )
+        return
+    # number_gt / number_max range contract (finite is already guaranteed by
+    # the structural NaN/Infinity rejection above).
+    if not _is_number(value) or not (spec.number_gt < float(value) <= spec.number_max):
+        fail(
+            field,
+            f"handler {capability.name!r} requires a number in "
+            f"({spec.number_gt}, {spec.number_max}] for this param, "
+            f"got {value!r} ({_type_name(value)})",
+        )
 
 
 def _validate_reentry(entry_raw: Mapping, capability: HandlerCapability, fail) -> str:

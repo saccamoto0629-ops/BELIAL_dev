@@ -58,7 +58,11 @@ for _dir in (BASE_DIR, MARKET_WATCH_DIR, PAPER_SIGNAL_DIR):
         sys.path.insert(0, str(_dir))
 
 from indicators import calculate_indicators  # noqa: E402  (market-watch)
-from market_state import classify_market_state  # noqa: E402  (market-watch)
+from market_state import (  # noqa: E402  (market-watch)
+    DEFAULT_SQUEEZE_LOOKBACK,
+    DEFAULT_SQUEEZE_PERCENTILE,
+    classify_market_state,
+)
 import warmup  # noqa: E402  (backtest: readiness contract + warmup/validation split)
 import exit_policy  # noqa: E402  (paper-signal: reuse status/reason vocabulary + result dataclass)
 
@@ -270,6 +274,8 @@ def evaluate_squeeze_breakout_signals(
     exec_model=None,
     time_exit_bars: int = TIME_EXIT_BARS,
     risk_reward: float = RISK_REWARD,
+    squeeze_lookback: int = DEFAULT_SQUEEZE_LOOKBACK,
+    squeeze_percentile: float = DEFAULT_SQUEEZE_PERCENTILE,
 ) -> list[SqueezeBreakoutSignal]:
     """Run the squeeze-episode breakout state machine over *candles*.
 
@@ -285,6 +291,12 @@ def evaluate_squeeze_breakout_signals(
     (Issue #44 no-reentry / new-episode rule). ``exec_model`` (an
     ``execution_model.ExecutionModel``) corrects the entry fill; when None, a
     no-op zero-cost model is used.
+
+    ``squeeze_lookback`` / ``squeeze_percentile`` (Issue #54 / PR #62) are
+    forwarded to ``classify_market_state()`` and parameterize only the
+    squeeze-episode *detection window*; the episode state transition, trigger
+    condition, and fill judgement stay fixed here. Defaults are market_state's
+    own, so omitting them is byte-identical to the pre-#54 behaviour.
     """
     if exec_model is None:
         import execution_model as execution
@@ -335,7 +347,11 @@ def evaluate_squeeze_breakout_signals(
         if not readiness.is_ready:
             continue
 
-        state_result = classify_market_state(indicators.iloc[: position + 1])
+        state_result = classify_market_state(
+            indicators.iloc[: position + 1],
+            squeeze_lookback=squeeze_lookback,
+            squeeze_percentile=squeeze_percentile,
+        )
         state = state_result["market_state"]
 
         if state == SQUEEZE_STATE:

@@ -208,6 +208,8 @@ def test_strategy_file_runs_and_records_the_normalized_definition(tmp_path):
         "squeeze_state": "squeeze",
         "require_episode_release": True,
         "breakout": "bollinger_close",
+        "squeeze_lookback": 20,
+        "squeeze_percentile": 0.10,
     }
     assert recorded["risk"]["take_profit"] == {"type": "r_multiple", "r": 2.0}
     assert recorded["exit"] == {"max_holding_bars": 24, "same_candle_priority": "stop_loss"}

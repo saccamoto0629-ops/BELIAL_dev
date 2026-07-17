@@ -172,6 +172,8 @@ Validator は定義を descriptor と突合し、**非対応フィールド、�
 | `entry.params.squeeze_state` | ✅ 対応(既定 `squeeze`) | ✕ 非対応 |
 | `entry.params.require_episode_release` | ✅ 対応 | ✕ 非対応 |
 | `entry.params.breakout` | ✅ 対応(`bollinger_close` のみ) | ✕ 非対応 |
+| `entry.params.squeeze_lookback` | ✅ 対応(**可変** int >= 1、既定 20 = `market_state.DEFAULT_SQUEEZE_LOOKBACK`) | ✕ 非対応 |
+| `entry.params.squeeze_percentile` | ✅ 対応(**可変** number 0 < x <= 1、既定 0.10 = `market_state.DEFAULT_SQUEEZE_PERCENTILE`) | ✕ 非対応 |
 | `allowed_market_states` | ✕ **非対応 → `null` 必須**(自前 episode state machine) | ✅ 対応 |
 | `entry.reentry` | `new_setup` のみ(構造的に単一ポジション) | `overlap` / `single_position` |
 | `entry.cooldown_bars` | `0` のみ | 任意(≥ 0) |
@@ -269,6 +271,8 @@ Loader / Validation の実装方式を左右するため、以下を **本 Issue
 |---|---|
 | `risk.take_profit.r` | `evaluate_squeeze_breakout_signals(risk_reward=<r>)` |
 | `exit.max_holding_bars` | `evaluate_squeeze_breakout_signals(time_exit_bars=<max_holding_bars>)` |
+| `entry.params.squeeze_lookback` | `evaluate_squeeze_breakout_signals(squeeze_lookback=...)` → `classify_market_state(squeeze_lookback=...)`(PR #62 で可変化) |
+| `entry.params.squeeze_percentile` | `evaluate_squeeze_breakout_signals(squeeze_percentile=...)` → `classify_market_state(squeeze_percentile=...)`(同上) |
 
 **② 適合検証(実行対象の妥当性)**
 
@@ -349,11 +353,14 @@ entry:
 - **`params`**:handler 固有の **宣言的値のみ**。generic loader は構造(下記の型規則)だけ検証し、
   **各 key の意味・範囲・必須は handler の capability descriptor(§4.1)が検証**する。これが唯一の
   未知 key 許容ゾーン(§3)。**式・条件文字列・コード片は入れない**(過剰な DSL 化の回避)。
-  - squeeze_breakout の場合、BB 期間(20)・±2σ・squeeze lookback(20)・下位 10% は
-    **indicators / market_state が所有する共通定義**であり、Strategy 固有の自由度ではない。
-    よって params には「どの state を準備に使うか」「解除足だけ評価するか」「break の種類」といった
-    **handler が明示的に読む宣言フラグ**のみを置き、指標定数そのものは持たせない
-    (持たせると指標計算の外部化=責務越境になる)。
+  - squeeze_breakout の場合、BB 期間(20)・±2σ は **indicators が所有する共通定義**であり、
+    Strategy 固有の自由度ではない(持たせると指標計算の外部化=責務越境になる)。
+    一方 **squeeze episode 検出窓(`squeeze_lookback` / `squeeze_percentile`)は PR #62(Issue #54)で
+    Strategy 可変の実行パラメータへ昇格**した:`classify_market_state()` は元々この 2 つを引数に
+    取り(既定 20 / 0.10)、handler が定義値を明示的に渡す。省略時の既定は `market_state` の
+    module 定数と同一で、Live 分類・旧経路と byte-identical。範囲は capability descriptor が
+    検証する(lookback: int >= 1、percentile: 0 < x <= 1。範囲外は validation error)。
+    分類ロジック自体(percentile 比較・window の作り方)は market_state が所有したまま。
   - **許可する値型(schema v1、generic loader が強制):**
     - スカラ: `str` / `int` / `float` / `bool` / `null`。
     - **スカラの平坦リスト** `list[scalar]`。
@@ -545,7 +552,9 @@ Loader は **専用例外 `StrategyDefinitionError(ValueError)`** を送出す�
 - **ファイル未指定時の後方互換 = 外部機構を起動せず現行 `--strategy-profile` を完全維持(opt-in)**(§5.1)。
 - **#53 は実行接続まで含む(案A)**:選択された外部定義の全受理フィールドが ①実行パラメータ /
   ②適合検証 / ③固定値契約 / ④メタデータ のいずれかで実行へ反映され、**死に設定ゼロ**(§5.2)。
-  squeeze の可変フィールドは `risk.take_profit.r`→`risk_reward`、`exit.max_holding_bars`→`time_exit_bars`。
+  squeeze の可変フィールドは `risk.take_profit.r`→`risk_reward`、`exit.max_holding_bars`→`time_exit_bars`、
+  および PR #62(Issue #54)で追加の `entry.params.squeeze_lookback` / `squeeze_percentile`
+  →`classify_market_state()` の squeeze 検出窓。
 - **handler 別対応フィールド一覧(capability descriptor)+ 非対応/非許容値は validation error、
   かつ固定値許容値は handler 実行挙動と一致(テストで固定)**(§4.1, §5.2)。
 - **`entry.params` の許可型(スカラ/平坦リスト、ネスト・NaN 不可、null 可)**(§7)。

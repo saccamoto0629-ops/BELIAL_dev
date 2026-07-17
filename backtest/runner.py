@@ -65,7 +65,11 @@ import execution_model as execution  # noqa: E402  (Issue #26: virtual fill spre
 import squeeze_breakout  # noqa: E402  (Issue #44: XAUUSD 1h squeeze-episode breakout strategy A)
 import warmup  # noqa: E402
 import chart_collector  # noqa: E402  (market-watch)
-from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch, Issue #39)
+from market_state import (  # noqa: E402  (market-watch, Issue #39 / #54)
+    DEFAULT_SQUEEZE_LOOKBACK,
+    DEFAULT_SQUEEZE_PERCENTILE,
+    KNOWN_MARKET_STATES,
+)
 import exit_policy  # noqa: E402  (paper-signal)
 from market_bias_store import (  # noqa: E402  (news-feed-bot)
     get_effective_market_bias_as_of,
@@ -555,12 +559,14 @@ def _run_squeeze_breakout(
     squeeze signal_type / trigger_type / strategy_profile on every row so the
     two strategies are never confused in storage or summaries.
 
-    Issue #53: when ``definition`` (a validated strategy_definition.
+    Issue #53 / #54: when ``definition`` (a validated strategy_definition.
     StrategyDefinition selecting the squeeze_breakout handler) is given, its
     variable fields drive the run -- ``risk.take_profit.r`` -> risk_reward,
-    ``exit.max_holding_bars`` -> time_exit_bars, its id labels every saved
-    row, and its full normalized form is recorded in config_json. All of its
-    remaining fields are fixed-value contracts already validated to match this
+    ``exit.max_holding_bars`` -> time_exit_bars,
+    ``entry.params.squeeze_lookback`` / ``squeeze_percentile`` -> the
+    squeeze-episode detection window, its id labels every saved row, and its
+    full normalized form is recorded in config_json. All of its remaining
+    fields are fixed-value contracts already validated to match this
     handler's actual behaviour (docs §5.2), so nothing accepted is ignored.
     When ``definition`` is None, the pre-#53 --strategy-profile behaviour is
     preserved unchanged (module-constant defaults).
@@ -570,11 +576,20 @@ def _run_squeeze_breakout(
         risk_reward = float(definition.risk.take_profit["r"])
         time_exit_bars = definition.exit.max_holding_bars
         same_candle_priority = definition.exit.same_candle_priority
+        # PR #62 review (Issue #54): the squeeze-episode detection window is a
+        # variable execution parameter now -- the validated (range-checked)
+        # values are forwarded to classify_market_state via
+        # evaluate_squeeze_breakout_signals. Defaults resolved by the Loader
+        # equal market_state's own, so an omitted key changes nothing.
+        squeeze_lookback = definition.entry.params["squeeze_lookback"]
+        squeeze_percentile = definition.entry.params["squeeze_percentile"]
     else:
         strategy_profile = squeeze_breakout.STRATEGY_PROFILE
         risk_reward = squeeze_breakout.RISK_REWARD
         time_exit_bars = squeeze_breakout.TIME_EXIT_BARS
         same_candle_priority = exit_policy.SAME_CANDLE_PRIORITY_STOP_LOSS
+        squeeze_lookback = DEFAULT_SQUEEZE_LOOKBACK
+        squeeze_percentile = DEFAULT_SQUEEZE_PERCENTILE
 
     # Issue #26: the same virtual-fill model the trend_follow path uses. Defaults
     # (spread=slippage=0.0) leave raw prices unchanged.
@@ -593,6 +608,11 @@ def _run_squeeze_breakout(
         "risk_reward": risk_reward,
         "time_exit_bars": time_exit_bars,
         "same_candle_priority": same_candle_priority,
+        # PR #62 (Issue #54): the effective squeeze-episode detection window,
+        # recorded on both paths so a saved run stays reproducible from its
+        # config alone (defaults equal market_state's module constants).
+        "squeeze_lookback": squeeze_lookback,
+        "squeeze_percentile": squeeze_percentile,
         # The episode state machine enforces a single position and a
         # new-episode-before-re-entry rule; there is no time-based cooldown.
         "no_reentry": True,
@@ -625,11 +645,14 @@ def _run_squeeze_breakout(
         timeframe=args.timeframe,
         warmup_bars=args.warmup_bars,
         exec_model=exec_model,
-        # Issue #53 (docs §5.2 ①): the two variable squeeze fields. On the
-        # non-definition path these equal the module constants, so passing
-        # them explicitly changes nothing for --strategy-profile runs.
+        # Issue #53 (docs §5.2 ①) + PR #62: the variable squeeze fields. On
+        # the non-definition path these equal the module/market_state
+        # constants, so passing them explicitly changes nothing for
+        # --strategy-profile runs.
         risk_reward=risk_reward,
         time_exit_bars=time_exit_bars,
+        squeeze_lookback=squeeze_lookback,
+        squeeze_percentile=squeeze_percentile,
     )
 
     signal_records: list[dict] = []

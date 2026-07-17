@@ -44,6 +44,7 @@ import strategy_definition as sd  # noqa: E402
 import squeeze_breakout as sb  # noqa: E402
 import execution_model as execution  # noqa: E402
 import exit_policy  # noqa: E402
+import market_state  # noqa: E402  (market-watch)
 from market_state import KNOWN_MARKET_STATES  # noqa: E402  (market-watch)
 
 SAMPLE_YAML_PATH = REPO_ROOT / "docs" / "architecture" / "examples" / "strategy_squeeze_breakout_v1.yaml"
@@ -121,6 +122,8 @@ def test_loading_a_valid_file_resolves_all_defaults(tmp_path):
         "squeeze_state": "squeeze",
         "require_episode_release": True,
         "breakout": "bollinger_close",
+        "squeeze_lookback": market_state.DEFAULT_SQUEEZE_LOOKBACK,
+        "squeeze_percentile": market_state.DEFAULT_SQUEEZE_PERCENTILE,
     }
 
 
@@ -448,6 +451,44 @@ def test_params_bool_contract_is_type_strict_never_accepts_int_one():
     assert error.field_path == "entry.params.require_episode_release"
     error = _params_error({"require_episode_release": False})
     assert error.field_path == "entry.params.require_episode_release"
+
+
+@pytest.mark.parametrize("value", [1, 5, 20, 500])
+def test_params_squeeze_lookback_accepts_any_int_at_least_one(value):
+    data = base_definition()
+    data["entry"]["params"] = {"squeeze_lookback": value}
+    definition = build(data)
+    assert definition.entry.params["squeeze_lookback"] == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 2.5, "20", True, [20]])
+def test_params_squeeze_lookback_rejects_non_int_or_below_one(value):
+    error = _params_error({"squeeze_lookback": value})
+    assert error.field_path == "entry.params.squeeze_lookback"
+    assert "int >= 1" in str(error)
+
+
+@pytest.mark.parametrize("value", [0.01, 0.10, 0.5, 1, 1.0])
+def test_params_squeeze_percentile_accepts_numbers_in_zero_one(value):
+    data = base_definition()
+    data["entry"]["params"] = {"squeeze_percentile": value}
+    definition = build(data)
+    assert definition.entry.params["squeeze_percentile"] == value
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -0.1, 1.5, "0.1", True, [0.1]])
+def test_params_squeeze_percentile_rejects_out_of_range_or_non_number(value):
+    error = _params_error({"squeeze_percentile": value})
+    assert error.field_path == "entry.params.squeeze_percentile"
+    assert "(0.0, 1.0]" in str(error)
+
+
+def test_params_squeeze_range_params_explicit_null_resolves_to_defaults():
+    data = base_definition()
+    data["entry"]["params"] = {"squeeze_lookback": None, "squeeze_percentile": None}
+    definition = build(data)
+    assert definition.entry.params["squeeze_lookback"] == market_state.DEFAULT_SQUEEZE_LOOKBACK
+    assert definition.entry.params["squeeze_percentile"] == market_state.DEFAULT_SQUEEZE_PERCENTILE
 
 
 def test_params_explicit_null_resolves_to_the_handler_default():
@@ -841,6 +882,40 @@ def test_descriptor_params_fixed_values_match_the_implementation_constants():
     # squeeze_breakout.TRIGGER_TYPE records on every saved signal.
     assert SQUEEZE_CAP.params["breakout"].allowed_values == ("bollinger_close",)
     assert sb.TRIGGER_TYPE == "bollinger_close_break"
+
+
+def test_descriptor_squeeze_window_defaults_match_the_market_state_classifier():
+    # PR #62: the range-validated squeeze-window params default to the live
+    # classifier's own constants, so an omitted key is byte-identical to the
+    # pre-#54 behaviour (and Backtest matches Live classification).
+    lookback_spec = SQUEEZE_CAP.params["squeeze_lookback"]
+    percentile_spec = SQUEEZE_CAP.params["squeeze_percentile"]
+    assert lookback_spec.allowed_values is None and lookback_spec.int_min == 1
+    assert percentile_spec.allowed_values is None
+    assert (percentile_spec.number_gt, percentile_spec.number_max) == (0.0, 1.0)
+    assert lookback_spec.default == market_state.DEFAULT_SQUEEZE_LOOKBACK == 20
+    assert percentile_spec.default == market_state.DEFAULT_SQUEEZE_PERCENTILE == 0.10
+
+
+def test_descriptor_squeeze_window_params_reach_the_episode_state_machine():
+    # The same bars that produce one Trigger with the defaults produce NONE
+    # when the window params are changed -- proving squeeze_lookback /
+    # squeeze_percentile are forwarded to classify_market_state and change
+    # episode formation, not just accepted by validation.
+    bars = _squeeze_prefix() + [(2009, 2010, 2005, 2010), (2011, 2012, 2011, 2011)]
+    _frame, default_signals = _squeeze_signals(bars)
+    assert len(default_signals) == 1
+
+    # percentile=1.0: every ready bar's bandwidth is trivially within the
+    # lowest 100% of its own trailing window -> the episode never releases,
+    # so no Trigger bar ever exists.
+    _frame, all_squeeze = _squeeze_signals(bars, squeeze_percentile=1.0)
+    assert all_squeeze == []
+
+    # lookback larger than the whole history: the trailing window is never
+    # filled -> no bar ever classifies squeeze -> no episode, no Trigger.
+    _frame, never_filled = _squeeze_signals(bars, squeeze_lookback=500)
+    assert never_filled == []
 
 
 def test_descriptor_market_state_gate_unsupported_matches_the_implementation():
