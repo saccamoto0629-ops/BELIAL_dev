@@ -1,10 +1,11 @@
 # =============================================================================
 # Strategy 定義サンプル(Issue #52 設計成果物)
 #
-# *** 参照用サンプル。Loader は Issue #53 で実装済み(backtest/strategy_definition.py)
-#     だが、このファイルは runtime 既定ディレクトリ(backtest/strategies/)には
-#     未配置で、既定では読み込まれない(--strategy-file で明示指定すれば実行可能)。
-#     既存 Strategy の外部定義への移行=配置は後続 Issue。 ***
+# *** 参照用サンプル。Loader は Issue #53 で実装済み(backtest/strategy_definition.py)。
+#     Issue #54 で、これと同値の runtime 定義を既定ディレクトリへ配置済み:
+#     backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml
+#     (--strategy xauusd_1h_squeeze_breakout_v1 で選択可能)。
+#     実行にはそちらを使い、このファイルはスキーマの参照サンプルとして残す。 ***
 #
 # 仕様: docs/architecture/strategy_definition.md
 # 表現対象: 既存の backtest/squeeze_breakout.py(XAUUSD 1h squeeze breakout, 案A)

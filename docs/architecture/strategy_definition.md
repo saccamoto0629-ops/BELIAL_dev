@@ -16,9 +16,10 @@ Issue #52 の **設計成果物**。Strategy ごとの可変設定を外部フ�
 サンプル定義: [`examples/strategy_squeeze_breakout_v1.yaml`](examples/strategy_squeeze_breakout_v1.yaml)
 (参照用サンプル。Loader / Validation / CLI 接続は **Issue #53 で実装済み**
 (`backtest/strategy_definition.py`、`--strategy-file` / `--strategy`、使用方法は
-[docs/backtest.md](../backtest.md))だが、このサンプルは runtime 既定ディレクトリ
-`backtest/strategies/` には未配置で、既定では読み込まれない。既存 Strategy の外部定義への
-移行=配置は後続 Issue)。
+[docs/backtest.md](../backtest.md))。既存 Strategy(`squeeze_breakout`)の外部定義への移行は
+**Issue #54 で完了**:旧 default と同値の定義が runtime 既定ディレクトリ
+`backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml` に配置済みで、
+`--strategy xauusd_1h_squeeze_breakout_v1` で選択できる)。
 
 ---
 
@@ -220,7 +221,8 @@ Loader / Validation の実装方式を左右するため、以下を **本 Issue
   `STRATEGY_DEFINITIONS_DIR` で上書き可(既存 `*_DB_PATH` 群と同じ上書き idiom)。
 - 拡張子は `.yaml`(`.yml` も許容)。`data/` のように `.gitignore` はしない(定義は成果物)。
 - 本 Issue のサンプルは **参照用として `docs/architecture/examples/` に置く**(Loader 未実装で非読込)。
-  #53 で実際にロードされる定義ファイルを `backtest/strategies/` へ置く(移行 Issue で squeeze を配置)。
+  #53 で実際にロードされる定義ファイルを `backtest/strategies/` へ置く(#54 で squeeze の定義
+  `xauusd_1h_squeeze_breakout_v1.yaml` を配置済み)。
 
 ### CLI 接続
 

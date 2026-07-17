@@ -1,0 +1,58 @@
+# =============================================================================
+# squeeze_breakout の外部 Strategy 定義(Issue #54 移行成果物)
+#
+# 既存 backtest/squeeze_breakout.py の default 設定(STRATEGY_PROFILE /
+# RISK_REWARD=2.0 / TIME_EXIT_BARS=24)と同値の宣言。`--strategy-profile
+# xauusd_1h_squeeze_breakout_v1` の旧経路と同一データ・同一期間・同一
+# Execution Model で結果が完全一致することをテストで固定している
+# (backtest/tests/test_squeeze_breakout_migration.py)。
+#
+# 外部化しているのは設定値のみ。squeeze episode の状態遷移、BB 終値 break の
+# 条件判定、long/short 決定、Trigger 足 low/high の SL、risk からの target 算出、
+# gap Stop → gap TP → intrabar SL/TP → time exit の判定順序、同一足 SL 優先、
+# future leakage 防止、単一ポジション制御、Execution Model 補正は
+# すべて Python 側(backtest/squeeze_breakout.py 等)に残る。
+#
+# 仕様: docs/architecture/strategy_definition.md(Issue #52)
+# Loader / Validation: backtest/strategy_definition.py(Issue #53)
+# 使い方: docs/backtest.md「外部 Strategy 定義による実行」
+# =============================================================================
+
+schema_version: 1
+
+id: xauusd_1h_squeeze_breakout_v1        # 既存 STRATEGY_PROFILE と同一(保存メタデータが旧経路と一致する)
+name: "XAUUSD 1h Squeeze Breakout v1"
+description: >
+  連続する Market State squeeze を 1 episode とし、その解除足(最初の非 squeeze 確定足)の
+  終値が Bollinger band を越えたら entry する paper-only Backtest 戦略(案A)。
+  Bias / MACD は使わない。指標計算・Trigger 判定・約定判定ロジックは Python 側に残す。
+
+# 適用可能な symbol / timeframe(CLI 表記。canonical 化は Python 側の責務)
+symbols: [XAU_USD]
+timeframes: [1h]
+
+# squeeze_breakout handler は自前の squeeze episode state machine を持ち、
+# market-state ゲートを使わないため null(= フィルタ無し)。非 null は validation error。
+allowed_market_states: null
+
+entry:
+  handler: squeeze_breakout              # 登録済み handler キー(コードが所有。コード注入は不可)
+  params:                                # handler が読む宣言フラグのみ。式・コードは置かない
+    squeeze_state: squeeze               # episode の準備状態ラベル
+    require_episode_release: true        # 連続 squeeze 解除足(最初の非 squeeze 足)だけを評価
+    breakout: bollinger_close            # BB 終値 break(ヒゲ到達は Trigger にしない)
+    # 注: BB 期間(20)/±2σ / squeeze lookback(20)/ 下位10% は indicators / market_state が
+    #     所有する共通定義であり Strategy 固有の自由度ではないため params に持たせない(仕様書 §7)。
+  reentry: new_setup                     # 新しい squeeze episode まで再 arm しない(構造的に単一ポジション)
+  cooldown_bars: 0                       # 時間 cooldown は置かない(new_setup 規則がより強いため)
+
+risk:
+  stop_loss:
+    type: trigger_bar_extreme            # long=Trigger足low / short=Trigger足high(価格算出は Python)
+  take_profit:
+    type: r_multiple
+    r: 2.0                               # Execution Model 適用後 Entry から有利方向へ 2R(旧 RISK_REWARD と同値)
+
+exit:
+  max_holding_bars: 24                   # Entry 後 24 本目の close で time exit(旧 TIME_EXIT_BARS と同値)
+  same_candle_priority: stop_loss        # 同一足 SL/TP 双方到達時は保守的に SL 優先
