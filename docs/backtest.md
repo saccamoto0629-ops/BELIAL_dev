@@ -177,23 +177,32 @@ spread / slippage / fee も Strategy 定義には置かない(run 単位の `--s
 
 - 既定ディレクトリ: **`backtest/strategies/`**(環境変数 `STRATEGY_DEFINITIONS_DIR` で上書き可)。
   対象拡張子は `.yaml` / `.yml`(非再帰、ファイル名ソート順の決定的走査)。
-- 参照用サンプル: [docs/architecture/examples/strategy_squeeze_breakout_v1.yaml](architecture/examples/strategy_squeeze_breakout_v1.yaml)。
-  **既存 `squeeze_breakout` の外部定義への移行(既定ディレクトリへの配置)は後続 Issue** で、
-  現時点で `backtest/strategies/` に定義ファイルは無い。
+- **Issue #54 で既存 `squeeze_breakout` の外部定義への移行が完了**:旧 default と同値の定義
+  [backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml](../backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml)
+  が既定ディレクトリに配置済みで、環境変数なしで `--strategy xauusd_1h_squeeze_breakout_v1` を選択できる。
+- 参照用サンプル(スキーマ解説付き): [docs/architecture/examples/strategy_squeeze_breakout_v1.yaml](architecture/examples/strategy_squeeze_breakout_v1.yaml)。
+  各項目の意味・型・default・許容範囲の一覧は
+  [docs/architecture/strategy_definition.md §2](architecture/strategy_definition.md)。
 
 ```bash
+# 配置済みの squeeze_breakout 外部定義を id で選択(Issue #54)
+python -m backtest run \
+  --symbol XAU_USD --timeframe 1h \
+  --from 2026-06-01T00:00:00 --to 2026-06-30T23:59:59 \
+  --strategy xauusd_1h_squeeze_breakout_v1
+
 # 単一ファイルを直接指定(アドホック検証用)
 python -m backtest run \
   --symbol XAU_USD --timeframe 1h \
   --from 2026-06-01T00:00:00 --to 2026-06-30T23:59:59 \
   --strategy-file my_strategy.yaml
 
-# 定義ディレクトリを全件validationし、idで選択
+# 既定以外の定義ディレクトリを全件validationし、idで選択
 STRATEGY_DEFINITIONS_DIR=/path/to/strategies \
 python -m backtest run \
   --symbol XAU_USD --timeframe 1h \
   --from 2026-06-01T00:00:00 --to 2026-06-30T23:59:59 \
-  --strategy xauusd_1h_squeeze_breakout_v1
+  --strategy my_strategy_id
 ```
 
 ### 排他関係と後方互換
@@ -219,6 +228,12 @@ field: exit.max_holding_bars] must be an int > 0, got 0 (int)
 
 - `risk.take_profit.r` / `exit.max_holding_bars` → squeeze_breakout の `risk_reward` / `time_exit_bars`
   として実行に渡る(実行パラメータ)。
+- `entry.params.squeeze_lookback`(int >= 1、既定 20)/ `entry.params.squeeze_percentile`
+  (0 < x <= 1、既定 0.10)→ squeeze episode 検出窓として
+  `evaluate_squeeze_breakout_signals()` 経由で `classify_market_state()` へ渡る
+  (PR #62 で可変化した実行パラメータ。既定は `market_state` の module 定数と同一で、
+  省略時は旧経路・Live 分類と byte-identical。範囲外は validation error)。実効値は両経路とも
+  `config_json` の `squeeze_lookback` / `squeeze_percentile` に記録される。
 - `symbols` / `timeframes` → 要求した `--symbol`/`--timeframe` が宣言に含まれない場合は終了コード2
   (適合検証)。
 - `entry.handler` / `entry.params` / `entry.reentry` / `entry.cooldown_bars` /
@@ -232,6 +247,42 @@ field: exit.max_holding_bars] must be an int > 0, got 0 (int)
 
 handler registry は Python コードが所有し、外部ファイルは登録済み handler 名(現行は
 `squeeze_breakout` のみ)を選ぶだけで、callable や module path を注入することはできない。
+
+### squeeze_breakout の外部定義移行と旧 default との互換性(Issue #54)
+
+`backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml` は、既存
+`backtest/squeeze_breakout.py` の default(`STRATEGY_PROFILE=xauusd_1h_squeeze_breakout_v1` /
+`RISK_REWARD=2.0` / `TIME_EXIT_BARS=24`)と**同値**の外部定義である。
+
+- **外部化されたのは設定値のみ**: strategy identity(`id`/`name`/`description`)、対象
+  `symbols`/`timeframes`、`risk.take_profit.r`(→ `risk_reward`)、`exit.max_holding_bars`
+  (→ `time_exit_bars`)、squeeze 検出窓の `entry.params.squeeze_lookback` /
+  `squeeze_percentile`(→ `classify_market_state()`、PR #62 で可変化)、および handler
+  固定値契約(`reentry=new_setup` / `cooldown_bars=0` / `stop_loss.type=trigger_bar_extreme` /
+  `same_candle_priority=stop_loss` / `allowed_market_states=null` / `entry.params` の宣言フラグ)。
+- **固定値契約として残る項目とその理由**: `allowed_market_states=null`(squeeze は自前の episode
+  state machine を持ち market-state ゲート非対応)、`cooldown_bars=0` / `reentry=new_setup`
+  (単一ポジションと再エントリー抑制は state machine が構造的に保証。時間 cooldown の実行接続は
+  存在しない)、`stop_loss.type=trigger_bar_extreme` / `same_candle_priority=stop_loss`
+  (Trigger 足 SL と同一足 SL 優先は約定判定順序=future-leakage 契約と一体)。これらを可変化する
+  ことは既存 Python 状態機械・約定契約の変更を意味するため、本移行では行わず、他値は
+  validation error とする(受理して無視する「死に設定」にはしない)。
+- **Python 側に残る条件ロジック**(定義ファイルへは移せない): squeeze episode の状態遷移、
+  BB 終値 break の条件判定、long/short 方向決定、Trigger 足 low/high の SL、risk からの target
+  算出、gap Stop → gap TP → intrabar SL/TP → time exit の判定順序、同一足 SL 優先、
+  future leakage 防止、単一ポジション制御(新 episode 形成後のみ再エントリー)、
+  Execution Model による価格補正(いずれも `squeeze_breakout.py` / `execution_model.py`)。
+- **warmup_bars は外部定義に含まれない**: Issue #52 スキーマは warm-up を Strategy 定義の項目と
+  していない(indicator のシード要件は run の実行条件)。従来どおり `--warmup-bars`(既定 75)が
+  外部定義 run にもそのまま適用される。
+- **後方互換性**: `--strategy-file` / `--strategy` を指定しない実行は従来の module 定数
+  default で完全に従来どおり動作する。旧経路(`--strategy-profile xauusd_1h_squeeze_breakout_v1`)
+  と新経路(配置済み外部定義)は、同一データ・同一期間・同一 Execution Model で trade 件数・
+  signal_time・direction・entry/stop/target・exit(時刻/価格/理由)・trade ごとの PnL・集計 PnL・
+  PF・max drawdown・market state・保存メタデータ(`strategy_profile`/`signal_type` 等)が
+  **完全一致**する(`backtest/tests/test_squeeze_breakout_migration.py` で固定。定義の `id` を
+  旧 `STRATEGY_PROFILE` と同一にしているため、保存行の `strategy_profile` も一致する)。
+- 新しい Strategy 定義の追加手順は [backtest/strategies/README.md](../backtest/strategies/README.md) を参照。
 
 ## warm-up期間とvalidation期間の分離
 
@@ -638,6 +689,13 @@ python -m pytest backtest/tests -q
   CLI 接続、排他関係、validation 失敗時の副作用ゼロ、YAML の take profit R / max holding bars が
   実行結果へ反映されること、外部定義 run と既存 `--strategy-profile` run の同値性、
   外部機構が opt-in であること(PyYAML 非 import)の統合・回帰テスト)
+- `backtest/tests/test_squeeze_breakout_migration.py`(Issue #54で新規追加。配置済み定義
+  `backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml` が既定ディレクトリから validation 込みで
+  ロードでき、旧 default(module 定数)と同値であること、旧経路と新経路の完全一致
+  (複数 trade fixture で trade 件数・per-trade 全フィールド・集計 PnL・PF・max drawdown・
+  メタデータ、コストあり run 含む)、`--strategy <id>` の CLI 経由実行、`--warmup-bars` が
+  外部定義 run にも既存経路どおり効くこと、外部定義の設定が built-in profile / trend_follow へ
+  漏れないことの回帰テスト)
 - Issue #39で `test_warmup.py`(各バーの Market State 判定と point-in-time / off-by-one 回帰)・
   `test_runner.py`(`--allowed-market-states` のパース/フィルタ/相互排他カウンタ/config・summary記録)・
   `test_backtest_store.py`(market_state 列の in-place migration と round-trip)・

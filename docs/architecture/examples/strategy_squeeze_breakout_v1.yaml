@@ -1,10 +1,11 @@
 # =============================================================================
 # Strategy 定義サンプル(Issue #52 設計成果物)
 #
-# *** 参照用サンプル。Loader は Issue #53 で実装済み(backtest/strategy_definition.py)
-#     だが、このファイルは runtime 既定ディレクトリ(backtest/strategies/)には
-#     未配置で、既定では読み込まれない(--strategy-file で明示指定すれば実行可能)。
-#     既存 Strategy の外部定義への移行=配置は後続 Issue。 ***
+# *** 参照用サンプル。Loader は Issue #53 で実装済み(backtest/strategy_definition.py)。
+#     Issue #54 で、これと同値の runtime 定義を既定ディレクトリへ配置済み:
+#     backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml
+#     (--strategy xauusd_1h_squeeze_breakout_v1 で選択可能)。
+#     実行にはそちらを使い、このファイルはスキーマの参照サンプルとして残す。 ***
 #
 # 仕様: docs/architecture/strategy_definition.md
 # 表現対象: 既存の backtest/squeeze_breakout.py(XAUUSD 1h squeeze breakout, 案A)
@@ -30,12 +31,15 @@ allowed_market_states: null
 
 entry:
   handler: squeeze_breakout              # 登録済み handler キー(コードが所有)
-  params:                                # handler が読む宣言フラグのみ。式・コードは置かない
+  params:                                # handler が読む宣言値のみ。式・コードは置かない
     squeeze_state: squeeze               # episode の準備状態ラベル
     require_episode_release: true        # 連続 squeeze 解除足(最初の非 squeeze 足)だけを評価
     breakout: bollinger_close            # BB 終値 break(ヒゲ到達は Trigger にしない)
-    # 注: BB 期間(20)/±2σ / squeeze lookback(20)/ 下位10% は indicators / market_state が
-    #     所有する共通定義であり Strategy 固有の自由度ではないため params に持たせない(仕様書 §7)。
+    squeeze_lookback: 20                 # squeeze 判定の trailing window 本数(int >= 1。省略時 20)
+    squeeze_percentile: 0.10             # BB 幅がこの下位分位以下なら squeeze(0 < x <= 1。省略時 0.10)
+    # 注: BB 期間(20)/±2σ は indicators が所有する共通定義であり Strategy 固有の自由度では
+    #     ないため params に持たせない(仕様書 §7)。squeeze_lookback / squeeze_percentile は
+    #     PR #62 で可変化された実行パラメータで、classify_market_state() へ明示的に渡される。
   reentry: new_setup                     # 新しい squeeze episode まで再 arm しない(構造的に単一ポジション)
   cooldown_bars: 0                       # 時間 cooldown は置かない(new_setup 規則がより強いため)
 
