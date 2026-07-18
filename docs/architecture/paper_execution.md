@@ -2,11 +2,11 @@
 
 Issue #49 の成果物。Paper Signal から仮想ポジションを生成し、決済まで追跡する **Paper Execution 層**の最小責務と状態遷移を定義する設計文書である。
 
-**本書は設計のみを対象とする。** DBテーブル・Repository・Open / Close判定コード・Discord通知・Broker API連携・実注文は本Issueのスコープ外であり、後続Issue(仮想ポジションデータモデルと保存層 / Open・Close判定エンジン)で実装する。
+**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。Discord通知は引き続き未対応、Broker API連携・実注文は恒久的に対象外。
 
 ## 目的と位置づけ
 
-Paper Execution は、[Paper Signal](paper_signal.md) が記録した paper_only の仮説を入力に、時間進行に沿って **仮想Entry → 仮想ポジション保持 → 仮想Close → 仮想損益確定** を行う独立レイヤーである。[Concept のレイヤー分離](../product/concept.md#レイヤー分離) における Execution variants の paper 側にあたる。
+Paper Execution は、[Paper Signal](paper_signal.md) が記録した paper_only の仮説を入力に、時間進行に沿って **仮想Entry → 仮想ポジション保持 → 仮想Close → 仮想損益確定** を行う独立レイヤーである。[Concept のレイヤー分離](../product/concept.md#レイヤー分離) における Execution の paper 側(Paper Execution)にあたる。
 
 ```text
 Market Bias + Chart Snapshot
@@ -65,7 +65,7 @@ Paper Signal の分類4フィールド(`signal_type` / `trigger_type` / `alert_s
 Signal生成戦略を示す `strategy_profile`(Paper Signal 所有・記録用)と、執行規則を示す **`execution_profile`(Paper Execution 所有)** を明確に分離する。
 
 - **定義するパラメータ**: SL / TP導出規則(`fallback_stop_pct` × `risk_reward`)、Entry有効期限(`max_entry_delay`)、最大保有時間(`max_holding_time`)、曖昧足の優先順位(`same_candle_priority`)、コスト(`spread` / `slippage` / `commission`)。すなわち本書の Entry / Close / 約定規則の可変パラメータはすべて execution_profile に属する。
-- **解決規則**: Paper Execution 自身の設定が持つ `(symbol, timeframe)` → execution_profile の明示的なマッピングで解決し、該当がなければ既定プロファイルへフォールバックする。**Signal の分類フィールド(`strategy_profile` を含む)は解決キーに使わない。**
+- **解決規則(現行実装)**: `resolve_execution_profile()` は、呼び出し側から `(symbol, timeframe)` → execution_profile の `overrides` 辞書が渡された場合にマッピングを解決し、該当がなければ既定プロファイルへフォールバックする。通常CLIは各profile値をCLI引数から単一のdefault profileとして構築し、全symbol/timeframeへ適用する。設定ファイルまたはCLIからsymbol/timeframe別マッピングをロードする通常運用経路は未実装である。いずれの経路でも **Signal の分類フィールド(`strategy_profile` を含む)は解決キーに使わない。**
 - **記録**: 適用した execution_profile 名と、その時点のパラメータ実額(コスト等)を仮想ポジションレコードへ記録し、後から設定を変えても既存レコードの再現性が壊れないようにする。
 - **将来拡張(参考)**: Signal生成戦略ごとに執行規則を変えたくなった場合、マッピングキーへ `strategy_profile` を加える拡張が考えられる。ただしその場合は「分類フィールドは判断に用いない」という Paper Signal 側の責務定義の更新が必要になるため、本設計では採用せず、採否は後続Issueで改めて判断する。
 
@@ -257,6 +257,6 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 
 - `position_models.py` — 状態(`pending` / `open` / `closed` / `expired` / `cancelled`)と `state × terminal_reason` の閉集合をアプリ層で検証。
 - `position_store.py` — 独立SQLite。`state` 集合・`state × terminal_reason` 閉集合・`same_candle_priority` 語彙・`signal_id` UNIQUE をDBの CHECK / UNIQUE 制約で担保。終端遷移は全て CAS(`WHERE state=...`)で、終端からの再遷移を拒否。close と watermark 前進は同一 UPDATE(watermark CAS で競合防止)。legacy schema からの移行は `PRAGMA user_version` + **table rebuild**(CREATE→検証コピー→DROP→RENAME、1トランザクション・失敗時 rollback)で CHECK/UNIQUE/NOT NULL を実際に付与し、安全に変換できない legacy row は明示的に migration 失敗させる。
-- `execution_profile.py` — 執行規則プロファイル(`(symbol, timeframe)` で解決、`strategy_profile` は解決キーにしない)。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
+- `execution_profile.py` — 執行規則プロファイル。内部APIは呼び出し側から渡された `(symbol, timeframe)` overridesを解決し、`strategy_profile` は解決キーにしない。通常CLIは単一default profileを使用し、symbol/timeframe別マッピングの設定ファイル/CLIロードは未実装。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
 - `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。損益は `gross_pnl`(コスト前, raw価格)、`net_pnl`(entry/exit コスト各1回 + commission を控除)、`r_multiple`(net / (初期リスク×size)、初期リスク≤0 は None)を算出。`pnl` は `net_pnl` の後方互換エイリアス。
 - `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。Chart DB は **strict read**(`load_candles_range_strict`)で読み、DB破損・candles table欠損・OperationalError を空データ扱いせず cycle failure として計上し、該当 position は無変更のままにする(期限切れへ誤遷移しない)。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用(読取エラーも成功扱いしない)。

@@ -22,14 +22,14 @@ FedWatch / Economic Calendar は外部取得元が不安定なため、今後も
 - Chart Snapshotの定期投稿頻度調整
 - ATR / 出来高 / Fear & Greed / COT Report などの補助指標追加
 - デモ口座でのPaper Signal記録
-- Pepperoniによる将来のエントリー執行レイヤー
+- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)は引き続き未実装・非スコープ
 
 これらは v1.3.1 以降の検討事項であり、v1.3.0では実装しない。
 
 ---
-## v1.4 Backtest / Paper Signal(v1.4.1 リリース候補)
+## v1.4 Backtest / Paper Signal(v1.4.1 リリース済み)
 
-v1.4系は、v1.3までに蓄積したChart Snapshot / Market Biasの永続データをもとに、過去の市場状態を再生するBacktest層(検証基盤)を追加したリリースラインである。**v1.4.1 は、既存の `v1.4` タグ以降に入った修正・整理をまとめたパッチリリース**であり、Market State 局面制御、銘柄別 Market Bias、戦略プロファイル、Paper Signal の常駐サービス化・日次集計レポートを含む。タグはまだ作成しておらず、本セクションはリリース候補の状態を記述する。
+v1.4系は、v1.3までに蓄積したChart Snapshot / Market Biasの永続データをもとに、過去の市場状態を再生するBacktest層(検証基盤)を追加したリリースラインである。**v1.4.1 は、既存の `v1.4` タグ以降に入った修正・整理をまとめたリリース済みのパッチリリース**であり、Market State 局面制御、銘柄別 Market Bias、戦略プロファイル、Paper Signal の常駐サービス化・日次集計レポートを含む。Paper Executionと外部Strategy定義(YAML)は `v1.4.1` タグ後の開発で追加されたため、v1.4.1の収録機能には含めない。
 
 | Issue | 内容 | 状態 |
 |---|---|---|
@@ -46,7 +46,7 @@ v1.4系は、v1.3までに蓄積したChart Snapshot / Market Biasの永続デ�
 | #41 | Paper Signal を常駐サービスとして実装 | 実装済み(v1.4.1) |
 | #47 | Paper Signal 日次集計レポート(読み取り専用) | 実装済み(v1.4.1) |
 
-v1.4 Backtest群に共通する非スコープ(各Issueで個別に明記されているものを集約):
+v1.4 Backtest群に共通する非スコープ(各Issueで個別に明記されているものを集約。いずれも実売買=Live Execution としての意味であり、仮想執行はのちに Issue #49〜#51 で Paper Execution として実装された):
 
 - 自動エントリー
 - 自動Exit
@@ -96,13 +96,19 @@ WantedBy=timers.target
 ```
 
 timer + oneshot 方式の実際のunit配置・有効化はv1.5以降の検討事項とする。
-## v1.5以降の検討(次フェーズ候補)
+## v1.4.1以降の実装と今後の検討
 
-- **Paper Execution(実装済み)**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・自動売買・ロット計算は含めない。Issue #49 で最小責務・状態遷移・約定規則を設計([Paper Execution](../architecture/paper_execution.md))、Issue #50 / #51 でデータモデル・保存層および Open / Close 判定エンジンを **`paper-execution/` に実装済み**。Broker API による **Live Execution** は引き続き未実装。
-- **Strategy 定義の外部化**: 現在コードに埋め込まれているエントリー/Exit条件・戦略プロファイル(例: `xauusd_1h_squeeze_breakout_v1`)を、設定/定義ファイルとして外部化し、コード変更なしに戦略を追加・切替できるようにする。
+**v1.4.1タグ後に実装済み:**
+
+- **Paper Execution**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・自動売買・ロット計算は含めない。Issue #49 で最小責務・状態遷移・約定規則を設計([Paper Execution](../architecture/paper_execution.md))、Issue #50 / #51 でデータモデル・保存層および Open / Close 判定エンジンを `paper-execution/` に実装した。
+- **外部Strategy定義(Backtest経路)**: Issue #52〜#54でYAML schema、loader / validator、`--strategy-file` / `--strategy` CLI、および `backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml` を実装した。外部定義を読み込むのは現在Backtest経路のみであり、Paper Signal / Paper Executionが同じ定義を共有する経路は未実装。
+
+**今後の検討:**
+
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
-- Entry Bot / Pepperoni(まだ設計しない)
+- Live Execution / Broker API(Pepperoni の実発注担当分。まだ設計しない)
+- 外部Strategy定義をPaper Signalへ接続し、Live相当のSignal生成とBacktestを同一定義で駆動する共有化
 
-これらはv1.5以降の検討事項である。上記のうち **Paper Execution**(仮想約定・仮想ポジション管理)は Issue #49 / #50 / #51 で **実装済み**(`paper-execution/`)。Broker API による実注文・自動売買(Live Execution)は引き続き未実装。**Strategy 定義の外部化** は次フェーズ候補として残る。
+Broker API による実注文・自動売買(Live Execution)は引き続き未実装・非スコープである。実装済みの外部Strategy定義をPaper Signal / Paper Executionへ接続する共有化は、現在のアーキテクチャの一部ではなく将来構想として扱う。
