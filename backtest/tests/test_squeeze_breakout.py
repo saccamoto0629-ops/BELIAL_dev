@@ -316,6 +316,180 @@ def test_new_squeeze_episode_allows_a_second_entry():
     assert signals[1].exit_result.status == exit_policy.STATUS_WIN
 
 
+def _force_state_at(monkeypatch, timestamp, state):
+    """Wrap classify_market_state so the bar at *timestamp* classifies as *state*.
+
+    Every other bar keeps its real classification, so episode formation (the
+    squeeze bars) is untouched -- only the Trigger bar's label is controlled.
+    """
+    real = sb.classify_market_state
+
+    def fake(indicators, **kwargs):
+        if indicators.index[-1] == timestamp:
+            return {"market_state": state, "confidence": 0.5, "reasons": ["forced by test"]}
+        return real(indicators, **kwargs)
+
+    monkeypatch.setattr(sb, "classify_market_state", fake)
+
+
+# =============================================================================
+# Issue #63: allowed_market_states gate on the Trigger bar
+# =============================================================================
+
+# Bars 94 AND 95 both close beyond the upper band (verified in exploration), and
+# both classify as Market State "trend_up" -- so bar 95 is a live would-be
+# breakout that pins "a suppressed release trigger consumes the episode":
+# after the gate drops bar 94, bar 95 must NOT enter.
+GATE_BARS = _prefix() + [(2009, 2010, 2005, 2010), (2011, 2021, 2011, 2015)]
+
+
+def _gated_signals(bars, allowed=None, stats=None):
+    frame = _frame(bars)
+    return frame, sb.evaluate_squeeze_breakout_signals(
+        frame,
+        frame.index[TRIGGER_INDEX],
+        frame.index[-1],
+        symbol="XAU_USD",
+        timeframe="1h",
+        allowed_market_states=allowed,
+        stats=stats,
+    )
+
+
+def test_gate_none_is_identical_to_not_passing_the_parameter():
+    # allowed_market_states=None (the default) must be byte-identical to the
+    # pre-#63 call: same signals, and the stats dict reports zero suppression.
+    stats: dict = {}
+    _frame_, default_signals = _run_signals(GATE_BARS)
+    _frame_, none_signals = _gated_signals(GATE_BARS, allowed=None, stats=stats)
+    assert none_signals == default_signals
+    assert len(none_signals) == 1
+    assert stats.get("suppressed_market_state", 0) == 0
+
+
+def test_gate_allows_entry_when_the_trigger_bar_state_is_listed():
+    _frame_, default_signals = _run_signals(GATE_BARS)
+    _frame_, gated_signals = _gated_signals(GATE_BARS, allowed=frozenset({"trend_up", "range"}))
+    assert gated_signals == default_signals  # every field identical, incl. exit
+    assert gated_signals[0].market_state == "trend_up"
+
+
+def test_gate_disallowed_release_trigger_consumes_the_episode_without_entry():
+    # Bars 94 AND 95 both fire a long trigger (and bar 95's high 2021 would
+    # even win a trade). With only "range" allowed, bar 94's release trigger
+    # is suppressed AND the episode is consumed: bar 95 (the very next
+    # non-squeeze breakout bar) must NOT enter -- trigger evaluation happens
+    # only on the episode-release bar (require_episode_release / new_setup),
+    # so the suppression count is exactly 1, never one per later breakout bar.
+    stats: dict = {}
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"range"}), stats=stats)
+    assert signals == []
+    assert stats["suppressed_market_state"] == 1
+
+
+def test_gate_disallowed_trigger_never_enters_on_later_non_squeeze_bars():
+    # Several consecutive non-squeeze breakout bars after the suppressed
+    # release bar: none of them may enter, and the suppression count stays at
+    # the single disallowed release trigger. No new squeeze episode forms, so
+    # no entry can ever happen in this window.
+    more_breakouts = [(2016 + i, 2026 + i, 2015 + i, 2020 + i) for i in range(4)]
+    bars = GATE_BARS + more_breakouts
+    stats: dict = {}
+    _frame_, signals = _gated_signals(bars, allowed=frozenset({"range"}), stats=stats)
+    assert signals == []
+    assert stats["suppressed_market_state"] == 1
+
+
+def test_gate_allows_entry_again_after_a_new_squeeze_episode_forms(monkeypatch):
+    # Episode 1's release trigger (bar 94, forced "range") is suppressed and
+    # consumed; a brand-new squeeze episode then forms (bars 113..128, verified
+    # in exploration), and ITS release trigger (bar 129, real state "volatile")
+    # enters. Re-entry requires the new episode -- not a later bar of the old
+    # one (bars 95.. break the band too but never enter).
+    flat2 = [
+        (2010 + (0.05 if i % 2 == 0 else -0.05), 2010 + 0.07, 2010 - 0.07,
+         2010 + (0.05 if i % 2 == 0 else -0.05))
+        for i in range(FLAT)
+    ]
+    breakout2 = [(2014, 2016, 2010, 2015), (2015, 2026, 2015, 2020)]
+    bars = _prefix() + [(2009, 2010, 2005, 2010)] + flat2 + breakout2
+    frame = _frame(bars)
+    _force_state_at(monkeypatch, frame.index[TRIGGER_INDEX], "range")
+
+    stats: dict = {}
+    _frame_, signals = _gated_signals(bars, allowed=frozenset({"volatile"}), stats=stats)
+    assert len(signals) == 1
+    assert stats["suppressed_market_state"] == 1
+    second_release = TRIGGER_INDEX + 1 + FLAT  # 129: first bar after the second flat run
+    assert signals[0].signal_time == frame.index[second_release].isoformat()
+    assert signals[0].market_state == "volatile"
+
+    # Same forced states WITHOUT a gate: the old default enters on the first
+    # release bar (94) -- the gate machinery changes nothing when off.
+    _frame_, ungated = _run_signals(bars)
+    assert ungated[0].signal_time == frame.index[TRIGGER_INDEX].isoformat()
+    assert ungated[0].market_state == "range"
+
+
+def test_gate_release_before_validation_start_never_enables_a_later_entry():
+    # Blocker 2 regression (PR #64 review): the episode releases at bar 94,
+    # BEFORE validation starts at bar 95. Whether or not that release would
+    # have been gate-suppressed, the episode is consumed identically -- so the
+    # in-validation breakout bar 95 must not enter, gated or ungated, and the
+    # gate reports no suppression (the release bar was outside validation and
+    # was never gate-evaluated). Same history + same settings can never flip
+    # a later entry on or off depending on where validation_start falls.
+    frame = _frame(GATE_BARS)
+    stats: dict = {}
+    gated = sb.evaluate_squeeze_breakout_signals(
+        frame,
+        frame.index[TRIGGER_INDEX + 1],  # validation starts after the release bar
+        frame.index[-1],
+        symbol="XAU_USD",
+        timeframe="1h",
+        allowed_market_states=frozenset({"trend_up"}),
+        stats=stats,
+    )
+    _frame_, ungated = _run_signals(GATE_BARS, from_index=TRIGGER_INDEX + 1)
+    assert gated == []
+    assert ungated == []
+    assert stats.get("suppressed_market_state", 0) == 0
+
+
+def test_gate_treats_unknown_as_a_state_that_must_be_explicitly_listed(monkeypatch):
+    # Issue #39 contract: "unknown" is one of KNOWN_MARKET_STATES, allowed only
+    # when listed -- there is no special-casing or normalization of it.
+    frame = _frame(GATE_BARS)
+    _force_state_at(monkeypatch, frame.index[TRIGGER_INDEX], "unknown")
+
+    # unknown NOT in the allow-list: the release trigger is suppressed and the
+    # episode is consumed -- no entry anywhere in the window.
+    stats: dict = {}
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"trend_up"}), stats=stats)
+    assert signals == []
+    assert stats["suppressed_market_state"] == 1
+
+    # unknown explicitly listed: the release bar enters and records the label.
+    _frame_, signals = _gated_signals(GATE_BARS, allowed=frozenset({"unknown"}))
+    assert len(signals) == 1
+    assert signals[0].signal_time == frame.index[TRIGGER_INDEX].isoformat()
+    assert signals[0].market_state == "unknown"
+
+
+def test_gate_release_bar_without_a_trigger_still_consumes_the_episode():
+    # A wick-only release bar (no close-break) consumes the episode exactly as
+    # before, gated or not, and counts no suppression (the gate only ever
+    # evaluates a fired trigger) -- the later breakout bar has no armed
+    # episode left and cannot enter.
+    bars = _prefix() + [(2000.0, 2005.1, 1999.0, 2000.1), (2011, 2021, 2011, 2015)]
+    stats: dict = {}
+    _frame_, ungated = _run_signals(bars)
+    _frame_, gated = _gated_signals(bars, allowed=frozenset({"trend_up"}), stats=stats)
+    assert ungated == []
+    assert gated == []
+    assert stats.get("suppressed_market_state", 0) == 0
+
+
 def test_episode_ending_in_warmup_is_consumed_not_emitted():
     # Validation starts *after* the breakout bar, so the episode that ends at
     # the breakout is consumed during warm-up and never emitted -- and no stale

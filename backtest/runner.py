@@ -564,8 +564,9 @@ def _run_squeeze_breakout(
     variable fields drive the run -- ``risk.take_profit.r`` -> risk_reward,
     ``exit.max_holding_bars`` -> time_exit_bars,
     ``entry.params.squeeze_lookback`` / ``squeeze_percentile`` -> the
-    squeeze-episode detection window, its id labels every saved row, and its
-    full normalized form is recorded in config_json. All of its remaining
+    squeeze-episode detection window, ``allowed_market_states`` -> the
+    Trigger-bar market-state gate (Issue #63), its id labels every saved row,
+    and its full normalized form is recorded in config_json. All of its remaining
     fields are fixed-value contracts already validated to match this
     handler's actual behaviour (docs §5.2), so nothing accepted is ignored.
     When ``definition`` is None, the pre-#53 --strategy-profile behaviour is
@@ -583,6 +584,11 @@ def _run_squeeze_breakout(
         # equal market_state's own, so an omitted key changes nothing.
         squeeze_lookback = definition.entry.params["squeeze_lookback"]
         squeeze_percentile = definition.entry.params["squeeze_percentile"]
+        # Issue #63: the definition's market-state gate for the Trigger bar
+        # (None = no gate). Only an external definition can set it -- the CLI
+        # --allowed-market-states flag stays trend_follow-only and is never
+        # consulted on this path.
+        allowed_market_states = definition.allowed_market_states
     else:
         strategy_profile = squeeze_breakout.STRATEGY_PROFILE
         risk_reward = squeeze_breakout.RISK_REWARD
@@ -590,6 +596,7 @@ def _run_squeeze_breakout(
         same_candle_priority = exit_policy.SAME_CANDLE_PRIORITY_STOP_LOSS
         squeeze_lookback = DEFAULT_SQUEEZE_LOOKBACK
         squeeze_percentile = DEFAULT_SQUEEZE_PERCENTILE
+        allowed_market_states = None
 
     # Issue #26: the same virtual-fill model the trend_follow path uses. Defaults
     # (spread=slippage=0.0) leave raw prices unchanged.
@@ -613,6 +620,13 @@ def _run_squeeze_breakout(
         # config alone (defaults equal market_state's module constants).
         "squeeze_lookback": squeeze_lookback,
         "squeeze_percentile": squeeze_percentile,
+        # Issue #63: the effective Trigger-bar market-state gate (sorted for a
+        # stable record, null = no gate). Recorded on both paths, same as the
+        # trend_follow path's config key, so a saved run is reproducible from
+        # config_json alone; the --strategy-profile path is always null.
+        "allowed_market_states": (
+            sorted(allowed_market_states) if allowed_market_states is not None else None
+        ),
         # The episode state machine enforces a single position and a
         # new-episode-before-re-entry rule; there is no time-based cooldown.
         "no_reentry": True,
@@ -637,6 +651,9 @@ def _run_squeeze_breakout(
     )
     store.save_backtest_run(run_record, db_path=backtest_db_path)
 
+    # Issue #63: the gate's suppression count, filled in by the evaluation so
+    # the summary reports how many fired triggers the market-state gate dropped.
+    gate_stats = {"suppressed_market_state": 0}
     signals = squeeze_breakout.evaluate_squeeze_breakout_signals(
         candles,
         validation_start,
@@ -653,6 +670,10 @@ def _run_squeeze_breakout(
         time_exit_bars=time_exit_bars,
         squeeze_lookback=squeeze_lookback,
         squeeze_percentile=squeeze_percentile,
+        # Issue #63: the Trigger-bar market-state gate (None on the
+        # --strategy-profile path = no gate, the pre-#63 behaviour).
+        allowed_market_states=allowed_market_states,
+        stats=gate_stats,
     )
 
     signal_records: list[dict] = []
@@ -727,12 +748,17 @@ def _run_squeeze_breakout(
         "signals_generated": len(signal_records),
         "result_counts": _summarize(signal_records),
         "backtest_db_path": str(backtest_db_path),
-        # These #38/#39/#40 fields don't apply to this strategy; report neutral
-        # values so print_summary stays uniform across both paths.
+        # The #38 re-entry/cooldown fields don't apply to this strategy (the
+        # episode state machine enforces both structurally); report neutral
+        # values so print_summary stays uniform across both paths. The
+        # market-state fields are real since Issue #63: the definition's gate
+        # (null without one) and how many fired triggers it dropped.
         "suppressed_reentry": 0,
         "suppressed_cooldown": 0,
-        "suppressed_market_state": 0,
-        "allowed_market_states": None,
+        "suppressed_market_state": gate_stats["suppressed_market_state"],
+        "allowed_market_states": (
+            sorted(allowed_market_states) if allowed_market_states is not None else None
+        ),
         "bias_mode": "n/a",
         "bias_resolution": {},
         "bias_global_fallback": False,

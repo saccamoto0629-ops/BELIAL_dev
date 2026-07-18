@@ -276,6 +276,8 @@ def evaluate_squeeze_breakout_signals(
     risk_reward: float = RISK_REWARD,
     squeeze_lookback: int = DEFAULT_SQUEEZE_LOOKBACK,
     squeeze_percentile: float = DEFAULT_SQUEEZE_PERCENTILE,
+    allowed_market_states: frozenset[str] | None = None,
+    stats: dict | None = None,
 ) -> list[SqueezeBreakoutSignal]:
     """Run the squeeze-episode breakout state machine over *candles*.
 
@@ -297,6 +299,24 @@ def evaluate_squeeze_breakout_signals(
     squeeze-episode *detection window*; the episode state transition, trigger
     condition, and fill judgement stay fixed here. Defaults are market_state's
     own, so omitting them is byte-identical to the pre-#54 behaviour.
+
+    ``allowed_market_states`` (Issue #63) is the market-state entry gate: when
+    not None, an entry is adopted only if the *Trigger bar's* classified state
+    (the same ``classify_market_state()`` label persisted as
+    ``SqueezeBreakoutSignal.market_state`` -- ``unknown`` included, exactly the
+    Issue #39 ``--allowed-market-states`` vocabulary) is a member of the set.
+    The gate is evaluated exactly once per episode, on the episode-release bar
+    whose close actually fired the breakout trigger -- never on the squeeze
+    bars forming the episode, and never on any later non-squeeze bar. A
+    disallowed Trigger bar produces no entry and opens no position, and the
+    episode stays consumed (released) exactly as it would for a no-trigger
+    release bar: that setup is over, and a brand-new squeeze episode must form
+    before the next entry can happen (the same new_setup /
+    require_episode_release contract as an adopted entry). ``None`` (the
+    default) means no gate: byte-identical to the pre-#63 behaviour.
+
+    ``stats``, when given a dict, receives the gate's suppression count under
+    ``"suppressed_market_state"`` (one per disallowed episode-release trigger).
     """
     if exec_model is None:
         import execution_model as execution
@@ -384,6 +404,19 @@ def evaluate_squeeze_breakout_signals(
         short_trigger = close_t <= bb_lower
         # XOR: no break, or (degenerate data) both sides -> no entry.
         if long_trigger == short_trigger:
+            continue
+
+        # Issue #63: the market-state gate applies once per episode, to the
+        # release bar the trigger just fired on (this bar's own classified
+        # state -- the value persisted as signal.market_state). A disallowed
+        # state produces no entry and the episode stays consumed (it was
+        # released above, same as a no-trigger release bar), so a NEW squeeze
+        # episode must form before the next entry -- trigger evaluation never
+        # continues onto later non-squeeze bars (require_episode_release /
+        # new_setup contract, PR #64 review).
+        if allowed_market_states is not None and state not in allowed_market_states:
+            if stats is not None:
+                stats["suppressed_market_state"] = stats.get("suppressed_market_state", 0) + 1
             continue
 
         direction = LONG if long_trigger else SHORT

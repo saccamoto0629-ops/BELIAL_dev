@@ -336,12 +336,34 @@ def test_allowed_market_states_non_list_is_rejected():
     assert error.field_path == "allowed_market_states"
 
 
-def test_allowed_market_states_known_state_is_still_rejected_by_squeeze_capability():
-    # trend_up is a valid state, but squeeze_breakout does not support the
-    # market-state gate at all -- accepting it would be a dead setting.
-    error = build_error(allowed_market_states=["trend_up"])
-    assert "does not support a market-state gate" in str(error)
-    assert "squeeze_breakout" in str(error)
+def test_allowed_market_states_known_states_are_accepted_for_squeeze():
+    # Issue #63: squeeze_breakout now supports the Trigger-bar market-state
+    # gate, so any subset of KNOWN_MARKET_STATES validates.
+    definition = build(allowed_market_states=["trend_up", "range"])
+    assert definition.allowed_market_states == frozenset({"trend_up", "range"})
+    # to_config() records the gate sorted (stable config_json), null stays null.
+    assert definition.to_config()["allowed_market_states"] == ["range", "trend_up"]
+    assert build(allowed_market_states=None).to_config()["allowed_market_states"] is None
+
+
+def test_allowed_market_states_every_known_state_is_individually_accepted():
+    for state in KNOWN_MARKET_STATES:
+        definition = build(allowed_market_states=[state])
+        assert definition.allowed_market_states == frozenset({state})
+
+
+def test_allowed_market_states_duplicates_collapse_like_the_cli_flag():
+    # Same contract as the Issue #39 CLI parser (_market_state_set): duplicate
+    # names are not an error, they collapse into the set.
+    definition = build(allowed_market_states=["trend_up", "trend_up", "range"])
+    assert definition.allowed_market_states == frozenset({"trend_up", "range"})
+    assert definition.to_config()["allowed_market_states"] == ["range", "trend_up"]
+
+
+@pytest.mark.parametrize("bad_item", [123, True, None, ""])
+def test_allowed_market_states_non_str_items_are_rejected(bad_item):
+    error = build_error(allowed_market_states=["trend_up", bad_item])
+    assert "allowed_market_states[1]" in str(error)
 
 
 # =============================================================================
@@ -918,15 +940,24 @@ def test_descriptor_squeeze_window_params_reach_the_episode_state_machine():
     assert never_filled == []
 
 
-def test_descriptor_market_state_gate_unsupported_matches_the_implementation():
-    # squeeze_breakout never consults a market-state allow-list: its signal
-    # evaluation has no such parameter at all, so the descriptor must say
-    # "unsupported" (docs §6) -- otherwise a gate would be accepted and ignored.
+def test_descriptor_market_state_gate_supported_matches_the_implementation():
+    # Issue #63: the descriptor says "supported" AND the evaluation actually
+    # consumes the allow-list -- a value accepted by validation can never be
+    # ignored at runtime. The same bars that produce one Trigger ungated
+    # produce none when the gate excludes the Trigger bar's state (trend_up).
     import inspect
 
-    assert SQUEEZE_CAP.supports_market_state_gate is False
+    assert SQUEEZE_CAP.supports_market_state_gate is True
     parameters = inspect.signature(sb.evaluate_squeeze_breakout_signals).parameters
-    assert "allowed_market_states" not in parameters
+    assert "allowed_market_states" in parameters
+
+    bars = _squeeze_prefix() + [(2009, 2010, 2005, 2010), (2011, 2012, 2011, 2011)]
+    _frame, ungated = _squeeze_signals(bars)
+    assert len(ungated) == 1
+    _frame, gated = _squeeze_signals(bars, allowed_market_states=frozenset({"range"}))
+    assert gated == []
+    _frame, allowed = _squeeze_signals(bars, allowed_market_states=frozenset({"trend_up"}))
+    assert len(allowed) == 1
 
 
 def test_schema_enums_match_the_exit_policy_vocabulary():

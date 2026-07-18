@@ -31,8 +31,16 @@ description: >
 symbols: [XAU_USD]
 timeframes: [1h]
 
-# squeeze_breakout handler は自前の squeeze episode state machine を持ち、
-# market-state ゲートを使わないため null(= フィルタ無し)。非 null は validation error。
+# Market State ゲート(Issue #63 で可変化)。null(既定)= フィルタ無し(旧 default と
+# 完全に同一の結果)。非 null リスト(各要素は trend_up / trend_down / range / volatile /
+# squeeze / unknown)を指定すると、breakout trigger が成立した足(episode 解除足)の
+# Market State がリストに含まれる場合のみ entry する。判定は episode 解除 trigger 足に
+# 一度だけ行い、値は trigger 足自身の分類結果(保存される signal.market_state と同じ値。
+# unknown も一状態としてリストに明示した場合のみ許可)。不許可の場合その setup は entry
+# せずに終了し、episode は消費済みのまま(再試行には新しい squeeze episode の形成が必要。
+# reentry: new_setup / require_episode_release: true の契約どおり)。
+# trigger 足は定義上非 squeeze なので、"squeeze" を含めてもその要素が一致することはない。
+# 空リストは validation error(全不許可は dead config。null を使う)。
 allowed_market_states: null
 
 entry:

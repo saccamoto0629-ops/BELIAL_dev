@@ -28,13 +28,16 @@ python -m backtest run \
 1. 既存の [xauusd_1h_squeeze_breakout_v1.yaml](xauusd_1h_squeeze_breakout_v1.yaml) をコピーし、
    `id`(`^[a-z0-9_]+$`、ディレクトリ内で一意)/ `name` / 可変設定
    (`risk.take_profit.r`、`exit.max_holding_bars`、`entry.params.squeeze_lookback`(int >= 1)、
-   `entry.params.squeeze_percentile`(0 < x <= 1)等)を書き換える。
+   `entry.params.squeeze_percentile`(0 < x <= 1)、`allowed_market_states`(Issue #63:
+   null = ゲート無し、または既知 Market State の非空リスト。breakout trigger が成立した足の
+   state がリストに含まれる場合のみ entry)等)を書き換える。
    スキーマの全項目・型・default・許容範囲は
    [docs/architecture/strategy_definition.md §2](../../docs/architecture/strategy_definition.md) を参照。
 2. `entry.handler` は登録済み handler(現行は `squeeze_breakout` のみ)から選ぶ。
    handler ごとに許容される値(capability)が異なり、squeeze_breakout では
    `reentry: new_setup` / `cooldown_bars: 0` / `stop_loss.type: trigger_bar_extreme` /
-   `same_candle_priority: stop_loss` / `allowed_market_states: null` 以外は validation error になる。
+   `same_candle_priority: stop_loss` 以外は validation error になる
+   (これらの可変化は後続 Issue の範囲)。
 3. `--strategy-file <path>` で単体検証してから、このディレクトリへ配置して `--strategy <id>` で選択する
    (配置しただけでは既存実行に影響しない。外部定義は完全な opt-in)。
 4. 条件ロジック(条件式・約定判定・状態遷移)は定義ファイルへ書けない。新しい挙動が必要な場合は
