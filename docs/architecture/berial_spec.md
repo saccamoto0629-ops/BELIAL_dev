@@ -18,7 +18,7 @@
 | [Backtest](../backtest.md) | Backtest Runner / CLI。過去データ上での Strategy / Execution ルールの再生・評価 |
 | [Operations](../operations/operations.md) | 環境変数、dry-run、起動例、本番運用、手動確認コマンド |
 | [Testing](../testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
-| [Roadmap](../product/roadmap.md) | v1.3.1以降、v1.4系(v1.4.1リリース候補)、本番常駐化(systemd)、v1.5以降、将来検討 |
+| [Roadmap](../product/roadmap.md) | v1.3.1以降、リリース済みv1.4.1、v1.4.1タグ後の実装、本番常駐化(systemd)、将来検討 |
 
 ## Documentation Rules
 

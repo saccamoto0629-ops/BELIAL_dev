@@ -2,7 +2,7 @@
 
 BELIAL は、ニュース・マーケットデータ・チャート指標を観測し、市場状態を分類し、`paper_only` の仮説を記録し、その仮説を Backtest(過去データでの検証)と Paper Execution(仮想約定・仮想ポジション管理)で検証するローカル検証基盤です。**Broker API 連携、実発注、実約定、ロット計算、売買推奨文言の生成(Live Execution 系)は行いません。**
 
-本ドキュメントは **v1.4.1 リリース候補**(タグ未作成)の状態を反映しています。v1.4.1 は、既存の `v1.4` タグ以降に入った修正・整理をまとめたパッチリリースです。v1.3系までの Observation / Classification / Alert / Paper Signal に加えて、過去データで仮説を遡及検証する Backtest(検証基盤)、Market State 局面別エントリー制御、銘柄別 Market Bias、XAUUSD squeeze breakout 戦略、Paper Signal の常駐サービス化と日次集計レポートを提供します。さらに v1.4.1 以降の実装として、Paper Signal を仮想執行する Paper Execution(`paper-execution/`: 仮想Entry / 仮想ポジション管理 / SL・TP・Exit 判定)を含みます。各機能の位置づけと非スコープは [docs/product/roadmap.md](docs/product/roadmap.md) を参照してください。
+本ドキュメントは、**リリース済みの `v1.4.1` タグ以降の main 開発状態**を反映しています。`v1.4.1` には、過去データで仮説を遡及検証する Backtest(検証基盤)、Market State 局面別エントリー制御、銘柄別 Market Bias、XAUUSD squeeze breakout 戦略、Paper Signal の常駐サービス化と日次集計レポートが含まれます。その後の開発で、Paper Signal を仮想執行する Paper Execution(`paper-execution/`: 仮想Entry / 仮想ポジション管理 / SL・TP・Exit 判定)と、Backtest 経路で利用する外部 Strategy 定義(YAML)が追加されています。各機能のリリース時点・位置づけ・非スコープは [docs/product/roadmap.md](docs/product/roadmap.md) を参照してください。
 
 ## ドキュメント
 
@@ -15,7 +15,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | [docs/operations/](docs/operations/README.md) | 環境変数、起動手順、dry-run方針、systemd運用 |
 | [Strategy 定義仕様](docs/architecture/strategy_definition.md) | Strategy ごとの可変設定を外部ファイルへ切り出すためのスキーマ・エラー方針(Issue #52 設計) |
 | [docs/development/](docs/development/README.md) | Issue / PR 運用ルール |
-| [v1.4.1 リリースノート](docs/development/reports/v1.4.1_release_notes.md) | リリース候補の変更内容、既知の制約、CI確認・タグ作成手順 |
+| [v1.4.1 リリースノート](docs/development/reports/v1.4.1_release_notes.md) | タグ作成前に作成された候補スナップショット。`v1.4.1` タグは後に作成済み |
 | [docs/testing/](docs/testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
 
 最初に読むべきドキュメント:
@@ -35,14 +35,15 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 
-## 責務分離(Observation → Classification → Alert → Hypothesis → Execution)
+## 責務分離(Observation → Classification → Alert → Strategy → Hypothesis → Execution)
 
 | Layer | Responsibility | 現行モジュール |
 |---|---|---|
 | Observation | 価格、ニュース、指標を取得する | `news-feed-bot/market_data.py` など各Provider, `market-watch/chart_collector.py` |
 | Classification | 市場状態を分類する | `market-watch/indicators.py`, `news-feed-bot/market_bias.py` |
 | Alert | 事実を検知して通知する(売買判断はしない) | `market-watch/macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` |
-| Hypothesis (Paper Signal) | `paper_only` の仮説を生成・保存する | `paper-signal/signal_generator.py` |
+| Strategy / Method | 観測・分類情報から候補を生成・評価するルール | `paper-signal/signal_generator.py`。外部YAML定義は現在Backtest経路のみ |
+| Hypothesis / Paper Signal | Strategy / Method の評価結果を `paper_only` 仮説レコードとして生成・保存する | `paper-signal/signal_generator.py`, `paper_signal_store.py` |
 | Execution | 執行層の総称。**Paper Execution**(仮想約定・仮想ポジション管理・仮想Exit・仮想損益)と **Live Execution**(実注文・約定確認・ポジション管理・Exit)に分かれる | **Paper Execution は実装済み**(`paper-execution/`。仮想約定のみ)。**Live Execution**(Broker API・実注文・自動売買)は**未実装** |
 
 詳細は [Concept のレイヤー分離](docs/product/concept.md#レイヤー分離)、Alert層の記述粒度は [Architecture の責務分離](docs/architecture/architecture.md#alert--strategy--signal--execution-の責務分離) を参照してください。
@@ -71,15 +72,21 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 
 `--dry-run` はコンソール出力のみで確認モードとして動作します。詳細は [Operations](docs/operations/operations.md) を参照してください。
 
-## v1.4 Backtest / Paper Signal(実装済み / v1.4.1 リリース候補)
+## v1.4.1 とタグ以降の開発状態
 
-v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層(検証基盤)を追加しました。v1.4.1 は、`v1.4` タグ以降に入った以下の機能の修正・整理をまとめたパッチリリースです。Backtest は Paper Signal を過去データで遡及検証する **独立した Validation レイヤー**であり、Execution 層(Paper Execution / Live Execution)ではありません。仮想執行を行う Paper Execution は別レイヤーとして実装済み(`paper-execution/`)で、実発注を行う Live Execution はスコープ外です。
+v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層(検証基盤)を追加しました。`v1.4.1` は、`v1.4` タグ以降に入ったBacktest / Paper Signal関連の修正・整理をまとめたリリース済みのパッチリリースです。Backtest は Paper Signal を過去データで遡及検証する **独立した Validation レイヤー**であり、Execution 層(Paper Execution / Live Execution)ではありません。
+
+**`v1.4.1` に含まれる主な機能:**
 
 - **Backtest Engine / Runner / CLI**(`python -m backtest`): 手元やEC2から実行可能。実行方法・引数・終了コードは [docs/backtest.md](docs/backtest.md) を参照。
 - **Market State 局面別エントリー制御**(`--allowed-market-states`)と**銘柄別 Market Bias**、時系列 Bias 参照・再エントリー抑制・cooldown。
 - **XAUUSD squeeze breakout 戦略**(`--strategy-profile xauusd_1h_squeeze_breakout_v1`)を paper-only Backtest に追加。
-- **外部 Strategy 定義(YAML)の Loader / Validation**(Issue #53): Strategy ごとの可変設定を YAML で外部化し、`--strategy-file <path>`(単一ファイル)または `--strategy <id>`(`backtest/strategies/` ディレクトリ、`STRATEGY_DEFINITIONS_DIR` で上書き可)で opt-in 実行。両者および既存 `--strategy-profile` とは排他で、**未指定時は従来動作を完全維持**する。不正な定義は実行開始前に副作用なしのvalidation errorになる。スキーマは [Strategy 定義仕様](docs/architecture/strategy_definition.md)、使用方法は [docs/backtest.md](docs/backtest.md) を参照(既存 Strategy の外部定義への移行は後続 Issue)。
 - **Paper Signal の常駐サービス化**(`paper_signal_bot.py`)と**日次集計レポート**(`paper_signal_daily_report.py`, 読み取り専用)。
+
+**`v1.4.1` タグ後に追加された主な機能:**
+
+- **Paper Execution**(`paper-execution/`): 保存済みPaper Signalから仮想Entry / Position / SL / TP / Exitを判定する別レイヤー。実発注を行うLive Executionは未実装・非スコープ。
+- **外部 Strategy 定義(YAML)の Loader / Validation**(Issue #53): Strategy ごとの可変設定を YAML で外部化し、`--strategy-file <path>`(単一ファイル)または `--strategy <id>`(`backtest/strategies/` ディレクトリ、`STRATEGY_DEFINITIONS_DIR` で上書き可)で opt-in 実行する。現在利用するのはBacktest経路のみであり、Paper Signal / Paper Executionとの定義共有は未実装。スキーマは [Strategy 定義仕様](docs/architecture/strategy_definition.md)、使用方法は [docs/backtest.md](docs/backtest.md) を参照。
 
 詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
 

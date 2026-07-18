@@ -58,7 +58,8 @@ Execution は **Paper Execution**(仮想約定・仮想ポジション管理・E
 | Observation | (Alert以前の入力) | 各Provider, `chart_collector.py` |
 | Classification | (Alert以前の入力) | `indicators.py`, `market_state.py`, `market_bias.py` |
 | Alert | Alert | `macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` |
-| Strategy / Hypothesis | Strategy 評価と Paper Signal(paper_only 仮説)の生成・保存 | `paper-signal/signal_generator.py`(実装済み) |
+| Strategy / Method | 候補生成・評価ルール | `paper-signal/signal_generator.py`、Backtest の外部定義は `backtest/strategy_definition.py`(実装済み) |
+| Hypothesis / Paper Signal | Strategy / Method の評価結果を paper_only 仮説として生成・保存 | `paper-signal/signal_generator.py`, `paper_signal_store.py`(実装済み) |
 | Execution | Paper Execution | 実装済み(`paper-execution/`。仮想約定のみ) |
 | Execution | Live Execution | 未実装(将来・非スコープ) |
 | Persistence | 各コンポーネントの store 層(下記「DB構成」「schema validation / migration」) | 実装済み |
@@ -67,7 +68,7 @@ Execution は **Paper Execution**(仮想約定・仮想ポジション管理・E
 
 - **Paper Signal は仮説の記録のみ**を行う。Entry価格・SL・TP・保有期限はレコードに含まれない。分類フィールド(`signal_type` / `trigger_type` / `alert_source` / `strategy_profile`)は記録用であり、判断には使わない。
 - **Paper Execution は保存済み `paper_signals` レコードの読み取りのみ**で連携する(Generator は呼ばない、Signal DB へは書かない)。Entry価格の決定、SL / TP / 最大保有時間の導出と判定、仮想損益計算はすべて Paper Execution の責務である。
-- 執行規則(SL / TP 導出、Entry有効期限、最大保有時間、曖昧足の優先順位、コスト)は Paper Execution 所有の **execution_profile** で解決し、Signal 側の `strategy_profile` は解決キーに使わない。
+- 執行規則(SL / TP 導出、Entry有効期限、最大保有時間、曖昧足の優先順位、コスト)は Paper Execution 所有の **execution_profile** で解決し、Signal 側の `strategy_profile` は解決キーに使わない。通常CLIはCLI引数から単一のdefault profileを作り、全symbol/timeframeへ適用する。内部APIは呼び出し側が `(symbol, timeframe)` ごとの `overrides` 辞書を渡した場合の解決にも対応するが、このマッピングを設定ファイルやCLIからロードする通常運用経路は未実装である。
 - 詳細な入出力境界・状態遷移・約定規則は [Paper Execution](paper_execution.md) を参照。
 
 ## Backtest と Paper Execution の役割差
@@ -99,7 +100,7 @@ Execution は **Paper Execution**(仮想約定・仮想ポジション管理・E
 
 **独立している部分(混同しない):**
 
-- Paper Execution の執行規則は Paper Execution 所有の **execution_profile** で解決する。Backtest の `--spread` / `--slippage` は run 単位のシミュレーションパラメータであり、両者は独立に管理する(同じ値を与えれば同じ調整式で比較できる、という関係に留める)。
+- Paper Execution の執行規則は Paper Execution 所有の **execution_profile** で解決する。通常CLIでは単一profile、内部APIでは任意に渡された `(symbol, timeframe)` overridesを扱う。symbol/timeframe別設定のファイル/CLIロードは未実装である。Backtest の `--spread` / `--slippage` は run 単位のシミュレーションパラメータであり、両者は独立に管理する(同じ値を与えれば同じ調整式で比較できる、という関係に留める)。
 - 外部 Strategy 定義(YAML, `backtest/strategies/`)は現在 **Backtest 経路のみ**が読み込む([Strategy 定義仕様](strategy_definition.md))。
 
 **将来構想(未実装):**
@@ -134,11 +135,13 @@ BELIAL はコンポーネントごとに独立したSQLiteファイルを持つ�
 
 ## SQLite schema validation / migration
 
-Persistence の責務は各コンポーネントの store 層が持つ。他コンポーネントのDBを migration することはない。
+Persistence の責務は各コンポーネントの store 層が持つ。他コンポーネントのDBを migration することはない。ただし、schema validation / migration の保証範囲はstoreごとに異なり、全store共通の完全検証を提供するものではない。
 
 - `paper-execution/position_store.py`: `PRAGMA user_version` を現行スキーマの目印としつつ、実スキーマ(`PRAGMA table_info`)を検証する。legacy schema からの migration は **table rebuild**(CREATE → 検証コピー → DROP → RENAME、1トランザクション・失敗時 rollback)で CHECK / UNIQUE / NOT NULL 制約を実際に付与し、安全に変換できない legacy row は明示的に migration を失敗させる(黙って捨てない)。
 - `backtest/backtest_store.py`: 不足列を冪等な `ALTER TABLE ADD COLUMN` で追加する。分類フィールドは安全な既定値で補完し、`market_state` のような事後復元不能な列は NULL のまま残す(値を捏造しない)。
-- 各 store の `init_db()` は冪等であり、不完全な既存スキーマは明確なエラーにする。
+- `paper-signal/paper_signal_store.py`: classification / `target_candle_utc` / `market_state` など既知の不足列を冪等に追加し、既知値をbackfillする。基本列の型・NOT NULL・PRIMARY KEYを含む既存schema全体の完全性検証ではない。
+- `market-watch/chart_collector.py`: テーブルを `CREATE TABLE IF NOT EXISTS` で初期化し、`chart_snapshots` などの一部既知列を追加する。全テーブル・全制約の完全性検証ではない。
+- `news-feed-bot/market_bias_store.py`: `CREATE TABLE/INDEX IF NOT EXISTS` による初期化が中心であり、既存schemaの型・制約を完全検証またはmigrationする仕組みではない。
 - **dry-run では DB作成・migration を行わない**(Paper Execution は読み取り専用のスキーマ確認のみ行う)。
 
 ## dry-run 方針

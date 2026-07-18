@@ -12,8 +12,8 @@ BELIAL軍団の眷属は、炎・辛味・スパイスをモチーフとした�
 |---|---|---|
 | Berial | 軍団長 / 市場監視、全体判断、戦略立案 | Observation / Classification / Strategy(Market Watch, Market Bias, Strategy 評価) |
 | Pepperoni | Entry / Position / Execution 系 | Paper Execution(`paper-execution/`: 仮想Entry、仮想ポジション管理、SL / TP / Exit 判定、Position Store)。将来の Live Execution も担当予定(未実装・非スコープ) |
-| 花椒 | Paper Signal / Test 結果・データ集約、外部データ窓口 | Paper Signal(`paper-signal/`: paper_only 仮説の生成・保存・日次集計レポート)、Backtest 結果の集約、外部データ取得(RSS / マーケットデータ Provider) |
-| Tabasco | Chart Alert / Discord 通知 | Alert(`market-watch/*_alert_bot.py`)と Discord 通知経路 |
+| 花椒 | Paper Signal / Test 結果・データ集約、外部データ窓口 | Paper Signal(`paper-signal/`: paper_only 仮説の生成・保存・通知イベント・日次集計レポート)、Backtest 結果の集約、外部データ取得(RSS / マーケットデータ Provider) |
+| Tabasco | Chart Alert / Discord 通知の象徴 | Alert(`market-watch/*_alert_bot.py`)と各コンポーネント内の Discord 配送経路を象徴する。独立した共通通知モジュールではない |
 
 ```text
 Berial(軍団長 / 市場監視・全体判断・戦略立案)
@@ -106,7 +106,7 @@ Pepperoni 自身は炎のエフェクトを出さないが、このペンだけ�
 
 花椒(ホアジャオ)は、Paper Signal と Test / Backtest 結果のデータ集約、および外部データの窓口を受け持つ。
 
-- Paper Signal(paper_only 仮説)の生成・保存・通知と日次集計レポート(`paper-signal/`)
+- Paper Signal(paper_only 仮説)の生成・保存、通知イベントの所有と日次集計レポート(`paper-signal/`)
 - Backtest / テスト結果のデータ集約(Backtest summary、検証レポート)
 - 外部データの窓口(RSS ニュース、マーケットデータ Provider からの取得)
 
@@ -114,12 +114,12 @@ Pepperoni 自身は炎のエフェクトを出さないが、このペンだけ�
 
 ## Tabasco の役割
 
-Tabasco は、Chart Alert と Discord 通知を受け持つ。
+Tabasco は、Chart Alert と Discord 通知・配送経路を象徴するキャラクターである。ただし、これはキャラクター上の責務整理であり、現行実装に独立した共通の「Tabasco通知モジュール」が存在するわけではない。
 
 - MA / MACD / Bollinger Bands / RSI のイベント検知と通知(`market-watch/*_alert_bot.py`)
-- Chart Snapshot / 各種通知の Discord 投稿経路
+- Chart Snapshot / 各種通知の Discord 投稿経路(現行は各コンポーネント内に個別実装)
 
-Alert は「何が起きたか」という事実の通知であり、売買判断を含まない([Concept の基本方針](concept.md#基本方針))。Tabasco はこの責務分離を体現するキャラクターである。キャラクターとしての性格・デザイン詳細は未整備(本書では役割のみ確定)。
+Alert は「何が起きたか」という事実の通知であり、売買判断を含まない([Concept の基本方針](concept.md#基本方針))。Paper Signal の通知は `paper-signal/signal_generator.py`、Chart Alert の通知は各 `market-watch/*_alert_bot.py` から直接送信される。花椒はPaper Signalの生成結果・通知イベントを所有し、Tabascoは横断的な配送責務を象徴するが、両者を実装モジュールと一対一対応させない。キャラクターとしての性格・デザイン詳細は未整備(本書では役割のみ確定)。
 
 ## 実装上の注意
 

@@ -6,9 +6,10 @@ BELIAL は、ニュース、マーケットデータ、チャート指標を観�
 
 1. **市場観測(Observation)**: RSSニュース監視、Market Snapshot、ローソク足・指標の収集
 2. **分類(Classification)**: Market Bias(Bull / Bear / Neutral)と Market State(trend_up / trend_down / range / squeeze / volatile / unknown)の判定
-3. **仮説生成(Strategy / Paper Signal)**: ルールベースの Strategy 評価による paper_only 仮説の生成・保存・通知
-4. **検証(Backtest)**: 過去のローソク足上で Strategy(シグナル生成ルール)と Execution ルール(Exit Policy / 仮想約定モデル)を再生・評価する検証基盤
-5. **仮想執行(Paper Execution)**: Paper Signal を入力に、時間進行に沿って仮想Entry、仮想ポジション管理、SL / TP / 最大保有時間による Exit 判定、仮想損益の確定を行う
+3. **戦略評価(Strategy / Method)**: 観測・分類結果をどの条件でエントリー候補とするかのルールを評価
+4. **仮説記録(Hypothesis / Paper Signal)**: Strategy / Method の評価結果を paper_only 仮説として生成・保存・通知
+5. **検証(Backtest)**: 過去のローソク足上で Strategy(シグナル生成ルール)と Execution ルール(Exit Policy / 仮想約定モデル)を再生・評価する検証基盤
+6. **仮想執行(Paper Execution)**: Paper Signal を入力に、時間進行に沿って仮想Entry、仮想ポジション管理、SL / TP / 最大保有時間による Exit 判定、仮想損益の確定を行う
 
 Broker API による実注文・実約定(**Live Execution**)は現行スコープに含まない(下記「非スコープ」)。
 
@@ -33,7 +34,7 @@ Broker API による実注文・実約定(**Live Execution**)は現行スコー�
 - Paper Execution: 保存済み Paper Signal を入力とした仮想Entry / 仮想ポジション管理(Position Store)/ SL・TP・最大保有時間による Exit 判定 / 仮想損益の記録
 - Backtest: 過去のローソク足上で Strategy / Execution ルールを再生・評価する検証基盤(Runner / CLI / summary)
 - Strategy 定義の外部化(YAML)と validation(現在は Backtest 経路のみが使用)
-- SQLite schema validation / migration(各コンポーネントの store 層が自DBのスキーマを検証・migration する)
+- SQLite の初期化・既知migration・schema検証(保証範囲はコンポーネントごとに異なる。`position_store` は実schema検証とtable rebuild、`backtest_store` は列追加とschema検証を行う一方、他storeは既知列の追加や `CREATE ... IF NOT EXISTS` が中心)
 - dry-run による副作用抑制(全Bot・生成処理共通)
 
 ## 非スコープ
@@ -68,7 +69,9 @@ Classification (Market Bias / Market State)
     ↓
 Alert                       … 事実の通知(売買判断なし)
     ↓
-Strategy / Hypothesis       … Paper Signal(paper_only 仮説)
+Strategy / Method           … 候補生成・評価ルール
+  ↓
+Hypothesis / Paper Signal   … Strategy / Method の評価結果を記録した paper_only 仮説
     ↓
 Execution
     ├─ Paper Execution      … 実装済み(仮想約定のみ)
@@ -82,9 +85,10 @@ Execution
 | Observation | 価格、ニュース、指標を取得する | 実装済み: `news-feed-bot/`, `market-watch/chart_collector.py` |
 | Classification | 市場状態を分類する(Market Bias / Market State) | 実装済み: `market-watch/indicators.py`, `market-watch/market_state.py`, `news-feed-bot/market_bias.py` |
 | Alert | 事実を通知する。売買判断はしない | 実装済み: `macd_alert_bot.py`, `ma_alert_bot.py`, `bollinger_alert_bot.py`, `rsi_alert_bot.py` |
-| Strategy / Hypothesis (Paper Signal) | ルールベースの Strategy 評価で paper_only の仮説を生成・保存する。entry / exit は判断しない | 実装済み: `paper-signal/signal_generator.py`(外部 Strategy 定義(YAML)は現在 Backtest 経路のみで使用) |
+| Strategy / Method | 観測・分類情報から候補を生成・評価するルール。Paper Signal の現行ルールはコード実装、外部 Strategy 定義(YAML)は現在 Backtest 経路のみで使用 | 実装済み: `paper-signal/signal_generator.py`, `backtest/strategy_definition.py` |
+| Hypothesis / Paper Signal | Strategy / Method の評価結果を paper_only の仮説レコードとして生成・保存する。entry / exit は判断しない | 実装済み: `paper-signal/signal_generator.py`, `paper_signal_store.py` |
 | Execution (Paper Execution) | Paper Signal を入力に、時間進行に沿って仮想Entry・仮想ポジション管理・SL / TP / Exit 判定・仮想損益計算を行う | **実装済み**: `paper-execution/`(設計は [Paper Execution](../architecture/paper_execution.md)。Issue #49 設計、#50 / #51 実装)。Broker API・実注文は含まない |
 | Execution (Live Execution) | Broker API による実注文・実約定・実ポジション管理 | 未実装(将来・非スコープ) |
-| Persistence | 各コンポーネントが独立した SQLite を所有し、store 層が schema validation / migration を行う | 実装済み: `chart_collector.py`, `market_bias_store.py`, `paper_signal_store.py`, `backtest_store.py`, `position_store.py` |
+| Persistence | 各コンポーネントが独立した SQLite を所有する。初期化・既知migration・schema検証の保証範囲はstoreごとに異なる | 実装済み: `chart_collector.py`, `market_bias_store.py`, `paper_signal_store.py`, `backtest_store.py`, `position_store.py`。詳細は [Architecture](../architecture/architecture.md#sqlite-schema-validation--migration) |
 
 Backtest はこの直列フローには含まれない独立した **Validation レイヤー(検証基盤)** であり、過去のローソク足で Strategy / Execution ルールを遡及再生・評価する。Backtest と Paper Execution の役割差、および両者が共有するルールは [Architecture](../architecture/architecture.md#backtest-と-paper-execution-の役割差) を参照。
