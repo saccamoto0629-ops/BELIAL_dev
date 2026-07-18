@@ -200,6 +200,37 @@ def test_mixed_id_types_still_tie_break_deterministically(tmp_path):
         assert find(db_path)["id"] == "z"
 
 
+def test_legacy_chart_snapshots_without_optional_columns_is_searchable(tmp_path):
+    # A schema predating s3_bucket / image_s3_key / captured_at / snapshot_at
+    # must still be searchable; the absent columns come back as None so the
+    # caller can fall back (e.g. to the environment bucket).
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE chart_snapshots (id TEXT, symbol TEXT, timeframe TEXT, candle_time TEXT, s3_key TEXT)")
+        conn.execute(
+            "INSERT INTO chart_snapshots VALUES ('snap-1', 'USDJPY', '1h', ?, 'key.png')", (TARGET,)
+        )
+
+    found = find(db_path)
+
+    assert found["id"] == "snap-1"
+    assert found["s3_key"] == "key.png"
+    assert found["s3_bucket"] is None
+    assert found["image_s3_key"] is None
+
+
+def test_missing_required_column_raises_schema_error(tmp_path):
+    # No s3_key: this table cannot serve an attachment. That is a schema error,
+    # not an empty search result.
+    db_path = tmp_path / "broken.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE chart_snapshots (id TEXT, symbol TEXT, timeframe TEXT, candle_time TEXT)")
+        conn.execute("INSERT INTO chart_snapshots VALUES ('snap-1', 'USDJPY', '1h', ?)", (TARGET,))
+
+    with pytest.raises(store.ChartSchemaError):
+        find(db_path)
+
+
 def test_db_path_with_uri_reserved_characters_is_still_readable(tmp_path):
     # "#" and " " are URI-reserved: an unescaped read-only URI would silently
     # truncate the filename and degrade a perfectly good DB to "not found".
@@ -285,9 +316,39 @@ def test_link_table_migration_is_idempotent_and_preserves_data(tmp_path):
     assert len(store.list_paper_signal_links(db_path, "sig-1")) == 1
 
 
-def test_incomplete_legacy_link_table_is_repaired_not_left_broken(tmp_path):
+# Canonical link-table shape: {column: (type, notnull, pk position)}.
+CANONICAL_LINKS_INFO = {
+    "paper_signal_id": ("TEXT", 1, 1),
+    "chart_snapshot_id": ("TEXT", 1, 2),
+    "created_at": ("TEXT", 1, 0),
+}
+
+
+def _links_table_info(db_path):
+    with sqlite3.connect(db_path) as conn:
+        return {
+            row[1]: (row[2].upper(), row[3], row[5])
+            for row in conn.execute("PRAGMA table_info(paper_signal_chart_snapshots)")
+        }
+
+
+def _links_foreign_keys(db_path):
+    with sqlite3.connect(db_path) as conn:
+        return conn.execute("PRAGMA foreign_key_list(paper_signal_chart_snapshots)").fetchall()
+
+
+def _replace_with_constraintless_legacy_table(db_path, rows):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE paper_signal_chart_snapshots")
+        conn.execute(
+            "CREATE TABLE paper_signal_chart_snapshots (paper_signal_id TEXT, chart_snapshot_id TEXT, created_at TEXT)"
+        )
+        conn.executemany("INSERT INTO paper_signal_chart_snapshots VALUES (?, ?, ?)", rows)
+
+
+def test_incomplete_legacy_link_table_is_rebuilt_not_left_broken(tmp_path):
     # A same-name table missing columns (partial legacy schema) must be
-    # repaired by the migration; otherwise every relation insert fails forever.
+    # rebuilt by the migration; otherwise every relation insert fails forever.
     db_path = make_db(tmp_path)
     insert_snapshot(db_path, snapshot_id="snap-1")
     with sqlite3.connect(db_path) as conn:
@@ -301,8 +362,98 @@ def test_incomplete_legacy_link_table_is_repaired_not_left_broken(tmp_path):
     assert inserted is True
     links = store.list_paper_signal_links(db_path, "sig-1")
     assert [link["chart_snapshot_id"] for link in links] == ["snap-1"]
-    # Idempotency holds even though the legacy table has no primary key.
     assert store.link_paper_signal_chart_snapshot(db_path, paper_signal_id="sig-1", chart_snapshot_id="snap-1") is False
+    assert len(store.list_paper_signal_links(db_path, "sig-1")) == 1
+    assert _links_table_info(db_path) == CANONICAL_LINKS_INFO
+
+
+def test_constraintless_legacy_table_is_rebuilt_to_canonical_schema(tmp_path):
+    # No PK, no NOT NULL, no FK, plus accumulated garbage: duplicates, an
+    # orphan, a NULL-keyed row, and an empty created_at. The rebuild keeps the
+    # valid relations only, on the canonical constraints.
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    insert_snapshot(db_path, snapshot_id="snap-2")
+    _replace_with_constraintless_legacy_table(
+        db_path,
+        [
+            ("sig-1", "snap-1", "2026-07-01T00:00:00Z"),
+            ("sig-1", "snap-1", "2026-07-02T00:00:00Z"),  # duplicate relation
+            ("sig-2", "ghost", "2026-07-01T00:00:00Z"),   # orphan (no such snapshot)
+            (None, "snap-2", "2026-07-01T00:00:00Z"),     # NULL key
+            ("sig-3", "snap-2", ""),                       # created_at to backfill
+        ],
+    )
+
+    collector.init_db(db_path)  # regular schema management triggers the rebuild
+
+    # Canonical constraints restored: columns/NOT NULL/composite PK and one FK.
+    assert _links_table_info(db_path) == CANONICAL_LINKS_INFO
+    fks = _links_foreign_keys(db_path)
+    assert len(fks) == 1
+    assert (fks[0][2], fks[0][3], fks[0][4]) == ("chart_snapshots", "chart_snapshot_id", "id")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA foreign_key_check(paper_signal_chart_snapshots)").fetchall() == []
+        total = conn.execute("SELECT COUNT(*) FROM paper_signal_chart_snapshots").fetchone()[0]
+    # Existing valid data survives; duplicates collapse to one; orphan/NULL gone.
+    assert total == 2
+    assert [link["chart_snapshot_id"] for link in store.list_paper_signal_links(db_path, "sig-1")] == ["snap-1"]
+    assert store.list_paper_signal_links(db_path, "sig-2") == []
+    sig3 = store.list_paper_signal_links(db_path, "sig-3")
+    assert [link["chart_snapshot_id"] for link in sig3] == ["snap-2"]
+    assert sig3[0]["created_at"]  # empty created_at was backfilled
+
+
+def test_rebuild_migration_is_idempotent(tmp_path):
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    _replace_with_constraintless_legacy_table(db_path, [("sig-1", "snap-1", "2026-07-01T00:00:00Z")])
+
+    collector.init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        schema_after_first = sorted(conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall())
+        rows_after_first = sorted(conn.execute("SELECT * FROM paper_signal_chart_snapshots").fetchall())
+
+    collector.init_db(db_path)
+    collector.init_db(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        schema_after_more = sorted(conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall())
+        rows_after_more = sorted(conn.execute("SELECT * FROM paper_signal_chart_snapshots").fetchall())
+    assert schema_after_more == schema_after_first
+    assert rows_after_more == rows_after_first
+
+
+def test_concurrent_links_after_rebuild_store_one_row(tmp_path):
+    # After migrating a constraintless legacy table, the restored composite PK
+    # keeps the relation unique even under genuinely concurrent writers.
+    import threading
+
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    _replace_with_constraintless_legacy_table(db_path, [])
+    collector.init_db(db_path)
+
+    n = 8
+    barrier = threading.Barrier(n)
+    results, lock = [], threading.Lock()
+
+    def worker():
+        barrier.wait()
+        inserted = store.link_paper_signal_chart_snapshot(
+            db_path, paper_signal_id="sig-1", chart_snapshot_id="snap-1"
+        )
+        with lock:
+            results.append(inserted)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == n - 1
     assert len(store.list_paper_signal_links(db_path, "sig-1")) == 1
 
 

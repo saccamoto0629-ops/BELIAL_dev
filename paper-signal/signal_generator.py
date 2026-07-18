@@ -547,16 +547,31 @@ def _valid_http_url(value) -> str | None:
     A blank or malformed embed URL would make Discord reject the WHOLE webhook
     post with a 400 -- taking the text body down with it -- so anything that is
     not clearly ``http(s)://host/...`` must drop the embed, not the message.
+    Never raises: ``urlparse``/``hostname`` themselves reject some malformed
+    inputs (e.g. ``http://[``) with ValueError, which counts as invalid here.
+    A valid URL is returned exactly as given (minus outer whitespace) -- query
+    strings, percent-encoding, and ports are part of a presigned URL's
+    signature and must not be altered.
     """
     if not isinstance(value, str):
         return None
     candidate = value.strip()
     if not candidate:
         return None
-    parsed = urlparse(candidate)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return candidate
-    return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in candidate):
+        return None
+    try:
+        parsed = urlparse(candidate)
+        hostname = parsed.hostname
+    except (ValueError, TypeError):
+        return None
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if not hostname:
+        return None
+    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in hostname):
+        return None
+    return candidate
 
 
 def build_discord_payload(message: str, image_url: str | None = None) -> dict:

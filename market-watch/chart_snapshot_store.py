@@ -43,8 +43,10 @@ LINKS_TABLE = "paper_signal_chart_snapshots"
 
 # Same shape and responsibility as alert_chart_snapshots (chart_collector.init_db),
 # except paper_signal_id carries no SQLite FK: Paper Signals live in another DB.
-PAPER_SIGNAL_LINKS_DDL = f"""
-CREATE TABLE IF NOT EXISTS {LINKS_TABLE} (
+# Kept as a template so the schema rebuild can create a staging table with the
+# byte-identical canonical DDL.
+_LINKS_DDL_TEMPLATE = """
+CREATE TABLE IF NOT EXISTS {table} (
     paper_signal_id TEXT NOT NULL,
     chart_snapshot_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS {LINKS_TABLE} (
     FOREIGN KEY (chart_snapshot_id) REFERENCES chart_snapshots(id)
 )
 """
+PAPER_SIGNAL_LINKS_DDL = _LINKS_DDL_TEMPLATE.format(table=LINKS_TABLE)
 
 _SNAPSHOT_COLUMNS = (
     "id",
@@ -65,7 +68,15 @@ _SNAPSHOT_COLUMNS = (
     "image_s3_key",
 )
 
+# A chart_snapshots table cannot be searched without these; the others are
+# nullable extras a legacy schema may predate (selected as NULL when absent).
+_REQUIRED_SNAPSHOT_COLUMNS = ("id", "symbol", "timeframe", "candle_time", "s3_key")
+
 _LINK_COLUMNS = ("paper_signal_id", "chart_snapshot_id", "created_at")
+
+# A locked Chart DB must degrade the snapshot attachment quickly (text-only
+# notification) instead of stalling each symbol on SQLite's 5s default.
+LOCK_TIMEOUT_SECONDS = 2.0
 
 
 class ChartLinkError(RuntimeError):
@@ -76,6 +87,16 @@ class ChartLinkError(RuntimeError):
     created in such a DB), or when the referenced snapshot row does not exist
     (an orphan relation must never be reported as saved). Callers treat this as
     an image-side failure and degrade to a text-only notification.
+    """
+
+
+class ChartSchemaError(RuntimeError):
+    """The ``chart_snapshots`` table exists but lacks a required column.
+
+    Deliberately distinct from "no snapshot matched" (None): a schema this
+    module cannot search must surface as an explicit error, never be silently
+    conflated with an empty result. Callers may still degrade to a text-only
+    notification, but the log then names the real problem.
     """
 
 
@@ -132,20 +153,37 @@ def find_snapshot_for_candle(
 
     Strictly read-only: opens the DB in SQLite ``mode=ro`` and returns None
     (rather than creating anything) when the DB file, table, or any qualifying
-    row is missing.
+    row is missing. Optional columns a legacy schema predates (``s3_bucket``,
+    ``image_s3_key``, ``captured_at``, ``snapshot_at``) are selected as NULL so
+    such a DB stays searchable; a table missing a REQUIRED column raises
+    :class:`ChartSchemaError` instead of masquerading as "no snapshot".
     """
     target = _parse_utc_or_none(target_candle_utc)
     db_path = Path(db_path)
     if target is None or not db_path.exists():
         return None
 
-    query = (
-        f"SELECT rowid, {', '.join(_SNAPSHOT_COLUMNS)} FROM chart_snapshots "
-        "WHERE symbol = ? AND timeframe = ?"
-    )
     try:
-        with sqlite3.connect(_read_only_uri(db_path), uri=True) as connection:
-            rows = connection.execute(query, (symbol.upper(), timeframe)).fetchall()
+        with sqlite3.connect(_read_only_uri(db_path), uri=True, timeout=LOCK_TIMEOUT_SECONDS) as connection:
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chart_snapshots'"
+            ).fetchone()
+            if table_exists is None:
+                return None
+            available = {row[1] for row in connection.execute("PRAGMA table_info(chart_snapshots)")}
+            missing = [column for column in _REQUIRED_SNAPSHOT_COLUMNS if column not in available]
+            if missing:
+                raise ChartSchemaError(
+                    f"chart_snapshots is missing required column(s): {', '.join(missing)}"
+                )
+            select_list = ", ".join(
+                column if column in available else f"NULL AS {column}"
+                for column in _SNAPSHOT_COLUMNS
+            )
+            rows = connection.execute(
+                f"SELECT rowid, {select_list} FROM chart_snapshots WHERE symbol = ? AND timeframe = ?",
+                (symbol.upper(), timeframe),
+            ).fetchall()
     except sqlite3.Error:
         return None
 
@@ -173,21 +211,88 @@ def _utc_now_iso_z() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _links_schema_is_canonical(connection: sqlite3.Connection) -> bool:
+    """True when the existing link table matches the canonical DDL's constraints.
+
+    Checks the exact column set with TEXT affinity and NOT NULL, the composite
+    ``(paper_signal_id, chart_snapshot_id)`` PRIMARY KEY (the duplicate
+    suppressor), and the single FK ``chart_snapshot_id -> chart_snapshots(id)``.
+    Anything else -- however close -- is non-canonical and must be rebuilt,
+    because SQLite cannot add constraints to an existing table via ALTER.
+    """
+    info = connection.execute(f"PRAGMA table_info({LINKS_TABLE})").fetchall()
+    columns = {row[1]: row for row in info}  # (cid, name, type, notnull, dflt, pk)
+    if set(columns) != set(_LINK_COLUMNS):
+        return False
+    expected_pk = {"paper_signal_id": 1, "chart_snapshot_id": 2, "created_at": 0}
+    for name in _LINK_COLUMNS:
+        _, _, col_type, notnull, _, pk = columns[name]
+        if col_type.upper() != "TEXT" or not notnull or pk != expected_pk[name]:
+            return False
+    fks = connection.execute(f"PRAGMA foreign_key_list({LINKS_TABLE})").fetchall()
+    if len(fks) != 1:
+        return False
+    _, _, ref_table, from_col, to_col, *_ = fks[0]
+    return ref_table == "chart_snapshots" and from_col == "chart_snapshot_id" and to_col in ("id", None)
+
+
+_REBUILD_TABLE = f"{LINKS_TABLE}_rebuild"
+
+
+def _rebuild_links_table(connection: sqlite3.Connection) -> None:
+    """Replace a non-canonical link table with a canonical one, keeping the data.
+
+    Copies every relation whose parent snapshot exists (the JOIN drops orphans a
+    constraintless schema may have accumulated), deduplicates through the new
+    primary key via INSERT OR IGNORE, drops NULL-keyed rows, backfills a missing
+    or empty ``created_at``, then swaps the tables. Runs inside the caller's
+    transaction, so any failure rolls back to the untouched original table.
+    """
+    connection.execute(f"DROP TABLE IF EXISTS {_REBUILD_TABLE}")
+    connection.execute(_LINKS_DDL_TEMPLATE.format(table=_REBUILD_TABLE))
+    old_columns = {row[1] for row in connection.execute(f"PRAGMA table_info({LINKS_TABLE})")}
+    if {"paper_signal_id", "chart_snapshot_id"} <= old_columns:
+        created_source = (
+            "COALESCE(NULLIF(old.created_at, ''), ?)" if "created_at" in old_columns else "?"
+        )
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO {_REBUILD_TABLE} (paper_signal_id, chart_snapshot_id, created_at)
+            SELECT old.paper_signal_id, old.chart_snapshot_id, {created_source}
+            FROM {LINKS_TABLE} AS old
+            JOIN chart_snapshots ON chart_snapshots.id = old.chart_snapshot_id
+            WHERE old.paper_signal_id IS NOT NULL AND old.chart_snapshot_id IS NOT NULL
+            """,
+            (_utc_now_iso_z(),),
+        )
+    connection.execute(f"DROP TABLE {LINKS_TABLE}")
+    connection.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO {LINKS_TABLE}")
+
+
 def ensure_paper_signal_links_schema(connection: sqlite3.Connection) -> None:
-    """Create or repair the ``paper_signal_chart_snapshots`` table, idempotently.
+    """Create -- or rebuild to -- the canonical link table, idempotently.
 
     Operates on an open Chart DB connection so ``chart_collector.init_db()``
-    runs this alongside the rest of the chart schema. ``CREATE TABLE IF NOT
-    EXISTS`` never alters an existing table, so a same-name table left by a
-    partial legacy schema additionally gets any missing column ALTERed in
-    (mirroring ``chart_collector._ensure_column``) -- otherwise every relation
-    insert would fail forever with an OperationalError.
+    runs this alongside the rest of the chart schema. A missing table is
+    created from the canonical DDL; a table already matching it is left
+    untouched (so re-running is a no-op); any other same-name legacy table is
+    rebuilt via :func:`_rebuild_links_table`, because the canonical PRIMARY
+    KEY / NOT NULL / FOREIGN KEY constraints cannot be added by ALTER. The
+    rebuild is wrapped in a transaction (started here unless the caller already
+    holds one, committed by the caller's ``with connection`` block) so the
+    original table survives any mid-rebuild failure.
     """
-    connection.execute(PAPER_SIGNAL_LINKS_DDL)
-    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({LINKS_TABLE})")}
-    for name in _LINK_COLUMNS:
-        if name not in existing:
-            connection.execute(f"ALTER TABLE {LINKS_TABLE} ADD COLUMN {name} TEXT")
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (LINKS_TABLE,)
+    ).fetchone()
+    if exists is None:
+        connection.execute(PAPER_SIGNAL_LINKS_DDL)
+        return
+    if _links_schema_is_canonical(connection):
+        return
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    _rebuild_links_table(connection)
 
 
 def link_paper_signal_chart_snapshot(
@@ -207,13 +312,14 @@ def link_paper_signal_chart_snapshot(
     a stray link table.
 
     Returns True when a new relation row was inserted, False on a duplicate
-    (checked explicitly, so idempotency holds even on a repaired legacy table
-    that lost its primary key).
+    (the canonical composite primary key, guaranteed by
+    :func:`ensure_paper_signal_links_schema`, makes INSERT OR IGNORE atomic
+    even under concurrent writers).
     """
     db_path = Path(db_path)
     if not db_path.exists():
         raise ChartLinkError(f"Chart DB file not found: {db_path}")
-    with sqlite3.connect(db_path) as connection:
+    with sqlite3.connect(db_path, timeout=LOCK_TIMEOUT_SECONDS) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         has_snapshots_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chart_snapshots'"
@@ -226,12 +332,6 @@ def link_paper_signal_chart_snapshot(
         ).fetchone()
         if snapshot_exists is None:
             raise ChartLinkError(f"chart snapshot not found: {chart_snapshot_id}")
-        already_linked = connection.execute(
-            f"SELECT 1 FROM {LINKS_TABLE} WHERE paper_signal_id = ? AND chart_snapshot_id = ?",
-            (paper_signal_id, chart_snapshot_id),
-        ).fetchone()
-        if already_linked is not None:
-            return False
         try:
             cursor = connection.execute(
                 f"""
@@ -256,7 +356,7 @@ def list_paper_signal_links(db_path: Path, paper_signal_id: str) -> list[dict]:
     if not db_path.exists():
         return []
     try:
-        with sqlite3.connect(_read_only_uri(db_path), uri=True) as connection:
+        with sqlite3.connect(_read_only_uri(db_path), uri=True, timeout=LOCK_TIMEOUT_SECONDS) as connection:
             rows = connection.execute(
                 f"""
                 SELECT {', '.join(_LINK_COLUMNS)} FROM {LINKS_TABLE}

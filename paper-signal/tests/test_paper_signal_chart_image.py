@@ -226,6 +226,30 @@ def test_presigned_url_falls_back_to_env_bucket_for_legacy_rows(bull_cycle, post
     assert signed_buckets == ["env-bucket"]
 
 
+def test_legacy_schema_without_bucket_column_falls_back_to_env_bucket(bull_cycle, posted, monkeypatch):
+    # A chart_snapshots table predating the s3_bucket / image_s3_key columns is
+    # still searchable; signing falls back to the configured bucket.
+    with sqlite3.connect(bull_cycle["chart_db"]) as conn:
+        conn.execute("CREATE TABLE chart_snapshots (id TEXT, symbol TEXT, timeframe TEXT, candle_time TEXT, s3_key TEXT)")
+        conn.execute(
+            "INSERT INTO chart_snapshots VALUES ('snap-1', 'USDJPY', '1h', ?, ?)",
+            (CANDLE_TS, SNAPSHOT_S3_KEY),
+        )
+    monkeypatch.setattr(sg, "load_chart_env_file", lambda *a, **k: {"S3_BUCKET_NAME": "env-bucket"})
+    signed_buckets = []
+    monkeypatch.setattr(
+        sg,
+        "generate_presigned_chart_url",
+        lambda s3_key, config=None, **kw: signed_buckets.append(config["bucket"]) or f"https://s3.test/{s3_key}",
+    )
+
+    created = sg.run_once(dry_run=False, db_path=bull_cycle["paper_db"], now_utc=EVAL_TIME)
+
+    assert len(created) == 1
+    assert signed_buckets == ["env-bucket"]
+    assert posted[0]["json"]["embeds"] == [{"image": {"url": f"https://s3.test/{SNAPSHOT_S3_KEY}"}}]
+
+
 def test_blank_presigned_url_degrades_to_text_only_post(bull_cycle, posted, monkeypatch):
     # A blank/garbage embed URL would make Discord 400 the whole post; the
     # embed must be dropped so the body still goes out.
@@ -288,16 +312,74 @@ def test_build_discord_payload_truncates_content_to_discord_limit():
     assert len(payload["content"]) == 2000
 
 
+# A realistic presigned URL: port, percent-encoded key, AWS signature params.
+LONG_PRESIGNED_URL = (
+    "https://belial-chart-snapshots.s3.ap-northeast-1.amazonaws.com:443"
+    "/charts/USDJPY/1h/2026%2F07%2F05/snap%20one.png"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    "&X-Amz-Credential=AKIAEXAMPLE%2F20260705%2Fap-northeast-1%2Fs3%2Faws4_request"
+    "&X-Amz-Date=20260705T120500Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host"
+    "&X-Amz-Signature=" + "ab12" * 16
+)
+
+
 def test_build_discord_payload_drops_blank_or_malformed_image_urls():
     # Discord rejects the whole post over a bad embed URL, so anything that is
-    # not a well-formed http(s) URL must yield a content-only payload.
-    for bad in (" ", "not-a-url", "ftp://host/x.png", "https://", 123):
+    # not a well-formed http(s) URL must yield a content-only payload -- and the
+    # validation itself must never raise (urlparse rejects e.g. "http://[").
+    bad_urls = (
+        " ",                              # blank
+        "not-a-url",                      # no scheme/host
+        "ftp://host/x.png",               # wrong scheme
+        "https://",                       # no host
+        "http://[",                       # urlparse/hostname raises ValueError
+        "https://exa mple.com/path",      # whitespace in hostname
+        "https://host/a\x00b.png",        # control character in URL
+        "https://host\x7f/x.png",         # control character in hostname
+        123,                              # not a string
+        None,
+    )
+    for bad in bad_urls:
         assert sg.build_discord_payload("hello", bad) == {"content": "hello"}
+
+
+def test_build_discord_payload_passes_valid_presigned_urls_through_unchanged():
+    # Query strings, percent-encoding, and ports are part of the signature and
+    # must never be altered.
+    for good in (LONG_PRESIGNED_URL, "https://host:8443/x.png", "https://host/a%20b%2Fc.png"):
+        payload = sg.build_discord_payload("hello", good)
+        assert payload["embeds"] == [{"image": {"url": good}}]
 
 
 def test_build_discord_payload_strips_whitespace_around_valid_url():
     payload = sg.build_discord_payload("hello", "  https://s3.test/x.png  ")
     assert payload["embeds"] == [{"image": {"url": "https://s3.test/x.png"}}]
+
+
+def test_malformed_presigned_urls_still_deliver_the_text_body(bull_cycle, posted, monkeypatch):
+    # End-to-end: whatever garbage the presigner returns, the body is posted
+    # and the signal is created -- the bad embed is simply dropped.
+    seed_stored_snapshot(bull_cycle["chart_db"])
+    for index, bad in enumerate(("http://[", "https://exa mple.com/path")):
+        posted.clear()
+        paper_db = bull_cycle["paper_db"].with_name(f"paper_signals_{index}.sqlite3")
+        monkeypatch.setattr(sg, "generate_presigned_chart_url", lambda s3_key, config=None, **kw: bad)
+
+        created = sg.run_once(dry_run=False, db_path=paper_db, now_utc=EVAL_TIME)
+
+        assert len(created) == 1
+        assert len(posted) == 1
+        assert "embeds" not in posted[0]["json"]
+
+
+def test_long_presigned_url_reaches_the_embed_unchanged(bull_cycle, posted, monkeypatch):
+    seed_stored_snapshot(bull_cycle["chart_db"])
+    monkeypatch.setattr(sg, "generate_presigned_chart_url", lambda s3_key, config=None, **kw: LONG_PRESIGNED_URL)
+
+    created = sg.run_once(dry_run=False, db_path=bull_cycle["paper_db"], now_utc=EVAL_TIME)
+
+    assert len(created) == 1
+    assert posted[0]["json"]["embeds"] == [{"image": {"url": LONG_PRESIGNED_URL}}]
 
 
 # --- dry-run: no image side effects ------------------------------------------
