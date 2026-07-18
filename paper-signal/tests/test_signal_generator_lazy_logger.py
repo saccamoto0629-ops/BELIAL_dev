@@ -31,6 +31,13 @@ import signal_generator as sg  # noqa: E402
 from signal_models import create_signal_context  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_chart_db(monkeypatch, tmp_path):
+    # Issue #55: run_once consults the Chart DB for snapshot attachment; point
+    # it at a nonexistent tmp path so no test ever reads or writes a real one.
+    monkeypatch.setenv("CHART_DB_PATH", str(tmp_path / "chart_data.sqlite3"))
+
+
 def _run_subprocess_script(script: str) -> subprocess.CompletedProcess:
     """Run *script* in a fresh interpreter with only paper-signal on PYTHONPATH.
 

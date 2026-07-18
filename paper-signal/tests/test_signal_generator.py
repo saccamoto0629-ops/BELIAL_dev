@@ -2,10 +2,19 @@ import pathlib
 import re
 import sys
 
+import pytest
+
 BOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BOT_DIR))
 
 import signal_generator as sg  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_chart_db(monkeypatch, tmp_path):
+    # Issue #55: run_once consults the Chart DB for snapshot attachment; point
+    # it at a nonexistent tmp path so no test ever reads or writes a real one.
+    monkeypatch.setenv("CHART_DB_PATH", str(tmp_path / "chart_data.sqlite3"))
 
 
 FORBIDDEN_WORDS = re.compile(
@@ -298,7 +307,9 @@ def test_run_once_generates_signal_then_suppresses_duplicate(tmp_path, monkeypat
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
 
     posted = []
-    monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False: posted.append(message))
+    monkeypatch.setattr(
+        sg, "post_discord_message", lambda message, dry_run=False, image_url=None: posted.append(message)
+    )
 
     first = sg.run_once(dry_run=False, db_path=db_path)
     second = sg.run_once(dry_run=False, db_path=db_path)
@@ -343,7 +354,7 @@ def test_run_once_normal_mode_persists_signal(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: sources)
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias(market_bias="Bull", confidence=0.8))
-    monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False: None)
+    monkeypatch.setattr(sg, "post_discord_message", lambda message, dry_run=False, image_url=None: None)
 
     created = sg.run_once(dry_run=False, db_path=db_path)
 

@@ -26,6 +26,13 @@ import paper_signal_store as store  # noqa: E402
 import signal_generator as sg  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_chart_db(monkeypatch, tmp_path):
+    # Issue #55: run_once consults the Chart DB for snapshot attachment; point
+    # it at a nonexistent tmp path so no test ever reads or writes a real one.
+    monkeypatch.setenv("CHART_DB_PATH", str(tmp_path / "chart_data.sqlite3"))
+
+
 # A fixed evaluation time well after the fixture candle closes, so the candle is
 # confirmed. The fixture candle opens at 12:00 (1h) -> closes 13:00 < 18:00.
 EVAL_TIME = datetime(2026, 7, 5, 18, 0, 0, tzinfo=UTC)
@@ -264,7 +271,7 @@ def test_run_once_duplicate_candle_notifies_only_once_under_repeat(tmp_path, mon
     monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: _bull_sources(make_chart_snapshot()))
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias("Bull", 0.8))
     posted = []
-    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False: posted.append(msg))
+    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False, image_url=None: posted.append(msg))
 
     for _ in range(4):
         sg.run_once(dry_run=False, db_path=db_path, now_utc=EVAL_TIME)
@@ -283,7 +290,7 @@ def test_run_once_persists_then_suppresses_duplicate_candle(tmp_path, monkeypatc
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias("Bull", 0.8))
 
     posted = []
-    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False: posted.append(msg))
+    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False, image_url=None: posted.append(msg))
 
     first = sg.run_once(dry_run=False, db_path=db_path, now_utc=EVAL_TIME)
     second = sg.run_once(dry_run=False, db_path=db_path, now_utc=EVAL_TIME)
@@ -303,7 +310,7 @@ def test_signal_is_saved_before_discord_is_notified(tmp_path, monkeypatch):
 
     saved_at_notify_time = {}
 
-    def check_db(msg, dry_run=False):
+    def check_db(msg, dry_run=False, image_url=None):
         # By the time Discord is notified, the signal must already be persisted.
         saved_at_notify_time["rows"] = store.list_signals(db_path=db_path)
 
@@ -320,7 +327,7 @@ def test_discord_failure_keeps_saved_signal(tmp_path, monkeypatch):
     monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: _bull_sources(make_chart_snapshot()))
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias("Bull", 0.8))
 
-    def boom(msg, dry_run=False):
+    def boom(msg, dry_run=False, image_url=None):
         raise requests.RequestException("discord down")
 
     monkeypatch.setattr(sg, "post_discord_message", boom)
@@ -342,7 +349,7 @@ def test_one_symbol_failure_does_not_stop_other_symbols(tmp_path, monkeypatch):
     xauusd = make_chart_snapshot(symbol="XAUUSD", macd_state="Bullish")
     monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: _bull_sources(usdjpy, xauusd))
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias("Bull", 0.8))
-    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False: None)
+    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False, image_url=None: None)
 
     real_save = store.save_signal_for_candle
 
@@ -372,7 +379,7 @@ def test_db_save_failure_does_not_notify_discord(tmp_path, monkeypatch):
     monkeypatch.setattr(sg.store, "save_signal_for_candle", failing_save)
 
     posted = []
-    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False: posted.append(msg))
+    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False, image_url=None: posted.append(msg))
 
     created = sg.run_once(dry_run=False, db_path=db_path, now_utc=EVAL_TIME)
 
@@ -403,7 +410,7 @@ def test_run_once_two_symbols_do_not_mix_candles(tmp_path, monkeypatch):
     xauusd = make_chart_snapshot(symbol="XAUUSD", timestamp="2026-07-05T13:00:00Z", macd_state="Bullish")
     monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: _bull_sources(usdjpy, xauusd))
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias("Bull", 0.8))
-    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False: None)
+    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False, image_url=None: None)
 
     created = sg.run_once(dry_run=False, db_path=db_path, now_utc=datetime(2026, 7, 5, 18, tzinfo=UTC))
 
@@ -457,7 +464,7 @@ def test_target_candle_timestamp_is_stored_in_utc(tmp_path, monkeypatch):
     db_path = tmp_path / "paper_signals.sqlite3"
     monkeypatch.setattr(sg, "fetch_snapshot_sources", lambda **kw: _bull_sources(make_chart_snapshot()))
     monkeypatch.setattr(sg, "classify_market_bias", lambda *a, **k: make_bias("Bull", 0.8))
-    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False: None)
+    monkeypatch.setattr(sg, "post_discord_message", lambda msg, dry_run=False, image_url=None: None)
 
     sg.run_once(dry_run=False, db_path=db_path, now_utc=EVAL_TIME)
 

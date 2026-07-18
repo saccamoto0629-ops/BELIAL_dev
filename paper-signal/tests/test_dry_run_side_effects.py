@@ -152,6 +152,9 @@ def _cli_subprocess(sandbox: pathlib.Path, args: str) -> subprocess.CompletedPro
     env = dict(os.environ)
     env["PYTHONPATH"] = str(BOT_DIR)
     env["PYTHONUNBUFFERED"] = "1"
+    # Issue #55: snapshot attachment consults the Chart DB; keep the subprocess
+    # hermetic (and prove no chart DB is created) by pointing it into the sandbox.
+    env["CHART_DB_PATH"] = str(sandbox / "chart_data.sqlite3")
     return subprocess.run(
         [sys.executable, "-c", script, str(sandbox)],
         capture_output=True, text=True, cwd=str(sandbox), env=env, timeout=60,
