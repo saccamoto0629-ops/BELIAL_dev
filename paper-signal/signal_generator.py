@@ -54,6 +54,18 @@ from freshness import (  # noqa: E402  (market-watch, dependency-light)
     parse_timestamp_utc,
 )
 
+# Issue #55: attach the matching EXISTING Chart Snapshot image to the Paper
+# Signal notification. Snapshot selection and relation persistence live in the
+# dependency-light chart_snapshot_store; S3 presigned URLs reuse the same
+# chart_image_uploader path Chart Snapshot notifications already use. Nothing
+# here renders charts or uploads to S3.
+from chart_collector import chart_db_path, load_env_file as load_chart_env_file  # noqa: E402  (market-watch)
+from chart_image_uploader import generate_presigned_chart_url, load_s3_config  # noqa: E402  (market-watch)
+from chart_snapshot_store import (  # noqa: E402  (market-watch, dependency-light)
+    find_snapshot_for_candle,
+    link_paper_signal_chart_snapshot,
+)
+
 import paper_signal_store as store  # noqa: E402
 from signal_models import (  # noqa: E402
     ALERT_SOURCE_COMPOSITE,
@@ -528,7 +540,26 @@ def format_discord_message(signal: dict) -> str:
     return "\n".join(lines)
 
 
-def post_discord_message(message: str, *, dry_run: bool = False, session=requests) -> None:
+def build_discord_payload(message: str, image_url: str | None = None) -> dict:
+    """Return the webhook payload: text always, plus an image embed when given.
+
+    Issue #55: the body format is unchanged; a matching Chart Snapshot image is
+    carried in the same single webhook post using the same embed shape as the
+    Chart Snapshot notification (``chart_snapshot.post_discord_message``).
+    """
+    payload: dict = {"content": message[:2000]}
+    if image_url:
+        payload["embeds"] = [{"image": {"url": image_url}}]
+    return payload
+
+
+def post_discord_message(
+    message: str,
+    *,
+    image_url: str | None = None,
+    dry_run: bool = False,
+    session=requests,
+) -> None:
     if dry_run:
         _get_logger().info("[DRY_RUN] Would post Paper Signal:\n%s", message)
         return
@@ -537,10 +568,85 @@ def post_discord_message(message: str, *, dry_run: bool = False, session=request
         return
     response = session.post(
         DISCORD_WEBHOOK_URL,
-        json={"content": message[:2000]},
+        json=build_discord_payload(message, image_url),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
+
+
+# --- Issue #55: attach the matching existing Chart Snapshot image -------------
+
+
+def resolve_signal_chart_snapshot(symbol: str, timeframe: str, target_candle_utc: str) -> dict | None:
+    """Read-only Chart DB lookup of the snapshot for one target candle.
+
+    Never raises and never creates/migrates the Chart DB: any lookup failure is
+    logged and reported as "no snapshot", so the Paper Signal itself is never
+    affected. Safe for --dry-run (a missing Chart DB simply yields None).
+    """
+    try:
+        db_path = chart_db_path(load_chart_env_file())
+        return find_snapshot_for_candle(
+            db_path, symbol=symbol, timeframe=timeframe, target_candle_utc=target_candle_utc
+        )
+    except Exception as exc:
+        _get_logger().warning(
+            "Chart snapshot lookup failed for %s %s (target_candle=%s): %s",
+            symbol, timeframe, target_candle_utc, exc,
+        )
+        return None
+
+
+def resolve_snapshot_image_url(snapshot: dict) -> str | None:
+    """Presigned URL for a stored snapshot's S3 image, or None on any failure.
+
+    Reuses the existing chart_image_uploader presigned-URL path against the
+    already-uploaded object -- no rendering, no new S3 upload. A failure is
+    logged and yields None so the text notification still goes out.
+    """
+    s3_key = snapshot.get("image_s3_key") or snapshot.get("s3_key")
+    if not s3_key:
+        _get_logger().warning("Chart snapshot %s has no S3 key; sending text-only.", snapshot.get("id"))
+        return None
+    try:
+        config = load_s3_config(load_chart_env_file())
+        return generate_presigned_chart_url(s3_key, config=config)
+    except Exception as exc:
+        _get_logger().warning("Presigned URL generation failed for %s: %s", s3_key, exc)
+        return None
+
+
+def prepare_signal_chart_image(
+    signal_id: str, symbol: str, timeframe: str, target_candle_utc: str
+) -> str | None:
+    """Find, link, and resolve the Chart Snapshot image for one saved signal.
+
+    Issue #55 ordering for a newly persisted (non-duplicate) Paper Signal:
+    search the existing snapshot, persist the relation to the Chart DB, then
+    generate the presigned URL for the same webhook post. Every step degrades
+    to text-only on failure -- a missing snapshot is an info-level non-event, a
+    failed link save still allows the image, and a failed URL still allows the
+    text. Never raises.
+    """
+    logger = _get_logger()
+    snapshot = resolve_signal_chart_snapshot(symbol, timeframe, target_candle_utc)
+    if snapshot is None:
+        logger.info(
+            "No chart snapshot for %s %s (target_candle=%s); sending text-only notification.",
+            symbol, timeframe, target_candle_utc,
+        )
+        return None
+    try:
+        db_path = chart_db_path(load_chart_env_file())
+        link_paper_signal_chart_snapshot(
+            db_path, paper_signal_id=signal_id, chart_snapshot_id=snapshot["id"]
+        )
+        logger.info("Linked paper signal %s to chart snapshot %s", signal_id, snapshot["id"])
+    except Exception as exc:
+        logger.warning(
+            "Chart snapshot link save failed for %s -> %s: %s", signal_id, snapshot.get("id"), exc
+        )
+    return resolve_snapshot_image_url(snapshot)
 
 
 def build_bias_by_scope(
@@ -743,6 +849,16 @@ def _process_candidate(candidate: dict, *, dry_run: bool, db_path: Path, created
             "[DRY_RUN] target_candle=%s would_persist=%s duplicate=%s",
             target_candle, not would_duplicate, would_duplicate,
         )
+        # Issue #55: report the attachment candidate only. The lookup is
+        # read-only (a missing Chart DB is never created) and no relation is
+        # saved, no presigned URL is generated, and no S3/Discord call is made.
+        candidate_snapshot = resolve_signal_chart_snapshot(
+            signal["symbol"], signal["timeframe"], target_candle
+        )
+        logger.info(
+            "[DRY_RUN] chart snapshot attachment candidate: %s",
+            candidate_snapshot["id"] if candidate_snapshot else "none",
+        )
         post_discord_message(format_discord_message(signal), dry_run=True)
         created.append(signal)
         return
@@ -768,8 +884,22 @@ def _process_candidate(candidate: dict, *, dry_run: bool, db_path: Path, created
 
     logger.info("DB save success: %s (target_candle=%s)", signal["signal_id"], target_candle)
 
+    # Issue #55: only a newly persisted signal gets snapshot search / relation
+    # save / presigned URL (a duplicate returned above). Any failure here
+    # degrades to a text-only notification -- never to a lost Paper Signal.
     try:
-        post_discord_message(format_discord_message(signal), dry_run=False)
+        image_url = prepare_signal_chart_image(
+            signal["signal_id"], signal["symbol"], signal["timeframe"], target_candle
+        )
+    except Exception as exc:
+        logger.warning(
+            "Chart snapshot attachment failed for %s (target_candle=%s): %s -- sending text-only.",
+            signal["signal_id"], target_candle, exc,
+        )
+        image_url = None
+
+    try:
+        post_discord_message(format_discord_message(signal), image_url=image_url, dry_run=False)
         logger.info("Discord send success: %s (target_candle=%s)", signal["signal_id"], target_candle)
     except requests.RequestException as exc:
         logger.error(
