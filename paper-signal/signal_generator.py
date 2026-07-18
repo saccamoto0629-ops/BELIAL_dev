@@ -14,6 +14,7 @@ import argparse
 import logging
 import signal
 import sys
+import tempfile
 import threading
 import unicodedata
 from datetime import UTC, datetime
@@ -61,8 +62,22 @@ from freshness import (  # noqa: E402  (market-watch, dependency-light)
 # dependency-light chart_snapshot_store; S3 presigned URLs reuse the same
 # chart_image_uploader path Chart Snapshot notifications already use. Nothing
 # here renders charts or uploads to S3.
-from chart_collector import chart_db_path, load_env_file as load_chart_env_file  # noqa: E402  (market-watch)
-from chart_image_uploader import generate_presigned_chart_url, load_s3_config  # noqa: E402  (market-watch)
+from chart_collector import (  # noqa: E402  (market-watch)
+    ChartReadError,
+    chart_db_path,
+    load_candles_range_strict,
+    load_env_file as load_chart_env_file,
+)
+from chart_image_uploader import (  # noqa: E402  (market-watch)
+    build_chart_s3_key,
+    generate_presigned_chart_url,
+    load_s3_config,
+    upload_chart_image,
+)
+# Issue #65: the Paper Signal annotated image is a DERIVED image rendered by
+# the one existing chart renderer (never a new drawing engine and never a
+# Pillow post-edit of the stored PNG), regenerated from the stored OHLCV.
+from chart_renderer import paper_signal_side_label, render_chart_snapshot  # noqa: E402  (market-watch)
 from chart_snapshot_store import (  # noqa: E402  (market-watch, dependency-light)
     find_snapshot_for_candle,
     link_paper_signal_chart_snapshot,
@@ -665,17 +680,192 @@ def resolve_snapshot_image_url(snapshot: dict) -> str | None:
         return None
 
 
-def prepare_signal_chart_image(
-    signal_id: str, symbol: str, timeframe: str, target_candle_utc: str
+# --- Issue #65: derived Paper Signal chart image with annotations -------------
+#
+# The annotated image is regenerated from the stored OHLCV through the one
+# existing chart renderer (chart_renderer.render_chart_snapshot with
+# event_type="paper_signal"), uploaded as a DERIVED object under its own S3
+# key segment -- the original Chart Snapshot object is never modified.
+PAPER_SIGNAL_CHART_SEGMENT = "paper-signals"
+# History window handed to the renderer; the renderer itself draws tail(120),
+# this only bounds the DB read. The window always ENDS at the target candle:
+# future bars are excluded so the image shows what was known at signal time.
+PAPER_SIGNAL_CHART_HISTORY_CANDLES = 160
+
+
+class PaperSignalChartError(RuntimeError):
+    """The derived Paper Signal chart image could not be produced.
+
+    Raised for Chart DB read failures, missing OHLCV, or a target candle that
+    is not stored with an exactly matching timestamp. Callers degrade to the
+    Issue #55 original snapshot image (and ultimately to text-only) -- the
+    Paper Signal itself is never affected.
+    """
+
+
+def load_signal_chart_candles(symbol: str, timeframe: str, target_candle_utc: str):
+    """Load the stored OHLCV window ending EXACTLY at the signal's target candle.
+
+    Reads the same Chart DB ``candles`` table the snapshots were rendered from,
+    read-only (:func:`chart_collector.load_candles_range_strict` -- never
+    creates or migrates the DB), restricted to the signal's own ``symbol`` and
+    ``timeframe`` and bounded at ``target_candle_utc`` so no future candle can
+    enter the window. The last candle must match the normalized target
+    timestamp exactly (timezone-aware/naive, ``Z``/``+00:00`` differences all
+    normalize to UTC); anything else raises :class:`PaperSignalChartError` --
+    there is no nearest-candle fallback.
+    """
+    target = canonical_candle_timestamp(target_candle_utc)
+    if target is None:
+        raise PaperSignalChartError(f"unusable target candle timestamp: {target_candle_utc!r}")
+    db_path = chart_db_path(load_chart_env_file())
+    try:
+        frame = load_candles_range_strict(db_path, symbol, timeframe, end=target)
+    except ChartReadError as exc:
+        raise PaperSignalChartError(str(exc)) from exc
+    if frame.empty:
+        raise PaperSignalChartError(
+            f"no stored candles for {symbol} {timeframe} up to target candle {target}"
+        )
+    frame = frame.tail(PAPER_SIGNAL_CHART_HISTORY_CANDLES)
+    last_candle = frame.index[-1]
+    if parse_timestamp_utc(last_candle) != parse_timestamp_utc(target):
+        raise PaperSignalChartError(
+            f"target candle {target} is not stored for {symbol} {timeframe} "
+            f"(latest stored candle at or before it: {last_candle})"
+        )
+    return frame
+
+
+def render_paper_signal_chart(
+    candles, output_path: Path, *, symbol: str, timeframe: str, side: str, target_candle_utc: str
+) -> Path:
+    """Render the annotated derived image via the EXISTING chart renderer.
+
+    Passes the Issue #65 paper_signal context; the renderer resolves the target
+    candle by exact UTC match and draws the PAPER LONG/SHORT annotation on both
+    the matplotlib and Pillow backends. Raises on any render failure.
+    """
+    return render_chart_snapshot(
+        candles,
+        output_path,
+        title=f"{symbol} {timeframe} Paper Signal",
+        event_type="paper_signal",
+        metadata={"side": side, "target_candle_utc": target_candle_utc},
+        source="paper_signal",
+    )
+
+
+def build_paper_signal_chart_s3_key(
+    symbol: str, timeframe: str, target_candle_utc: str, signal_id: str, *, prefix: str
+) -> str:
+    """Deterministic derived-image S3 key for one Paper Signal.
+
+    Follows the existing ``build_chart_s3_key`` layout under a dedicated
+    ``paper-signals`` segment, with the date path taken from the TARGET CANDLE
+    (not the wall clock) and the object name from the target candle + signal
+    id -- so the same Paper Signal always maps to the same key (idempotent,
+    no unbounded duplicates, no DB persistence needed) and never collides
+    with a regular Chart Snapshot object.
+    """
+    target = parse_timestamp_utc(target_candle_utc)
+    segment_prefix = f"{prefix}/{PAPER_SIGNAL_CHART_SEGMENT}" if prefix else PAPER_SIGNAL_CHART_SEGMENT
+    return build_chart_s3_key(
+        symbol,
+        timeframe,
+        target.to_pydatetime(),
+        prefix=segment_prefix,
+        object_id=f"{target.strftime('%Y%m%dT%H%M%SZ')}_{signal_id}",
+    )
+
+
+def upload_paper_signal_chart(
+    local_path: Path, *, symbol: str, timeframe: str, target_candle_utc: str, signal_id: str
+) -> str:
+    """Upload the derived image to its own S3 key and return a presigned URL.
+
+    Reuses the existing chart_image_uploader upload/presign path with the
+    derived key from :func:`build_paper_signal_chart_s3_key`; the original
+    Chart Snapshot S3 object is never touched. Raises on any failure.
+    """
+    config = load_s3_config(load_chart_env_file())
+    s3_key = build_paper_signal_chart_s3_key(
+        symbol, timeframe, target_candle_utc, signal_id, prefix=config["prefix"]
+    )
+    upload_chart_image(
+        local_path,
+        symbol,
+        timeframe,
+        parse_timestamp_utc(target_candle_utc).to_pydatetime(),
+        config=config,
+        s3_key=s3_key,
+    )
+    return generate_presigned_chart_url(s3_key, config=config)
+
+
+def render_and_upload_paper_signal_chart(
+    signal_id: str, symbol: str, timeframe: str, target_candle_utc: str, side
 ) -> str | None:
-    """Find, link, and resolve the Chart Snapshot image for one saved signal.
+    """Produce the derived annotated image end-to-end, or None on ANY failure.
+
+    Validates the side strictly first (an unknown side is never guessed into a
+    direction), loads the candle window ending exactly at the target candle,
+    renders through the existing renderer into a temporary directory (removed
+    afterwards -- no local PNG remains), uploads to the derived S3 key, and
+    returns the presigned URL. Every failure -- Chart DB read, missing OHLCV,
+    target candle mismatch, renderer, temp file, S3 upload, presigned URL --
+    is logged and yields None so the caller can fall back to the Issue #55
+    original snapshot image.
+    """
+    logger = _get_logger()
+    try:
+        paper_signal_side_label(side)
+        candles = load_signal_chart_candles(symbol, timeframe, target_candle_utc)
+        with tempfile.TemporaryDirectory(prefix="belial_paper_signal_chart_") as temp_dir:
+            local_path = Path(temp_dir) / f"{signal_id}.png"
+            render_paper_signal_chart(
+                candles,
+                local_path,
+                symbol=symbol,
+                timeframe=timeframe,
+                side=side,
+                target_candle_utc=target_candle_utc,
+            )
+            return upload_paper_signal_chart(
+                local_path,
+                symbol=symbol,
+                timeframe=timeframe,
+                target_candle_utc=target_candle_utc,
+                signal_id=signal_id,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Paper signal annotated chart failed for %s %s %s (target_candle=%s side=%s): %s "
+            "-- falling back to the original snapshot image.",
+            signal_id, symbol, timeframe, target_candle_utc, side, exc,
+        )
+        return None
+
+
+def prepare_signal_chart_image(
+    signal_id: str, symbol: str, timeframe: str, target_candle_utc: str, side: str | None = None
+) -> str | None:
+    """Find, link, and resolve the chart image URL for one saved signal.
 
     Issue #55 ordering for a newly persisted (non-duplicate) Paper Signal:
     search the existing snapshot, persist the relation to the Chart DB, then
-    generate the presigned URL for the same webhook post. Every step degrades
-    to text-only on failure -- a missing snapshot is an info-level non-event, a
-    failed link save still allows the image, and a failed URL still allows the
-    text. Never raises.
+    resolve the image URL for the same webhook post. Issue #65 layers the
+    derived annotated image on top with this fallback order:
+
+      1. derived PAPER LONG/SHORT annotated image (regenerated from OHLCV)
+      2. the Issue #55 original Chart Snapshot presigned URL
+      3. None -- the text-only notification still goes out
+
+    The derived image is only attempted when an Issue #55 snapshot anchors the
+    signal, and its failure never affects the snapshot relation already saved.
+    Every step degrades instead of raising -- a missing snapshot is an
+    info-level non-event, a failed link save still allows the image, and a
+    failed URL still allows the text. Never raises.
     """
     logger = _get_logger()
     snapshot = resolve_signal_chart_snapshot(symbol, timeframe, target_candle_utc)
@@ -695,6 +885,12 @@ def prepare_signal_chart_image(
         logger.warning(
             "Chart snapshot link save failed for %s -> %s: %s", signal_id, snapshot.get("id"), exc
         )
+    if side is not None:
+        derived_url = render_and_upload_paper_signal_chart(
+            signal_id, symbol, timeframe, target_candle_utc, side
+        )
+        if derived_url:
+            return derived_url
     return resolve_snapshot_image_url(snapshot)
 
 
@@ -908,6 +1104,20 @@ def _process_candidate(candidate: dict, *, dry_run: bool, db_path: Path, created
             "[DRY_RUN] chart snapshot attachment candidate: %s",
             candidate_snapshot["id"] if candidate_snapshot else "none",
         )
+        # Issue #65: report the derived-image plan only. No renderer call, no
+        # temp path/directory, no S3 upload, no presigned URL -- diagnostics
+        # are computed from the (read-only) snapshot candidate and the side.
+        try:
+            paper_signal_side_label(signal["side"])
+            side_known = True
+        except ValueError:
+            side_known = False
+        logger.info(
+            "[DRY_RUN] paper signal annotated chart plan: symbol=%s timeframe=%s "
+            "target_candle=%s side=%s would_generate=%s",
+            signal["symbol"], signal["timeframe"], target_candle, signal["side"],
+            candidate_snapshot is not None and side_known,
+        )
         post_discord_message(format_discord_message(signal), dry_run=True)
         created.append(signal)
         return
@@ -934,11 +1144,13 @@ def _process_candidate(candidate: dict, *, dry_run: bool, db_path: Path, created
     logger.info("DB save success: %s (target_candle=%s)", signal["signal_id"], target_candle)
 
     # Issue #55: only a newly persisted signal gets snapshot search / relation
-    # save / presigned URL (a duplicate returned above). Any failure here
-    # degrades to a text-only notification -- never to a lost Paper Signal.
+    # save / presigned URL (a duplicate returned above). Issue #65: the side
+    # lets it try the derived annotated image first. Any failure here degrades
+    # to a text-only notification -- never to a lost Paper Signal.
     try:
         image_url = prepare_signal_chart_image(
-            signal["signal_id"], signal["symbol"], signal["timeframe"], target_candle
+            signal["signal_id"], signal["symbol"], signal["timeframe"], target_candle,
+            side=signal["side"],
         )
     except Exception as exc:
         logger.warning(
