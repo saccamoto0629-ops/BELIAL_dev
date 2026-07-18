@@ -305,17 +305,18 @@ def evaluate_squeeze_breakout_signals(
     (the same ``classify_market_state()`` label persisted as
     ``SqueezeBreakoutSignal.market_state`` -- ``unknown`` included, exactly the
     Issue #39 ``--allowed-market-states`` vocabulary) is a member of the set.
-    The gate is evaluated only on a bar whose close actually fired the
-    breakout trigger, never on the squeeze bars forming the episode. A
-    disallowed Trigger bar produces no entry, opens no position, and does NOT
-    consume the episode: it stays armed, so a later bar of the same episode
-    that fires the trigger again in an allowed state can still enter. The
-    episode is consumed as before by the first non-squeeze bar that does not
-    fire a trigger at all, or by an adopted entry. ``None`` (the default) means
-    no gate: byte-identical to the pre-#63 behaviour.
+    The gate is evaluated exactly once per episode, on the episode-release bar
+    whose close actually fired the breakout trigger -- never on the squeeze
+    bars forming the episode, and never on any later non-squeeze bar. A
+    disallowed Trigger bar produces no entry and opens no position, and the
+    episode stays consumed (released) exactly as it would for a no-trigger
+    release bar: that setup is over, and a brand-new squeeze episode must form
+    before the next entry can happen (the same new_setup /
+    require_episode_release contract as an adopted entry). ``None`` (the
+    default) means no gate: byte-identical to the pre-#63 behaviour.
 
     ``stats``, when given a dict, receives the gate's suppression count under
-    ``"suppressed_market_state"`` (how many fired triggers the gate dropped).
+    ``"suppressed_market_state"`` (one per disallowed episode-release trigger).
     """
     if exec_model is None:
         import execution_model as execution
@@ -388,10 +389,7 @@ def evaluate_squeeze_breakout_signals(
         # confirmed-ready bar was squeeze (episode_active could only have been
         # set by a squeeze bar and would have been cleared by any earlier
         # non-squeeze ready bar), so state[t-1] == squeeze holds.
-        # The episode is consumed here whether or not it triggers -- with one
-        # Issue #63 exception below: a fired trigger whose bar state the
-        # market-state gate disallows re-arms the episode instead.
-        episode_active = False
+        episode_active = False  # episode is consumed whether or not it triggers.
 
         in_validation = timestamp in validation_index
         if not in_validation:
@@ -408,17 +406,17 @@ def evaluate_squeeze_breakout_signals(
         if long_trigger == short_trigger:
             continue
 
-        # Issue #63: the market-state gate applies to the bar the trigger just
-        # fired on (this bar's own classified state -- the value persisted as
-        # signal.market_state). A disallowed state is neither an entry nor a
-        # consumed episode: re-arm it, so a later trigger bar of the same
-        # episode can still enter in an allowed state. Bars that never fire a
-        # trigger are untouched by the gate (the episode was already consumed
-        # above, exactly as without a gate).
+        # Issue #63: the market-state gate applies once per episode, to the
+        # release bar the trigger just fired on (this bar's own classified
+        # state -- the value persisted as signal.market_state). A disallowed
+        # state produces no entry and the episode stays consumed (it was
+        # released above, same as a no-trigger release bar), so a NEW squeeze
+        # episode must form before the next entry -- trigger evaluation never
+        # continues onto later non-squeeze bars (require_episode_release /
+        # new_setup contract, PR #64 review).
         if allowed_market_states is not None and state not in allowed_market_states:
             if stats is not None:
                 stats["suppressed_market_state"] = stats.get("suppressed_market_state", 0) + 1
-            episode_active = True
             continue
 
         direction = LONG if long_trigger else SHORT

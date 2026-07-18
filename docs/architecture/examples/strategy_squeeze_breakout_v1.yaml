@@ -27,8 +27,9 @@ timeframes: [1h]
 
 # Market State ゲート(Issue #63 で可変化)。null(既定)= フィルタ無し。非 null リストを
 # 指定すると、breakout trigger が成立した足(episode 解除足)自身の Market State が
-# リストに含まれる場合のみ entry する。不許可の trigger 足は entry せず episode は
-# armed のまま残る(同一 episode 内の後続 trigger 足で再評価される)。詳細は仕様書 §6。
+# リストに含まれる場合のみ entry する。判定は解除 trigger 足に一度だけで、不許可なら
+# その setup は entry せず終了(episode は消費済みのまま。再試行には新しい squeeze
+# episode の形成が必要)。詳細は仕様書 §6。
 allowed_market_states: null
 
 entry:

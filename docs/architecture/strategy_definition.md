@@ -335,14 +335,16 @@ cooldown を許容する handler を追加する時点で、その handler の�
 - `null`(既定)= フィルタ無し。既存 CLI `--allowed-market-states` と同じ意味論を宣言化したもの。
   `null` 時の実行結果は Issue #63 以前(PR #62 時点)と**完全一致**する。
 - **squeeze_breakout での実行意味論(Issue #63 で可変化)**:
-  - 判定タイミングは **breakout trigger が成立した足(episode 解除足)そのもの**。squeeze episode
-    形成中の各足には適用しない。判定に使う値は trigger 足自身を最新行として
-    `classify_market_state()` が返した label(保存される `signal.market_state` と同一値)。
+  - 判定タイミングは **breakout trigger が成立した足(episode 解除足)そのもの**に **1 episode に
+    つき一度だけ**。squeeze episode 形成中の各足にも、解除後の後続非 squeeze 足にも適用しない。
+    判定に使う値は trigger 足自身を最新行として `classify_market_state()` が返した label
+    (保存される `signal.market_state` と同一値)。
   - trigger 足の state が許可リストに**含まれる** → 従来どおり entry(null 時と同一の約定)。
-  - **含まれない** → entry を生成せず、position も開かず、**episode は消費されない**(armed のまま
-    残る)。同一 episode 内の後続足が再び trigger を成立させ、その足の state が許可されていれば
-    entry できる。trigger が成立しなかった非 squeeze 足が episode を消費する規則は従来のまま
-    (ゲートは「trigger が成立したのに state 不許可」の場合のみ消費を保留する)。
+  - **含まれない** → entry を生成せず、position も開かず、その setup は終了する。**episode は
+    trigger 不成立の解除足と同様に消費済みのまま**であり、再 arm されない。再試行には**新しい
+    squeeze episode の形成が必要**(`reentry: new_setup` / `require_episode_release: true` と同じ
+    契約。trigger 評価が解除足の後の非 squeeze 足へ継続することはない)。suppression 件数は
+    不許可となった解除 trigger 1 件につき 1 のみ。
   - `unknown` は特別扱いしない:一状態としてリストに明示した場合のみ許可される(Issue #39 の
     runner 契約と同じ membership 比較。正規化・文字列変換の新設は行わない)。
   - trigger 足は定義上 squeeze 以外の state に分類されるため、リスト中の `squeeze` 要素が

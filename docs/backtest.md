@@ -305,11 +305,14 @@ handler registry は Python コードが所有し、外部ファイルは登録�
   比較。独自の正規化・文字列変換は行わない)。squeeze 経路の Market State は各 Trigger 足で
   point-in-time に分類されるため DB の NULL を読むことはない(NULL は Issue #39 の
   by_market_state 集計上の扱いのまま)。
-- **episode state machine との関係**: 許可されない trigger 足は entry を生成せず、position も
-  開かず、**episode を消費しない**(armed のまま残る)。同一 episode 内の後続足で再び trigger が
-  成立し、その足の state が許可されていれば entry する。trigger が成立しなかった非 squeeze 足が
-  episode を消費する規則、および entry 成立時に episode が消費される規則は従来のまま。
-  suppression の件数は summary の `suppressed_market_state` に報告される。
+- **episode state machine との関係**: ゲートは **episode 解除 trigger 足に一度だけ**適用される。
+  許可されない場合、entry を生成せず、position も開かず、その setup は終了する。episode は
+  trigger 不成立の解除足と同様に**消費済みのまま**で、再 arm されない(解除足より後の非 squeeze
+  足で trigger 評価が継続することはない)。再試行には**新しい squeeze episode の形成が必要**
+  (`reentry: new_setup` / `require_episode_release: true` の既存契約を維持)。warm-up 中に解除
+  した episode の扱いも従来のまま(validation 開始位置によって後続 entry の可否が変わることは
+  ない)。suppression の件数(不許可となった解除 trigger 1 件につき 1)は summary の
+  `suppressed_market_state` に報告される。
 - **記録**: 実効値は `backtest_runs.config_json` の `allowed_market_states`(ソート済み、
   ゲート無しは null)と `strategy_definition.allowed_market_states` の両方に記録され、
   再現可能性を維持する。

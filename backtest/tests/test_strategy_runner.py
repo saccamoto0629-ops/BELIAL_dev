@@ -534,7 +534,10 @@ def test_allowed_market_states_from_yaml_blocks_the_entry_and_changes_the_result
     assert exit_code == runner.EXIT_OK
     assert gated_summary["signals_generated"] == 0
     assert gated_summary["allowed_market_states"] == ["range"]
-    assert gated_summary["suppressed_market_state"] >= 1
+    # Exactly one: the disallowed episode-release trigger (bar 94). Bar 95
+    # also breaks the band but the episode is already consumed, so it is
+    # neither an entry nor a second suppression (PR #64 review).
+    assert gated_summary["suppressed_market_state"] == 1
 
     # The effective gate is recorded for reproducibility: both in the run's
     # flat config key and inside the normalized definition.
