@@ -6,14 +6,18 @@
 
 | Document | Purpose |
 |---|---|
-| [Concept](../product/concept.md) | BELIAL の目的、基本方針、現行スコープ、非スコープ、設計思想 |
-| [Organization](../product/organization.md) | BELIAL Demon Organization / Pepperoni の設定と責務 |
-| [Architecture](architecture.md) | 全体構成、データ連携、Alert / Strategy / Execution の責務分離 |
+| [Concept](../product/concept.md) | BELIAL の目的、基本方針、現行スコープ、非スコープ、設計思想、レイヤー分離 |
+| [Organization](../product/organization.md) | BELIAL Demon Organization。確定済みキャラクター(Berial / Pepperoni / 花椒 / Tabasco)の役割と候補キャラクター |
+| [Architecture](architecture.md) | 全体構成、データ連携、Alert / Strategy / Signal / Execution の責務分離、DB構成、schema migration |
 | [Market Snapshot](market_snapshot.md) | Market Snapshot の仕様とProvider概要 |
 | [Market Watch](market_watch.md) | Chart Snapshot、MACD Alert、MA Alert、Bollinger Bands Alert の仕様 |
 | [Market Bias](market_bias.md) | Bull / Bear / Neutral 判定仕様と制約 |
 | [Paper Signal](paper_signal.md) | paper_only の仮説生成・保存・通知仕様 |
+| [Paper Execution](paper_execution.md) | 仮想ポジションの状態遷移、Entry / Close / SL / TP 約定規則、Position Store(Issue #49 設計、#50 / #51 実装) |
+| [Strategy 定義仕様](strategy_definition.md) | Strategy ごとの可変設定を外部 YAML へ切り出すスキーマ・エラー方針(現在は Backtest 経路のみで使用) |
+| [Backtest](../backtest.md) | Backtest Runner / CLI。過去データ上での Strategy / Execution ルールの再生・評価 |
 | [Operations](../operations/operations.md) | 環境変数、dry-run、起動例、本番運用、手動確認コマンド |
+| [Testing](../testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
 | [Roadmap](../product/roadmap.md) | v1.3.1以降、v1.4系(v1.4.1リリース候補)、本番常駐化(systemd)、v1.5以降、将来検討 |
 
 ## Documentation Rules
@@ -28,4 +32,4 @@
 
 ## Current Scope
 
-現行実装は、市場観測、分類、paper_only の仮説生成までを扱う。自動エントリー、自動Exit、損切り、利確、Broker API 接続、実発注は現行スコープ外です。
+現行実装は、市場観測、分類、Alert、paper_only の仮説生成(Paper Signal)、過去データでの検証(Backtest)、および仮想執行(Paper Execution: 仮想Entry / 仮想ポジション管理 / SL・TP・Exit 判定 / 仮想損益)までを扱う。Broker API 接続、実発注、実約定、ロット計算、売買推奨文言の生成(Live Execution 系)は現行スコープ外です。詳細は [Concept](../product/concept.md) を参照。

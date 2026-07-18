@@ -1,8 +1,8 @@
 # BELIAL
 
-BELIAL は、ニュース・マーケットデータ・チャート指標を観測し、市場状態を分類し、`paper_only` の仮説を記録するローカル監視システムです。**自動エントリー、自動Exit、損切り、利確、Broker API 連携、実発注、売買推奨文言の生成は行いません。**
+BELIAL は、ニュース・マーケットデータ・チャート指標を観測し、市場状態を分類し、`paper_only` の仮説を記録し、その仮説を Backtest(過去データでの検証)と Paper Execution(仮想約定・仮想ポジション管理)で検証するローカル検証基盤です。**Broker API 連携、実発注、実約定、ロット計算、売買推奨文言の生成(Live Execution 系)は行いません。**
 
-本ドキュメントは **v1.4.1 リリース候補**(タグ未作成)の状態を反映しています。v1.4.1 は、既存の `v1.4` タグ以降に入った修正・整理をまとめたパッチリリースです。v1.3系までの Observation / Classification / Alert / Paper Signal に加えて、過去データで仮説を遡及検証する Backtest(検証基盤)、Market State 局面別エントリー制御、銘柄別 Market Bias、XAUUSD squeeze breakout 戦略、Paper Signal の常駐サービス化と日次集計レポートを提供します。各機能の位置づけと非スコープは [docs/product/roadmap.md](docs/product/roadmap.md) を参照してください。
+本ドキュメントは **v1.4.1 リリース候補**(タグ未作成)の状態を反映しています。v1.4.1 は、既存の `v1.4` タグ以降に入った修正・整理をまとめたパッチリリースです。v1.3系までの Observation / Classification / Alert / Paper Signal に加えて、過去データで仮説を遡及検証する Backtest(検証基盤)、Market State 局面別エントリー制御、銘柄別 Market Bias、XAUUSD squeeze breakout 戦略、Paper Signal の常駐サービス化と日次集計レポートを提供します。さらに v1.4.1 以降の実装として、Paper Signal を仮想執行する Paper Execution(`paper-execution/`: 仮想Entry / 仮想ポジション管理 / SL・TP・Exit 判定)を含みます。各機能の位置づけと非スコープは [docs/product/roadmap.md](docs/product/roadmap.md) を参照してください。
 
 ## ドキュメント
 
@@ -45,7 +45,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | Hypothesis (Paper Signal) | `paper_only` の仮説を生成・保存する | `paper-signal/signal_generator.py` |
 | Execution | 執行層の総称。**Paper Execution**(仮想約定・仮想ポジション管理・仮想Exit・仮想損益)と **Live Execution**(実注文・約定確認・ポジション管理・Exit)に分かれる | **Paper Execution は実装済み**(`paper-execution/`。仮想約定のみ)。**Live Execution**(Broker API・実注文・自動売買)は**未実装** |
 
-詳細は [Concept のレイヤー分離](docs/product/concept.md#レイヤー分離)、Alert層の記述粒度は [Architecture の責務分離](docs/architecture/architecture.md#alert--strategy--execution-の責務分離) を参照してください。
+詳細は [Concept のレイヤー分離](docs/product/concept.md#レイヤー分離)、Alert層の記述粒度は [Architecture の責務分離](docs/architecture/architecture.md#alert--strategy--signal--execution-の責務分離) を参照してください。
 
 ## DB構成
 
@@ -73,7 +73,7 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 
 ## v1.4 Backtest / Paper Signal(実装済み / v1.4.1 リリース候補)
 
-v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層(検証基盤)を追加しました。v1.4.1 は、`v1.4` タグ以降に入った以下の機能の修正・整理をまとめたパッチリリースです。Backtest は Paper Signal を過去データで遡及検証する **独立した Validation レイヤー**であり、発注・約定を行う Execution 層ではありません(Execution は現行スコープ外)。
+v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続データをもとに、過去の市場状態を再生する Backtest 層(検証基盤)を追加しました。v1.4.1 は、`v1.4` タグ以降に入った以下の機能の修正・整理をまとめたパッチリリースです。Backtest は Paper Signal を過去データで遡及検証する **独立した Validation レイヤー**であり、Execution 層(Paper Execution / Live Execution)ではありません。仮想執行を行う Paper Execution は別レイヤーとして実装済み(`paper-execution/`)で、実発注を行う Live Execution はスコープ外です。
 
 - **Backtest Engine / Runner / CLI**(`python -m backtest`): 手元やEC2から実行可能。実行方法・引数・終了コードは [docs/backtest.md](docs/backtest.md) を参照。
 - **Market State 局面別エントリー制御**(`--allowed-market-states`)と**銘柄別 Market Bias**、時系列 Bias 参照・再エントリー抑制・cooldown。
@@ -85,16 +85,15 @@ v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続
 
 ## 非スコープ(全レイヤー共通)
 
-- 自動エントリー
-- 自動Exit
-- 損切り判断
-- 利確判断
-- ロット計算
+以下は実売買(Live Execution)に踏み込む領域であり、行いません。
+
 - Broker API 連携(OANDA / XM / MT5 など)
-- 実発注
+- 実発注・実約定・実ポジション管理
+- 自動売買(実口座での自動エントリー・自動Exit・損切り・利確)
+- ロット計算・レバレッジ計算・資金管理
 - 売買推奨文言の生成
 
-詳細は [Concept の非スコープ](docs/product/concept.md#非スコープ) を参照してください。
+Paper Execution が行う仮想 Entry / Exit / SL / TP 判定は仮想レコード上のシミュレーションであり、上記の実売買には該当しません。詳細は [Concept の非スコープ](docs/product/concept.md#非スコープ) を参照してください。
 
 ## Setup
 

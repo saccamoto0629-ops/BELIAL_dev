@@ -2,11 +2,11 @@
 
 Issue #49 の成果物。Paper Signal から仮想ポジションを生成し、決済まで追跡する **Paper Execution 層**の最小責務と状態遷移を定義する設計文書である。
 
-**本書は設計のみを対象とする。** DBテーブル・Repository・Open / Close判定コード・Discord通知・Broker API連携・実注文は本Issueのスコープ外であり、後続Issue(仮想ポジションデータモデルと保存層 / Open・Close判定エンジン)で実装する。
+**本書の本文は Issue #49 時点の設計を記述する。** 設計当時スコープ外としていた DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。Discord通知は引き続き未対応、Broker API連携・実注文は恒久的に対象外。
 
 ## 目的と位置づけ
 
-Paper Execution は、[Paper Signal](paper_signal.md) が記録した paper_only の仮説を入力に、時間進行に沿って **仮想Entry → 仮想ポジション保持 → 仮想Close → 仮想損益確定** を行う独立レイヤーである。[Concept のレイヤー分離](../product/concept.md#レイヤー分離) における Execution variants の paper 側にあたる。
+Paper Execution は、[Paper Signal](paper_signal.md) が記録した paper_only の仮説を入力に、時間進行に沿って **仮想Entry → 仮想ポジション保持 → 仮想Close → 仮想損益確定** を行う独立レイヤーである。[Concept のレイヤー分離](../product/concept.md#レイヤー分離) における Execution の paper 側(Paper Execution)にあたる。
 
 ```text
 Market Bias + Chart Snapshot

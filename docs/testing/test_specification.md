@@ -13,7 +13,7 @@ Issue #34。本書は品質の百科事典ではなく、**Claude Code・Codex�
 ## 1. テスト対象・目的・範囲・非対象
 
 ### 対象
-BELIAL の観測〜分類〜Alert〜仮説(Paper Signal)〜Backtest の各レイヤーと、その副作用境界(DB / Discord / S3 / state ファイル)。
+BELIAL の観測〜分類〜Alert〜仮説(Paper Signal)〜検証(Backtest)〜仮想執行(Paper Execution)の各レイヤーと、その副作用境界(DB / Discord / S3 / state ファイル)。
 
 ### 目的
 - レイヤー責務ごとの**壊れてはいけない性質**を明文化する。
@@ -22,14 +22,14 @@ BELIAL の観測〜分類〜Alert〜仮説(Paper Signal)〜Backtest の各レイ
 - 重要ケースと既存pytestの**対応関係**を追跡可能にする。
 
 ### 範囲
-- `backtest/` / `market-watch/` / `news-feed-bot/` / `paper-signal/` の単体・軽量結合テスト。
+- `backtest/` / `market-watch/` / `news-feed-bot/` / `paper-signal/` / `paper-execution/` の単体・軽量結合テスト。
 - 副作用抑止(DB作成/更新・Discord送信・S3アップロード・presigned URL・state更新)の検証観点。
 
 ### 非対象(Non-Scope)
 - 全単体テストの人間向け転記、手動試験の証跡保存。
 - CI workflow の実装(#32)。
 - integration test / heavy backtest の全面整備。
-- 自動売買・Broker API・Execution層(現行スコープ外・未実装)。
+- 自動売買・Broker API・Live Execution(現行スコープ外・未実装。仮想執行の Paper Execution は対象に含む)。
 
 ---
 
@@ -42,11 +42,12 @@ python -m pytest backtest/tests -q
 python -m pytest market-watch/tests -q
 python -m pytest news-feed-bot/tests -q
 python -m pytest paper-signal/tests -q
+python -m pytest paper-execution/tests -q
 ```
 
-CI(#32)では最低限この4スイートを継続実行することを想定する。テストは外部ネットワーク・実DB・実S3・実Discordに到達しない(§4–§5)。
+CI(#32)では最低限この5スイートを継続実行することを想定する(現行の `.github/workflows/ci.yml` は5スイートすべてを実行している)。テストは外部ネットワーク・実DB・実S3・実Discordに到達しない(§4–§5)。
 
-現状のテスト件数(`def test_` 実数、目安):backtest 128 / market-watch 127 / news-feed-bot 117 / paper-signal 89。
+現状のテスト件数(`def test_` 実数、目安):backtest 128 / market-watch 127 / news-feed-bot 117 / paper-signal 89 / paper-execution 91。
 
 ---
 
@@ -60,6 +61,7 @@ CI(#32)では最低限この4スイートを継続実行することを想定す
 | Paper Signal / hypothesis | `paper-signal/signal_generator.py`, `signal_models.py` | Bull/Bear/Neutral別候補生成、confidence閾値、`status=paper_only` 固定、重複窓 | `test_signal_generator.py`, `test_paper_signal_store.py` |
 | Exit / Invalidation | `paper-signal/exit_policy.py` | fixed_rr / time_based_close / ma_break、同足優先、open(no_close)、空/None candles | `test_exit_policy.py` |
 | Backtest | `backtest/{runner,warmup,summary,report,backtest_store,backtest_models}.py` | 境界分離・future leak禁止・skip・DB保存・集計 | `test_warmup.py`, `test_runner.py`, `test_backtest_engine.py` ほか |
+| Paper Execution | `paper-execution/{execution_engine,execution_runner,position_store,position_models,execution_profile}.py` | Entry / Close判定の決定論、`state × terminal_reason` 閉集合、`signal_id` 冪等、schema migration(table rebuild)、strict read、dry-run無副作用 | `paper-execution/tests/test_*.py` |
 | 副作用境界 | 各store / uploader | 一時DB利用、dry-run抑止、run/signalの分離DB、FK/重複ID | `test_*_store.py`, `test_chart_alert_context.py` |
 
 補足:
