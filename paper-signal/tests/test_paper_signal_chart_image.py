@@ -48,14 +48,14 @@ def make_bias(market_bias="Bull", confidence=0.8):
     return {"market_bias": market_bias, "confidence": confidence, "scores": {}, "reasons": [], "warnings": [], "note": ""}
 
 
-def seed_stored_snapshot(chart_db, *, snapshot_id="snap-1", candle_time=CANDLE_TS):
+def seed_stored_snapshot(chart_db, *, snapshot_id="snap-1", candle_time=CANDLE_TS, s3_bucket="belial-chart-snapshots"):
     chart_collector.init_db(chart_db)
     return chart_collector.insert_chart_snapshot(
         chart_db,
         symbol="USDJPY",
         timeframe="1h",
         snapshot_at="2026-07-05T12:05:00Z",
-        s3_bucket="belial-chart-snapshots",
+        s3_bucket=s3_bucket,
         s3_key=SNAPSHOT_S3_KEY,
         captured_at="2026-07-05T12:05:00Z",
         candle_time=candle_time,
@@ -190,6 +190,55 @@ def test_discord_failure_keeps_saved_signal_and_link(bull_cycle, monkeypatch):
     assert len(links) == 1
 
 
+def test_presigned_url_signs_against_snapshot_row_bucket(bull_cycle, posted, monkeypatch):
+    # The row records where its image actually lives; the environment bucket
+    # may have changed since upload and must not win.
+    seed_stored_snapshot(bull_cycle["chart_db"], s3_bucket="db-bucket")
+    monkeypatch.setattr(sg, "load_chart_env_file", lambda *a, **k: {"S3_BUCKET_NAME": "env-bucket"})
+    signed_buckets = []
+    monkeypatch.setattr(
+        sg,
+        "generate_presigned_chart_url",
+        lambda s3_key, config=None, **kw: signed_buckets.append(config["bucket"]) or f"https://s3.test/{s3_key}",
+    )
+
+    created = sg.run_once(dry_run=False, db_path=bull_cycle["paper_db"], now_utc=EVAL_TIME)
+
+    assert len(created) == 1
+    assert signed_buckets == ["db-bucket"]
+    assert posted[0]["json"]["embeds"] == [{"image": {"url": f"https://s3.test/{SNAPSHOT_S3_KEY}"}}]
+
+
+def test_presigned_url_falls_back_to_env_bucket_for_legacy_rows(bull_cycle, posted, monkeypatch):
+    # A legacy row without a recorded bucket uses the configured one.
+    seed_stored_snapshot(bull_cycle["chart_db"], s3_bucket="")
+    monkeypatch.setattr(sg, "load_chart_env_file", lambda *a, **k: {"S3_BUCKET_NAME": "env-bucket"})
+    signed_buckets = []
+    monkeypatch.setattr(
+        sg,
+        "generate_presigned_chart_url",
+        lambda s3_key, config=None, **kw: signed_buckets.append(config["bucket"]) or f"https://s3.test/{s3_key}",
+    )
+
+    created = sg.run_once(dry_run=False, db_path=bull_cycle["paper_db"], now_utc=EVAL_TIME)
+
+    assert len(created) == 1
+    assert signed_buckets == ["env-bucket"]
+
+
+def test_blank_presigned_url_degrades_to_text_only_post(bull_cycle, posted, monkeypatch):
+    # A blank/garbage embed URL would make Discord 400 the whole post; the
+    # embed must be dropped so the body still goes out.
+    seed_stored_snapshot(bull_cycle["chart_db"])
+    monkeypatch.setattr(sg, "generate_presigned_chart_url", lambda s3_key, config=None, **kw: " ")
+
+    created = sg.run_once(dry_run=False, db_path=bull_cycle["paper_db"], now_utc=EVAL_TIME)
+
+    assert len(created) == 1
+    assert len(posted) == 1
+    assert "embeds" not in posted[0]["json"]
+
+
 def test_duplicate_signal_skips_link_url_and_discord(bull_cycle, posted, monkeypatch):
     seed_stored_snapshot(bull_cycle["chart_db"])
     link_calls = []
@@ -239,6 +288,18 @@ def test_build_discord_payload_truncates_content_to_discord_limit():
     assert len(payload["content"]) == 2000
 
 
+def test_build_discord_payload_drops_blank_or_malformed_image_urls():
+    # Discord rejects the whole post over a bad embed URL, so anything that is
+    # not a well-formed http(s) URL must yield a content-only payload.
+    for bad in (" ", "not-a-url", "ftp://host/x.png", "https://", 123):
+        assert sg.build_discord_payload("hello", bad) == {"content": "hello"}
+
+
+def test_build_discord_payload_strips_whitespace_around_valid_url():
+    payload = sg.build_discord_payload("hello", "  https://s3.test/x.png  ")
+    assert payload["embeds"] == [{"image": {"url": "https://s3.test/x.png"}}]
+
+
 # --- dry-run: no image side effects ------------------------------------------
 
 
@@ -267,7 +328,7 @@ def test_dry_run_performs_no_image_side_effects(bull_cycle, monkeypatch, caplog)
 
     assert len(created) == 1
     assert not bull_cycle["paper_db"].exists()                       # no Paper Signal DB
-    assert _schema(bull_cycle["chart_db"]) == schema_before          # no link table migration
+    assert _schema(bull_cycle["chart_db"]) == schema_before          # no schema migration
     assert bull_cycle["chart_db"].stat().st_mtime_ns == mtime_before  # Chart DB untouched
     # The attachment candidate is reported on the console log only.
     assert "chart snapshot attachment candidate: snap-1" in caplog.text

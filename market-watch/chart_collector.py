@@ -16,6 +16,7 @@ import pandas as pd
 import yfinance as yf
 
 from chart_models import Candle, ChartTarget
+from chart_snapshot_store import ensure_paper_signal_links_schema
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
@@ -209,6 +210,10 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        # Issue #55: the Paper Signal <-> Chart Snapshot link table is part of
+        # the regular chart schema (alert_chart_snapshots analogue), owned and
+        # migrated here like every other chart table.
+        ensure_paper_signal_links_schema(connection)
         _ensure_column(connection, "chart_snapshots", "snapshot_at", "TEXT")
         _ensure_column(connection, "chart_snapshots", "s3_bucket", "TEXT")
         _ensure_column(connection, "chart_snapshots", "s3_key", "TEXT")

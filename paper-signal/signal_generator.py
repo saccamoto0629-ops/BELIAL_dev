@@ -18,6 +18,7 @@ import threading
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -540,16 +541,37 @@ def format_discord_message(signal: dict) -> str:
     return "\n".join(lines)
 
 
+def _valid_http_url(value) -> str | None:
+    """Return the stripped URL when *value* is a well-formed http(s) URL, else None.
+
+    A blank or malformed embed URL would make Discord reject the WHOLE webhook
+    post with a 400 -- taking the text body down with it -- so anything that is
+    not clearly ``http(s)://host/...`` must drop the embed, not the message.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    parsed = urlparse(candidate)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return candidate
+    return None
+
+
 def build_discord_payload(message: str, image_url: str | None = None) -> dict:
     """Return the webhook payload: text always, plus an image embed when given.
 
     Issue #55: the body format is unchanged; a matching Chart Snapshot image is
     carried in the same single webhook post using the same embed shape as the
-    Chart Snapshot notification (``chart_snapshot.post_discord_message``).
+    Chart Snapshot notification (``chart_snapshot.post_discord_message``). The
+    embed is added only for a well-formed http(s) URL (see
+    :func:`_valid_http_url`) so a bad URL can never cost the text body.
     """
     payload: dict = {"content": message[:2000]}
-    if image_url:
-        payload["embeds"] = [{"image": {"url": image_url}}]
+    valid_url = _valid_http_url(image_url)
+    if valid_url:
+        payload["embeds"] = [{"image": {"url": valid_url}}]
     return payload
 
 
@@ -610,6 +632,14 @@ def resolve_snapshot_image_url(snapshot: dict) -> str | None:
         return None
     try:
         config = load_s3_config(load_chart_env_file())
+        # Sign against the bucket this snapshot's image was actually uploaded
+        # to (chart_snapshots.s3_bucket): the environment bucket may have
+        # changed since, and signing the row's key against it would yield a
+        # 404 or the wrong image. The environment bucket remains the fallback
+        # for legacy rows without one.
+        row_bucket = str(snapshot.get("s3_bucket") or "").strip()
+        if row_bucket:
+            config["bucket"] = row_bucket
         return generate_presigned_chart_url(s3_key, config=config)
     except Exception as exc:
         _get_logger().warning("Presigned URL generation failed for %s: %s", s3_key, exc)
