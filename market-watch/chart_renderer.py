@@ -17,12 +17,101 @@ import pandas as pd
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_FILE = LOGS_DIR / "chart_renderer.log"
 
+# Issue #65: Paper Signal derived images reuse THIS renderer with a dedicated
+# event_type/source. Only this event type ever draws the PAPER LONG/SHORT
+# annotation -- scheduled Chart Snapshots and Alert images never do.
+PAPER_SIGNAL_EVENT_TYPE = "paper_signal"
+PAPER_SIGNAL_SOURCE = "paper_signal"
+_PAPER_SIGNAL_SIDE_LABELS = {"long": "PAPER LONG", "short": "PAPER SHORT"}
+_PAPER_SIGNAL_SIDE_COLORS = {"long": "#2ecc71", "short": "#e74c3c"}
+
 
 @dataclass(frozen=True)
 class RenderContext:
     event_type: str | None = None
     metadata: dict[str, Any] | None = None
     source: str = "scheduled"
+
+
+@dataclass(frozen=True)
+class PaperSignalAnnotation:
+    """Resolved Paper Signal annotation for one rendered candle window.
+
+    ``position`` is the integer offset of the target candle inside the frame
+    actually being drawn, resolved by EXACT UTC timestamp match -- there is no
+    nearest-candle fallback, so the marker can never land on the wrong bar.
+    """
+
+    side: str
+    label: str
+    target_display: str
+    position: int
+
+
+def paper_signal_side_label(side) -> str:
+    """Map a Paper Signal side to its annotation label, strictly.
+
+    Only ``long``/``short`` (any case, surrounding whitespace tolerated) are
+    accepted; anything else raises ValueError -- an unknown side is never
+    guessed into a direction.
+    """
+    normalized = str(side).strip().lower() if side is not None else ""
+    label = _PAPER_SIGNAL_SIDE_LABELS.get(normalized)
+    if label is None:
+        raise ValueError(f"unknown paper signal side: {side!r}")
+    return label
+
+
+def _normalize_utc(value) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
+def resolve_paper_signal_annotation(frame: pd.DataFrame, context: RenderContext) -> PaperSignalAnnotation | None:
+    """Resolve the Paper Signal annotation for *frame*, or None for other events.
+
+    Returns None for every non-``paper_signal`` event type, so scheduled Chart
+    Snapshots and Alert renders never gain the annotation. For a paper_signal
+    render it raises ValueError when the metadata is unusable (missing/unknown
+    ``side``, missing/unparseable ``target_candle_utc``) or when the target
+    candle is not present in the rendered window by exact UTC match -- the
+    derived image then fails instead of annotating the wrong candle.
+    """
+    if _event_name(context) != PAPER_SIGNAL_EVENT_TYPE:
+        return None
+    metadata = context.metadata or {}
+    side = str(metadata.get("side")).strip().lower() if metadata.get("side") is not None else ""
+    label = paper_signal_side_label(metadata.get("side"))
+
+    raw_target = metadata.get("target_candle_utc")
+    if raw_target in (None, ""):
+        raise ValueError("paper signal annotation requires metadata['target_candle_utc']")
+    try:
+        target = _normalize_utc(raw_target)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"unparseable target_candle_utc: {raw_target!r}") from exc
+    if pd.isna(target):
+        raise ValueError(f"unparseable target_candle_utc: {raw_target!r}")
+
+    index = pd.DatetimeIndex(pd.to_datetime(frame.index))
+    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    positions = [offset for offset, candle_time in enumerate(index) if candle_time == target]
+    if not positions:
+        raise ValueError(
+            f"target candle {raw_target!r} is not in the rendered candle window; "
+            "refusing to annotate a different candle"
+        )
+
+    jst = target.tz_convert("Asia/Tokyo")
+    target_display = f"{target.strftime('%Y-%m-%dT%H:%M:%SZ')} ({jst.strftime('%m-%d %H:%M')} JST)"
+    return PaperSignalAnnotation(
+        side=side,
+        label=label,
+        target_display=target_display,
+        position=positions[-1],
+    )
 
 
 def _logger() -> logging.Logger:
@@ -191,7 +280,13 @@ def _bollinger_band_styles(context: RenderContext) -> dict[str, dict[str, Any]]:
     }
 
 
-def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, context: RenderContext) -> None:
+def _render_with_matplotlib(
+    frame: pd.DataFrame,
+    output_path: Path,
+    title: str,
+    context: RenderContext,
+    annotation: PaperSignalAnnotation | None = None,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -274,8 +369,34 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
                 linewidth=1.0,
                 linestyle=":",
             )
-    price_ax.set_title(title, color="#f0f6fc", fontsize=14)
+    # A paper-signal render moves the title left so the annotation label fits
+    # to its right in the top margin; every other render keeps the centered
+    # title unchanged.
+    price_ax.set_title(title, color="#f0f6fc", fontsize=14, loc="left" if annotation is not None else "center")
     price_ax.legend(facecolor="#161b22", edgecolor="#3d444d", labelcolor="#d0d7de")
+
+    if annotation is not None:
+        annotation_color = _PAPER_SIGNAL_SIDE_COLORS[annotation.side]
+        price_ax.axvline(
+            x_values[annotation.position],
+            color=annotation_color,
+            linewidth=1.6,
+            linestyle="--",
+            alpha=0.9,
+        )
+        # Placed in the margin ABOVE the plot area (right of the title), so the
+        # label can never cover candles, MAs, Bollinger Bands, or the legend.
+        price_ax.text(
+            1.0,
+            1.01,
+            f"{annotation.label}  Target: {annotation.target_display}",
+            transform=price_ax.transAxes,
+            ha="right",
+            va="bottom",
+            color=annotation_color,
+            fontsize=11,
+            fontweight="bold",
+        )
 
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
@@ -295,7 +416,13 @@ def _render_with_matplotlib(frame: pd.DataFrame, output_path: Path, title: str, 
     plt.close(fig)
 
 
-def _render_with_pillow(frame: pd.DataFrame, output_path: Path, title: str, context: RenderContext) -> None:
+def _render_with_pillow(
+    frame: pd.DataFrame,
+    output_path: Path,
+    title: str,
+    context: RenderContext,
+    annotation: PaperSignalAnnotation | None = None,
+) -> None:
     from PIL import Image, ImageDraw
 
     _logger().info(
@@ -356,6 +483,15 @@ def _render_with_pillow(frame: pd.DataFrame, output_path: Path, title: str, cont
         for band_name, style in _bollinger_band_styles(context).items():
             draw_series(bands[band_name], style["color"], width=3 if style["highlight"] else 2)
 
+    if annotation is not None:
+        annotation_color = _PAPER_SIGNAL_SIDE_COLORS[annotation.side]
+        target_x = plot_left + step * annotation.position + step / 2
+        draw.line((target_x, plot_top, target_x, plot_bottom), fill=annotation_color, width=2)
+        # The 700px canvas leaves free space under the plot box, so the label
+        # never covers candles, MAs, or bands.
+        draw.text((plot_left, plot_bottom + 12), annotation.label, fill=annotation_color)
+        draw.text((plot_left, plot_bottom + 30), f"Target: {annotation.target_display}", fill=annotation_color)
+
     image.save(output_path, format="PNG")
 
 
@@ -376,10 +512,14 @@ def render_chart_snapshot(
 
     frame = _prepare_frame(candles)
     context = RenderContext(event_type=event_type, metadata=metadata, source=source)
+    # Issue #65: resolve the Paper Signal annotation (None for every other
+    # event) BEFORE creating directories, so an unresolvable target candle
+    # fails the render without leaving anything behind.
+    annotation = resolve_paper_signal_annotation(frame, context)
     _log_render_input(frame, title, context)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        _render_with_matplotlib(frame, output_path, title, context)
+        _render_with_matplotlib(frame, output_path, title, context, annotation)
     except ModuleNotFoundError:
-        _render_with_pillow(frame, output_path, title, context)
+        _render_with_pillow(frame, output_path, title, context, annotation)
     return output_path
