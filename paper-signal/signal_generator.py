@@ -15,6 +15,7 @@ import logging
 import signal
 import sys
 import threading
+import unicodedata
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -558,7 +559,10 @@ def _valid_http_url(value) -> str | None:
     candidate = value.strip()
     if not candidate:
         return None
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in candidate):
+    # Unicode category Cc covers ALL control characters -- C0 (\x00-\x1f, incl.
+    # tab/newline), DEL (\x7f), and the C1 range (\x80-\x9f, e.g. U+0085 NEL) that a
+    # raw ordinal check below 0x20 would miss.
+    if any(unicodedata.category(char) == "Cc" for char in candidate):
         return None
     try:
         parsed = urlparse(candidate)
@@ -569,7 +573,7 @@ def _valid_http_url(value) -> str | None:
         return None
     if not hostname:
         return None
-    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in hostname):
+    if any(char.isspace() for char in hostname):
         return None
     return candidate
 

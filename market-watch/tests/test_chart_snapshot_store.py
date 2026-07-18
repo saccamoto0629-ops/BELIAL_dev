@@ -424,6 +424,185 @@ def test_rebuild_migration_is_idempotent(tmp_path):
     assert rows_after_more == rows_after_first
 
 
+def _insert_raw_links(db_path, rows):
+    """Insert rows the way a historic FK-disabled writer could have: sqlite3
+    connections default to PRAGMA foreign_keys=OFF, so orphans go straight in."""
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO paper_signal_chart_snapshots VALUES (?, ?, ?)", rows
+        )
+
+
+def _run_schema_ensure(db_path):
+    with sqlite3.connect(db_path) as conn:
+        return store.ensure_paper_signal_links_schema(conn)
+
+
+def test_canonical_table_with_orphans_is_cleaned(tmp_path):
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    store.link_paper_signal_chart_snapshot(db_path, paper_signal_id="sig-1", chart_snapshot_id="snap-1")
+    _insert_raw_links(db_path, [("sig-2", "ghost", "2026-07-01T00:00:00Z")])
+
+    counts = _run_schema_ensure(db_path)
+
+    assert counts == {"orphans_removed": 1, "created_at_backfilled": 0}
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA foreign_key_check(paper_signal_chart_snapshots)").fetchall() == []
+    # The valid relation survives the cleanup.
+    assert [link["chart_snapshot_id"] for link in store.list_paper_signal_links(db_path, "sig-1")] == ["snap-1"]
+    assert store.list_paper_signal_links(db_path, "sig-2") == []
+
+
+def test_canonical_table_with_blank_created_at_is_backfilled(tmp_path):
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    _insert_raw_links(db_path, [("sig-1", "snap-1", "   ")])
+
+    counts = _run_schema_ensure(db_path)
+
+    assert counts == {"orphans_removed": 0, "created_at_backfilled": 1}
+    links = store.list_paper_signal_links(db_path, "sig-1")
+    assert len(links) == 1
+    assert links[0]["created_at"].strip()
+    assert links[0]["created_at"].endswith("Z")
+
+
+def test_canonical_table_with_orphans_and_blank_created_at_together(tmp_path):
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    _insert_raw_links(
+        db_path,
+        [
+            ("sig-1", "snap-1", ""),                       # valid, blank created_at
+            ("sig-2", "ghost", "2026-07-01T00:00:00Z"),    # orphan
+        ],
+    )
+
+    counts = _run_schema_ensure(db_path)
+
+    assert counts == {"orphans_removed": 1, "created_at_backfilled": 1}
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA foreign_key_check(paper_signal_chart_snapshots)").fetchall() == []
+    assert len(store.list_paper_signal_links(db_path, "sig-1")) == 1
+    assert store.list_paper_signal_links(db_path, "sig-2") == []
+
+
+def test_canonical_cleanup_is_idempotent(tmp_path):
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    _insert_raw_links(
+        db_path,
+        [("sig-1", "snap-1", ""), ("sig-2", "ghost", "t")],
+    )
+
+    first = _run_schema_ensure(db_path)
+    with sqlite3.connect(db_path) as conn:
+        rows_after_first = sorted(conn.execute("SELECT * FROM paper_signal_chart_snapshots").fetchall())
+
+    second = _run_schema_ensure(db_path)
+    third = _run_schema_ensure(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        rows_after_more = sorted(conn.execute("SELECT * FROM paper_signal_chart_snapshots").fetchall())
+    assert first == {"orphans_removed": 1, "created_at_backfilled": 1}
+    assert second == third == {"orphans_removed": 0, "created_at_backfilled": 0}
+    assert rows_after_more == rows_after_first
+
+
+def test_canonical_cleanup_failure_rolls_back(tmp_path):
+    # If the cleanup dies mid-way (here: on the created_at backfill UPDATE,
+    # after the orphan DELETE already ran), the rollback must restore the
+    # original rows -- orphan included -- rather than commit half a cleanup.
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    _insert_raw_links(
+        db_path,
+        [("sig-1", "snap-1", ""), ("sig-2", "ghost", "t")],
+    )
+
+    class FailingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        @property
+        def in_transaction(self):
+            return self.inner.in_transaction
+
+        def execute(self, sql, *args):
+            if sql.strip().startswith("UPDATE"):
+                raise sqlite3.OperationalError("simulated crash mid-cleanup")
+            return self.inner.execute(sql, *args)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.ensure_paper_signal_links_schema(FailingConnection(conn))
+        conn.rollback()
+    finally:
+        conn.close()
+
+    with sqlite3.connect(db_path) as check:
+        rows = sorted(check.execute("SELECT * FROM paper_signal_chart_snapshots").fetchall())
+    assert rows == [("sig-1", "snap-1", ""), ("sig-2", "ghost", "t")]
+
+
+def _table_names(db_path):
+    with sqlite3.connect(db_path) as conn:
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_stale_staging_only_state_is_normalized(tmp_path):
+    # An interrupted historic migration could leave ONLY the internal staging
+    # table behind: it must be dropped and the canonical table created.
+    db_path = make_db(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE paper_signal_chart_snapshots")
+        conn.execute("CREATE TABLE paper_signal_chart_snapshots_rebuild (x TEXT)")
+
+    collector.init_db(db_path)
+
+    tables = _table_names(db_path)
+    assert "paper_signal_chart_snapshots" in tables
+    assert "paper_signal_chart_snapshots_rebuild" not in tables
+    assert _links_table_info(db_path) == CANONICAL_LINKS_INFO
+    # Re-running stays a no-op.
+    collector.init_db(db_path)
+    assert "paper_signal_chart_snapshots_rebuild" not in _table_names(db_path)
+
+
+def test_stale_staging_next_to_canonical_table_is_dropped(tmp_path):
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    store.link_paper_signal_chart_snapshot(db_path, paper_signal_id="sig-1", chart_snapshot_id="snap-1")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE paper_signal_chart_snapshots_rebuild (x TEXT)")
+
+    collector.init_db(db_path)
+
+    assert "paper_signal_chart_snapshots_rebuild" not in _table_names(db_path)
+    # The canonical table and its data are untouched.
+    assert [link["chart_snapshot_id"] for link in store.list_paper_signal_links(db_path, "sig-1")] == ["snap-1"]
+
+
+def test_healthy_canonical_table_sees_no_drop(tmp_path):
+    # With a healthy canonical table and no staging leftover, the migration
+    # must not touch the schema at all (no DROP/recreate churn).
+    db_path = make_db(tmp_path)
+    insert_snapshot(db_path, snapshot_id="snap-1")
+    store.link_paper_signal_chart_snapshot(db_path, paper_signal_id="sig-1", chart_snapshot_id="snap-1")
+    with sqlite3.connect(db_path) as conn:
+        before = sorted(conn.execute("SELECT type, name, sql, rootpage FROM sqlite_master").fetchall())
+
+    counts = _run_schema_ensure(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        after = sorted(conn.execute("SELECT type, name, sql, rootpage FROM sqlite_master").fetchall())
+    # rootpage would change if the table had been dropped and recreated.
+    assert after == before
+    assert counts == {"orphans_removed": 0, "created_at_backfilled": 0}
+
+
 def test_concurrent_links_after_rebuild_store_one_row(tmp_path):
     # After migrating a constraintless legacy table, the restored composite PK
     # keeps the relation unique even under genuinely concurrent writers.

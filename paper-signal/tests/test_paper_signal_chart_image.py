@@ -334,8 +334,12 @@ def test_build_discord_payload_drops_blank_or_malformed_image_urls():
         "https://",                       # no host
         "http://[",                       # urlparse/hostname raises ValueError
         "https://exa mple.com/path",      # whitespace in hostname
-        "https://host/a\x00b.png",        # control character in URL
-        "https://host\x7f/x.png",         # control character in hostname
+        "https://host/a\x00b.png",        # NUL (C0)
+        "https://host/a\tb.png",          # tab (C0)
+        "https://host/a\nb.png",          # newline (C0)
+        "https://host\x7f/x.png",         # DEL
+        "https://host/a\u0085b",       # NEL (C1)
+        "https://host/a\u009fb",       # APC (C1)
         123,                              # not a string
         None,
     )

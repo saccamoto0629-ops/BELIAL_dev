@@ -31,6 +31,7 @@ without pulling in Live's rendering or upload code.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,6 +78,10 @@ _LINK_COLUMNS = ("paper_signal_id", "chart_snapshot_id", "created_at")
 # A locked Chart DB must degrade the snapshot attachment quickly (text-only
 # notification) instead of stalling each symbol on SQLite's 5s default.
 LOCK_TIMEOUT_SECONDS = 2.0
+
+_LOGGER = logging.getLogger("chart_snapshot_store")
+
+_NO_CLEANUP = {"orphans_removed": 0, "created_at_backfilled": 0}
 
 
 class ChartLinkError(RuntimeError):
@@ -269,30 +274,105 @@ def _rebuild_links_table(connection: sqlite3.Connection) -> None:
     connection.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO {LINKS_TABLE}")
 
 
-def ensure_paper_signal_links_schema(connection: sqlite3.Connection) -> None:
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _begin_if_needed(connection: sqlite3.Connection) -> None:
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+
+
+def _cleanup_canonical_links_data(connection: sqlite3.Connection) -> dict:
+    """Repair data inside an already-canonical link table, idempotently.
+
+    The canonical FK is only enforced on connections that switch it on, so a
+    historic writer (foreign_keys defaults to OFF) may have left orphaned
+    relations, and blank ``created_at`` values may predate the rebuild
+    backfill. Orphans are deleted, blank/NULL ``created_at`` is backfilled with
+    the current UTC time, and a final ``PRAGMA foreign_key_check`` must come
+    back empty -- anything still violating raises :class:`ChartSchemaError` so
+    a half-broken table is never reported as normalized. All writes share the
+    caller's transaction. Returns the cleanup counts (all zero when the data
+    was already consistent, making the fast path read-only).
+    """
+    orphan_rows = connection.execute(f"PRAGMA foreign_key_check({LINKS_TABLE})").fetchall()
+    blank_created = connection.execute(
+        f"SELECT COUNT(*) FROM {LINKS_TABLE} WHERE created_at IS NULL OR TRIM(created_at) = ''"
+    ).fetchone()[0]
+    if not orphan_rows and not blank_created:
+        return dict(_NO_CLEANUP)
+
+    _begin_if_needed(connection)
+    orphans_removed = 0
+    if orphan_rows:
+        orphans_removed = connection.execute(
+            f"""
+            DELETE FROM {LINKS_TABLE}
+            WHERE NOT EXISTS (
+                SELECT 1 FROM chart_snapshots
+                WHERE chart_snapshots.id = {LINKS_TABLE}.chart_snapshot_id
+            )
+            """
+        ).rowcount
+    backfilled = 0
+    if blank_created:
+        backfilled = connection.execute(
+            f"UPDATE {LINKS_TABLE} SET created_at = ? WHERE created_at IS NULL OR TRIM(created_at) = ''",
+            (_utc_now_iso_z(),),
+        ).rowcount
+    remaining = connection.execute(f"PRAGMA foreign_key_check({LINKS_TABLE})").fetchall()
+    if remaining:
+        raise ChartSchemaError(
+            f"{len(remaining)} orphaned relation(s) remain in {LINKS_TABLE} after cleanup"
+        )
+    counts = {"orphans_removed": orphans_removed, "created_at_backfilled": backfilled}
+    _LOGGER.info(
+        "%s cleanup: removed %d orphaned relation(s), backfilled %d created_at value(s)",
+        LINKS_TABLE, orphans_removed, backfilled,
+    )
+    return counts
+
+
+def ensure_paper_signal_links_schema(connection: sqlite3.Connection) -> dict:
     """Create -- or rebuild to -- the canonical link table, idempotently.
 
     Operates on an open Chart DB connection so ``chart_collector.init_db()``
     runs this alongside the rest of the chart schema. A missing table is
-    created from the canonical DDL; a table already matching it is left
-    untouched (so re-running is a no-op); any other same-name legacy table is
-    rebuilt via :func:`_rebuild_links_table`, because the canonical PRIMARY
-    KEY / NOT NULL / FOREIGN KEY constraints cannot be added by ALTER. The
-    rebuild is wrapped in a transaction (started here unless the caller already
-    holds one, committed by the caller's ``with connection`` block) so the
-    original table survives any mid-rebuild failure.
+    created from the canonical DDL; any other same-name legacy table is rebuilt
+    via :func:`_rebuild_links_table`, because the canonical PRIMARY KEY /
+    NOT NULL / FOREIGN KEY constraints cannot be added by ALTER. A table
+    already matching the canonical schema still gets its DATA verified
+    (:func:`_cleanup_canonical_links_data`): orphans left by historic
+    FK-disabled writers are deleted and blank ``created_at`` backfilled. A
+    stale ``..._rebuild`` staging table (an internal-only name an interrupted
+    historic migration may have left) is dropped first -- but only when it
+    actually exists, so a healthy DB sees no DROP at all.
+
+    Every mutating step shares one transaction (started here unless the caller
+    already holds one, committed by the caller's ``with connection`` block), so
+    the original table and data survive any mid-migration failure.
+
+    Returns the canonical-path cleanup counts
+    (``{"orphans_removed": n, "created_at_backfilled": m}``; zeros on the
+    create/rebuild paths and on already-consistent data).
     """
-    exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (LINKS_TABLE,)
-    ).fetchone()
-    if exists is None:
+    if _table_exists(connection, _REBUILD_TABLE):
+        _begin_if_needed(connection)
+        connection.execute(f"DROP TABLE {_REBUILD_TABLE}")
+    if not _table_exists(connection, LINKS_TABLE):
         connection.execute(PAPER_SIGNAL_LINKS_DDL)
-        return
+        return dict(_NO_CLEANUP)
     if _links_schema_is_canonical(connection):
-        return
-    if not connection.in_transaction:
-        connection.execute("BEGIN IMMEDIATE")
+        return _cleanup_canonical_links_data(connection)
+    _begin_if_needed(connection)
     _rebuild_links_table(connection)
+    return dict(_NO_CLEANUP)
 
 
 def link_paper_signal_chart_snapshot(
