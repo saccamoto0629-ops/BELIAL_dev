@@ -21,12 +21,16 @@ non-zero. A ``sqlite3.OperationalError`` is never converted into "no data".
 dry-run: computes and logs every decision but performs NO writes -- no schema
 creation, no migration, no row insert/update, no Signal-DB write, no log file.
 
-Discord notification (Issue #83): committed state transitions (open / closed /
-expired / cancelled) are handed to ``paper_execution_notifier`` as events at
-the END of the cycle -- position DB first, notify second. Notification
-failures are counted separately (``CycleResult.notification_failures``), never
-fail the cycle / ``--once`` exit code, and are retried on later cycles via the
-notifier's history table. dry-run only logs the would-be bodies.
+Discord notification (Issue #83, transactional outbox): every notifiable
+transition (open / closed / expired / cancelled) commits ATOMICALLY with its
+outbox row via the store's ``*_with_notification`` APIs -- a crash at any point
+leaves either "no transition" or "transition + outbox row", never a transition
+whose notification is lost. Delivery happens at the END of the cycle via
+``paper_execution_notifier.deliver_outbox`` (atomic claim + lease, batch-
+limited, at-least-once). HTTP delivery failures are counted separately
+(``CycleResult.notification_failures``) and retried on later cycles; outbox
+persistence/claim failures count as data-plane ``failures`` (non-zero
+``--once`` exit). dry-run only logs the would-be bodies.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ import logging
 import signal as signal_module
 import sqlite3
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,13 +119,21 @@ def _get_logger() -> logging.Logger:
 class CycleResult:
     """Outcome of one Paper Execution cycle.
 
-    ``failures`` counts data-plane failures (reads, writes, migration, Chart DB)
-    and keeps its Issue #49 contract: non-zero fails ``--once``. Discord
-    notification failures (Issue #83) are counted SEPARATELY in
-    ``notification_failures`` and deliberately do NOT affect ``failures`` /
-    ``ok`` / the exit code: the position data stays fully consistent (transitions
-    commit before any notify) and delivery is retried automatically on later
-    cycles, so a webhook outage must not fail the cycle or stop the runner.
+    ``failures`` counts data-plane failures (reads, writes, migration, Chart DB
+    -- and, per the Issue #83 review, notification OUTBOX persistence/claim
+    failures, because there the notification guarantee itself is broken) and
+    keeps its Issue #49 contract: non-zero fails ``--once``.
+
+    ``notification_failures`` counts DELIVERY-side failures only (timeout /
+    429 / 5xx / connection error, and the post-POST success-record failure):
+    positions and outbox rows stay fully consistent and delivery is retried
+    automatically on later cycles, so a webhook outage must not fail the cycle
+    or stop the runner.
+
+    ``dead_letter_notifications`` is a GAUGE: the current number of unresolved
+    ``dead_letter`` outbox rows (attempt cap reached; manual recovery needed).
+    Reported and warned about EVERY cycle so exhausted notifications can never
+    silently disappear.
     """
 
     failures: int = 0
@@ -130,6 +143,7 @@ class CycleResult:
     expired: int = 0
     closed: int = 0
     notification_failures: int = 0
+    dead_letter_notifications: int = 0
     touched: list = field(default_factory=list)
 
     @property
@@ -211,17 +225,20 @@ def _candles_for_close(candles: pd.DataFrame, entry_time_utc: str, watermark: st
 # --- per-phase processing ----------------------------------------------------
 
 
-def _process_signal(signal: dict, *, dry_run: bool, db_path: Path, profile_for) -> tuple[str | None, dict | None]:
+def _process_signal(
+    signal: dict, *, dry_run: bool, db_path: Path, read_db_path: Path, profile_for
+) -> tuple[str | None, dict | None]:
     """Store one signal as pending (or cancelled).
 
     Returns ``(action, record)`` -- the action taken (or None if skipped) and
     the resulting position record (for Issue #83 notification events; on a dry
-    run this is the projected record, built but never written).
+    run this is the projected record, built but never written). Reads go to
+    ``read_db_path`` (the dry-run snapshot on a dry run); writes to ``db_path``.
     """
     logger = _get_logger()
     signal_id = signal.get("signal_id") or ""
     # Idempotency: one position per signal (repository probe + UNIQUE index).
-    if signal_id and store.get_position_by_signal(signal_id, db_path=db_path) is not None:
+    if signal_id and store.get_position_by_signal(signal_id, db_path=read_db_path) is not None:
         return None, None
 
     if not _is_valid_signal(signal):
@@ -238,7 +255,9 @@ def _process_signal(signal: dict, *, dry_run: bool, db_path: Path, profile_for) 
         if dry_run:
             logger.info("[DRY_RUN] would CANCEL invalid signal %s (invalid_input)", signal_id or "<no id>")
             return "cancelled", record
-        return ("cancelled", record) if store.create_position(record, db_path=db_path) else (None, None)
+        # Atomic (Issue #83): the cancelled position and its outbox row commit together.
+        created = store.create_cancelled_position_with_notification(record, db_path=db_path)
+        return ("cancelled", record) if created else (None, None)
 
     symbol = signal["symbol"]
     timeframe = signal["timeframe"]
@@ -280,7 +299,8 @@ def _process_pending(
                 **position, "state": models.STATE_EXPIRED, "terminal_reason": models.REASON_ENTRY_TIMEOUT,
             }
             return "expired", projected
-        updated = store.transition_pending_terminal(
+        # Atomic (Issue #83): the expired transition and its outbox row commit together.
+        updated = store.transition_pending_terminal_with_notification(
             position["position_id"], state=models.STATE_EXPIRED,
             terminal_reason=models.REASON_ENTRY_TIMEOUT, db_path=db_path,
         )
@@ -299,7 +319,8 @@ def _process_pending(
             "max_hold_deadline_utc": outcome.max_hold_deadline_utc,
         }
         return "opened", projected
-    updated = store.transition_to_open(
+    # Atomic (Issue #83): the open transition and its outbox row commit together.
+    updated = store.transition_to_open_with_notification(
         position["position_id"], entry_price=outcome.entry_price, entry_time_utc=outcome.entry_time_utc,
         stop_loss_price=outcome.stop_loss_price, take_profit_price=outcome.take_profit_price,
         max_hold_deadline_utc=outcome.max_hold_deadline_utc, db_path=db_path,
@@ -341,7 +362,8 @@ def _process_open(
         return None, None
     if result.closed:
         try:
-            updated = store.close_open_position(
+            # Atomic (Issue #83): the close transition and its outbox row commit together.
+            updated = store.close_open_position_with_notification(
                 position["position_id"], expected_watermark=watermark, new_watermark=result.new_watermark,
                 close_price=result.close_price, close_time_utc=result.close_time_utc,
                 terminal_reason=result.terminal_reason, gross_pnl=result.gross_pnl,
@@ -373,11 +395,13 @@ def run_once(
 ) -> CycleResult:
     """Run one Paper Execution cycle. Returns a :class:`CycleResult` (failures counted).
 
-    Discord notification (Issue #83): state transitions committed in this cycle
-    are handed to ``paper_execution_notifier`` as events AFTER all position
-    writes, so a delivery failure can never roll back or block a transition.
-    ``notify_webhook_url`` / ``notify_session`` override the env-resolved
-    webhook and HTTP session (tests); by default the URL comes from
+    Discord notification (Issue #83, transactional outbox): each notifiable
+    transition commits atomically WITH its outbox row inside the store; at the
+    end of the cycle ``paper_execution_notifier.deliver_outbox`` claims and
+    delivers queued rows (at-least-once, batch-limited). A delivery failure can
+    never roll back or block a transition. ``notify_webhook_url`` /
+    ``notify_session`` override the env-resolved webhook and HTTP session
+    (tests); by default the URL comes from
     ``PAPER_EXECUTION_DISCORD_WEBHOOK_URL``.
     """
     configure_logging(dry_run=dry_run)
@@ -478,92 +502,135 @@ def run_once(
             result.failures += 1
             return result
 
-    # Notification events (Issue #83): collected as transitions COMMIT, handed to
-    # the notifier only after all position writes for the cycle are done.
+    # --- Dry-run read isolation (Issue #83 review): a dry run must leave the
+    # position DB and its -wal/-shm sidecars byte-identical, but ANY SQLite
+    # connection to a WAL DB can create/touch the -shm sidecar (and checkpoint
+    # the WAL). So on a dry run the REAL file is never opened at all: every
+    # position read goes to a private snapshot copy that is deleted afterwards.
+    read_db_path = db_path
+    dry_snapshot: tempfile.TemporaryDirectory | None = None
+    if dry_run and db_path.exists():
+        try:
+            dry_snapshot = tempfile.TemporaryDirectory(prefix="paper_exec_dry_")
+            read_db_path = store.snapshot_db_for_read(db_path, Path(dry_snapshot.name))
+        except OSError as exc:
+            logger.error(
+                "Paper Execution [DRY_RUN]: snapshotting the position DB failed (%s) -- aborting cycle.", exc
+            )
+            result.failures += 1
+            if dry_snapshot is not None:
+                dry_snapshot.cleanup()
+            return result
+
+    # Dry-run notification preview (Issue #83): projected transitions are
+    # collected ONLY so their would-be bodies can be logged. On a normal run the
+    # outbox row is committed atomically with each transition inside the store,
+    # so nothing needs to be carried in memory.
     notify_events: list["notifier.ExecutionEvent"] = []
 
     def collect_event(event_type: str, record: dict | None) -> None:
-        if record is not None:
+        if dry_run and record is not None:
             notify_events.append(notifier.ExecutionEvent(event_type, record))
 
-    # Phase 1: signals -> pending / cancelled.
     try:
-        signal_rows = signals if signals is not None else read_paper_signals(signal_db_path)
-    except Exception as exc:  # a read failure must surface, not be swallowed
-        logger.error("Paper Execution: reading Paper Signals failed: %s", exc)
-        result.failures += 1
-        signal_rows = []
-    for signal in signal_rows:
+        # Phase 1: signals -> pending / cancelled.
         try:
-            action, record = _process_signal(signal, dry_run=dry_run, db_path=db_path, profile_for=profile_for)
-        except Exception as exc:
-            logger.error("Paper Execution: signal %s failed: %s", signal.get("signal_id"), exc)
+            signal_rows = signals if signals is not None else read_paper_signals(signal_db_path)
+        except Exception as exc:  # a read failure must surface, not be swallowed
+            logger.error("Paper Execution: reading Paper Signals failed: %s", exc)
             result.failures += 1
-            continue
-        if action == "pending":
-            result.pending_created += 1  # pending creation is NOT a notification event (Issue #83 scope)
-        elif action == "cancelled":
-            result.cancelled += 1
-            collect_event(notifier.EVENT_CANCELLED, record)
+            signal_rows = []
+        for signal in signal_rows:
+            try:
+                action, record = _process_signal(
+                    signal, dry_run=dry_run, db_path=db_path, read_db_path=read_db_path, profile_for=profile_for
+                )
+            except Exception as exc:
+                logger.error("Paper Execution: signal %s failed: %s", signal.get("signal_id"), exc)
+                result.failures += 1
+                continue
+            if action == "pending":
+                result.pending_created += 1  # pending creation is NOT a notification event (Issue #83 scope)
+            elif action == "cancelled":
+                result.cancelled += 1
+                collect_event(notifier.EVENT_CANCELLED, record)
 
-    # Phase 2: pending -> open / expired. (Dry-run reads never create the DB.)
-    for position in _safe_list(store.list_positions_by_state, models.STATE_PENDING, db_path=db_path, result=result):
-        candles, ok = candles_or_skip(position)
-        if not ok:
-            continue
-        try:
-            action, record = _process_pending(position, candles, dry_run=dry_run, db_path=db_path, now_utc=now)
-        except Exception as exc:
-            logger.error("Paper Execution: pending %s failed: %s", position["position_id"], exc)
-            result.failures += 1
-            continue
-        if action == "opened":
-            result.opened += 1
-            collect_event(notifier.EVENT_OPEN, record)
-        elif action == "expired":
-            result.expired += 1
-            collect_event(notifier.EVENT_EXPIRED, record)
+        # Phase 2: pending -> open / expired. (Dry-run reads only ever touch the snapshot.)
+        for position in _safe_list(
+            store.list_positions_by_state, models.STATE_PENDING, db_path=read_db_path, result=result
+        ):
+            candles, ok = candles_or_skip(position)
+            if not ok:
+                continue
+            try:
+                action, record = _process_pending(position, candles, dry_run=dry_run, db_path=db_path, now_utc=now)
+            except Exception as exc:
+                logger.error("Paper Execution: pending %s failed: %s", position["position_id"], exc)
+                result.failures += 1
+                continue
+            if action == "opened":
+                result.opened += 1
+                collect_event(notifier.EVENT_OPEN, record)
+            elif action == "expired":
+                result.expired += 1
+                collect_event(notifier.EVENT_EXPIRED, record)
 
-    # Phase 3: open -> closed / watermark advance.
-    for position in _safe_list(store.list_positions_by_state, models.STATE_OPEN, db_path=db_path, result=result):
-        candles, ok = candles_or_skip(position)
-        if not ok:
-            continue
-        try:
-            action, record = _process_open(position, candles, dry_run=dry_run, db_path=db_path)
-        except Exception as exc:
-            logger.error("Paper Execution: open %s failed: %s", position["position_id"], exc)
-            result.failures += 1
-            continue
-        if action == "closed":
-            result.closed += 1
-            collect_event(notifier.EVENT_CLOSED, record)
+        # Phase 3: open -> closed / watermark advance.
+        for position in _safe_list(
+            store.list_positions_by_state, models.STATE_OPEN, db_path=read_db_path, result=result
+        ):
+            candles, ok = candles_or_skip(position)
+            if not ok:
+                continue
+            try:
+                action, record = _process_open(position, candles, dry_run=dry_run, db_path=db_path)
+            except Exception as exc:
+                logger.error("Paper Execution: open %s failed: %s", position["position_id"], exc)
+                result.failures += 1
+                continue
+            if action == "closed":
+                result.closed += 1
+                collect_event(notifier.EVENT_CLOSED, record)
 
-    # Chart read failures are cycle failures (one per affected symbol/timeframe),
-    # never silently treated as "no candles".
-    result.failures += len(chart_failures)
+        # Chart read failures are cycle failures (one per affected symbol/timeframe),
+        # never silently treated as "no candles".
+        result.failures += len(chart_failures)
 
-    # Discord notification (Issue #83): AFTER every position transition committed.
-    # Failures here are counted separately (notification_failures) and never fail
-    # the cycle, roll back a position, or stop the resident runner; failed
-    # deliveries are retried on later cycles by the notifier's history table.
-    # Dry-run: the notifier only logs the would-be bodies (no DB/HTTP/file).
-    try:
-        notify_result = notifier.process_events(
-            notify_events, db_path=db_path, dry_run=dry_run,
-            webhook_url_value=notify_webhook_url, session=notify_session,
+        # Discord delivery (Issue #83): every transition above already committed
+        # atomically WITH its outbox row, so a crash anywhere from here on only
+        # delays delivery -- it can never lose a notification. deliver_outbox claims
+        # (atomic claim + lease), posts, and settles; HTTP failures are counted
+        # separately (notification_failures) and retried on later cycles, while
+        # outbox/claim DB failures break the notification guarantee itself and are
+        # counted as data-plane failures. Dry-run: log the would-be bodies only.
+        if dry_run:
+            try:
+                notifier.log_dry_run_events(notify_events)
+            except Exception as exc:  # a notifier bug must never kill the cycle
+                logger.error("Paper Execution: dry-run notification logging raised: %s", exc)
+                result.notification_failures += 1
+        else:
+            try:
+                delivery = notifier.deliver_outbox(
+                    db_path=db_path, webhook_url_value=notify_webhook_url, session=notify_session,
+                )
+                result.notification_failures += delivery.delivery_failures
+                result.failures += delivery.outbox_failures
+                result.dead_letter_notifications = delivery.dead_letter_total
+            except Exception as exc:  # a notifier bug must never kill the cycle
+                logger.error("Paper Execution: notification delivery raised: %s", exc)
+                result.notification_failures += 1
+
+        logger.info(
+            "Cycle done: pending=%d cancelled=%d opened=%d expired=%d closed=%d "
+            "failures=%d notification_failures=%d dead_letter=%d",
+            result.pending_created, result.cancelled, result.opened, result.expired, result.closed,
+            result.failures, result.notification_failures, result.dead_letter_notifications,
         )
-        result.notification_failures += notify_result.failed
-    except Exception as exc:  # a notifier bug must never kill the cycle
-        logger.error("Paper Execution: notification processing raised: %s", exc)
-        result.notification_failures += 1
-
-    logger.info(
-        "Cycle done: pending=%d cancelled=%d opened=%d expired=%d closed=%d failures=%d notification_failures=%d",
-        result.pending_created, result.cancelled, result.opened, result.expired, result.closed,
-        result.failures, result.notification_failures,
-    )
-    return result
+        return result
+    finally:
+        if dry_snapshot is not None:
+            dry_snapshot.cleanup()
 
 
 def _safe_list(list_fn, state, *, db_path, result: CycleResult) -> list[dict]:

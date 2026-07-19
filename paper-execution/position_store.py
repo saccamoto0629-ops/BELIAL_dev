@@ -28,22 +28,36 @@ swallow a ``sqlite3.OperationalError`` on an existing file into an empty result
 (Issue #49 runner contract: a real read failure must surface, not masquerade as
 "no data"). Only a *missing* DB file returns the empty/None default.
 
-Issue #83 adds the ``paper_execution_notifications`` table (schema v2) to the
-same DB: a per-event notification history keyed by a deterministic
-``event_key`` (``position_id:event_type``, UNIQUE) that gives Discord
-notifications duplicate suppression across runner restarts and retryability
-for failed deliveries. Each notification write helper is its own transaction
-(single statement, committed by the connection context manager) and is always
-separate from the position transition it follows -- a notification failure can
-never roll back a position state change.
+Issue #83 adds the ``paper_execution_notifications`` table to the same DB as a
+**transactional outbox** for Discord notifications, keyed by a deterministic
+``event_key`` (``position_id:event_type``, UNIQUE):
+
+- **Atomic transition + enqueue**: the ``*_with_notification`` APIs commit the
+  position state change AND the outbox row in ONE ``BEGIN IMMEDIATE``
+  transaction. A position transition can never exist without its outbox row
+  (no crash window between them); an enqueue failure rolls the position change
+  back too; a CAS loss enqueues nothing.
+- **Atomic delivery claim**: :func:`claim_notifications` moves rows to
+  ``processing`` with a ``claimed_by`` / ``claimed_until_utc`` lease inside one
+  ``BEGIN IMMEDIATE`` transaction, so two concurrent runners can never deliver
+  the same row at once; expired leases (crashed worker) become claimable again.
+- **Bounded retry / dead-letter**: :func:`finish_notification_delivery` settles
+  an attempt; at ``max_attempts`` a failing row becomes ``dead_letter`` (never
+  auto-retried, kept visible for monitoring; see :func:`requeue_notification`).
+- The HTTP delivery itself happens AFTER the outbox commit, in the notifier --
+  a delivery failure never rolls back a position state change.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -70,11 +84,19 @@ KNOWN_NOTIFY_EVENTS: frozenset[str] = frozenset(
     {NOTIFY_EVENT_OPEN, NOTIFY_EVENT_CLOSED, NOTIFY_EVENT_EXPIRED, NOTIFY_EVENT_CANCELLED}
 )
 
-DELIVERY_STATUS_PENDING = "pending"   # recorded, not yet attempted
-DELIVERY_STATUS_SUCCESS = "success"   # delivered; never re-sent
-DELIVERY_STATUS_FAILED = "failed"     # last attempt failed; retryable until the attempt cap
+DELIVERY_STATUS_PENDING = "pending"          # enqueued, not yet attempted
+DELIVERY_STATUS_PROCESSING = "processing"    # claimed by a worker (lease: claimed_until_utc)
+DELIVERY_STATUS_SUCCESS = "success"          # outbox row settled; never re-claimed
+DELIVERY_STATUS_FAILED = "failed"            # last attempt failed; retryable until the attempt cap
+DELIVERY_STATUS_DEAD_LETTER = "dead_letter"  # attempt cap reached; kept visible, never auto-retried
 KNOWN_DELIVERY_STATUSES: frozenset[str] = frozenset(
-    {DELIVERY_STATUS_PENDING, DELIVERY_STATUS_SUCCESS, DELIVERY_STATUS_FAILED}
+    {
+        DELIVERY_STATUS_PENDING,
+        DELIVERY_STATUS_PROCESSING,
+        DELIVERY_STATUS_SUCCESS,
+        DELIVERY_STATUS_FAILED,
+        DELIVERY_STATUS_DEAD_LETTER,
+    }
 )
 
 _NOTIFICATION_COLUMNS: tuple[str, ...] = (
@@ -84,11 +106,18 @@ _NOTIFICATION_COLUMNS: tuple[str, ...] = (
     "delivery_status",
     "attempt_count",
     "last_error",
+    "claimed_by",
+    "claimed_until_utc",
     "notified_at_utc",
     "created_at_utc",
     "updated_at_utc",
 )
 REQUIRED_NOTIFICATION_COLUMNS: frozenset[str] = frozenset(_NOTIFICATION_COLUMNS)
+# Columns that must be NOT NULL in the physical schema (event_key is covered by
+# its PRIMARY KEY). Verified structurally by _notifications_table_object_current.
+_NOTIFICATION_NOT_NULL_COLUMNS: frozenset[str] = frozenset(
+    {"position_id", "event_type", "delivery_status", "attempt_count", "created_at_utc", "updated_at_utc"}
+)
 
 
 def notification_event_key(position_id: str, event_type: str) -> str:
@@ -146,9 +175,12 @@ _ALL_COLUMNS: tuple[str, ...] = (
 # ``PRAGMA user_version`` and used as the fast-path "already current" marker; the
 # migration itself still inspects the real schema (PRAGMA table_info) rather than
 # trusting CREATE TABLE IF NOT EXISTS.
-# v1: constrained virtual_positions. v2 (Issue #83): + paper_execution_notifications.
+# v1: constrained virtual_positions.
+# v2 (Issue #83 prototype): + paper_execution_notifications (no claim columns).
+# v3 (Issue #83 review): outbox claim/lease columns (claimed_by, claimed_until_utc)
+#     and the processing / dead_letter delivery statuses.
 POSITIONS_SCHEMA_VERSION = 1
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 REQUIRED_COLUMNS: frozenset[str] = frozenset(_ALL_COLUMNS)
 
@@ -293,18 +325,28 @@ def _create_table_sql(table_name: str) -> str:
     """
 
 
-def _create_notifications_table_sql(table_name: str) -> str:
-    """The Issue #83 notification-history schema (event_key UNIQUE via PRIMARY KEY)."""
+def _notify_events_check_sql() -> str:
     events = "', '".join(sorted(KNOWN_NOTIFY_EVENTS))
+    return f"event_type IN ('{events}')"
+
+
+def _delivery_statuses_check_sql() -> str:
     statuses = "', '".join(sorted(KNOWN_DELIVERY_STATUSES))
+    return f"delivery_status IN ('{statuses}')"
+
+
+def _create_notifications_table_sql(table_name: str) -> str:
+    """The Issue #83 outbox schema (event_key UNIQUE via PRIMARY KEY, claim/lease columns)."""
     return f"""
         CREATE TABLE {table_name} (
             event_key TEXT PRIMARY KEY,
             position_id TEXT NOT NULL,
-            event_type TEXT NOT NULL CHECK (event_type IN ('{events}')),
-            delivery_status TEXT NOT NULL CHECK (delivery_status IN ('{statuses}')),
+            event_type TEXT NOT NULL CHECK ({_notify_events_check_sql()}),
+            delivery_status TEXT NOT NULL CHECK ({_delivery_statuses_check_sql()}),
             attempt_count INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
+            claimed_by TEXT,
+            claimed_until_utc TEXT,
             notified_at_utc TEXT,
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
@@ -312,22 +354,136 @@ def _create_notifications_table_sql(table_name: str) -> str:
     """
 
 
-def _ensure_notifications_table(connection: sqlite3.Connection) -> None:
-    """Create the notifications table, or fail loudly if a same-named table is unusable.
+_NOTIFICATIONS_STATUS_INDEX = f"idx_{NOTIFICATIONS_TABLE}_status"
 
-    Never guesses a column-level migration for an existing incompatible table --
-    consistent with the positions migration policy (explicit failure over silent
-    data rounding). Must run inside the caller's transaction.
+
+def _normalized_sql(sql) -> str:
+    return " ".join(str(sql or "").lower().split())
+
+
+def _notifications_table_object_current(connection: sqlite3.Connection) -> bool:
+    """Structurally verify the outbox table's REAL constraints, not just column names.
+
+    Checks (all read-only): full column set; ``event_key`` is the PRIMARY KEY
+    (``PRAGMA table_info`` pk flag -- PK implies UNIQUE + NOT NULL); the NOT NULL
+    flags of every required column; and both CHECK constraints (event_type /
+    delivery_status closed sets) via the stored ``sqlite_master.sql`` text.
+    A table missing any of these is NOT current (it gets a transactional rebuild
+    in init_db); a write path additionally behavior-probes the constraints
+    (see :func:`_behavioral_probe_notifications`).
+    """
+    if not _table_exists(connection, NOTIFICATIONS_TABLE):
+        return False
+    info = {
+        row[1]: row  # name -> (cid, name, type, notnull, dflt_value, pk)
+        for row in connection.execute(f"PRAGMA table_info({NOTIFICATIONS_TABLE})").fetchall()
+    }
+    if set(info) != set(_NOTIFICATION_COLUMNS):
+        return False
+    if info["event_key"][5] != 1:  # not the (single-column) PRIMARY KEY
+        return False
+    for column in _NOTIFICATION_NOT_NULL_COLUMNS:
+        if info[column][3] != 1:
+            return False
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (NOTIFICATIONS_TABLE,)
+    ).fetchone()
+    table_sql = _normalized_sql(row[0] if row else "")
+    for check in (_notify_events_check_sql(), _delivery_statuses_check_sql()):
+        if f"check ({check.lower()})" not in table_sql:
+            return False
+    return True
+
+
+def _notifications_index_present(connection: sqlite3.Connection) -> bool:
+    """Verify the delivery-status index exists with the expected columns."""
+    for row in connection.execute(f"PRAGMA index_list({NOTIFICATIONS_TABLE})").fetchall():
+        if row[1] == _NOTIFICATIONS_STATUS_INDEX:
+            columns = [r[2] for r in connection.execute(f"PRAGMA index_info({_NOTIFICATIONS_STATUS_INDEX})")]
+            return columns == ["delivery_status", "created_at_utc"]
+    return False
+
+
+def _migrate_legacy_notification_row(legacy: dict, now: str) -> dict:
+    """Map one legacy outbox row (e.g. the v2 prototype table) to the v3 shape.
+
+    Preserves delivery history; unknown vocabulary or missing identity fails
+    loudly (:class:`PositionMigrationError`) rather than guessing.
+    """
+    position_id = legacy.get("position_id")
+    event_type = legacy.get("event_type")
+    if not position_id or event_type not in KNOWN_NOTIFY_EVENTS:
+        raise PositionMigrationError(
+            f"legacy notification row {legacy.get('event_key')!r} has unusable "
+            f"position_id={position_id!r} / event_type={event_type!r}; cannot migrate"
+        )
+    status = legacy.get("delivery_status") or DELIVERY_STATUS_PENDING
+    if status not in KNOWN_DELIVERY_STATUSES:
+        raise PositionMigrationError(
+            f"legacy notification row {legacy.get('event_key')!r} has unknown delivery_status {status!r}"
+        )
+    try:
+        attempts = int(legacy.get("attempt_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise PositionMigrationError(
+            f"legacy notification row {legacy.get('event_key')!r} has non-integer attempt_count"
+        ) from exc
+    return {
+        "event_key": legacy.get("event_key") or notification_event_key(position_id, event_type),
+        "position_id": position_id,
+        "event_type": event_type,
+        "delivery_status": status,
+        "attempt_count": attempts,
+        "last_error": legacy.get("last_error"),
+        "claimed_by": legacy.get("claimed_by"),
+        "claimed_until_utc": legacy.get("claimed_until_utc"),
+        "notified_at_utc": legacy.get("notified_at_utc"),
+        "created_at_utc": legacy.get("created_at_utc") or now,
+        "updated_at_utc": legacy.get("updated_at_utc") or now,
+    }
+
+
+def _migrate_notifications_table(connection: sqlite3.Connection) -> None:
+    """Create, keep, or transactionally rebuild the outbox table to the canonical shape.
+
+    - absent -> create with all constraints.
+    - structurally current -> no-op.
+    - anything else (v2 prototype without claim columns, constraint-less table,
+      wrong NOT NULL/PK/CHECK) -> a true rebuild (CREATE new -> validated copy ->
+      DROP -> RENAME) that PRESERVES existing rows; unmappable rows fail the
+      migration loudly. Must run inside the caller's transaction (rolled back
+      as one unit on failure).
     """
     if not _table_exists(connection, NOTIFICATIONS_TABLE):
         connection.execute(_create_notifications_table_sql(NOTIFICATIONS_TABLE))
         return
-    missing = REQUIRED_NOTIFICATION_COLUMNS - _table_columns(connection, NOTIFICATIONS_TABLE)
-    if missing:
+    if _notifications_table_object_current(connection):
+        return
+    temp_table = f"{NOTIFICATIONS_TABLE}__migrate_new"
+    legacy_columns = [row[1] for row in connection.execute(f"PRAGMA table_info({NOTIFICATIONS_TABLE})")]
+    legacy_rows = connection.execute(f"SELECT * FROM {NOTIFICATIONS_TABLE}").fetchall()
+    connection.execute(f"DROP TABLE IF EXISTS {temp_table}")
+    connection.execute(_create_notifications_table_sql(temp_table))
+    insert_sql = (
+        f"INSERT INTO {temp_table} ({', '.join(_NOTIFICATION_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in _NOTIFICATION_COLUMNS)})"
+    )
+    now = models.utc_now_iso()
+    for raw in legacy_rows:
+        migrated = _migrate_legacy_notification_row(dict(zip(legacy_columns, raw)), now)
+        try:
+            connection.execute(insert_sql, tuple(migrated[col] for col in _NOTIFICATION_COLUMNS))
+        except sqlite3.IntegrityError as exc:
+            raise PositionMigrationError(
+                f"legacy notification row {migrated.get('event_key')!r} violates the outbox schema: {exc}"
+            ) from exc
+    migrated_count = connection.execute(f"SELECT COUNT(*) FROM {temp_table}").fetchone()[0]
+    if migrated_count != len(legacy_rows):
         raise PositionMigrationError(
-            f"table {NOTIFICATIONS_TABLE} exists but is missing columns {sorted(missing)}; "
-            "refusing to guess a migration"
+            f"notification row-count mismatch during migration: legacy={len(legacy_rows)} migrated={migrated_count}"
         )
+    connection.execute(f"DROP TABLE {NOTIFICATIONS_TABLE}")
+    connection.execute(f"ALTER TABLE {temp_table} RENAME TO {NOTIFICATIONS_TABLE}")
 
 
 def _create_indexes(connection: sqlite3.Connection) -> None:
@@ -336,7 +492,7 @@ def _create_indexes(connection: sqlite3.Connection) -> None:
         f"ON {POSITIONS_TABLE} (state, symbol, timeframe)"
     )
     connection.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{NOTIFICATIONS_TABLE}_status "
+        f"CREATE INDEX IF NOT EXISTS {_NOTIFICATIONS_STATUS_INDEX} "
         f"ON {NOTIFICATIONS_TABLE} (delivery_status, created_at_utc)"
     )
 
@@ -355,19 +511,20 @@ def _positions_schema_current(connection: sqlite3.Connection) -> bool:
 
 
 def _schema_is_current(connection: sqlite3.Connection) -> bool:
-    """True only when the DB reports the current version AND has every column
-    of every table (positions + notifications).
+    """True only when the DB reports the current version AND every table's REAL
+    schema is current (positions columns; notifications constraints + index).
 
     Deliberately checks the real schema (``PRAGMA user_version`` + ``PRAGMA
-    table_info``), never "the table exists" -- a constraint-less legacy table
-    reports ``user_version = 0`` and is rebuilt.
+    table_info`` + ``sqlite_master.sql`` + ``PRAGMA index_list``), never "the
+    table exists" -- a constraint-less table is never accepted as current, even
+    with a forged ``user_version``.
     """
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version < CURRENT_SCHEMA_VERSION:
         return False
     if REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE):
         return False
-    return not (REQUIRED_NOTIFICATION_COLUMNS - _table_columns(connection, NOTIFICATIONS_TABLE))
+    return _notifications_table_object_current(connection) and _notifications_index_present(connection)
 
 
 def init_db(db_path: Path | None = None) -> None:
@@ -395,7 +552,7 @@ def init_db(db_path: Path | None = None) -> None:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(_create_table_sql(POSITIONS_TABLE))
-                _ensure_notifications_table(connection)
+                _migrate_notifications_table(connection)
                 _create_indexes(connection)
                 connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
                 connection.execute("COMMIT")
@@ -407,12 +564,14 @@ def init_db(db_path: Path | None = None) -> None:
             _create_indexes(connection)
             return
         if _positions_schema_current(connection):
-            # v1 -> v2 (Issue #83): positions are already fully constrained; only
-            # the notifications table / version stamp are missing. Additive-only,
-            # one transaction, full rollback on failure -- position rows untouched.
+            # Notifications-only migration (Issue #83): positions are already fully
+            # constrained; only the outbox table needs creating (v1), rebuilding
+            # (v2 prototype / constraint-less table -- rows preserved), or the
+            # index / version stamp is missing. One transaction, full rollback on
+            # failure -- position rows are never rebuilt or touched here.
             connection.execute("BEGIN IMMEDIATE")
             try:
-                _ensure_notifications_table(connection)
+                _migrate_notifications_table(connection)
                 _create_indexes(connection)
                 connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
                 connection.execute("COMMIT")
@@ -535,7 +694,7 @@ def _migrate_rebuild(connection: sqlite3.Connection) -> None:
 
         connection.execute(f"DROP TABLE {POSITIONS_TABLE}")
         connection.execute(f"ALTER TABLE {temp_table} RENAME TO {POSITIONS_TABLE}")
-        _ensure_notifications_table(connection)
+        _migrate_notifications_table(connection)
         _create_indexes(connection)
         connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         connection.execute("COMMIT")
@@ -556,35 +715,13 @@ SCHEMA_STATUS_LEGACY = "legacy"      # table present but older/incomplete -> nee
 SCHEMA_STATUS_INVALID = "invalid"    # file present but not a usable positions DB
 
 
-def get_schema_status(db_path: Path | None = None) -> str:
-    """Return the position DB's schema status WITHOUT writing anything.
+def _classify_schema(db_path: Path) -> str:
+    """Classify one on-disk DB file (see :func:`get_schema_status` for the vocabulary).
 
-    One of ``missing`` / ``current`` / ``legacy`` / ``invalid``. Read-only: never
-    creates the DB file, never migrates, never touches ``mtime``/size -- safe on a
-    dry run. ``validate_schema_read_only`` is an alias for callers that want the
-    intent spelled out.
-
-    Classification:
-      * ``missing``  -- no file yet.
-      * ``invalid``  -- the file exists but is NOT a usable SQLite database (a
-                        non-SQLite byte stream, a corrupt header, an unreadable
-                        schema). This is detected by catching ``sqlite3.DatabaseError``
-                        -- which ``file is not a database`` raises, and of which
-                        ``sqlite3.OperationalError`` (missing table etc.) is a
-                        subclass, so both are covered. We deliberately catch this
-                        narrow SQLite family (NOT the whole ``sqlite3.Error``, and
-                        NOT ``ProgrammingError``/``Exception``), so a genuine
-                        programming bug still surfaces rather than being masked as
-                        ``invalid``.
-      * ``legacy``   -- a valid SQLite DB, but our tables are absent (need creating)
-                        or present at an older version / missing columns (needs a
-                        migration -- a v1 DB lacking the Issue #83 notifications
-                        table classifies here). A normal (non-dry) run resolves this.
-      * ``current``  -- all tables present at the current version with every column.
+    Only ever called on a private SNAPSHOT COPY of the real DB, so a plain
+    read-write connection here is safe -- checkpoints or sidecar churn hit the
+    throwaway copy, never the original.
     """
-    db_path = Path(db_path) if db_path is not None else position_db_path()
-    if not db_path.exists():
-        return SCHEMA_STATUS_MISSING
     try:
         connection = sqlite3.connect(db_path)
     except sqlite3.DatabaseError:
@@ -594,20 +731,69 @@ def get_schema_status(db_path: Path | None = None) -> str:
         # non-SQLite/corrupt file raises sqlite3.DatabaseError here.
         if not _table_exists(connection, POSITIONS_TABLE):
             return SCHEMA_STATUS_LEGACY  # valid SQLite, our table not created yet
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = _table_columns(connection, POSITIONS_TABLE)
-        notification_columns = _table_columns(connection, NOTIFICATIONS_TABLE)  # empty when absent
+        current = _schema_is_current(connection)
     except sqlite3.DatabaseError:
         return SCHEMA_STATUS_INVALID
     finally:
-        connection.close()  # close() never commits -- no write, mtime/size unchanged
-    if (
-        version >= CURRENT_SCHEMA_VERSION
-        and not (REQUIRED_COLUMNS - columns)
-        and not (REQUIRED_NOTIFICATION_COLUMNS - notification_columns)
-    ):
-        return SCHEMA_STATUS_CURRENT
-    return SCHEMA_STATUS_LEGACY
+        connection.close()
+    return SCHEMA_STATUS_CURRENT if current else SCHEMA_STATUS_LEGACY
+
+
+def snapshot_db_for_read(db_path: Path, directory: Path) -> Path:
+    """Copy the DB file plus any ``-wal`` / ``-shm`` sidecars into *directory*.
+
+    Returns the snapshot's path. Reading the snapshot instead of the real file
+    is what keeps a dry run byte-invariant even for WAL DBs: SQLite readers
+    create/modify the ``-shm`` sidecar and can checkpoint the WAL, so the real
+    file must never be opened at all on a dry run.
+    """
+    snapshot = Path(directory) / (db_path.name or "positions.sqlite3")
+    shutil.copy2(db_path, snapshot)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        if sidecar.exists():
+            shutil.copy2(sidecar, Path(str(snapshot) + suffix))
+    return snapshot
+
+
+def get_schema_status(db_path: Path | None = None) -> str:
+    """Return the position DB's schema status WITHOUT touching the file AT ALL.
+
+    One of ``missing`` / ``current`` / ``legacy`` / ``invalid``.
+    ``validate_schema_read_only`` is an alias for callers that want the intent
+    spelled out.
+
+    **Snapshot probe (Issue #83 review):** SQLite is NEVER pointed at the real
+    file here -- not even read-only, because a plain connection can checkpoint a
+    WAL DB (rewriting the main file and deleting ``-wal``), and even a
+    ``mode=ro`` URI connection can create/modify the ``-shm`` sidecar of a WAL
+    DB. Instead the DB file plus any ``-wal`` / ``-shm`` sidecars are copied to
+    a private temp directory and the COPY is probed. Guarantee: the real DB,
+    ``-wal`` and ``-shm`` keep their exact bytes, size and mtime across a probe
+    (dry-run contract). A copy torn by a concurrent writer can classify as
+    ``invalid`` for that probe -- a diagnostic false negative, never a write.
+
+    Classification:
+      * ``missing``  -- no file yet.
+      * ``invalid``  -- the file exists but is NOT a usable SQLite database
+                        (detected via ``sqlite3.DatabaseError`` on the snapshot;
+                        the narrow SQLite family only, so genuine programming
+                        bugs still surface).
+      * ``legacy``   -- a valid SQLite DB needing migration: tables absent, an
+                        older version (v1 / the v2 outbox prototype), missing
+                        columns, or missing REAL constraints (PK / NOT NULL /
+                        CHECK / index) on the notifications table. A normal
+                        (non-dry) run resolves this.
+      * ``current``  -- every table present at the current version with its full
+                        physical schema (constraints verified, not assumed).
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    if not db_path.exists():
+        return SCHEMA_STATUS_MISSING
+    # OSError while snapshotting (permissions, disk full) propagates: it is an
+    # environment failure, not a schema state -- callers count it as a failure.
+    with tempfile.TemporaryDirectory(prefix="paper_exec_probe_") as tmp_dir:
+        return _classify_schema(snapshot_db_for_read(db_path, Path(tmp_dir)))
 
 
 # Explicit alias: dry-run schema validation is a READ-ONLY status probe.
@@ -638,6 +824,64 @@ def ensure_schema_migrated(db_path: Path | None = None) -> None:
     if status != SCHEMA_STATUS_CURRENT:
         raise PositionSchemaError(
             f"position DB schema is {status!r} after migration at {db_path}; refusing to proceed"
+        )
+    # Belt and braces (Issue #83 review): after the structural verification,
+    # prove the outbox constraints actually FIRE with a SAVEPOINT-rolled-back
+    # behavioral probe. Write path only -- never runs on a dry run.
+    _behavioral_probe_notifications(db_path)
+
+
+def _behavioral_probe_notifications(db_path: Path) -> None:
+    """Behaviorally verify the outbox constraints inside a rolled-back SAVEPOINT.
+
+    Probes that (a) an unknown ``event_type`` and (b) an unknown
+    ``delivery_status`` are rejected by their CHECKs, (c) a NULL ``position_id``
+    is rejected by NOT NULL, and (d) a duplicate ``event_key`` is rejected by
+    the PRIMARY KEY. Everything happens inside ``SAVEPOINT`` + ``ROLLBACK TO``
+    within a transaction that is itself rolled back -- no probe row can ever be
+    committed. Raises :class:`PositionSchemaError` when a constraint fails to fire.
+    """
+    now = models.utc_now_iso()
+    probe_key = "__schema_probe__:open"
+    base = (probe_key, "__schema_probe__", NOTIFY_EVENT_OPEN, DELIVERY_STATUS_PENDING, 0, None, None, None, None, now, now)
+    insert_sql = (
+        f"INSERT INTO {NOTIFICATIONS_TABLE} ({', '.join(_NOTIFICATION_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in _NOTIFICATION_COLUMNS)})"
+    )
+
+    connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+    not_enforced: list[str] = []
+    try:
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("SAVEPOINT schema_probe")
+
+            def expect_rejected(params: tuple, label: str) -> None:
+                try:
+                    connection.execute(insert_sql, params)
+                except sqlite3.IntegrityError:
+                    return
+                not_enforced.append(label)
+
+            expect_rejected(base[:2] + ("__invalid_event__",) + base[3:], "event_type CHECK")
+            expect_rejected(base[:3] + ("__invalid_status__",) + base[4:], "delivery_status CHECK")
+            expect_rejected((probe_key, None) + base[2:], "position_id NOT NULL")
+            try:
+                connection.execute(insert_sql, base)  # valid probe row must insert...
+                expect_rejected(base, "event_key PRIMARY KEY")  # ...and its duplicate must not
+            except sqlite3.IntegrityError:
+                not_enforced.append("valid probe row rejected (schema unusable)")
+            connection.execute("ROLLBACK TO schema_probe")
+            connection.execute("RELEASE SAVEPOINT schema_probe")
+        finally:
+            connection.execute("ROLLBACK")  # discard the probe transaction entirely
+    finally:
+        connection.close()
+    if not_enforced:
+        raise PositionSchemaError(
+            f"notifications table constraints not actually enforced at {db_path}: "
+            f"{', '.join(not_enforced)}; refusing to proceed"
         )
 
 
@@ -889,16 +1133,219 @@ def list_positions(*, db_path: Path | None = None, limit: int = 1000) -> list[di
     )
 
 
-# --- notification history (Issue #83) ----------------------------------------
-# Duplicate suppression + retry bookkeeping for Paper Execution Discord
-# notifications. Transaction boundary: each helper is ONE SQL statement in its
-# own transaction (committed by the connection context manager), always issued
-# AFTER the position transition it refers to has committed -- so a notification
-# write failure can never roll back or block a position state change.
+# --- transactional outbox (Issue #83) ----------------------------------------
+# Position transition + notification enqueue commit as ONE transaction (the
+# ``*_with_notification`` APIs); delivery claims rows atomically with a lease.
+# Transaction boundaries:
+#   * transition + enqueue      -> one BEGIN IMMEDIATE (atomic; both or neither)
+#   * claim (SELECT + UPDATEs)  -> one BEGIN IMMEDIATE (single winner per row)
+#   * finish / requeue          -> one BEGIN IMMEDIATE each
+# The Discord HTTP call itself happens OUTSIDE any transaction, after the
+# enqueue commit -- a delivery failure never rolls back a position change.
 
 
 class NotificationNotFoundError(PositionStoreError):
-    """No notification history row exists for the given event_key."""
+    """No notification outbox row exists for the given event_key."""
+
+
+class NotificationClaimError(PositionStoreError):
+    """The delivery claim was lost: the row is no longer ``processing`` under this
+    worker (its lease expired and another worker re-claimed it, or it was
+    requeued). The caller must not update the new owner's state."""
+
+
+@contextmanager
+def _immediate_txn(db_path: Path):
+    """One explicit ``BEGIN IMMEDIATE ... COMMIT`` transaction (ROLLBACK on error)."""
+    connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+    try:
+        connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
+
+
+def _iso_plus_seconds(iso_utc: str, seconds: float) -> str:
+    base = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
+    result = (base + timedelta(seconds=seconds)).astimezone(timezone.utc)
+    return result.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _enqueue_notification(connection: sqlite3.Connection, position_id: str, event_type: str, now: str) -> None:
+    """INSERT one ``pending`` outbox row inside the CALLER's transaction.
+
+    ``ON CONFLICT(event_key) DO NOTHING``: a replayed transition (which the CAS
+    guards already prevent) or a leftover row from an earlier schema can never
+    produce a duplicate outbox row or clobber delivery state.
+    """
+    key = notification_event_key(position_id, event_type)
+    connection.execute(
+        f"""
+        INSERT INTO {NOTIFICATIONS_TABLE}
+            (event_key, position_id, event_type, delivery_status, attempt_count,
+             last_error, claimed_by, claimed_until_utc, notified_at_utc, created_at_utc, updated_at_utc)
+        VALUES (?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?)
+        ON CONFLICT(event_key) DO NOTHING
+        """,
+        (key, position_id, event_type, DELIVERY_STATUS_PENDING, now, now),
+    )
+
+
+# --- atomic transition + enqueue APIs -----------------------------------------
+# The runner MUST use these for every notifiable transition (Issue #83 review
+# Blocker): a position transition commits together with its outbox row, so a
+# crash/SIGKILL at ANY point leaves either "no transition" or "transition +
+# outbox row" -- never a transition whose notification is lost forever.
+# Plain create_position / transition_* remain for non-notifiable writes
+# (pending creation) and callers that explicitly do not want notifications.
+
+
+def create_cancelled_position_with_notification(record: dict, *, db_path: Path | None = None) -> bool:
+    """Insert a terminal ``cancelled`` position AND its outbox row atomically.
+
+    Returns True when the position was inserted (and the event enqueued), False
+    when a position for this ``signal_id`` already existed (idempotent skip --
+    no outbox row is created for a duplicate). Only accepts ``cancelled``
+    records: pending creation is deliberately NOT a notification event.
+    """
+    if record.get("state") != models.STATE_CANCELLED:
+        raise ValueError(
+            f"create_cancelled_position_with_notification requires state='cancelled', got {record.get('state')!r}"
+        )
+    models.validate_state_reason(record["state"], record.get("terminal_reason"))
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = models.utc_now_iso()
+    with _immediate_txn(db_path) as connection:
+        cursor = connection.execute(_INSERT_SQL, _row_tuple(record))
+        if cursor.rowcount == 0:
+            return False  # duplicate signal_id: no position, no outbox row
+        _enqueue_notification(connection, record["position_id"], NOTIFY_EVENT_CANCELLED, now)
+    return True
+
+
+def transition_to_open_with_notification(
+    position_id: str,
+    *,
+    entry_price: float,
+    entry_time_utc: str,
+    stop_loss_price: float,
+    take_profit_price: float,
+    max_hold_deadline_utc: str,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """``pending -> open`` AND the ``open`` outbox row, in ONE transaction.
+
+    Same CAS contract as :func:`transition_to_open`; a CAS loss raises and
+    enqueues nothing (rolled back). An enqueue failure rolls the position
+    transition back too -- never a transition without its outbox row.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    with _immediate_txn(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {POSITIONS_TABLE}
+            SET state = ?, entry_price = ?, entry_time_utc = ?, stop_loss_price = ?,
+                take_profit_price = ?, max_hold_deadline_utc = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ?
+            """,
+            (
+                models.STATE_OPEN, float(entry_price), entry_time_utc, float(stop_loss_price),
+                float(take_profit_price), max_hold_deadline_utc, now,
+                position_id, models.STATE_PENDING,
+            ),
+        )
+        _require_cas(connection, cursor, position_id, expected_state=models.STATE_PENDING)
+        _enqueue_notification(connection, position_id, NOTIFY_EVENT_OPEN, now)
+    return _require_get(position_id, db_path=db_path)
+
+
+def transition_pending_terminal_with_notification(
+    position_id: str,
+    *,
+    state: str,
+    terminal_reason: str,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """``pending -> expired|cancelled`` AND the matching outbox row, in ONE transaction."""
+    if state not in (models.STATE_EXPIRED, models.STATE_CANCELLED):
+        raise ValueError(f"transition_pending_terminal only handles expired/cancelled, got {state!r}")
+    models.validate_state_reason(state, terminal_reason)
+    event_type = NOTIFY_EVENT_EXPIRED if state == models.STATE_EXPIRED else NOTIFY_EVENT_CANCELLED
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    with _immediate_txn(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {POSITIONS_TABLE}
+            SET state = ?, terminal_reason = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ?
+            """,
+            (state, terminal_reason, now, position_id, models.STATE_PENDING),
+        )
+        _require_cas(connection, cursor, position_id, expected_state=models.STATE_PENDING)
+        _enqueue_notification(connection, position_id, event_type, now)
+    return _require_get(position_id, db_path=db_path)
+
+
+def close_open_position_with_notification(
+    position_id: str,
+    *,
+    expected_watermark: str | None,
+    new_watermark: str,
+    close_price: float,
+    close_time_utc: str,
+    terminal_reason: str,
+    gross_pnl: float,
+    net_pnl: float,
+    r_multiple: float | None,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """``open -> closed`` (+ watermark) AND the ``closed`` outbox row, in ONE transaction."""
+    if terminal_reason not in models.STATE_TERMINAL_REASONS[models.STATE_CLOSED]:
+        raise ValueError(
+            f"close terminal_reason must be in {sorted(models.STATE_TERMINAL_REASONS[models.STATE_CLOSED])}, "
+            f"got {terminal_reason!r}"
+        )
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    with _immediate_txn(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {POSITIONS_TABLE}
+            SET state = ?, close_price = ?, close_time_utc = ?, terminal_reason = ?,
+                gross_pnl = ?, net_pnl = ?, pnl = ?, r_multiple = ?,
+                last_evaluated_candle_utc = ?, updated_at_utc = ?
+            WHERE position_id = ? AND state = ? AND last_evaluated_candle_utc IS ?
+            """,
+            (
+                models.STATE_CLOSED, float(close_price), close_time_utc, terminal_reason,
+                float(gross_pnl), float(net_pnl), float(net_pnl),
+                None if r_multiple is None else float(r_multiple),
+                new_watermark, now,
+                position_id, models.STATE_OPEN, expected_watermark,
+            ),
+        )
+        _require_cas(connection, cursor, position_id, expected_state=models.STATE_OPEN)
+        _enqueue_notification(connection, position_id, NOTIFY_EVENT_CLOSED, now)
+    return _require_get(position_id, db_path=db_path)
+
+
+# --- outbox reads / delivery claim / settle -----------------------------------
 
 
 def record_notification_event(
@@ -908,29 +1355,20 @@ def record_notification_event(
     created_at: str | None = None,
     db_path: Path | None = None,
 ) -> bool:
-    """Idempotently record one notification event as ``pending``.
+    """Enqueue-only helper (tests / manual ops): one ``pending`` outbox row.
 
-    Returns True if a new row was inserted, False when the event was already
-    recorded (``ON CONFLICT(event_key) DO NOTHING`` -- the runner-restart /
-    re-run duplicate guard). Never modifies an existing row, so an already
-    ``success`` event stays delivered and is never re-queued.
+    The runner never calls this directly -- transitions enqueue atomically via
+    the ``*_with_notification`` APIs. Returns True if a new row was inserted,
+    False when the event was already recorded (never clobbers delivery state).
     """
-    key = notification_event_key(position_id, event_type)
     db_path = Path(db_path) if db_path is not None else position_db_path()
     init_db(db_path)
     now = created_at or models.utc_now_iso()
-    with _connect(db_path) as connection:
-        cursor = connection.execute(
-            f"""
-            INSERT INTO {NOTIFICATIONS_TABLE}
-                (event_key, position_id, event_type, delivery_status, attempt_count,
-                 last_error, notified_at_utc, created_at_utc, updated_at_utc)
-            VALUES (?, ?, ?, ?, 0, NULL, NULL, ?, ?)
-            ON CONFLICT(event_key) DO NOTHING
-            """,
-            (key, position_id, event_type, DELIVERY_STATUS_PENDING, now, now),
-        )
-    return cursor.rowcount > 0
+    with _immediate_txn(db_path) as connection:
+        before = connection.total_changes
+        _enqueue_notification(connection, position_id, event_type, now)
+        inserted = connection.total_changes > before
+    return inserted
 
 
 def get_notification(event_key: str, *, db_path: Path | None = None) -> dict | None:
@@ -938,59 +1376,174 @@ def get_notification(event_key: str, *, db_path: Path | None = None) -> dict | N
     return _read_one(db_path, f"SELECT * FROM {NOTIFICATIONS_TABLE} WHERE event_key = ?", (event_key,))
 
 
-def list_undelivered_notifications(
-    *, db_path: Path | None = None, max_attempts: int | None = None
-) -> list[dict]:
-    """Rows still awaiting delivery: ``pending`` plus retryable ``failed``.
+def list_undelivered_notifications(*, db_path: Path | None = None) -> list[dict]:
+    """Monitoring/test view of unsettled rows (``pending`` / ``processing`` / ``failed``).
 
-    ``max_attempts`` caps retries: rows at/over the cap are excluded, so a
-    permanently failing delivery (429 / 5xx / connection error) is never
-    retried forever. Successful rows are never returned (no re-send).
+    NOT the delivery path: delivery must go through :func:`claim_notifications`
+    (atomic claim + lease) so concurrent workers cannot double-send.
+    ``success`` and ``dead_letter`` rows are excluded.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
-    sql = (
-        f"SELECT * FROM {NOTIFICATIONS_TABLE} WHERE delivery_status != ?"
+    return _read_many(
+        db_path,
+        f"SELECT * FROM {NOTIFICATIONS_TABLE} WHERE delivery_status NOT IN (?, ?) ORDER BY created_at_utc ASC",
+        (DELIVERY_STATUS_SUCCESS, DELIVERY_STATUS_DEAD_LETTER),
     )
-    params: tuple = (DELIVERY_STATUS_SUCCESS,)
-    if max_attempts is not None:
-        sql += " AND attempt_count < ?"
-        params += (int(max_attempts),)
-    sql += " ORDER BY created_at_utc ASC"
-    return _read_many(db_path, sql, params)
 
 
-def mark_notification_delivery(
+def count_notifications_by_status(*, db_path: Path | None = None) -> dict[str, int]:
+    """``{delivery_status: row count}`` -- dead-letter monitoring etc. Missing DB -> {}."""
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    rows = _read_many(
+        db_path,
+        f"SELECT delivery_status, COUNT(*) AS n FROM {NOTIFICATIONS_TABLE} GROUP BY delivery_status",
+        (),
+    )
+    return {row["delivery_status"]: row["n"] for row in rows}
+
+
+def claim_notifications(
+    *,
+    worker_id: str,
+    lease_seconds: float,
+    batch_limit: int,
+    max_attempts: int,
+    now_utc: str | None = None,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Atomically claim up to ``batch_limit`` deliverable outbox rows for one worker.
+
+    One ``BEGIN IMMEDIATE`` transaction (SQLite single-writer): the candidate
+    SELECT and every per-row UPDATE to ``processing`` commit together, so two
+    concurrent workers can never claim -- and therefore never deliver -- the
+    same row at once. Claimable rows are ``pending`` / ``failed`` under the
+    attempt cap, plus ``processing`` rows whose lease (``claimed_until_utc``)
+    has expired (a crashed worker's rows become deliverable again after the
+    lease). ``success`` and ``dead_letter`` rows are never claimed.
+    Returns the claimed rows (post-claim state), oldest first.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = now_utc or models.utc_now_iso()
+    lease_until = _iso_plus_seconds(now, lease_seconds)
+    claimed: list[dict] = []
+    with _immediate_txn(db_path) as connection:
+        candidates = connection.execute(
+            f"""
+            SELECT * FROM {NOTIFICATIONS_TABLE}
+            WHERE attempt_count < ?
+              AND (
+                delivery_status IN (?, ?)
+                OR (delivery_status = ? AND (claimed_until_utc IS NULL OR claimed_until_utc <= ?))
+              )
+            ORDER BY created_at_utc ASC
+            LIMIT ?
+            """,
+            (
+                int(max_attempts),
+                DELIVERY_STATUS_PENDING, DELIVERY_STATUS_FAILED,
+                DELIVERY_STATUS_PROCESSING, now,
+                int(batch_limit),
+            ),
+        ).fetchall()
+        for row in candidates:
+            connection.execute(
+                f"""
+                UPDATE {NOTIFICATIONS_TABLE}
+                SET delivery_status = ?, claimed_by = ?, claimed_until_utc = ?, updated_at_utc = ?
+                WHERE event_key = ?
+                """,
+                (DELIVERY_STATUS_PROCESSING, worker_id, lease_until, now, row["event_key"]),
+            )
+            claimed.append(
+                {
+                    **dict(row),
+                    "delivery_status": DELIVERY_STATUS_PROCESSING,
+                    "claimed_by": worker_id,
+                    "claimed_until_utc": lease_until,
+                    "updated_at_utc": now,
+                }
+            )
+    return claimed
+
+
+def finish_notification_delivery(
     event_key: str,
     *,
+    worker_id: str,
     success: bool,
+    max_attempts: int,
     error: str | None = None,
     updated_at: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
-    """Record one delivery attempt's outcome (attempt_count += 1, status update).
+    """Settle one CLAIMED delivery attempt (attempt_count += 1) and release the claim.
 
-    Success sets ``notified_at_utc`` and clears ``last_error``; failure stores a
-    sanitized ``last_error`` (callers must never pass the webhook URL or other
-    secrets in *error*). Raises :class:`NotificationNotFoundError` for an
-    unknown event_key.
+    Guarded on ``(delivery_status = 'processing', claimed_by = worker_id)``: if
+    the lease expired and another worker re-claimed the row (or it was
+    requeued), this raises :class:`NotificationClaimError` instead of
+    clobbering the new owner's state. Outcomes: ``success`` (never re-claimed);
+    failure -> ``failed`` (retryable), or ``dead_letter`` once ``attempt_count``
+    reaches ``max_attempts`` (kept visible, never auto-retried -- see
+    :func:`requeue_notification`). ``error`` must already be sanitized (never a
+    webhook URL/secret). One transaction.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
-    init_db(db_path)
     now = updated_at or models.utc_now_iso()
-    status = DELIVERY_STATUS_SUCCESS if success else DELIVERY_STATUS_FAILED
-    with _connect(db_path) as connection:
+    with _immediate_txn(db_path) as connection:
+        row = connection.execute(
+            f"SELECT attempt_count FROM {NOTIFICATIONS_TABLE} "
+            "WHERE event_key = ? AND delivery_status = ? AND claimed_by = ?",
+            (event_key, DELIVERY_STATUS_PROCESSING, worker_id),
+        ).fetchone()
+        if row is None:
+            raise NotificationClaimError(
+                f"claim lost for {event_key!r} (worker {worker_id!r}): row is not processing under this worker"
+            )
+        attempts = row["attempt_count"] + 1
+        if success:
+            status = DELIVERY_STATUS_SUCCESS
+        elif attempts >= int(max_attempts):
+            status = DELIVERY_STATUS_DEAD_LETTER
+        else:
+            status = DELIVERY_STATUS_FAILED
+        connection.execute(
+            f"""
+            UPDATE {NOTIFICATIONS_TABLE}
+            SET delivery_status = ?, attempt_count = ?, last_error = ?,
+                claimed_by = NULL, claimed_until_utc = NULL,
+                notified_at_utc = ?, updated_at_utc = ?
+            WHERE event_key = ?
+            """,
+            (status, attempts, None if success else error, now if success else None, now, event_key),
+        )
+    row = get_notification(event_key, db_path=db_path)
+    if row is None:  # pragma: no cover - row cannot vanish behind the settled UPDATE
+        raise NotificationNotFoundError(f"no notification outbox row for event_key {event_key!r}")
+    return row
+
+
+def requeue_notification(event_key: str, *, db_path: Path | None = None) -> dict:
+    """Manual ops recovery: reset one row (incl. ``dead_letter``) to a fresh ``pending``.
+
+    Clears the claim and ``attempt_count`` so the next cycle re-delivers it.
+    Raises :class:`NotificationNotFoundError` for an unknown event_key.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    now = models.utc_now_iso()
+    with _immediate_txn(db_path) as connection:
         cursor = connection.execute(
             f"""
             UPDATE {NOTIFICATIONS_TABLE}
-            SET delivery_status = ?, attempt_count = attempt_count + 1,
-                last_error = ?, notified_at_utc = ?, updated_at_utc = ?
+            SET delivery_status = ?, attempt_count = 0, last_error = NULL,
+                claimed_by = NULL, claimed_until_utc = NULL, updated_at_utc = ?
             WHERE event_key = ?
             """,
-            (status, None if success else error, now if success else None, now, event_key),
+            (DELIVERY_STATUS_PENDING, now, event_key),
         )
         if cursor.rowcount == 0:
-            raise NotificationNotFoundError(f"no notification history row for event_key {event_key!r}")
+            raise NotificationNotFoundError(f"no notification outbox row for event_key {event_key!r}")
     row = get_notification(event_key, db_path=db_path)
-    if row is None:  # pragma: no cover - row cannot vanish between UPDATE and SELECT here
-        raise NotificationNotFoundError(f"no notification history row for event_key {event_key!r}")
+    if row is None:  # pragma: no cover
+        raise NotificationNotFoundError(f"no notification outbox row for event_key {event_key!r}")
     return row

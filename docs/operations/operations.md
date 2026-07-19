@@ -35,8 +35,8 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `ENABLE_ECONOMIC_CALENDAR` | `false` | Economic Calendar optional Providerを有効化 |
 | `CHART_DB_PATH` | `market-watch/data/chart_data.sqlite3` | Chart DBのパス上書き(`market-watch/chart_collector.py`) |
 | `MARKET_BIAS_DB_PATH` | `news-feed-bot/data/market_bias.sqlite3` | Market Bias DBのパス上書き。Backtestから別プロセスで参照する場合に使う(`news-feed-bot/market_bias_store.py`) |
-| `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む(v2 で通知履歴テーブル `paper_execution_notifications` を追加)。dry-run では作成・migration せず読み取り専用のスキーマ確認のみ行う |
-| `PAPER_EXECUTION_DISCORD_WEBHOOK_URL` | empty | Paper Execution 状態遷移通知(仮想約定・仮想損益。Issue #83)の Discord Webhook。`paper-execution/.env` またはプロセス環境変数。Paper Signal の `DISCORD_WEBHOOK_URL` とは別変数(責務分離)。未設定時は通知イベントを Position DB へ記録した上で配送をスキップ(runner は正常動作)。通知失敗は position 状態・`--once` 終了コードへ影響せず、後続 cycle で自動再送(上限5回) |
+| `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む(v3 で通知 outbox テーブル `paper_execution_notifications` を追加)。dry-run では作成・migration せず、本体+WAL/SHM の snapshot コピーに対する読み取り専用スキーマ確認のみ行う(実 DB へ接続しない) |
+| `PAPER_EXECUTION_DISCORD_WEBHOOK_URL` | empty | Paper Execution 状態遷移通知(仮想約定・仮想損益。Issue #83)の Discord Webhook。`paper-execution/.env` またはプロセス環境変数。Paper Signal の `DISCORD_WEBHOOK_URL` とは別変数(責務分離)。Transactional Outbox 方式: 通知 outbox 行は Position 遷移と同一トランザクションで確定するため、Webhook 未設定でも記録され消えない。未設定時は claim せず attempt を消費せず滞留し、URL 設定後に `DELIVERY_BATCH_LIMIT`=20 件/cycle で順次配送する。配送は at-least-once(HTTP 成功後 success 記録前に停止すると同一 Event ID の重複があり得る)。配送失敗は position 状態・`--once` 終了コードへ影響せず、後続 cycle で自動再送(上限5回、以後 `dead_letter`) |
 
 注意: `news-feed-bot/` のニュース投稿では、現行コードで使用している実変数名は `NEWS_WEBHOOK_URL` である。`DISCORD_WEBHOOK_URL` はニュース投稿用の設定名ではない。一方、`market-watch/` のイベント通知では旧設定との互換性のため、`BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り `DISCORD_WEBHOOK_URL` をlegacy fallbackとして扱う。
 
@@ -160,6 +160,61 @@ ps -aux | grep .py
 ```
 
 `--dry-run` ではDiscord送信もstate更新も行わない。
+
+---
+## Paper Execution 通知 outbox の運用(Issue #83)
+
+Paper Execution の Discord 通知は Position DB(`paper_positions.sqlite3`)内の
+`paper_execution_notifications` テーブルを **Transactional Outbox** として使う。
+状態遷移(open/closed/expired/cancelled)行はポジション遷移と同一トランザクションで
+確定し、配送は commit 後に claim/lease 付きで行う(at-least-once)。
+
+### 状態確認
+
+```bash
+DB=/opt/berial/paper-execution/data/paper_positions.sqlite3
+
+# delivery_status ごとの件数(dead_letter / processing の滞留を監視)
+sqlite3 "$DB" \
+  "SELECT delivery_status, COUNT(*) FROM paper_execution_notifications GROUP BY delivery_status;"
+
+# 未解消 dead-letter(上限到達で配送を諦めた通知)の一覧
+sqlite3 "$DB" \
+  "SELECT event_key, attempt_count, last_error, updated_at_utc
+     FROM paper_execution_notifications
+    WHERE delivery_status = 'dead_letter' ORDER BY updated_at_utc;"
+
+# lease が生きたまま長時間 processing の行(worker 停止の疑い。lease 期限後は自動再claim)
+sqlite3 "$DB" \
+  "SELECT event_key, claimed_by, claimed_until_utc
+     FROM paper_execution_notifications WHERE delivery_status = 'processing';"
+```
+
+各 cycle のログ末尾 `Cycle done: ... dead_letter=N` と、`N>0` 時の
+`WARNING ... dead-letter notification(s) awaiting manual recovery` で継続監視できる
+(dead-letter は SELECT 対象外にして静かに消さない)。
+
+### 復旧(手動再送 / attempt リセット)
+
+`dead_letter` や再送したい行は、Python から `requeue_notification` で
+`pending`(attempt_count=0)へ戻すと次 cycle で再配送される。
+
+```bash
+cd /opt/berial/paper-execution
+python -c "import position_store as s; print(s.requeue_notification('POSITION_ID:closed'))"
+```
+
+不要になった通知行は運用判断で手動削除してよい(outbox は無期限保持が既定)。
+Webhook 未設定のあいだ滞留した行も、`PAPER_EXECUTION_DISCORD_WEBHOOK_URL` 設定後に
+`DELIVERY_BATCH_LIMIT`=20 件/cycle で順次配送される(未設定中は attempt を消費しない)。
+
+### 重複通知について
+
+配送は **at-least-once**。HTTP POST 成功後・DB の success 記録前に停止すると、
+lease 期限後に同一通知が再配送され Discord 上で重複し得る。各本文の
+`Event ID: <position_id:event_type>` 行で同一イベントと識別できる。厳密な
+exactly-once は保証しない(「outbox 成功済みは再送しない」ことと「Discord で重複しない」
+ことは別)。
 
 ---
 ## CLI

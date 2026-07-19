@@ -7,33 +7,49 @@ Execution notifications announce "that hypothesis was virtually filled /
 virtually settled as time advanced". This module owns ONLY the latter and is
 deliberately decoupled from ``execution_runner``:
 
-    execution_runner  ->  ExecutionEvent (DTO)  ->  this module  ->  Discord Webhook
+    execution_runner --(atomic transition + outbox enqueue in position_store)-->
+        paper_execution_notifications (transactional outbox, Position DB)
+            --(this module: claim -> format -> HTTP -> settle)--> Discord Webhook
 
 Separated responsibilities:
 
-- **event generation**: the runner emits an :class:`ExecutionEvent` only AFTER
-  the position transition committed to the Position DB (DB first, notify
-  second; a Discord failure never rolls back a position).
+- **event persistence**: NOT here. Position transitions and their outbox rows
+  commit atomically in ``position_store`` (``*_with_notification`` APIs) -- a
+  transition can never exist without its outbox row, and a crash at any point
+  before delivery leaves the row behind for a later cycle.
 - **body / payload generation**: :func:`format_event_message` /
   :func:`build_discord_payload` are pure functions. Missing values render as a
-  safe placeholder, never an exception.
+  safe placeholder, never an exception. Every body carries
+  ``Event ID: <position_id:event_type>`` so duplicates are identifiable.
 - **HTTP delivery**: :func:`deliver_payload` -- timeout always set, exactly one
   attempt per call, errors classified into a sanitized
   :class:`NotificationDeliveryError` (never containing the webhook URL).
-- **history / duplicate suppression**: the ``paper_execution_notifications``
-  table in the Position DB (``position_store``): ``event_key`` =
-  ``position_id:event_type`` UNIQUE. Delivered events are never re-sent (also
-  across runner restarts); failed events are retried on later cycles up to
-  ``MAX_DELIVERY_ATTEMPTS`` -- never an infinite retry loop.
-- **dry-run**: format + log the would-be body only. No DB row, no HTTP call,
-  no file.
+- **claim / lease**: :func:`deliver_outbox` claims at most
+  ``batch_limit`` rows per cycle via ``position_store.claim_notifications``
+  (atomic; single worker per row; expired leases recoverable), delivers, then
+  settles each row (``success`` / ``failed`` / ``dead_letter``).
+- **dry-run**: :func:`log_dry_run_events` logs the would-be bodies only. No DB
+  row, no HTTP call, no file.
+
+DELIVERY CONTRACT -- AT-LEAST-ONCE, NOT EXACTLY-ONCE: the Discord POST and the
+``success`` DB update cannot be atomic. A settled (``success``) outbox row is
+never re-sent; but if the process dies (or the DB write fails) AFTER a
+successful POST and BEFORE the ``success`` record, the row stays claimed until
+its lease expires and is then re-delivered -- the SAME Event ID appears twice
+on Discord. Consumers identify duplicates by the ``Event ID`` line.
+
+Failure classification (see ``CycleResult``):
+- outbox persistence / claim / settle DB failures -> data-plane ``failures``
+  (the notification guarantee itself is broken; ``--once`` exits non-zero).
+- HTTP delivery failures (timeout / 429 / 5xx / connection error) and the
+  success-record failure above -> ``notification_failures`` (positions stay
+  consistent; retried automatically).
 
 Configuration: ``PAPER_EXECUTION_DISCORD_WEBHOOK_URL`` in
 ``paper-execution/.env`` (or the process environment). Deliberately a separate
-variable from Paper Signal's ``DISCORD_WEBHOOK_URL`` so the two notification
-responsibilities stay independent. When unset, events are still recorded
-(queued) but delivery is skipped with a warning -- never an error, never a
-crash of the resident runner.
+variable from Paper Signal's ``DISCORD_WEBHOOK_URL``. When unset, outbox rows
+keep accumulating (attempt_count untouched, nothing claimed) and are delivered
+-- ``batch_limit`` per cycle -- once the URL is configured.
 """
 
 from __future__ import annotations
@@ -61,6 +77,8 @@ EVENT_CANCELLED = store.NOTIFY_EVENT_CANCELLED
 WEBHOOK_ENV_VAR = "PAPER_EXECUTION_DISCORD_WEBHOOK_URL"
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_DELIVERY_ATTEMPTS = 5
+DELIVERY_BATCH_LIMIT = 20          # max HTTP deliveries per cycle (backlog drain cap)
+DEFAULT_LEASE_SECONDS = 600        # processing-claim lease; expired claims are recoverable
 DISCORD_CONTENT_LIMIT = 2000
 
 PAPER_EXECUTION_NOTE = "Paper Execution only. 仮想約定・仮想損益の記録であり、実注文は行っていません。"
@@ -75,13 +93,22 @@ def _get_logger() -> logging.Logger:
     return logging.getLogger(_logger_name)
 
 
+def default_worker_id() -> str:
+    """Claim owner id for this process (host + pid: unique enough per lease window)."""
+    try:
+        host = os.uname().nodename
+    except AttributeError:  # pragma: no cover - non-POSIX
+        host = "local"
+    return f"{host}:pid-{os.getpid()}"
+
+
 @dataclass(frozen=True)
 class ExecutionEvent:
-    """DTO handed from the runner to the notifier: one committed state transition.
+    """DTO for dry-run logging: one would-be state transition and its projected record.
 
-    ``position`` is the post-transition row (or, on a dry run, the projected
-    record) -- used for immediate formatting; retries re-read the row from the
-    Position DB by ``position_id``.
+    On a NORMAL run events are never carried in memory -- the outbox row is
+    committed atomically with the transition in ``position_store`` and delivery
+    reads back from the DB. This DTO only feeds :func:`log_dry_run_events`.
     """
 
     event_type: str
@@ -122,12 +149,23 @@ def _number(value, digits: int = 5) -> str:
         return str(value)
 
 
+def _event_id_line(event_type: str, position: dict) -> str:
+    """``Event ID: <position_id:event_type>`` -- the at-least-once duplicate marker.
+
+    Matches the outbox ``event_key`` exactly, so a duplicated Discord post
+    (possible when the success record fails after a successful POST) is
+    identifiable as the same underlying event.
+    """
+    return f"Event ID: {_display(position.get('position_id'))}:{event_type}"
+
+
 def format_open_message(position: dict) -> str:
     """pending -> open: the virtual fill notification body."""
     return "\n".join(
         [
             "\U0001f4c8 Paper Execution OPEN — 仮想約定 (virtual fill)",
             "",
+            _event_id_line(EVENT_OPEN, position),
             f"Symbol: {_display(position.get('symbol'))}",
             f"Timeframe: {_display(position.get('timeframe'))}",
             f"Side: {_display(position.get('side'))}",
@@ -151,6 +189,7 @@ def format_closed_message(position: dict) -> str:
         [
             "\U0001f4b0 Paper Execution CLOSED — 仮想損益 (virtual PnL)",
             "",
+            _event_id_line(EVENT_CLOSED, position),
             f"Symbol: {_display(position.get('symbol'))}",
             f"Timeframe: {_display(position.get('timeframe'))}",
             f"Side: {_display(position.get('side'))}",
@@ -180,6 +219,7 @@ def format_terminal_message(event_type: str, position: dict) -> str:
         [
             header,
             "",
+            _event_id_line(event_type, position),
             f"Symbol: {_display(position.get('symbol'))}",
             f"Timeframe: {_display(position.get('timeframe'))}",
             f"Side: {_display(position.get('side'))}",
@@ -251,121 +291,190 @@ def deliver_payload(
         raise NotificationDeliveryError(f"HTTP {status}")
 
 
-# --- orchestration ------------------------------------------------------------
+# --- dry-run ------------------------------------------------------------------
+
+
+def log_dry_run_events(events) -> None:
+    """Log the would-be notification bodies. NO side effects: no DB, no HTTP, no file."""
+    logger = _get_logger()
+    for event in events:
+        message = format_event_message(event.event_type, event.position)
+        logger.info(
+            "[DRY_RUN] would notify Paper Execution %s (%s):\n%s",
+            event.event_type, event.position_id or "<no id>", message,
+        )
+
+
+# --- delivery orchestration ---------------------------------------------------
 
 
 @dataclass
-class NotifyResult:
-    """Outcome of one notification pass (one runner cycle)."""
+class DeliveryResult:
+    """Outcome of one outbox delivery pass (one runner cycle).
+
+    ``outbox_failures`` are DB/bookkeeping failures (claim, settle, reads) --
+    the notification guarantee itself is at risk, so the runner counts them as
+    data-plane ``failures``. ``delivery_failures`` are HTTP-side failures plus
+    the success-record failure (positions stay consistent; retried
+    automatically). ``dead_letter_total`` is the CURRENT number of unresolved
+    dead-letter rows (a gauge for continuous monitoring, not a per-cycle count).
+    """
 
     sent: int = 0
-    failed: int = 0
-    skipped_duplicates: int = 0
+    delivery_failures: int = 0
+    outbox_failures: int = 0
+    dead_letter_total: int = 0
 
 
-def process_events(
-    events,
+def deliver_outbox(
     *,
     db_path: Path | None = None,
-    dry_run: bool = False,
     webhook_url_value: str | None = None,
     session=None,
-) -> NotifyResult:
-    """Record new events, then deliver everything undelivered (incl. retries).
+    worker_id: str | None = None,
+    batch_limit: int = DELIVERY_BATCH_LIMIT,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    max_attempts: int = MAX_DELIVERY_ATTEMPTS,
+    now_utc: str | None = None,
+) -> DeliveryResult:
+    """Claim and deliver queued outbox rows; settle each attempt. At-least-once.
 
     Contract (Issue #83):
 
-    - Called AFTER the cycle's position transitions committed; nothing here can
-      roll them back, and no exception from here should stop the runner (the
-      runner additionally guards the call).
-    - dry-run: logs each would-be body and returns. No DB row, no HTTP, no file.
-    - Duplicate suppression: ``event_key`` UNIQUE insert; already-``success``
-      rows are never re-delivered (also across restarts / re-runs).
-    - Failed deliveries stay in the table and are retried on later cycles until
-      ``MAX_DELIVERY_ATTEMPTS``; each cycle makes at most one attempt per event.
-    - Missing webhook URL: events are recorded (queued) but delivery is skipped
-      with a warning.
+    - Runs AFTER the cycle's transitions (each already committed atomically with
+      its outbox row); nothing here can roll a position back, and no exception
+      from here should stop the runner (the runner additionally guards the call).
+    - Claims at most ``batch_limit`` rows (atomic claim + lease -- one worker per
+      row; expired leases from crashed workers become claimable again).
+    - Settled ``success`` rows are never re-claimed. Failures retry on later
+      cycles until ``max_attempts``, then move to ``dead_letter`` (kept visible;
+      the per-cycle dead-letter gauge is always reported/logged).
+    - Missing webhook URL: nothing is claimed, no attempt is consumed; rows keep
+      accumulating and drain (``batch_limit`` per cycle) once the URL is set.
+    - A successful POST whose ``success`` record then fails is logged loudly and
+      counted as a delivery failure: the row will be re-delivered after its
+      lease expires (duplicate on Discord, same Event ID -- at-least-once).
     """
     logger = _get_logger()
-    result = NotifyResult()
-    events = list(events)
-
-    if dry_run:
-        for event in events:
-            message = format_event_message(event.event_type, event.position)
-            logger.info(
-                "[DRY_RUN] would notify Paper Execution %s (%s):\n%s",
-                event.event_type, event.position_id or "<no id>", message,
-            )
-        return result
-
+    result = DeliveryResult()
     db_path = Path(db_path) if db_path is not None else store.position_db_path()
+    worker = worker_id or default_worker_id()
 
-    # Phase 1: record this cycle's events (idempotent; duplicates suppressed).
-    for event in events:
-        try:
-            inserted = store.record_notification_event(
-                event.position_id, event.event_type, db_path=db_path
-            )
-        except Exception as exc:
-            logger.error(
-                "Paper Execution notification: recording %s for %s failed: %s",
-                event.event_type, event.position_id, exc,
-            )
-            result.failed += 1
-            continue
-        if not inserted:
-            result.skipped_duplicates += 1
-
-    # Phase 2: deliver everything undelivered -- this cycle's rows plus failed
-    # rows from earlier cycles (retry), capped at MAX_DELIVERY_ATTEMPTS.
+    # Dead-letter gauge first: monitored EVERY cycle, webhook set or not, so
+    # exhausted notifications can never silently disappear from view.
     try:
-        rows = store.list_undelivered_notifications(db_path=db_path, max_attempts=MAX_DELIVERY_ATTEMPTS)
+        counts = store.count_notifications_by_status(db_path=db_path)
     except Exception as exc:
-        logger.error("Paper Execution notification: listing undelivered rows failed: %s", exc)
-        result.failed += 1
+        logger.error("Paper Execution outbox: status read failed: %s", exc)
+        result.outbox_failures += 1
         return result
-    if not rows:
-        return result
+    result.dead_letter_total = counts.get(store.DELIVERY_STATUS_DEAD_LETTER, 0)
+    if result.dead_letter_total:
+        logger.warning(
+            "Paper Execution outbox: %d dead-letter notification(s) awaiting manual recovery "
+            "(see docs/operations/operations.md).",
+            result.dead_letter_total,
+        )
 
     url = webhook_url_value if webhook_url_value is not None else webhook_url()
     if not url:
-        logger.warning(
-            "%s is not set; %d Paper Execution notification(s) stay queued (delivery skipped).",
-            WEBHOOK_ENV_VAR, len(rows),
+        queued = sum(
+            counts.get(status, 0)
+            for status in (
+                store.DELIVERY_STATUS_PENDING,
+                store.DELIVERY_STATUS_FAILED,
+                store.DELIVERY_STATUS_PROCESSING,
+            )
         )
+        if queued:
+            logger.warning(
+                "%s is not set; %d Paper Execution notification(s) stay queued "
+                "(nothing claimed, no attempt consumed).",
+                WEBHOOK_ENV_VAR, queued,
+            )
         return result
 
-    for row in rows:
+    try:
+        claimed = store.claim_notifications(
+            worker_id=worker, lease_seconds=lease_seconds, batch_limit=batch_limit,
+            max_attempts=max_attempts, now_utc=now_utc, db_path=db_path,
+        )
+    except Exception as exc:
+        logger.error("Paper Execution outbox: claim failed: %s", exc)
+        result.outbox_failures += 1
+        return result
+
+    for row in claimed:
         event_key = row["event_key"]
         try:
             position = store.get_position(row["position_id"], db_path=db_path)
-            if position is None:
-                # Unbuildable message: count the attempt so it cannot retry forever.
-                store.mark_notification_delivery(
-                    event_key, success=False, error="position row not found", db_path=db_path
-                )
-                logger.error(
-                    "Paper Execution notification %s failed: position row not found.", event_key
-                )
-                result.failed += 1
-                continue
+        except Exception as exc:
+            # DB read failure: leave the row processing; the lease will expire
+            # and a later cycle retries. Outbox-side failure (data plane).
+            logger.error("Paper Execution outbox: position read failed for %s: %s", event_key, exc)
+            result.outbox_failures += 1
+            continue
+        if position is None:
+            _settle(row, worker, success=False, error="position row not found",
+                    max_attempts=max_attempts, db_path=db_path, result=result, logger=logger)
+            result.delivery_failures += 1
+            continue
+
+        try:
             payload = build_discord_payload(format_event_message(row["event_type"], position))
             deliver_payload(payload, webhook_url=url, session=session)
         except NotificationDeliveryError as exc:
-            store.mark_notification_delivery(event_key, success=False, error=str(exc), db_path=db_path)
+            _settle(row, worker, success=False, error=str(exc),
+                    max_attempts=max_attempts, db_path=db_path, result=result, logger=logger)
             logger.error(
                 "Paper Execution notification %s failed (attempt %d/%d): %s",
-                event_key, row["attempt_count"] + 1, MAX_DELIVERY_ATTEMPTS, exc,
+                event_key, row["attempt_count"] + 1, max_attempts, exc,
             )
-            result.failed += 1
+            result.delivery_failures += 1
             continue
         except Exception as exc:
-            # Formatting / bookkeeping bug: never let it kill the loop or the runner.
+            # Formatting/bookkeeping bug: never let it kill the loop or the runner.
             logger.error("Paper Execution notification %s failed: %s", event_key, exc)
-            result.failed += 1
+            _settle(row, worker, success=False, error=f"internal error: {type(exc).__name__}",
+                    max_attempts=max_attempts, db_path=db_path, result=result, logger=logger)
+            result.delivery_failures += 1
             continue
-        store.mark_notification_delivery(event_key, success=True, db_path=db_path)
+
+        # HTTP POST succeeded -> record success. NOT atomic with the POST:
+        try:
+            store.finish_notification_delivery(
+                event_key, worker_id=worker, success=True, max_attempts=max_attempts, db_path=db_path,
+            )
+        except Exception as exc:
+            # AT-LEAST-ONCE window: Discord accepted the message but the success
+            # record failed. The row stays claimed until the lease expires, then
+            # re-delivers -- the SAME Event ID will appear twice on Discord.
+            logger.error(
+                "Paper Execution notification %s: Discord POST succeeded but the success record "
+                "FAILED (%s). The row will be re-delivered after its lease expires -- a DUPLICATE "
+                "Discord message with the same Event ID is possible (at-least-once contract).",
+                event_key, exc,
+            )
+            result.delivery_failures += 1
+            continue
         logger.info("Paper Execution notification sent: %s", event_key)
         result.sent += 1
     return result
+
+
+def _settle(row, worker, *, success, error, max_attempts, db_path, result, logger) -> None:
+    """Settle one claimed row's failed attempt; escalate settle failures to outbox failures."""
+    try:
+        finished = store.finish_notification_delivery(
+            row["event_key"], worker_id=worker, success=success, error=error,
+            max_attempts=max_attempts, db_path=db_path,
+        )
+        if finished["delivery_status"] == store.DELIVERY_STATUS_DEAD_LETTER:
+            logger.error(
+                "Paper Execution notification %s moved to dead_letter after %d attempt(s); "
+                "manual recovery required (see docs/operations/operations.md).",
+                row["event_key"], finished["attempt_count"],
+            )
+    except Exception as exc:
+        logger.error("Paper Execution outbox: settling %s failed: %s", row["event_key"], exc)
+        result.outbox_failures += 1
