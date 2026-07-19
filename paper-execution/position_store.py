@@ -27,6 +27,15 @@ Read helpers never create the DB file (dry-run safe) and deliberately do NOT
 swallow a ``sqlite3.OperationalError`` on an existing file into an empty result
 (Issue #49 runner contract: a real read failure must surface, not masquerade as
 "no data"). Only a *missing* DB file returns the empty/None default.
+
+Issue #83 adds the ``paper_execution_notifications`` table (schema v2) to the
+same DB: a per-event notification history keyed by a deterministic
+``event_key`` (``position_id:event_type``, UNIQUE) that gives Discord
+notifications duplicate suppression across runner restarts and retryability
+for failed deliveries. Each notification write helper is its own transaction
+(single statement, committed by the connection context manager) and is always
+separate from the position transition it follows -- a notification failure can
+never roll back a position state change.
 """
 
 from __future__ import annotations
@@ -48,6 +57,52 @@ if str(BASE_DIR) not in sys.path:
 import position_models as models  # noqa: E402
 
 POSITIONS_TABLE = "virtual_positions"
+NOTIFICATIONS_TABLE = "paper_execution_notifications"
+
+# --- notification event vocabulary (Issue #83, closed set) -------------------
+# One event per observable transition. `pending` creation is deliberately NOT
+# an event (out of the Issue #83 scope).
+NOTIFY_EVENT_OPEN = "open"            # pending -> open (virtual fill)
+NOTIFY_EVENT_CLOSED = "closed"        # open -> closed (SL / TP / max hold)
+NOTIFY_EVENT_EXPIRED = "expired"      # pending -> expired (entry timeout)
+NOTIFY_EVENT_CANCELLED = "cancelled"  # invalid signal -> cancelled
+KNOWN_NOTIFY_EVENTS: frozenset[str] = frozenset(
+    {NOTIFY_EVENT_OPEN, NOTIFY_EVENT_CLOSED, NOTIFY_EVENT_EXPIRED, NOTIFY_EVENT_CANCELLED}
+)
+
+DELIVERY_STATUS_PENDING = "pending"   # recorded, not yet attempted
+DELIVERY_STATUS_SUCCESS = "success"   # delivered; never re-sent
+DELIVERY_STATUS_FAILED = "failed"     # last attempt failed; retryable until the attempt cap
+KNOWN_DELIVERY_STATUSES: frozenset[str] = frozenset(
+    {DELIVERY_STATUS_PENDING, DELIVERY_STATUS_SUCCESS, DELIVERY_STATUS_FAILED}
+)
+
+_NOTIFICATION_COLUMNS: tuple[str, ...] = (
+    "event_key",
+    "position_id",
+    "event_type",
+    "delivery_status",
+    "attempt_count",
+    "last_error",
+    "notified_at_utc",
+    "created_at_utc",
+    "updated_at_utc",
+)
+REQUIRED_NOTIFICATION_COLUMNS: frozenset[str] = frozenset(_NOTIFICATION_COLUMNS)
+
+
+def notification_event_key(position_id: str, event_type: str) -> str:
+    """Deterministic dedup key for one notification event: ``position_id:event_type``.
+
+    The state machine allows each transition at most once per position, so this
+    key is unique per real-world event; the DB enforces it with a UNIQUE
+    constraint (PRIMARY KEY) as the second guard.
+    """
+    if not position_id:
+        raise ValueError("position_id must be non-empty for a notification event key")
+    if event_type not in KNOWN_NOTIFY_EVENTS:
+        raise ValueError(f"event_type must be one of {sorted(KNOWN_NOTIFY_EVENTS)}, got {event_type!r}")
+    return f"{position_id}:{event_type}"
 
 # Column order used by both the INSERT and the row tuple builder.
 _ALL_COLUMNS: tuple[str, ...] = (
@@ -91,7 +146,9 @@ _ALL_COLUMNS: tuple[str, ...] = (
 # ``PRAGMA user_version`` and used as the fast-path "already current" marker; the
 # migration itself still inspects the real schema (PRAGMA table_info) rather than
 # trusting CREATE TABLE IF NOT EXISTS.
-CURRENT_SCHEMA_VERSION = 1
+# v1: constrained virtual_positions. v2 (Issue #83): + paper_execution_notifications.
+POSITIONS_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 REQUIRED_COLUMNS: frozenset[str] = frozenset(_ALL_COLUMNS)
 
@@ -236,15 +293,70 @@ def _create_table_sql(table_name: str) -> str:
     """
 
 
+def _create_notifications_table_sql(table_name: str) -> str:
+    """The Issue #83 notification-history schema (event_key UNIQUE via PRIMARY KEY)."""
+    events = "', '".join(sorted(KNOWN_NOTIFY_EVENTS))
+    statuses = "', '".join(sorted(KNOWN_DELIVERY_STATUSES))
+    return f"""
+        CREATE TABLE {table_name} (
+            event_key TEXT PRIMARY KEY,
+            position_id TEXT NOT NULL,
+            event_type TEXT NOT NULL CHECK (event_type IN ('{events}')),
+            delivery_status TEXT NOT NULL CHECK (delivery_status IN ('{statuses}')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            notified_at_utc TEXT,
+            created_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        )
+    """
+
+
+def _ensure_notifications_table(connection: sqlite3.Connection) -> None:
+    """Create the notifications table, or fail loudly if a same-named table is unusable.
+
+    Never guesses a column-level migration for an existing incompatible table --
+    consistent with the positions migration policy (explicit failure over silent
+    data rounding). Must run inside the caller's transaction.
+    """
+    if not _table_exists(connection, NOTIFICATIONS_TABLE):
+        connection.execute(_create_notifications_table_sql(NOTIFICATIONS_TABLE))
+        return
+    missing = REQUIRED_NOTIFICATION_COLUMNS - _table_columns(connection, NOTIFICATIONS_TABLE)
+    if missing:
+        raise PositionMigrationError(
+            f"table {NOTIFICATIONS_TABLE} exists but is missing columns {sorted(missing)}; "
+            "refusing to guess a migration"
+        )
+
+
 def _create_indexes(connection: sqlite3.Connection) -> None:
     connection.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{POSITIONS_TABLE}_state "
         f"ON {POSITIONS_TABLE} (state, symbol, timeframe)"
     )
+    connection.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{NOTIFICATIONS_TABLE}_status "
+        f"ON {NOTIFICATIONS_TABLE} (delivery_status, created_at_utc)"
+    )
+
+
+def _positions_schema_current(connection: sqlite3.Connection) -> bool:
+    """True when ``virtual_positions`` itself needs no rebuild (v1 constraints present).
+
+    ``user_version >= POSITIONS_SCHEMA_VERSION`` distinguishes a properly
+    constrained v1 table from a constraint-less legacy table that merely has all
+    columns (which reports ``user_version = 0`` and must be rebuilt).
+    """
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version < POSITIONS_SCHEMA_VERSION:
+        return False
+    return not (REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE))
 
 
 def _schema_is_current(connection: sqlite3.Connection) -> bool:
-    """True only when the DB reports the current version AND has every column.
+    """True only when the DB reports the current version AND has every column
+    of every table (positions + notifications).
 
     Deliberately checks the real schema (``PRAGMA user_version`` + ``PRAGMA
     table_info``), never "the table exists" -- a constraint-less legacy table
@@ -253,7 +365,9 @@ def _schema_is_current(connection: sqlite3.Connection) -> bool:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version < CURRENT_SCHEMA_VERSION:
         return False
-    return not (REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE))
+    if REQUIRED_COLUMNS - _table_columns(connection, POSITIONS_TABLE):
+        return False
+    return not (REQUIRED_NOTIFICATION_COLUMNS - _table_columns(connection, NOTIFICATIONS_TABLE))
 
 
 def init_db(db_path: Path | None = None) -> None:
@@ -281,6 +395,7 @@ def init_db(db_path: Path | None = None) -> None:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(_create_table_sql(POSITIONS_TABLE))
+                _ensure_notifications_table(connection)
                 _create_indexes(connection)
                 connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
                 connection.execute("COMMIT")
@@ -290,6 +405,20 @@ def init_db(db_path: Path | None = None) -> None:
             return
         if _schema_is_current(connection):
             _create_indexes(connection)
+            return
+        if _positions_schema_current(connection):
+            # v1 -> v2 (Issue #83): positions are already fully constrained; only
+            # the notifications table / version stamp are missing. Additive-only,
+            # one transaction, full rollback on failure -- position rows untouched.
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                _ensure_notifications_table(connection)
+                _create_indexes(connection)
+                connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
             return
         _migrate_rebuild(connection)
     finally:
@@ -406,6 +535,7 @@ def _migrate_rebuild(connection: sqlite3.Connection) -> None:
 
         connection.execute(f"DROP TABLE {POSITIONS_TABLE}")
         connection.execute(f"ALTER TABLE {temp_table} RENAME TO {POSITIONS_TABLE}")
+        _ensure_notifications_table(connection)
         _create_indexes(connection)
         connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         connection.execute("COMMIT")
@@ -446,10 +576,11 @@ def get_schema_status(db_path: Path | None = None) -> str:
                         NOT ``ProgrammingError``/``Exception``), so a genuine
                         programming bug still surfaces rather than being masked as
                         ``invalid``.
-      * ``legacy``   -- a valid SQLite DB, but our table is absent (needs creating)
+      * ``legacy``   -- a valid SQLite DB, but our tables are absent (need creating)
                         or present at an older version / missing columns (needs a
-                        rebuild migration). A normal (non-dry) run resolves this.
-      * ``current``  -- our table present at the current version with every column.
+                        migration -- a v1 DB lacking the Issue #83 notifications
+                        table classifies here). A normal (non-dry) run resolves this.
+      * ``current``  -- all tables present at the current version with every column.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
     if not db_path.exists():
@@ -465,11 +596,16 @@ def get_schema_status(db_path: Path | None = None) -> str:
             return SCHEMA_STATUS_LEGACY  # valid SQLite, our table not created yet
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         columns = _table_columns(connection, POSITIONS_TABLE)
+        notification_columns = _table_columns(connection, NOTIFICATIONS_TABLE)  # empty when absent
     except sqlite3.DatabaseError:
         return SCHEMA_STATUS_INVALID
     finally:
         connection.close()  # close() never commits -- no write, mtime/size unchanged
-    if version >= CURRENT_SCHEMA_VERSION and not (REQUIRED_COLUMNS - columns):
+    if (
+        version >= CURRENT_SCHEMA_VERSION
+        and not (REQUIRED_COLUMNS - columns)
+        and not (REQUIRED_NOTIFICATION_COLUMNS - notification_columns)
+    ):
         return SCHEMA_STATUS_CURRENT
     return SCHEMA_STATUS_LEGACY
 
@@ -751,3 +887,110 @@ def list_positions(*, db_path: Path | None = None, limit: int = 1000) -> list[di
     return _read_many(
         db_path, f"SELECT * FROM {POSITIONS_TABLE} ORDER BY created_at_utc DESC LIMIT ?", (limit,)
     )
+
+
+# --- notification history (Issue #83) ----------------------------------------
+# Duplicate suppression + retry bookkeeping for Paper Execution Discord
+# notifications. Transaction boundary: each helper is ONE SQL statement in its
+# own transaction (committed by the connection context manager), always issued
+# AFTER the position transition it refers to has committed -- so a notification
+# write failure can never roll back or block a position state change.
+
+
+class NotificationNotFoundError(PositionStoreError):
+    """No notification history row exists for the given event_key."""
+
+
+def record_notification_event(
+    position_id: str,
+    event_type: str,
+    *,
+    created_at: str | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Idempotently record one notification event as ``pending``.
+
+    Returns True if a new row was inserted, False when the event was already
+    recorded (``ON CONFLICT(event_key) DO NOTHING`` -- the runner-restart /
+    re-run duplicate guard). Never modifies an existing row, so an already
+    ``success`` event stays delivered and is never re-queued.
+    """
+    key = notification_event_key(position_id, event_type)
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = created_at or models.utc_now_iso()
+    with _connect(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            INSERT INTO {NOTIFICATIONS_TABLE}
+                (event_key, position_id, event_type, delivery_status, attempt_count,
+                 last_error, notified_at_utc, created_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+            ON CONFLICT(event_key) DO NOTHING
+            """,
+            (key, position_id, event_type, DELIVERY_STATUS_PENDING, now, now),
+        )
+    return cursor.rowcount > 0
+
+
+def get_notification(event_key: str, *, db_path: Path | None = None) -> dict | None:
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    return _read_one(db_path, f"SELECT * FROM {NOTIFICATIONS_TABLE} WHERE event_key = ?", (event_key,))
+
+
+def list_undelivered_notifications(
+    *, db_path: Path | None = None, max_attempts: int | None = None
+) -> list[dict]:
+    """Rows still awaiting delivery: ``pending`` plus retryable ``failed``.
+
+    ``max_attempts`` caps retries: rows at/over the cap are excluded, so a
+    permanently failing delivery (429 / 5xx / connection error) is never
+    retried forever. Successful rows are never returned (no re-send).
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    sql = (
+        f"SELECT * FROM {NOTIFICATIONS_TABLE} WHERE delivery_status != ?"
+    )
+    params: tuple = (DELIVERY_STATUS_SUCCESS,)
+    if max_attempts is not None:
+        sql += " AND attempt_count < ?"
+        params += (int(max_attempts),)
+    sql += " ORDER BY created_at_utc ASC"
+    return _read_many(db_path, sql, params)
+
+
+def mark_notification_delivery(
+    event_key: str,
+    *,
+    success: bool,
+    error: str | None = None,
+    updated_at: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """Record one delivery attempt's outcome (attempt_count += 1, status update).
+
+    Success sets ``notified_at_utc`` and clears ``last_error``; failure stores a
+    sanitized ``last_error`` (callers must never pass the webhook URL or other
+    secrets in *error*). Raises :class:`NotificationNotFoundError` for an
+    unknown event_key.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = updated_at or models.utc_now_iso()
+    status = DELIVERY_STATUS_SUCCESS if success else DELIVERY_STATUS_FAILED
+    with _connect(db_path) as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE {NOTIFICATIONS_TABLE}
+            SET delivery_status = ?, attempt_count = attempt_count + 1,
+                last_error = ?, notified_at_utc = ?, updated_at_utc = ?
+            WHERE event_key = ?
+            """,
+            (status, None if success else error, now if success else None, now, event_key),
+        )
+        if cursor.rowcount == 0:
+            raise NotificationNotFoundError(f"no notification history row for event_key {event_key!r}")
+    row = get_notification(event_key, db_path=db_path)
+    if row is None:  # pragma: no cover - row cannot vanish between UPDATE and SELECT here
+        raise NotificationNotFoundError(f"no notification history row for event_key {event_key!r}")
+    return row

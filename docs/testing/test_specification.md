@@ -61,7 +61,7 @@ CI(#32)では最低限この5スイートを継続実行することを想定す
 | Paper Signal / hypothesis | `paper-signal/signal_generator.py`, `signal_models.py` | Bull/Bear/Neutral別候補生成、confidence閾値、`status=paper_only` 固定、重複窓 | `test_signal_generator.py`, `test_paper_signal_store.py` |
 | Exit / Invalidation | `paper-signal/exit_policy.py` | fixed_rr / time_based_close / ma_break、同足優先、open(no_close)、空/None candles | `test_exit_policy.py` |
 | Backtest | `backtest/{runner,warmup,summary,report,backtest_store,backtest_models}.py` | 境界分離・future leak禁止・skip・DB保存・集計 | `test_warmup.py`, `test_runner.py`, `test_backtest_engine.py` ほか |
-| Paper Execution | `paper-execution/{execution_engine,execution_runner,position_store,position_models,execution_profile}.py` | Entry / Close判定の決定論、`state × terminal_reason` 閉集合、`signal_id` 冪等、schema migration(table rebuild)、strict read、dry-run無副作用 | `paper-execution/tests/test_*.py` |
+| Paper Execution | `paper-execution/{execution_engine,execution_runner,position_store,position_models,execution_profile,paper_execution_notifier}.py` | Entry / Close判定の決定論、`state × terminal_reason` 閉集合、`signal_id` 冪等、schema migration(table rebuild / v2 additive)、strict read、dry-run無副作用、Discord状態遷移通知(本文生成・`event_key` 重複防止・失敗再送・timeout / 429 / 5xx / connection error 分類・配送失敗時に position を巻き戻さないこと) | `paper-execution/tests/test_*.py` |
 | 副作用境界 | 各store / uploader | 一時DB利用、dry-run抑止、run/signalの分離DB、FK/重複ID | `test_*_store.py`, `test_chart_alert_context.py` |
 
 補足:

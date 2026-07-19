@@ -2,7 +2,7 @@
 
 Issue #49 の成果物。Paper Signal から仮想ポジションを生成し、決済まで追跡する **Paper Execution 層**の最小責務と状態遷移を定義する設計文書である。
 
-**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。Discord通知は引き続き未対応、Broker API連携・実注文は恒久的に対象外。
+**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。状態遷移の Discord通知は Issue #83 で**実装済み**(末尾の「Discord通知(Issue #83)」を参照)、Broker API連携・実注文は恒久的に対象外。
 
 ## 目的と位置づけ
 
@@ -41,7 +41,7 @@ Paper Execution(本書・設計のみ)
 | 過去データの遡及検証 | Backtest(Validation) |
 | 実注文・実約定・実ポジション管理・Broker API 連携 | Live Execution(将来・未実装) |
 | ロット計算・レバレッジ計算・資金管理 | 非スコープ(将来検討) |
-| Discord通知 | 本設計では非スコープ(後続Issueで別途検討) |
+| Discord通知 | 本設計(Issue #49)では非スコープとしたが、後続 Issue #83 で状態遷移通知として実装済み(`paper_execution_notifier.py`。末尾の「Discord通知(Issue #83)」) |
 
 ## 入力(Paper Signal から受け取る項目)
 
@@ -235,7 +235,8 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 | 自レイヤーのDB | 出力 | 仮想ポジションレコード(独立した SQLite。コンポーネントごとに独立DBという既存方針に従う。物理設計は後続Issue) |
 | Market Bias / Market State | なし | 執行判定に参照しない(Signal 生成側の入力) |
 | Backtest | なし(語彙共有のみ) | 直接のデータ連携はしない。約定規則・状態語彙を揃えて結果を突合可能に保つ |
-| Discord / Broker API | なし | 本設計では出力しない(通知は後続検討、Broker API は恒久的に対象外) |
+| Discord | 出力(Issue #83) | 確定済み状態遷移(open / closed / expired / cancelled)の通知のみ。`paper_execution_notifier.py` が担当(下記「Discord通知(Issue #83)」) |
+| Broker API | なし | 恒久的に対象外 |
 
 ## 後続Issue(実装の分割)
 
@@ -260,3 +261,58 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 - `execution_profile.py` — 執行規則プロファイル。内部APIは呼び出し側から渡された `(symbol, timeframe)` overridesを解決し、`strategy_profile` は解決キーにしない。通常CLIは単一default profileを使用し、symbol/timeframe別マッピングの設定ファイル/CLIロードは未実装。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
 - `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。損益は `gross_pnl`(コスト前, raw価格)、`net_pnl`(entry/exit コスト各1回 + commission を控除)、`r_multiple`(net / (初期リスク×size)、初期リスク≤0 は None)を算出。`pnl` は `net_pnl` の後方互換エイリアス。
 - `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。Chart DB は **strict read**(`load_candles_range_strict`)で読み、DB破損・candles table欠損・OperationalError を空データ扱いせず cycle failure として計上し、該当 position は無変更のままにする(期限切れへ誤遷移しない)。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用(読取エラーも成功扱いしない)。
+
+## Discord通知(Issue #83)
+
+Paper Execution の状態遷移を Discord へ通知する。**Paper Signal 通知は「仮説の発生」、Paper Execution 通知は「仮説が時間進行の中で仮想約定・仮想決済された結果」**を伝える。両者は責務・Webhook設定とも分離する。
+
+### 責務分離
+
+`execution_runner.py` は Discord Webhook を直接呼ばない。以下の分離で実装する。
+
+```text
+execution_runner
+  -> ExecutionEvent(DTO。DB確定済みの遷移1件)
+  -> paper_execution_notifier
+       - 本文生成(format_event_message: 純関数)
+       - payload生成(build_discord_payload)
+       - HTTP配送(deliver_payload: timeout必須・1回の呼び出しで1試行)
+       - 通知履歴・重複防止(position_store の paper_execution_notifications)
+       - dry-run(本文ログのみ)
+  -> Discord Webhook
+```
+
+### 対象イベント(閉集合)
+
+| event_type | 遷移 | 本文の最低要素 |
+|---|---|---|
+| `open` | `pending -> open` | Paper Execution / 仮想約定であること、symbol / timeframe / side / signal_id / position_id / entry_time_utc / entry_price / stop_loss_price / take_profit_price / max_hold_deadline_utc / execution_profile |
+| `closed` | `open -> closed`(`stop_loss` / `take_profit` / `max_holding_time`) | Paper Execution / 仮想損益であること、symbol / timeframe / side / signal_id / position_id / terminal_reason / entry_time_utc / close_time_utc / entry_price / close_price / gross_pnl / net_pnl / r_multiple |
+| `expired` | `pending -> expired` | symbol / timeframe / side / signal_id / position_id / state / terminal_reason / 仮想処理であること |
+| `cancelled` | invalid signal による `cancelled` | 同上 |
+
+`pending` 作成時点の通知はスコープ外(イベントを発行しない)。表示できない値(NULL等)は例外にせず `-` 表記で安全にレンダリングする。
+
+### 重複通知防止(通知履歴テーブル)
+
+Position DB(schema v2)の `paper_execution_notifications` テーブルで管理する。
+
+- `event_key` = `position_id:event_type`(決定論的。PRIMARY KEY = UNIQUE)
+- 列: `event_key` / `position_id` / `event_type` / `delivery_status`(`pending` / `success` / `failed`)/ `attempt_count` / `last_error` / `notified_at_utc` / `created_at_utc` / `updated_at_utc`
+- **成功済み(`success`)イベントは再送しない**(runner再起動・再実行後も。状態機械が各遷移を高々1回に制限し、`event_key` UNIQUE が二重の防波堤)
+- **失敗イベントは後続cycleで再送する**(1 cycle につき1試行、`MAX_DELIVERY_ATTEMPTS` = 5 回で打ち切り。429 / 5xx / connection error を無限リトライしない)
+- 通知履歴の作成・更新は1文=1トランザクション(position 遷移のトランザクションとは常に分離)
+- migration は `position_store.py` の既存契約に従う: v1 → v2 は additive(既存 `virtual_positions` を rebuild せず、1トランザクションでテーブル追加 + `PRAGMA user_version = 2`。失敗時 rollback)。legacy rebuild 経路でも同一トランザクション内で通知テーブルを作成する
+
+### 配送失敗時の契約
+
+- **Position 状態遷移を DB へ確定した後に通知する**(cycle 内の全 position 書き込み完了後にイベントをまとめて処理)
+- Discord送信失敗で Position 状態を巻き戻さない・常駐 runner を停止しない
+- HTTP timeout は常に設定(10秒)。エラーは分類してログへ残すが、**Webhook URL・秘密情報はログにも `last_error` にも出さない**(例外は型名のみ記録)
+- 通知失敗は `CycleResult.failures` に**含めず**、専用の `CycleResult.notification_failures` として分離する。理由: `failures` は Issue #49 のデータ層契約(`--once` 非0終了)を担っており、position データが完全に整合したままの Webhook 障害で cycle を失敗扱いにしない(自動再送で回復する)。常駐ループは warning ログで可視化する
+
+### 設定・dry-run
+
+- Webhook URL は `paper-execution/.env` の `PAPER_EXECUTION_DISCORD_WEBHOOK_URL`(プロセス環境変数優先)。Paper Signal の `DISCORD_WEBHOOK_URL` とは意図的に別変数(責務分離)。未設定時はイベントを履歴へ記録(queued)した上で配送のみスキップし、warning を出す
+- Paper Signal DB / Chart DB は読み取り専用のまま。Broker API・実注文・売買推奨は一切実装しない
+- `--dry-run` は完全無副作用を維持する: Discord送信なし・Position DB更新なし・通知テーブル作成/migration/更新なし・ファイル作成なし。送信予定本文は `[DRY_RUN] would notify ...` ログで確認できる。既存の read-only schema probe 契約(v2 未満の DB は「migration required」で failure 計上)も維持する

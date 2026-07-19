@@ -35,7 +35,8 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `ENABLE_ECONOMIC_CALENDAR` | `false` | Economic Calendar optional Providerを有効化 |
 | `CHART_DB_PATH` | `market-watch/data/chart_data.sqlite3` | Chart DBのパス上書き(`market-watch/chart_collector.py`) |
 | `MARKET_BIAS_DB_PATH` | `news-feed-bot/data/market_bias.sqlite3` | Market Bias DBのパス上書き。Backtestから別プロセスで参照する場合に使う(`news-feed-bot/market_bias_store.py`) |
-| `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む。dry-run では作成・migration せず読み取り専用のスキーマ確認のみ行う |
+| `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む(v2 で通知履歴テーブル `paper_execution_notifications` を追加)。dry-run では作成・migration せず読み取り専用のスキーマ確認のみ行う |
+| `PAPER_EXECUTION_DISCORD_WEBHOOK_URL` | empty | Paper Execution 状態遷移通知(仮想約定・仮想損益。Issue #83)の Discord Webhook。`paper-execution/.env` またはプロセス環境変数。Paper Signal の `DISCORD_WEBHOOK_URL` とは別変数(責務分離)。未設定時は通知イベントを Position DB へ記録した上で配送をスキップ(runner は正常動作)。通知失敗は position 状態・`--once` 終了コードへ影響せず、後続 cycle で自動再送(上限5回) |
 
 注意: `news-feed-bot/` のニュース投稿では、現行コードで使用している実変数名は `NEWS_WEBHOOK_URL` である。`DISCORD_WEBHOOK_URL` はニュース投稿用の設定名ではない。一方、`market-watch/` のイベント通知では旧設定との互換性のため、`BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り `DISCORD_WEBHOOK_URL` をlegacy fallbackとして扱う。
 
