@@ -356,8 +356,12 @@ def test_cli_timezone_changes_the_day_a_signal_belongs_to(tmp_path, capsys):
     assert "USDJPY" not in out  # 2026-07-12T15:30Z is 2026-07-12 in UTC
 
 
-def test_cli_writes_output_file_and_does_not_touch_signal_db(tmp_path, capsys):
-    db_path = tmp_path / "never_created.sqlite3"  # intentionally absent
+def test_cli_writes_output_file_and_does_not_write_signal_db(tmp_path, capsys):
+    # A valid-but-empty DB: the CLI must read it without mutating it. (Issue #71
+    # made a *missing* DB a runtime error; see test_daily_report_scheduled.py.)
+    db_path = tmp_path / "paper_signals.sqlite3"
+    store.init_db(db_path)
+    before = db_path.read_bytes()
     out_path = tmp_path / "nested" / "report.md"
 
     rc = cli.main([
@@ -367,8 +371,8 @@ def test_cli_writes_output_file_and_does_not_touch_signal_db(tmp_path, capsys):
     assert rc == 0
     assert out_path.exists()
     assert out_path.read_text(encoding="utf-8").startswith("# Paper Signal Daily Report")
-    # Generating the report must not have created the signal DB (no side effects).
-    assert not db_path.exists()
+    # Generating the report must not have modified the signal DB (read-only).
+    assert db_path.read_bytes() == before
     assert f"Saved daily report to {out_path}" in capsys.readouterr().out
 
 

@@ -28,6 +28,7 @@ EXPECTED_ORDER = [
     "berial-bollinger-alert.service",
     "berial-paper-signal.service",
     "berial-chart-snapshot.timer",
+    "berial-paper-signal-report.timer",
 ]
 
 SH = shutil.which("sh") or shutil.which("bash")
@@ -80,6 +81,15 @@ def test_restart_all_includes_paper_signal_and_keeps_existing_units(tmp_path):
     assert "berial-paper-signal.service" in calls
     for unit in EXPECTED_ORDER:
         assert unit in calls, f"missing unit: {unit}"
+
+
+def test_restart_all_touches_report_timer_but_never_its_oneshot_service(tmp_path):
+    # Issue #71: restarting the *timer* re-reads its schedule without running a
+    # report; the oneshot service itself must never be started from here.
+    _result, calls = _run(tmp_path)
+
+    assert "berial-paper-signal-report.timer" in calls
+    assert "berial-paper-signal-report.service" not in calls
 
 
 def test_one_failing_unit_does_not_stop_the_rest_and_exit_is_nonzero(tmp_path):

@@ -10,8 +10,11 @@ set -eu
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
 # Space-separated unit lists, restarted in this order.
+# TIMER_UNITS restarts the *timer* units only -- restarting a timer re-reads its
+# schedule but does NOT start the service it triggers, so the oneshot
+# berial-paper-signal-report.service is never run from here (Issue #71).
 LONG_RUNNING_SERVICES="berial-news.service berial-ma-alert.service berial-macd-alert.service berial-bollinger-alert.service berial-paper-signal.service"
-TIMER_UNITS="berial-chart-snapshot.timer"
+TIMER_UNITS="berial-chart-snapshot.timer berial-paper-signal-report.timer"
 
 rc=0
 

@@ -37,7 +37,7 @@ python paper_signal_bot.py
 
 ## 2.1 Daily report(日次集計, Issue #47)
 
-`paper_signal_daily_report.py` は、保存済み Paper Signal を **指定日の1日分**だけ集計し、symbol / timeframe / direction(long/short)/ market state / strategy 別の件数と confidence の平均・最小・最大を text または Markdown で出力します。**読み取り専用で永続副作用なし**: signal DB を書き換えず(存在しなければ作成もせず)、Discord 送信も broker/Execution API 呼び出しも一切しません(唯一の書き込みは `--output` 指定時のファイルのみ)。仮想約定・PnL・勝率などの Execution 系指標はスコープ外です。
+`paper_signal_daily_report.py` は、保存済み Paper Signal を **指定日の1日分**だけ集計し、symbol / timeframe / direction(long/short)/ market state / strategy 別の件数と confidence の平均・最小・最大を text または Markdown で出力します。**読み取り専用で永続副作用なし**: signal DB を書き換えず(存在しなければ作成もせず)、Discord 送信も broker/Execution API 呼び出しも一切しません(唯一の書き込みは `--output` / `--output-dir` 指定時のレポートファイルのみ)。仮想約定・PnL・勝率などの Execution 系指標はスコープ外です。
 
 ```powershell
 cd C:\Users\kinniki\ClaudeLocalSession\opt\BELIAL_dev\paper-signal
@@ -50,9 +50,14 @@ python paper_signal_daily_report.py --date 2026-07-13 --format markdown --output
 
 # 日付境界を別タイムゾーンで判定
 python paper_signal_daily_report.py --date 2026-07-13 --timezone UTC
+
+# 前日分(--timezone 基準)を reports/paper_signal_YYYY-MM-DD.md へ自動命名で保存
+# (Issue #71 の systemd timer が毎日 00:10 JST に実行する形)
+python paper_signal_daily_report.py --previous-day --timezone Asia/Tokyo --format markdown --output-dir reports
 ```
 
-- `--date`(既定: 設定タイムゾーンの今日, `YYYY-MM-DD`)/ `--timezone`(既定: `$PAPER_SIGNAL_REPORT_TIMEZONE` → `.env` → `Asia/Tokyo`)/ `--format text|markdown` / `--output` / `--db-path`。
+- `--date`(既定: 設定タイムゾーンの今日, `YYYY-MM-DD`)/ `--previous-day`(タイムゾーン解決後の前日。`--date` と排他)/ `--timezone`(既定: `$PAPER_SIGNAL_REPORT_TIMEZONE` → `.env` → `Asia/Tokyo`)/ `--format text|markdown` / `--output` / `--output-dir`(対象日から自動命名・atomic上書き。`--output` と排他)/ `--db-path`。
+- DB異常(不存在 / ディレクトリ / 非SQLite / `paper_signals` テーブル・`created_at_utc` カラム欠如 / 読込エラー)は0件レポートに化けず、stderrへ原因を出して非0終了する(exit 1)。usage/設定エラーは exit 2。正常なDBで対象日0件は exit 0 で0件レポートを生成する(Issue #71)。
 - 日付境界は**設定タイムゾーンの現地0時〜翌0時**を UTC に変換した半開区間 `[start, end)` で一貫して扱うため、`2026-07-13T15:00:00Z` の Signal は JST では翌日、UTC ではその日、と取り違えなく集計されます。
 - market state / strategy が NULL・空文字・`unknown` のものは欠落させず明示的に `unknown` バケットへ集計するので、各軸の合計は常に `Total Signals` と一致します。0件の日も例外終了せずレポートを生成します。
 - 日次定期実行への組み込みは [docs/operations/operations.md](../docs/operations/operations.md) を参照。

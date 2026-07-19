@@ -11,6 +11,8 @@ UNITS=(
   "berial-paper-signal.service"
   "berial-chart-snapshot.service"
   "berial-chart-snapshot.timer"
+  "berial-paper-signal-report.service"
+  "berial-paper-signal-report.timer"
 )
 
 "${SYSTEMCTL}" status --no-pager "${UNITS[@]}"

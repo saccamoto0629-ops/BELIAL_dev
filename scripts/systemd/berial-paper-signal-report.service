@@ -1,0 +1,40 @@
+[Unit]
+# Berial Paper Signal daily report, oneshot (Issue #71). Triggered every day at
+# 00:10 Asia/Tokyo by berial-paper-signal-report.timer; writes the PREVIOUS
+# day's aggregation as Markdown to /opt/berial/paper-signal/reports/
+# paper_signal_YYYY-MM-DD.md ("yesterday" and the filename date are both
+# computed by the CLI in Asia/Tokyo, so a 00:10 run reports the day that just
+# ended, never an empty "today").
+#
+# Copy/adapt this template to /etc/systemd/system/berial-paper-signal-report.service,
+# then: systemctl daemon-reload && systemctl enable --now berial-paper-signal-report.timer
+# (enable the TIMER, not this service; starting the service runs one report now).
+# See docs/operations/operations.md for the full deploy/enable/verify steps.
+#
+# Read-only against the signal DB: it never creates the DB, runs a migration,
+# or writes a row. A missing/unreadable/non-SQLite DB or a missing
+# paper_signals table/column exits non-zero, so this unit shows "failed" and
+# journalctl -u berial-paper-signal-report explains why. Only a valid DB with
+# zero signals for the day succeeds (with a zero-signal report). Independent of
+# the resident berial-paper-signal.service.
+Description=Berial Paper Signal Daily Report (previous day, Markdown)
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/berial/paper-signal
+# Same env policy as berial-paper-signal.service: "-" keeps a missing .env
+# non-fatal. --timezone is passed explicitly below, so the report day never
+# depends on the server's local timezone or shell date arithmetic.
+EnvironmentFile=-/opt/berial/paper-signal/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PAPER_SIGNAL_REPORT_TIMEZONE=Asia/Tokyo
+ExecStart=/opt/berial/.venv/bin/python /opt/berial/paper-signal/paper_signal_daily_report.py --previous-day --timezone Asia/Tokyo --format markdown --output-dir /opt/berial/paper-signal/reports
+# stdout/stderr to the journal (journalctl -u berial-paper-signal-report).
+StandardOutput=journal
+StandardError=journal
+# Deliberately no Restart=: a oneshot report must not create a failure loop;
+# the timer simply tries again the next day (or run the service manually).
+
+# No [Install] section on purpose: this unit is started by its timer (or
+# manually) and is not enabled on its own.

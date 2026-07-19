@@ -11,6 +11,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "paper_signals.sqlite3"
@@ -366,6 +367,95 @@ def list_signals_in_range(
             ).fetchall()
     except sqlite3.OperationalError:
         return []
+    return [dict(row) for row in rows]
+
+
+class PaperSignalDbError(RuntimeError):
+    """Raised by :func:`list_signals_in_range_strict` when the DB is unusable.
+
+    Issue #71: the scheduled daily report must distinguish "a valid DB with zero
+    signals for the day" (normal, exit 0) from "the DB is missing / unreadable /
+    not SQLite / missing the table or columns" (a runtime failure that must make
+    the systemd service fail). The message always names the DB path and the
+    concrete problem so ``journalctl`` shows the cause directly.
+    """
+
+
+# The minimum paper_signals columns a report read depends on. The windowed query
+# filters/orders on created_at_utc; every other column is tolerated as missing by
+# build_daily_report (absent keys fold into the "unknown" bucket).
+REPORT_REQUIRED_COLUMNS: tuple[str, ...] = ("created_at_utc",)
+
+
+def list_signals_in_range_strict(
+    start_utc: str,
+    end_utc: str,
+    *,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> list[dict]:
+    """Like :func:`list_signals_in_range`, but DB problems raise instead of hiding.
+
+    Issue #71: the strict read for the scheduled daily report. Validates, in
+    order: the DB path exists, is a regular file, opens as SQLite in read-only
+    mode, has a ``paper_signals`` table with :data:`REPORT_REQUIRED_COLUMNS`,
+    and the windowed SELECT itself succeeds. Any failure raises
+    :class:`PaperSignalDbError`; only a *valid* DB whose window is simply empty
+    returns ``[]``.
+
+    Every bit as side-effect-free as the lenient variant: the read-only URI
+    connection (``mode=ro``) makes it impossible to create the DB file, run
+    ``init_db()``/migrations, or write anything -- SQLite itself rejects a
+    write. ``list_signals_in_range`` keeps its tolerant contract for existing
+    callers; this function is additive.
+    """
+    db_path = Path(db_path)
+    if not db_path.exists():
+        raise PaperSignalDbError(f"paper signal DB not found: {db_path}")
+    if not db_path.is_file():
+        raise PaperSignalDbError(f"paper signal DB path is not a regular file: {db_path}")
+
+    # Percent-encode the resolved path so characters that are special in a URI
+    # (?, #, %) cannot be misread as URI parameters; "/" stays literal.
+    uri = "file:" + quote(str(db_path.resolve()), safe="/") + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        raise PaperSignalDbError(f"could not open paper signal DB {db_path} read-only: {exc}") from exc
+    try:
+        connection.row_factory = sqlite3.Row
+        try:
+            table_row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paper_signals'"
+            ).fetchone()
+            if table_row is None:
+                raise PaperSignalDbError(
+                    f"paper signal DB {db_path} has no paper_signals table"
+                )
+            existing_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(paper_signals)")
+            }
+            missing = [column for column in REPORT_REQUIRED_COLUMNS if column not in existing_columns]
+            if missing:
+                raise PaperSignalDbError(
+                    f"paper signal DB {db_path} table paper_signals is missing "
+                    f"required column(s): {', '.join(missing)}"
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM paper_signals
+                WHERE created_at_utc >= ? AND created_at_utc < ?
+                ORDER BY created_at_utc DESC
+                """,
+                (start_utc, end_utc),
+            ).fetchall()
+        # DatabaseError covers OperationalError ("unable to open database file",
+        # locked, ...) AND the plain DatabaseError raised for a non-SQLite file
+        # ("file is not a database"), which the first query surfaces because
+        # sqlite3.connect() opens lazily.
+        except sqlite3.DatabaseError as exc:
+            raise PaperSignalDbError(f"could not read paper signal DB {db_path}: {exc}") from exc
+    finally:
+        connection.close()
     return [dict(row) for row in rows]
 
 

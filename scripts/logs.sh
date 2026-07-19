@@ -15,6 +15,7 @@ Targets:
   signal      berial-paper-signal.service
   snapshot    berial-chart-snapshot.service
   timer       berial-chart-snapshot.timer
+  report      berial-paper-signal-report.service (daily report oneshot + its timer)
   all         all Berial units
 
 Examples:
@@ -54,6 +55,9 @@ case "${target}" in
   timer)
     units=("berial-chart-snapshot.timer")
     ;;
+  report)
+    units=("berial-paper-signal-report.service" "berial-paper-signal-report.timer")
+    ;;
   all)
     units=(
       "berial-news.service"
@@ -63,6 +67,8 @@ case "${target}" in
       "berial-paper-signal.service"
       "berial-chart-snapshot.service"
       "berial-chart-snapshot.timer"
+      "berial-paper-signal-report.service"
+      "berial-paper-signal-report.timer"
     )
     ;;
   -h|--help|help)
