@@ -10,6 +10,14 @@ set -eu
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
 # Space-separated unit lists, restarted in this order.
+# NOTE (Issue #71 review, Major 1): berial-paper-signal-report.timer (and its
+# oneshot service) is deliberately NOT listed here. Re-activating a
+# Persistent=true timer that missed its OnCalendar time while inactive can
+# trigger its service immediately, so including it would let a plain
+# restart_all run silently generate a daily report. That timer is deployed and
+# updated explicitly instead (systemctl daemon-reload; enable --now on first
+# install; an operator restarts the timer only when its unit file changed) --
+# see docs/operations/operations.md.
 LONG_RUNNING_SERVICES="berial-news.service berial-ma-alert.service berial-macd-alert.service berial-bollinger-alert.service berial-paper-signal.service"
 TIMER_UNITS="berial-chart-snapshot.timer"
 

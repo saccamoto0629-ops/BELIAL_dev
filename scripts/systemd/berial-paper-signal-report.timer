@@ -1,0 +1,32 @@
+[Unit]
+# Daily trigger for berial-paper-signal-report.service (Issue #71): every day
+# at 00:10 *Asia/Tokyo*, matching the CLI's --timezone Asia/Tokyo so the timer
+# fires just after the JST day boundary and the service reports the day that
+# just ended.
+#
+# The "<time> Asia/Tokyo" OnCalendar suffix needs systemd >= 235 (Ubuntu
+# 18.04+). Verify on the target host with:
+#   systemd-analyze calendar '*-*-* 00:10:00 Asia/Tokyo'
+# If unsupported, replace the line with the fixed-UTC equivalent (JST has no
+# DST): OnCalendar=*-*-* 15:10:00 UTC
+#
+# Copy to /etc/systemd/system/ next to berial-paper-signal-report.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now berial-paper-signal-report.timer
+Description=Daily 00:10 Asia/Tokyo trigger for Berial Paper Signal Daily Report
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 Asia/Tokyo
+# If the host was down/rebooting at 00:10, run once as soon as possible after
+# boot instead of skipping the day. NOTE: after a multi-day outage this
+# catch-up is still a single run, and --previous-day only generates the day
+# before the catch-up moment -- older missed days are NOT backfilled
+# automatically. Generate them manually with --date (see
+# docs/operations/operations.md). Deliberately not part of
+# scripts/restart_all.sh: re-activating a Persistent timer that missed its
+# schedule can start the service immediately.
+Persistent=true
+Unit=berial-paper-signal-report.service
+
+[Install]
+WantedBy=timers.target

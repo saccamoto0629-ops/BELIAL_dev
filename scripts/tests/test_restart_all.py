@@ -82,6 +82,19 @@ def test_restart_all_includes_paper_signal_and_keeps_existing_units(tmp_path):
         assert unit in calls, f"missing unit: {unit}"
 
 
+def test_restart_all_never_touches_the_daily_report_units(tmp_path):
+    # Issue #71 review (Major 1): re-activating a Persistent=true timer that
+    # missed its schedule while inactive can fire its oneshot service
+    # immediately, so restart_all must not touch the report timer at all --
+    # and must never start the report service either. Its absence also means a
+    # not-yet-deployed report timer cannot affect restart_all's exit code.
+    result, calls = _run(tmp_path)
+
+    assert "berial-paper-signal-report.timer" not in calls
+    assert "berial-paper-signal-report.service" not in calls
+    assert result.returncode == 0
+
+
 def test_one_failing_unit_does_not_stop_the_rest_and_exit_is_nonzero(tmp_path):
     # Simulate a not-yet-deployed paper-signal unit failing to restart.
     result, calls = _run(tmp_path, fail_unit="berial-paper-signal.service")

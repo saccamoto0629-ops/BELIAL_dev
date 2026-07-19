@@ -187,14 +187,104 @@ python paper_signal_bot.py
 ```bash
 cd /opt/berial/paper-signal
 
-# 設定タイムゾーン基準の前日分を Markdown で保存(日次 cron/timer 想定)
-report_tz="${PAPER_SIGNAL_REPORT_TIMEZONE:-Asia/Tokyo}"
-report_date="$(TZ="$report_tz" date -d 'yesterday' +%F)"
-python paper_signal_daily_report.py --date "$report_date" --timezone "$report_tz" \
-    --format markdown --output "reports/paper_signal_${report_date}.md"
+# 前日分(--timezone 基準)を Markdown で reports/paper_signal_YYYY-MM-DD.md へ保存
+# (日次 systemd timer と同じ形。前日計算もファイル名の日付も CLI 内部で行うため、
+#  shell の date 展開に依存しない)
+python paper_signal_daily_report.py --previous-day --timezone Asia/Tokyo \
+    --format markdown --output-dir reports
+
+# 特定日を明示する場合(従来どおり)
+python paper_signal_daily_report.py --date 2026-07-13 --timezone Asia/Tokyo \
+    --format markdown --output reports/paper_signal_2026-07-13.md
 ```
 
-日次定期実行は、既存の `berial-chart-snapshot.timer` と同様に systemd の `OnCalendar=` timer(例: 毎日 JST 00:10 = `OnCalendar=*-*-* 15:10:00 UTC` を前日 `--date` 付きで起動)へ組み込める。レポート生成は読み取り専用なので、常駐サービスとは独立に任意タイミングで再実行してよい(冪等)。
+Issue #71 でのCLI仕様:
+
+- `--previous-day`: タイムゾーン解決後の「現在日付の1日前」を対象にする。`--date` と同時指定不可(usage error)。指定なしは従来どおり「当日」。
+- `--output-dir DIR`: 実際の集計対象日から `paper_signal_YYYY-MM-DD.md`(`--format text` なら `.txt`)をディレクトリ内へ自動命名で保存する。ディレクトリは自動作成、同日再実行は一時ファイル経由の atomic replace で安全に上書き。`--output` と同時指定不可(`--output` は従来どおり維持)。
+- DB検証: DB不存在 / パスがディレクトリ / SQLiteでないファイル / `paper_signals` テーブル無し / `created_at_utc` カラム無し / その他読込エラーは、**0件レポートに化けず**エラーをstderrへ出して非0終了する(`paper_signal_store.list_signals_in_range_strict`)。正常なDBで対象日0件のときだけ正常終了して0件レポートを生成する。
+- DBへの保証範囲: read-only URI接続(`mode=ro`)で読むため、**DB本体の内容・schemaを変更せず、DBを新規作成せず、`init_db()`・migration・backfill・INSERT/UPDATE/DELETE を実行しない**。ただし SQLite の WAL mode では、read-only 接続でも SQLite 自身が `-shm` sidecar を作成・利用する場合があるため、DBディレクトリにはWAL運用上の書込み権限が必要になることがある。DBディレクトリが書込み不可の場合、DB本体が読めてもWAL/SHM関連で読み込みに失敗し、runtime error として非0終了し得る(原因は journal のエラーメッセージで確認できる)。
+- 終了コード: `0`=正常(0件含む)/ `2`=引数・日付・タイムゾーン等のusage error / `1`=DB読込失敗・schema異常・出力失敗等のruntime error。systemdからはruntime errorがそのまま service failure になる。
+
+日次定期実行は下記の `berial-paper-signal-report.timer` を使う。レポート生成は読み取り専用なので、常駐サービスとは独立に任意タイミングで再実行してよい(冪等)。
+
+### Paper Signal 日次レポート timer(Issue #71)
+
+テンプレートは `scripts/systemd/berial-paper-signal-report.service` / `berial-paper-signal-report.timer`(リポジトリにコミット済み)。毎日 **00:10 Asia/Tokyo** に oneshot service を起動し、前日分(Asia/Tokyo基準)を `/opt/berial/paper-signal/reports/paper_signal_YYYY-MM-DD.md` へ保存する。timer の `OnCalendar=*-*-* 00:10:00 Asia/Tokyo` と CLI の `--timezone Asia/Tokyo` を一致させているため、タイムゾーンの食い違いは起きない。`Persistent=true` により、00:10 に停止していた場合も次回起動時に1回だけ追い付き実行される。
+
+`OnCalendar` のタイムゾーン付き構文は systemd >= 235(Ubuntu 18.04+)が必要。対象サーバーで `systemd-analyze calendar '*-*-* 00:10:00 Asia/Tokyo'` が通ることを確認する。通らない場合は `OnCalendar=*-*-* 15:10:00 UTC` へ書き換える(JSTはDSTが無いため恒等)。
+
+配備手順:
+
+```bash
+# 1. テンプレートを配置(User / パスは環境に合わせて調整)
+sudo cp /opt/berial/scripts/systemd/berial-paper-signal-report.service /etc/systemd/system/
+sudo cp /opt/berial/scripts/systemd/berial-paper-signal-report.timer /etc/systemd/system/
+
+# 2. 反映して timer を有効化(enable するのは timer。service を enable しない)
+sudo systemctl daemon-reload
+sudo systemctl enable --now berial-paper-signal-report.timer
+```
+
+確認:
+
+```bash
+# timer 一覧と次回実行時刻(毎日 00:10 JST = 15:10 UTC)
+systemctl list-timers --all | grep berial-paper-signal-report
+systemctl status berial-paper-signal-report.timer
+
+# 手動で1回実行(前日分を生成。timer を待たずに動作確認できる)
+sudo systemctl start berial-paper-signal-report.service
+
+# service の結果と journal(DB異常時は Result: exit-code / failed になり、
+# stderr の "error: paper signal DB ..." で原因が分かる)
+systemctl status berial-paper-signal-report.service
+journalctl -u berial-paper-signal-report.service        # または ./scripts/logs.sh report
+
+# 生成された Markdown の確認
+ls -l /opt/berial/paper-signal/reports/
+cat /opt/berial/paper-signal/reports/paper_signal_$(TZ=Asia/Tokyo date -d yesterday +%F).md
+
+# 再起動後も timer が有効なことの確認(enable 済みなら enabled のまま)
+systemctl is-enabled berial-paper-signal-report.timer
+systemctl list-timers --all | grep berial-paper-signal-report
+
+# 停止・無効化
+sudo systemctl disable --now berial-paper-signal-report.timer
+```
+
+DB異常時の切り分け: service が failed の場合、`journalctl -u berial-paper-signal-report.service -n 20` に「DB not found / not a regular file / no paper_signals table / missing required column / could not read」のいずれかが出る。正常なDBで対象日0件の場合は failed にならず、`Total Signals: 0` のレポートが生成される。
+
+`Persistent=true` と停止期間中の欠損日: `Persistent=true` は「停止中に逃した日数分の service をすべて順番に実行する」ものでは**ない**。複数日停止していた場合でも、起動時の追い付き実行は通常1回だけであり、CLI の `--previous-day` により**起動時点の前日分だけ**が生成される。停止期間中の古い欠損日は自動 backfill されないため、`--date YYYY-MM-DD` で手動生成する:
+
+```bash
+cd /opt/berial/paper-signal
+
+/opt/berial/.venv/bin/python paper_signal_daily_report.py \
+  --date 2026-07-15 \
+  --timezone Asia/Tokyo \
+  --format markdown \
+  --output-dir /opt/berial/paper-signal/reports
+```
+
+レポートファイルの permission: 生成される `paper_signal_YYYY-MM-DD.md` は **`0600`(所有者のみ読み書き)** を仕様とする。閲覧は service の実行ユーザー(`ubuntu`)で行う(他ユーザーで読む場合は `sudo cat` など)。既存ファイルが `0644` 等だった場合も、同日再生成後は `0600` に統一される。
+
+DBディレクトリの権限(WAL): レポート読み込みは read-only 接続で、DB本体の内容・schemaは変更しないが、SQLite の WAL mode では read-only 接続でも `-shm` sidecar が作成・利用される場合がある。実行ユーザーには DB ファイルの読み取りに加えて、WAL運用上 DBディレクトリへの権限が必要になることがある。ディレクトリが書込み不可だと読み込みが runtime error になり service は failed となる(journal で原因確認)。
+
+実機のみで確認する項目(pytestには含めない): `systemd-analyze verify` の通過、timer 発火時刻、`Persistent=true` による追い付き実行、再起動後の enable 状態、実DB・実 reports ディレクトリへの権限(WAL sidecar 含む)。
+
+`scripts/restart_all.sh` には**組み込んでいない**(timer も service も対象外)。理由: `Persistent=true` の timer は、停止中に予定時刻を逃した状態で再activateされると oneshot service を即時起動し得るため、常駐プロセス再起動用の `restart_all.sh` に含めると、実行のたびに意図しない日次レポート生成が起き得る。timer の配備・更新は次の明示的な運用で行う:
+
+```bash
+# unit ファイル変更を反映
+sudo systemctl daemon-reload
+
+# 初回のみ
+sudo systemctl enable --now berial-paper-signal-report.timer
+
+# unit 変更後に必要な場合のみ、管理者が明示的に
+sudo systemctl restart berial-paper-signal-report.timer
+```
 
 ## Paper Signal systemd(常駐サービス, Issue #41)
 
@@ -259,6 +349,8 @@ berial-paper-signal.service
 berial-chart-snapshot.timer
 ```
 
+`berial-paper-signal-report.timer` は `restart_all.sh` の対象に**含めない**(下記「Paper Signal 日次レポート timer」の節を参照)。
+
 `logs.sh` は `journalctl` の短縮ラッパーとして使う。
 
 ```bash
@@ -268,6 +360,7 @@ berial-chart-snapshot.timer
 ./scripts/logs.sh signal
 ./scripts/logs.sh snapshot
 ./scripts/logs.sh timer
+./scripts/logs.sh report
 ./scripts/logs.sh news
 ./scripts/logs.sh all --since today
 ```
