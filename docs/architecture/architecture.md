@@ -116,7 +116,7 @@ Execution は **Paper Execution**(仮想約定・仮想ポジション管理・E
 - `news-feed-bot/market_bias.py` はMarket Bias(trend / risk / volatility)を計算する。
 - `news-feed-bot/market_bias_store.py` はMarket Biasの評価結果をSQLiteへ永続化し、時点参照APIを提供する。
 - `paper-signal/signal_generator.py` は paper_only 仮説を生成する(`paper_signal_bot.py` が常駐サービスとして保存・通知する)。
-- `paper-execution/execution_runner.py` / `paper_execution_bot.py` は、保存済み Paper Signal と確定足(Chart DB)から仮想ポジションを生成・更新する。
+- `paper-execution/execution_runner.py` / `paper_execution_bot.py` は、保存済み Paper Signal と確定足(Chart DB)から仮想ポジションを生成・更新する。確定した状態遷移(open / closed / expired / cancelled)は `paper_execution_notifier.py` が Discord へ通知する(Issue #83。**Transactional Outbox**: Position 遷移と通知 enqueue を同一トランザクションで確定し、配送は commit 後・claim/lease 付き・at-least-once。失敗はポジションへ影響しない)。
 - `backtest/runner.py` は過去データを再生し、結果を Backtest DB へ保存する([Backtest](../backtest.md))。
 
 ## DB構成
@@ -128,7 +128,7 @@ BELIAL はコンポーネントごとに独立したSQLiteファイルを持つ�
 | Chart DB | `market-watch/data/chart_data.sqlite3` | `market-watch/` | `candles`, `chart_snapshots`, `alerts`, `alert_chart_snapshots` |
 | Paper Signal DB | `paper-signal/data/paper_signals.sqlite3` | `paper-signal/` | `paper_signals` |
 | Market Bias DB | `news-feed-bot/data/market_bias.sqlite3` | `news-feed-bot/` | `market_bias` |
-| Paper Position DB | `paper-execution/data/paper_positions.sqlite3` | `paper-execution/` | `virtual_positions` |
+| Paper Position DB | `paper-execution/data/paper_positions.sqlite3` | `paper-execution/` | `virtual_positions`, `paper_execution_notifications` |
 | Backtest DB | `backtest/data/backtest_results.sqlite3` | `backtest/` | `backtest_runs`, `backtest_signals` |
 
 いずれも `data/` はGit管理しない。関連付けは時刻のみに依存せず、可能な限りIDで行う(例: `alerts.snapshot_id` → `chart_snapshots.id`、`virtual_positions.signal_id` → `paper_signals.signal_id`)。時刻は補助情報として扱う。詳細スキーマは [Market Watch](market_watch.md)、[Market Bias](market_bias.md)、[Paper Signal](paper_signal.md)、[Paper Execution](paper_execution.md)、[Backtest](../backtest.md) を参照。
@@ -137,7 +137,7 @@ BELIAL はコンポーネントごとに独立したSQLiteファイルを持つ�
 
 Persistence の責務は各コンポーネントの store 層が持つ。他コンポーネントのDBを migration することはない。ただし、schema validation / migration の保証範囲はstoreごとに異なり、全store共通の完全検証を提供するものではない。
 
-- `paper-execution/position_store.py`: `PRAGMA user_version` を現行スキーマの目印としつつ、実スキーマ(`PRAGMA table_info`)を検証する。legacy schema からの migration は **table rebuild**(CREATE → 検証コピー → DROP → RENAME、1トランザクション・失敗時 rollback)で CHECK / UNIQUE / NOT NULL 制約を実際に付与し、安全に変換できない legacy row は明示的に migration を失敗させる(黙って捨てない)。
+- `paper-execution/position_store.py`: `PRAGMA user_version` を現行スキーマの目印としつつ、実スキーマ(`PRAGMA table_info` の pk/notnull、`sqlite_master.sql` の CHECK、`PRAGMA index_list`/`index_info`、write 経路では SAVEPOINT 内の behavioral probe)を検証する。列名だけの検証ではなく実制約を検証し、制約欠損テーブルは user_version を偽装しても `current` としない。legacy schema からの migration は **table rebuild**(CREATE → 検証コピー → DROP → RENAME、1トランザクション・失敗時 rollback)で CHECK / UNIQUE / NOT NULL 制約を実際に付与し、安全に変換できない legacy row は明示的に migration を失敗させる(黙って捨てない)。schema v3(Issue #83)は通知 outbox テーブル `paper_execution_notifications`(claim/lease 列付き)を追加する: v1 からの upgrade は additive(`virtual_positions` を rebuild せず)、v2 prototype(claim 列無し)からは outbox テーブルの transactional rebuild(既存行を保持)。
 - `backtest/backtest_store.py`: 不足列を冪等な `ALTER TABLE ADD COLUMN` で追加する。分類フィールドは安全な既定値で補完し、`market_state` のような事後復元不能な列は NULL のまま残す(値を捏造しない)。
 - `paper-signal/paper_signal_store.py`: classification / `target_candle_utc` / `market_state` など既知の不足列を冪等に追加し、既知値をbackfillする。基本列の型・NOT NULL・PRIMARY KEYを含む既存schema全体の完全性検証ではない。
 - `market-watch/chart_collector.py`: テーブルを `CREATE TABLE IF NOT EXISTS` で初期化し、`chart_snapshots` などの一部既知列を追加する。全テーブル・全制約の完全性検証ではない。
@@ -153,7 +153,7 @@ Persistence の責務は各コンポーネントの store 層が持つ。他コ�
 - DB作成・更新・migration
 - S3アップロード
 
-Paper Execution の dry-run は完全無副作用であり、読み取りエラーも成功扱いしない(Chart DB は strict read で読み、破損・テーブル欠損を cycle failure として計上する)。詳細と起動コマンドは [Operations](../operations/operations.md) を参照。
+Paper Execution の dry-run は完全無副作用であり、読み取りエラーも成功扱いしない(Chart DB は strict read で読み、破損・テーブル欠損を cycle failure として計上する)。WAL DB でも副作用ゼロを守るため、dry-run の schema probe / position 読み取りは実 DB へ接続せず、本体 + `-wal` / `-shm` を一時ディレクトリへコピーした snapshot を読む(通常の read-write 接続は WAL を checkpoint して本体を書き換えるため)。詳細と起動コマンドは [Operations](../operations/operations.md) を参照。
 
 ## 関連ドキュメント
 

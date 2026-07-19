@@ -2,7 +2,7 @@
 
 Issue #49 の成果物。Paper Signal から仮想ポジションを生成し、決済まで追跡する **Paper Execution 層**の最小責務と状態遷移を定義する設計文書である。
 
-**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。Discord通知は引き続き未対応、Broker API連携・実注文は恒久的に対象外。
+**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。状態遷移の Discord通知は Issue #83 で**実装済み**(末尾の「Discord通知(Issue #83)」を参照)、Broker API連携・実注文は恒久的に対象外。
 
 ## 目的と位置づけ
 
@@ -41,7 +41,7 @@ Paper Execution(本書・設計のみ)
 | 過去データの遡及検証 | Backtest(Validation) |
 | 実注文・実約定・実ポジション管理・Broker API 連携 | Live Execution(将来・未実装) |
 | ロット計算・レバレッジ計算・資金管理 | 非スコープ(将来検討) |
-| Discord通知 | 本設計では非スコープ(後続Issueで別途検討) |
+| Discord通知 | 本設計(Issue #49)では非スコープとしたが、後続 Issue #83 で状態遷移通知として実装済み(`paper_execution_notifier.py`。末尾の「Discord通知(Issue #83)」) |
 
 ## 入力(Paper Signal から受け取る項目)
 
@@ -235,7 +235,8 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 | 自レイヤーのDB | 出力 | 仮想ポジションレコード(独立した SQLite。コンポーネントごとに独立DBという既存方針に従う。物理設計は後続Issue) |
 | Market Bias / Market State | なし | 執行判定に参照しない(Signal 生成側の入力) |
 | Backtest | なし(語彙共有のみ) | 直接のデータ連携はしない。約定規則・状態語彙を揃えて結果を突合可能に保つ |
-| Discord / Broker API | なし | 本設計では出力しない(通知は後続検討、Broker API は恒久的に対象外) |
+| Discord | 出力(Issue #83) | 確定済み状態遷移(open / closed / expired / cancelled)の通知のみ。Position 遷移と outbox enqueue を同一トランザクションで確定し、配送は commit 後(Transactional Outbox)。`paper_execution_notifier.py` が担当(下記「Discord通知(Issue #83: Transactional Outbox)」) |
+| Broker API | なし | 恒久的に対象外 |
 
 ## 後続Issue(実装の分割)
 
@@ -260,3 +261,120 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 - `execution_profile.py` — 執行規則プロファイル。内部APIは呼び出し側から渡された `(symbol, timeframe)` overridesを解決し、`strategy_profile` は解決キーにしない。通常CLIは単一default profileを使用し、symbol/timeframe別マッピングの設定ファイル/CLIロードは未実装。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
 - `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。損益は `gross_pnl`(コスト前, raw価格)、`net_pnl`(entry/exit コスト各1回 + commission を控除)、`r_multiple`(net / (初期リスク×size)、初期リスク≤0 は None)を算出。`pnl` は `net_pnl` の後方互換エイリアス。
 - `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。Chart DB は **strict read**(`load_candles_range_strict`)で読み、DB破損・candles table欠損・OperationalError を空データ扱いせず cycle failure として計上し、該当 position は無変更のままにする(期限切れへ誤遷移しない)。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用(読取エラーも成功扱いしない)。
+
+## Discord通知(Issue #83: Transactional Outbox)
+
+Paper Execution の状態遷移を Discord へ通知する。**Paper Signal 通知は「仮説の発生」、Paper Execution 通知は「仮説が時間進行の中で仮想約定・仮想決済された結果」**を伝える。両者は責務・Webhook設定とも分離する。
+
+方式は **Transactional Outbox**。Position 状態遷移と通知イベントの enqueue を **同一 SQLite connection・同一トランザクション**で確定し、Discord への HTTP 配送はその commit 後に別工程で行う。これにより「Position 遷移が commit されたのに通知 outbox 行が存在しない」状態を構造的に作らない。
+
+### 責務分離
+
+`execution_runner.py` は Discord Webhook を直接呼ばない。
+
+```text
+execution_runner
+  -> position_store の *_with_notification API
+       [ BEGIN IMMEDIATE
+           UPDATE/INSERT virtual_positions
+           INSERT paper_execution_notifications   ← 同一COMMIT
+         COMMIT ]
+  -> paper_execution_notifier.deliver_outbox   (commit後)
+       - claim/lease(position_store.claim_notifications: atomic)
+       - 本文生成(format_event_message: 純関数・None安全・Event ID付き)
+       - payload生成(build_discord_payload)
+       - HTTP配送(deliver_payload: timeout必須・1呼び出し1試行)
+       - settle(finish_notification_delivery: success/failed/dead_letter)
+  -> Discord Webhook
+```
+
+### 対象イベント(閉集合)
+
+| event_type | 遷移 | atomic API | 本文の最低要素 |
+|---|---|---|---|
+| `open` | `pending -> open` | `transition_to_open_with_notification` | Paper Execution / 仮想約定であること、Event ID、symbol / timeframe / side / signal_id / position_id / entry_time_utc / entry_price / stop_loss_price / take_profit_price / max_hold_deadline_utc / execution_profile |
+| `closed` | `open -> closed`(`stop_loss` / `take_profit` / `max_holding_time`) | `close_open_position_with_notification` | Paper Execution / 仮想損益であること、Event ID、symbol / timeframe / side / signal_id / position_id / terminal_reason / entry_time_utc / close_time_utc / entry_price / close_price / gross_pnl / net_pnl / r_multiple |
+| `expired` | `pending -> expired` | `transition_pending_terminal_with_notification` | Event ID、symbol / timeframe / side / signal_id / position_id / state / terminal_reason / 仮想処理であること |
+| `cancelled` | invalid signal による `cancelled` | `create_cancelled_position_with_notification` | 同上 |
+
+`pending` 作成時点の通知はスコープ外(outbox 行を作らない)。表示できない値(NULL等)は例外にせず `-` 表記で安全にレンダリングする。
+
+### Position遷移とenqueueのatomicity
+
+各 atomic API は1つの `BEGIN IMMEDIATE` トランザクション内で position の UPDATE/INSERT と outbox 行の INSERT を実行し、`COMMIT`(失敗時 `ROLLBACK`)する。
+
+- Position 変更だけ commit され通知行が無い状態を作らない
+- 通知行 INSERT に失敗した場合は Position 変更も rollback する
+- CAS 競合(`WHERE state=...` が0行)時は例外を送出し、通知行を作らずトランザクション全体を rollback する
+- outbox INSERT は `ON CONFLICT(event_key) DO NOTHING`。同一遷移の再実行(CAS が本来防ぐ)や旧スキーマの残存行があっても重複 outbox 行や配送状態の破壊を起こさない
+- `SIGKILL 相当(commit後・HTTP前)`でプロセスが落ちても、outbox 行は既にディスク上にあるため、次 cycle の `deliver_outbox` が検出・配送する
+
+### 配送claim / lease(並行runner対策)
+
+`deliver_outbox` は `list_undelivered_notifications` の SELECT-then-send を使わず、`claim_notifications` で **atomic claim** する。
+
+- 1つの `BEGIN IMMEDIATE` トランザクション(SQLite は単一writer)で候補 SELECT と各行の `processing` への UPDATE を一括 commit する。2つの runner が同じ行を同時に claim できない = 同時配送しない
+- claim 対象: `pending` / `failed`(attempt cap 未満)+ lease 期限切れの `processing`(claimed_until_utc <= now)。`success` / `dead_letter` は claim しない
+- claim 時に `claimed_by`(worker id = host:pid)と `claimed_until_utc`(now + `DEFAULT_LEASE_SECONDS` = 600秒)を書く
+- claim 中の worker が停止しても、lease 期限を過ぎれば別 worker が再 claim できる(crash 回収)。stale worker が後から settle しようとしても、`(delivery_status='processing', claimed_by=worker)` guard により `NotificationClaimError` で拒否され、新 owner の状態を壊さない
+- 1 cycle の配送件数は `DELIVERY_BATCH_LIMIT` = 20 件(oldest-first)。滞留は cycle をまたいで順次 drain する
+
+### at-least-once配送(Event ID・重複の可能性)
+
+Discord への HTTP POST と DB の `success` 記録は **atomic にできない**。したがって外部 Discord への配送は **exactly-once ではなく at-least-once** である。
+
+- **outbox 上の成功済み(`success`)イベントは再送しない**(runner 再起動・再実行後も)
+- ただし **HTTP POST 成功後・`success` 記録前**にプロセスが落ちる/DB 書き込みが失敗すると、その行は `processing` のまま残り lease 期限後に再配送される → **同一 Event ID の Discord メッセージが重複し得る**
+- 「outbox 成功済みは再送しない」ことと「Discord で重複しない」ことは**別物**である。後者は保証しない
+- 各通知本文に `Event ID: <position_id:event_type>`(outbox の `event_key` と一致)を必ず含め、重複が起きても利用者が同一イベントと識別できるようにする
+- `success` 記録失敗は明示的に ERROR ログへ出し(「DUPLICATE ... at-least-once」)、`notification_failures` に計上する
+
+### 通知履歴テーブル(outbox schema)
+
+Position DB(schema v3)の `paper_execution_notifications` テーブル。
+
+- `event_key` **PRIMARY KEY**(= UNIQUE + NOT NULL)= `position_id:event_type`(決定論的)
+- 列: `event_key` / `position_id` / `event_type`(CHECK)/ `delivery_status`(CHECK)/ `attempt_count` / `last_error` / `claimed_by` / `claimed_until_utc` / `notified_at_utc` / `created_at_utc` / `updated_at_utc`
+- `delivery_status` ∈ `pending` / `processing` / `success` / `failed` / `dead_letter`
+- index: `(delivery_status, created_at_utc)`
+
+### failure分類
+
+| 種別 | 例 | 計上先 | `--once` |
+|---|---|---|---|
+| data-plane / outbox永続化 | Position+outbox atomic tx 失敗、outbox schema 不正、claim DB 操作失敗、outbox 行作成失敗、settle の DB 失敗、position 再読込失敗 | `CycleResult.failures` | 非0終了 |
+| delivery | timeout / connection error / HTTP 429 / HTTP 5xx / success記録失敗 / lease期限切れ回収 | `CycleResult.notification_failures` | 0終了(自動再送) |
+
+outbox 永続化障害は「通知保証そのものが成立していない」ため通常の `failures` に含め `--once` を非0にする。純粋な配送障害は position が整合したままなので分離し、自動再送で回復させる。`success` 記録失敗は重複リスクがあるため必ずログに出す。
+
+### dead-letter(継続監視)
+
+- 失敗が `MAX_DELIVERY_ATTEMPTS` = 5 回に達した行は `dead_letter` へ遷移する(SELECT 対象外にして静かに消さない)
+- **上限到達済み `failed` 行の正規化**: claim トランザクションの冒頭で `delivery_status='failed' AND attempt_count >= max_attempts` の行を `dead_letter` へ UPDATE する。claim 条件は `attempt_count < max_attempts` のため、これが無いと「claim 不能・dead-letter 監視対象外・自動再送不能」で永久に取り残される行が生じる。**LIVE の `max_attempts` 設定に追従**するため、(a) v2 prototype から `failed` のまま移行した行(v2 に `dead_letter` は無い)、(b) 既存 v3 の取り残し、(c) `max_attempts` を後から下げた場合、いずれも次 cycle の claim で reconcile される。migration 時に固定値で焼き込まないのは設定値依存を避けるため
+- `CycleResult.dead_letter_notifications` に未解消 dead-letter 件数を gauge として載せる。**同一 cycle 内で新たに dead_letter 化した分も即時反映**する(配送後に再集計してから返す)。0でなければ warning ログを出す
+- 復旧は `position_store.requeue_notification(event_key)`(attempt_count=0, `pending` へリセット)。確認 SQL・手順は [Operations](../operations/operations.md) を参照
+
+### Webhook未設定時
+
+- outbox 行は atomic transition により**通常どおり作成**する
+- URL 未設定時は **claim しない = attempt_count を消費しない**。滞留件数を warning ログに出す
+- URL 設定後、滞留分を `DELIVERY_BATCH_LIMIT` 件/cycle で順次配送する
+- 現行方針は**滞留通知を無期限保持**する(自動削除・保持期限なし)。運用上不要になった行は手動削除する
+
+### 設定・dry-run
+
+- Webhook URL は `paper-execution/.env` の `PAPER_EXECUTION_DISCORD_WEBHOOK_URL`(プロセス環境変数優先)。Paper Signal の `DISCORD_WEBHOOK_URL` とは意図的に別変数(責務分離)
+- Paper Signal DB / Chart DB は読み取り専用のまま。Broker API・実注文・売買推奨は一切実装しない
+- `--dry-run` は完全無副作用: Discord送信なし・Position DB 更新なし・outbox 作成/migration/更新なし・ファイル作成なし。送信予定本文は `[DRY_RUN] would notify ...` ログで確認できる
+- **WAL 対応**: dry-run の schema probe と position 読み取りは、実 DB へ SQLite 接続を一切張らない。DB 本体と `-wal` / `-shm` sidecar を一時ディレクトリへコピーし、**snapshot 側**を読む。通常の `sqlite3.connect(path)` は WAL DB を checkpoint して本体を書き換え `-wal` を消し得るため、read-only URI ではなく snapshot 方式を採る。dry-run 前後で DB 本体・`-wal`・`-shm` の内容・size・mtime・hash・schema・user_version が完全不変であることをテストで実ファイルの hash/mtime まで検証する
+- **接続の明示 close(Windows)**: read helper(`_read_one` / `_read_many`)は `contextlib.closing()` で SQLite connection を必ず close する。sqlite3 の connection context manager は transaction を終えるだけで connection を close しないため、Windows では snapshot DB のファイルハンドルが残り `TemporaryDirectory.cleanup()` が `WinError 32` で失敗する。close を保証することで dry-run 後の snapshot 削除が全 OS で成功する(Windows CI job で検証)
+
+### migration経路(v3)
+
+`position_store.py` の既存契約(`PRAGMA user_version` + 実スキーマ検証)に統合する。
+
+- **schema 検証は列名だけでなく実制約を検証**する: `PRAGMA table_info` の `pk`/`notnull`、`sqlite_master.sql` の CHECK 文字列、`PRAGMA index_list`/`index_info` を確認し、加えて write 経路では SAVEPOINT 内の **behavioral probe**(不正 event_type / 不正 status / NULL position_id / 重複 event_key の INSERT が実際に拒否されること)を rollback 付きで実行する。制約欠損テーブルは `user_version` を偽装しても `current` として扱わない
+- `v1`(outbox テーブル無し)→ `v3`: additive(既存 `virtual_positions` を rebuild せず、1トランザクションで outbox テーブル作成 + index + `user_version=3`)
+- `v2 prototype`(claim 列無し・旧 status 集合の outbox テーブル)→ `v3`: outbox テーブルの **transactional rebuild**(CREATE→検証コピー→DROP→RENAME)。既存 notification 行(delivery_status / attempt_count / last_error 等)を保持し、新列は NULL 埋め。変換不能な行(不正 event_type 等)は明示的に migration 失敗
+- legacy positions rebuild 経路でも同一トランザクション内で outbox テーブルを整える
+- いずれも失敗時は全 rollback(user_version・既存行とも不変)
