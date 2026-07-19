@@ -350,7 +350,8 @@ outbox 永続化障害は「通知保証そのものが成立していない」�
 ### dead-letter(継続監視)
 
 - 失敗が `MAX_DELIVERY_ATTEMPTS` = 5 回に達した行は `dead_letter` へ遷移する(SELECT 対象外にして静かに消さない)
-- `CycleResult.dead_letter_notifications` に**毎 cycle** 未解消 dead-letter 件数を gauge として載せ、0でなければ warning ログを出す
+- **上限到達済み `failed` 行の正規化**: claim トランザクションの冒頭で `delivery_status='failed' AND attempt_count >= max_attempts` の行を `dead_letter` へ UPDATE する。claim 条件は `attempt_count < max_attempts` のため、これが無いと「claim 不能・dead-letter 監視対象外・自動再送不能」で永久に取り残される行が生じる。**LIVE の `max_attempts` 設定に追従**するため、(a) v2 prototype から `failed` のまま移行した行(v2 に `dead_letter` は無い)、(b) 既存 v3 の取り残し、(c) `max_attempts` を後から下げた場合、いずれも次 cycle の claim で reconcile される。migration 時に固定値で焼き込まないのは設定値依存を避けるため
+- `CycleResult.dead_letter_notifications` に未解消 dead-letter 件数を gauge として載せる。**同一 cycle 内で新たに dead_letter 化した分も即時反映**する(配送後に再集計してから返す)。0でなければ warning ログを出す
 - 復旧は `position_store.requeue_notification(event_key)`(attempt_count=0, `pending` へリセット)。確認 SQL・手順は [Operations](../operations/operations.md) を参照
 
 ### Webhook未設定時
@@ -366,6 +367,7 @@ outbox 永続化障害は「通知保証そのものが成立していない」�
 - Paper Signal DB / Chart DB は読み取り専用のまま。Broker API・実注文・売買推奨は一切実装しない
 - `--dry-run` は完全無副作用: Discord送信なし・Position DB 更新なし・outbox 作成/migration/更新なし・ファイル作成なし。送信予定本文は `[DRY_RUN] would notify ...` ログで確認できる
 - **WAL 対応**: dry-run の schema probe と position 読み取りは、実 DB へ SQLite 接続を一切張らない。DB 本体と `-wal` / `-shm` sidecar を一時ディレクトリへコピーし、**snapshot 側**を読む。通常の `sqlite3.connect(path)` は WAL DB を checkpoint して本体を書き換え `-wal` を消し得るため、read-only URI ではなく snapshot 方式を採る。dry-run 前後で DB 本体・`-wal`・`-shm` の内容・size・mtime・hash・schema・user_version が完全不変であることをテストで実ファイルの hash/mtime まで検証する
+- **接続の明示 close(Windows)**: read helper(`_read_one` / `_read_many`)は `contextlib.closing()` で SQLite connection を必ず close する。sqlite3 の connection context manager は transaction を終えるだけで connection を close しないため、Windows では snapshot DB のファイルハンドルが残り `TemporaryDirectory.cleanup()` が `WinError 32` で失敗する。close を保証することで dry-run 後の snapshot 削除が全 OS で成功する(Windows CI job で検証)
 
 ### migration経路(v3)
 

@@ -360,8 +360,10 @@ def deliver_outbox(
     db_path = Path(db_path) if db_path is not None else store.position_db_path()
     worker = worker_id or default_worker_id()
 
-    # Dead-letter gauge first: monitored EVERY cycle, webhook set or not, so
-    # exhausted notifications can never silently disappear from view.
+    # Pre-delivery dead-letter gauge: monitored EVERY cycle, webhook set or not,
+    # so exhausted notifications can never silently disappear from view. When a
+    # webhook is configured this is refreshed after delivery (below) so the
+    # returned gauge reflects same-cycle dead-letter transitions.
     try:
         counts = store.count_notifications_by_status(db_path=db_path)
     except Exception as exc:
@@ -459,6 +461,24 @@ def deliver_outbox(
             continue
         logger.info("Paper Execution notification sent: %s", event_key)
         result.sent += 1
+
+    # Same-cycle dead-letter gauge (Issue #83 review): recount AFTER delivery so
+    # rows that reached the attempt cap in THIS cycle (or were reconciled to
+    # dead_letter at claim time) are reflected now, not only next cycle.
+    try:
+        final_counts = store.count_notifications_by_status(db_path=db_path)
+    except Exception as exc:
+        logger.error("Paper Execution outbox: post-delivery status read failed: %s", exc)
+        result.outbox_failures += 1
+        return result
+    final_dead_letter = final_counts.get(store.DELIVERY_STATUS_DEAD_LETTER, 0)
+    if final_dead_letter > result.dead_letter_total:
+        logger.warning(
+            "Paper Execution outbox: %d dead-letter notification(s) after this cycle "
+            "(+%d newly exhausted); manual recovery required (see docs/operations/operations.md).",
+            final_dead_letter, final_dead_letter - result.dead_letter_total,
+        )
+    result.dead_letter_total = final_dead_letter
     return result
 
 

@@ -60,3 +60,30 @@ jobs:
 
       - name: Run paper-execution tests
         run: python -m pytest paper-execution/tests -q
+
+  # Issue #83: the Paper Execution notification outbox does dry-run schema
+  # probing and reads via private snapshot copies, then deletes the snapshot
+  # TemporaryDirectory. On Windows an unclosed SQLite connection keeps the file
+  # handle open and cleanup fails with WinError 32, so the dry-run / snapshot
+  # paths must be exercised on Windows too. Scoped to paper-execution to keep
+  # this job fast.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run paper-execution tests (Windows)
+        run: python -m pytest paper-execution/tests -q

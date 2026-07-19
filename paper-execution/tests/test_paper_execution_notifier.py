@@ -959,3 +959,194 @@ def test_migration_rollback_on_unmappable_notification_row(tmp_path):
     assert _user_version(db) == 2   # rolled back: stamp unchanged
     with sqlite3.connect(db) as conn:   # legacy table + row intact
         assert conn.execute(f"SELECT COUNT(*) FROM {store.NOTIFICATIONS_TABLE}").fetchone()[0] == 1
+
+
+# --- review round 2: Windows snapshot cleanup, exhausted-failed reconcile, same-cycle gauge
+
+
+def _insert_notification_row(db, **over):
+    """Insert a raw outbox row directly (bypasses the atomic APIs) for edge-case setup."""
+    row = _notification_row(**over)
+    store.init_db(db)
+    with sqlite3.connect(db) as conn:
+        cols = ", ".join(row)
+        conn.execute(
+            f"INSERT INTO {store.NOTIFICATIONS_TABLE} ({cols}) VALUES ({', '.join('?' for _ in row)})",
+            tuple(row.values()),
+        )
+
+
+# 1. Major: read helpers must close the connection (Windows handle release) ----
+
+
+def test_read_helpers_close_connection_handle(tmp_path, monkeypatch):
+    """A connection left open would keep the file handle -> Windows cleanup fails.
+
+    We can't spawn Windows here, so we assert the invariant that CAUSES WinError
+    32: every connection sqlite3.connect returns on the read path must be closed.
+    """
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)
+    opened = []
+    real_connect = sqlite3.connect
+
+    class TrackedConn:
+        """Transparent proxy that records whether close() was called."""
+
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+            object.__setattr__(self, "closed", False)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_conn"), name)
+
+        def __setattr__(self, name, value):
+            setattr(object.__getattribute__(self, "_conn"), name, value)
+
+        def __enter__(self):
+            return object.__getattribute__(self, "_conn").__enter__()
+
+        def __exit__(self, *a):
+            return object.__getattribute__(self, "_conn").__exit__(*a)
+
+        def close(self):
+            object.__setattr__(self, "closed", True)
+            object.__getattribute__(self, "_conn").close()
+
+    def tracking_connect(*a, **k):
+        conn = TrackedConn(real_connect(*a, **k))
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(store.sqlite3, "connect", tracking_connect)
+    assert store.get_position("pos-1", db_path=db)["state"] == "pending"   # _read_one
+    assert len(store.list_positions_by_state("pending", db_path=db)) == 1  # _read_many
+    monkeypatch.undo()
+    assert opened and all(object.__getattribute__(c, "closed") for c in opened)   # every read conn closed
+
+
+def test_dry_run_snapshot_tempdir_is_removed_after_reads(tmp_path, monkeypatch):
+    """The dry-run snapshot TemporaryDirectory must be deletable after read helpers run."""
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)
+    created = {}
+    import tempfile as _tempfile
+    real_tempdir = _tempfile.TemporaryDirectory
+
+    class TrackingTempDir(real_tempdir):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created["path"] = pathlib.Path(self.name)
+
+    monkeypatch.setattr(runner.tempfile, "TemporaryDirectory", TrackingTempDir)
+    before = _db_family_fingerprints(db)
+    res = _dry_run(db, tmp_path)
+    assert res.failures == 0 and res.opened == 1
+    assert "path" in created and not created["path"].exists()   # cleanup() succeeded
+    assert _db_family_fingerprints(db) == before                # original untouched
+
+
+def test_snapshot_dir_removable_after_read_helpers_directly(tmp_path):
+    """Directly exercise a read helper against a snapshot, then delete the temp dir."""
+    import tempfile as _tempfile
+    db = tmp_path / "p.sqlite3"
+    _seed_closed_with_outbox(db)
+    tmp = _tempfile.TemporaryDirectory(prefix="probe_")
+    snap = store.snapshot_db_for_read(db, pathlib.Path(tmp.name))
+    assert store.list_positions_by_state("closed", db_path=snap)[0]["position_id"] == "pos-1"
+    assert store.get_notification("pos-1:open", db_path=snap) is not None
+    tmp.cleanup()                                    # would raise WinError 32 if a handle leaked
+    assert not pathlib.Path(tmp.name).exists()
+
+
+# 2. Major: exhausted (attempt_count >= max) failed rows reconcile to dead_letter
+
+
+def test_exhausted_failed_row_reconciled_to_dead_letter_at_claim(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _insert_notification_row(db, event_key="old:closed", position_id="old", event_type="closed",
+                             delivery_status="failed", attempt_count=5)   # v2-style exhausted failed
+    # claim (max_attempts=5) reconciles it before selecting candidates
+    claimed = store.claim_notifications(
+        worker_id="A", lease_seconds=600, batch_limit=10, max_attempts=5, now_utc=T0, db_path=db)
+    assert claimed == []                                             # not claimable
+    row = store.get_notification("old:closed", db_path=db)
+    assert row["delivery_status"] == "dead_letter"                  # normalized
+    assert row["claimed_by"] is None and row["claimed_until_utc"] is None
+    assert store.count_notifications_by_status(db_path=db).get("dead_letter") == 1
+    # and manual requeue still works
+    store.requeue_notification("old:closed", db_path=db)
+    assert store.get_notification("old:closed", db_path=db)["delivery_status"] == "pending"
+
+
+def test_retryable_and_terminal_rows_untouched_by_reconcile(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _insert_notification_row(db, event_key="r:closed", position_id="r", event_type="closed",
+                             delivery_status="failed", attempt_count=2)   # below cap -> retryable
+    _insert_notification_row(db, event_key="s:open", position_id="s", event_type="open",
+                             delivery_status="success", attempt_count=1)
+    _insert_notification_row(db, event_key="p:open", position_id="p", event_type="open",
+                             delivery_status="pending", attempt_count=0)
+    _insert_notification_row(db, event_key="proc:open", position_id="proc", event_type="open",
+                             delivery_status="processing", attempt_count=1,
+                             claimed_by="X", claimed_until_utc=T_LATER)
+    store.claim_notifications(worker_id="A", lease_seconds=600, batch_limit=10, max_attempts=5,
+                              now_utc=T0, db_path=db)
+    assert store.get_notification("r:closed", db_path=db)["delivery_status"] in ("failed", "processing")
+    assert store.get_notification("s:open", db_path=db)["delivery_status"] == "success"
+    # pending got claimed (now processing); success/processing-with-live-lease unchanged in status class
+    assert store.get_notification("proc:open", db_path=db)["delivery_status"] == "processing"
+    # the retryable failed row was NOT dead-lettered
+    assert store.get_notification("r:closed", db_path=db)["delivery_status"] != "dead_letter"
+
+
+def test_v2_exhausted_failed_migrates_then_reconciles(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _make_v2_prototype(db, [
+        dict(event_key="b:closed", position_id="b", event_type="closed", delivery_status="failed",
+             attempt_count=5, last_error="HTTP 500", created_at_utc="t0", updated_at_utc="t1"),
+    ])
+    store.init_db(db)   # v2 -> v3 keeps it 'failed' (no dead_letter status existed in v2)
+    assert store.get_notification("b:closed", db_path=db)["delivery_status"] == "failed"
+    # first delivery cycle reconciles the exhausted row to dead_letter via claim
+    res = _deliver(db, session=FakeSession(), now=T0)
+    assert store.get_notification("b:closed", db_path=db)["delivery_status"] == "dead_letter"
+    assert res.dead_letter_total == 1                              # reflected same cycle (Minor 3)
+
+
+# 3. Minor: same-cycle dead_letter gauge
+
+
+def test_same_cycle_dead_letter_gauge(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)
+    _open_atomic(db)
+    session = FakeSession(exc=requests.ConnectionError("down"))
+    # max_attempts=1: the single failed attempt this cycle -> dead_letter immediately
+    res = _deliver(db, session=session, now=T0, max_attempts=1)
+    assert res.delivery_failures == 1
+    assert store.get_notification("pos-1:open", db_path=db)["delivery_status"] == "dead_letter"
+    assert res.dead_letter_total == 1                              # same-cycle, not next-cycle
+
+
+def test_runner_same_cycle_dead_letter_gauge(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    # Cycle 1 opens+closes the position (2 outbox rows) but every POST 500s.
+    # A failed delivery clears the claim, so each following cycle re-claims and
+    # re-fails, incrementing attempt_count until the MAX-th cycle tips both rows
+    # to dead_letter -- and THAT cycle's CycleResult must report it immediately.
+    res = None
+    for _ in range(MAX):
+        res = _run(db, [_signal()], _candles(CLOSE_CANDLES),
+                   session=FakeSession(exc=requests.ConnectionError("down")))
+    assert res.dead_letter_notifications == 2                 # same cycle it tipped over
+    assert store.count_notifications_by_status(db_path=db).get("dead_letter") == 2
+    assert store.list_positions(db_path=db)[0]["state"] == "closed"
+
+
+def test_gauge_excludes_success_and_reflects_zero(tmp_path):
+    db = tmp_path / "p.sqlite3"
+    _seed_pending(db)
+    _open_atomic(db)
+    res = _deliver(db, session=FakeSession(), now=T0)   # succeeds
+    assert res.sent == 1 and res.dead_letter_total == 0

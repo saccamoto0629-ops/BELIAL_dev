@@ -191,8 +191,20 @@ sqlite3 "$DB" \
 ```
 
 各 cycle のログ末尾 `Cycle done: ... dead_letter=N` と、`N>0` 時の
-`WARNING ... dead-letter notification(s) awaiting manual recovery` で継続監視できる
-(dead-letter は SELECT 対象外にして静かに消さない)。
+`WARNING ... dead-letter notification(s)` で継続監視できる(dead-letter は SELECT
+対象外にして静かに消さない)。`dead_letter=N` は**同一 cycle 内で新たに上限到達した分も
+即時反映**する(配送後に再集計)。
+
+上限到達済みの `failed` 行(`attempt_count >= max_attempts`。旧 v2 prototype から
+移行した行や `max_attempts` を後から下げた場合に生じ得る)は、次の配送 cycle の claim
+開始時に自動で `dead_letter` へ正規化され、監視対象に入る。手元で先に確認したい場合:
+
+```bash
+# 上限到達済みなのに failed のまま残っている行(次 cycle で dead_letter へ正規化される)
+sqlite3 "$DB" \
+  "SELECT event_key, attempt_count FROM paper_execution_notifications
+    WHERE delivery_status = 'failed' AND attempt_count >= 5;"
+```
 
 ### 復旧(手動再送 / attempt リセット)
 

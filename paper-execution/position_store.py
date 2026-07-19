@@ -56,7 +56,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1085,7 +1085,12 @@ def _require_cas(connection, cursor, position_id: str, *, expected_state: str) -
 def _read_one(db_path: Path, sql: str, params: tuple) -> dict | None:
     if not db_path.exists():
         return None
-    with sqlite3.connect(db_path) as connection:
+    # closing(): the sqlite3 connection CONTEXT MANAGER only ends the
+    # transaction, it does NOT close the connection. On Windows an unclosed
+    # connection keeps the (snapshot) DB file handle open, so a dry-run's
+    # TemporaryDirectory.cleanup() fails with WinError 32. closing() guarantees
+    # the handle is released on every path, including exceptions.
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(sql, params).fetchone()
     return dict(row) if row is not None else None
@@ -1094,7 +1099,7 @@ def _read_one(db_path: Path, sql: str, params: tuple) -> dict | None:
 def _read_many(db_path: Path, sql: str, params: tuple) -> list[dict]:
     if not db_path.exists():
         return []
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:  # see _read_one re: closing()
         connection.row_factory = sqlite3.Row
         rows = connection.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
@@ -1421,6 +1426,16 @@ def claim_notifications(
     has expired (a crashed worker's rows become deliverable again after the
     lease). ``success`` and ``dead_letter`` rows are never claimed.
     Returns the claimed rows (post-claim state), oldest first.
+
+    Reconciliation (Issue #83 review): each claim transaction first normalizes
+    any ``failed`` row already at/over ``max_attempts`` to ``dead_letter``. Such
+    rows are otherwise unclaimable (claim requires ``attempt_count <
+    max_attempts``) AND excluded from the dead-letter gauge, so without this
+    they would be stuck forever -- not retried, not monitored. This runs against
+    the LIVE ``max_attempts`` setting, so it reconciles v2-prototype rows that
+    migrated as ``failed`` (no dead_letter status existed there) and any stale
+    v3 rows, without baking a fixed cap into the migration. Lowering
+    ``max_attempts`` later also demotes now-exhausted rows on the next cycle.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
     init_db(db_path)
@@ -1428,6 +1443,14 @@ def claim_notifications(
     lease_until = _iso_plus_seconds(now, lease_seconds)
     claimed: list[dict] = []
     with _immediate_txn(db_path) as connection:
+        connection.execute(
+            f"""
+            UPDATE {NOTIFICATIONS_TABLE}
+            SET delivery_status = ?, claimed_by = NULL, claimed_until_utc = NULL, updated_at_utc = ?
+            WHERE delivery_status = ? AND attempt_count >= ?
+            """,
+            (DELIVERY_STATUS_DEAD_LETTER, now, DELIVERY_STATUS_FAILED, int(max_attempts)),
+        )
         candidates = connection.execute(
             f"""
             SELECT * FROM {NOTIFICATIONS_TABLE}
