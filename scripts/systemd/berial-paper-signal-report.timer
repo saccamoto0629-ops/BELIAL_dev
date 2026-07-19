@@ -18,7 +18,13 @@ Description=Daily 00:10 Asia/Tokyo trigger for Berial Paper Signal Daily Report
 [Timer]
 OnCalendar=*-*-* 00:10:00 Asia/Tokyo
 # If the host was down/rebooting at 00:10, run once as soon as possible after
-# boot instead of skipping the day.
+# boot instead of skipping the day. NOTE: after a multi-day outage this
+# catch-up is still a single run, and --previous-day only generates the day
+# before the catch-up moment -- older missed days are NOT backfilled
+# automatically. Generate them manually with --date (see
+# docs/operations/operations.md). Deliberately not part of
+# scripts/restart_all.sh: re-activating a Persistent timer that missed its
+# schedule can start the service immediately.
 Persistent=true
 Unit=berial-paper-signal-report.service
 

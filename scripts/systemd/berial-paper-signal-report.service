@@ -11,9 +11,13 @@
 # (enable the TIMER, not this service; starting the service runs one report now).
 # See docs/operations/operations.md for the full deploy/enable/verify steps.
 #
-# Read-only against the signal DB: it never creates the DB, runs a migration,
-# or writes a row. A missing/unreadable/non-SQLite DB or a missing
-# paper_signals table/column exits non-zero, so this unit shows "failed" and
+# Read-only against the signal DB: it never creates the DB, runs a migration
+# or backfill, or changes the DB's content/schema. Note: for a WAL-mode DB,
+# SQLite itself may create/use the -shm sidecar even on a read-only
+# connection, so the report user may need write permission on the DB
+# *directory*; without it the read fails (visible in the journal). A
+# missing/unreadable/non-SQLite DB or a missing paper_signals table/column
+# exits non-zero, so this unit shows "failed" and
 # journalctl -u berial-paper-signal-report explains why. Only a valid DB with
 # zero signals for the day succeeds (with a zero-signal report). Independent of
 # the resident berial-paper-signal.service.

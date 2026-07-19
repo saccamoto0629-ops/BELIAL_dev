@@ -402,11 +402,17 @@ def list_signals_in_range_strict(
     :class:`PaperSignalDbError`; only a *valid* DB whose window is simply empty
     returns ``[]``.
 
-    Every bit as side-effect-free as the lenient variant: the read-only URI
-    connection (``mode=ro``) makes it impossible to create the DB file, run
-    ``init_db()``/migrations, or write anything -- SQLite itself rejects a
-    write. ``list_signals_in_range`` keeps its tolerant contract for existing
-    callers; this function is additive.
+    Write discipline: the read-only URI connection (``mode=ro``) never creates
+    the DB file and never runs ``init_db()``, a migration, a backfill, or any
+    INSERT/UPDATE/DELETE -- the DB's content and schema are left unchanged.
+    Caveat (Issue #71 review): for a WAL-mode DB, SQLite itself may create and
+    use the ``-shm`` shared-memory sidecar even on a read-only connection, so
+    the DB *directory* may need to be writable for WAL bookkeeping. If it is
+    not, the read can fail even though the main DB file is readable; that
+    failure surfaces as :class:`PaperSignalDbError` (never as a silent
+    zero-row day), with the cause in the message. ``list_signals_in_range``
+    keeps its tolerant contract for existing callers; this function is
+    additive.
     """
     db_path = Path(db_path)
     if not db_path.exists():

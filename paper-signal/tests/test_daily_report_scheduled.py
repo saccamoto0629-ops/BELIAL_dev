@@ -15,7 +15,9 @@ Covers:
 
 import os
 import pathlib
+import shutil
 import sqlite3
+import stat
 import sys
 from datetime import UTC, datetime
 
@@ -219,6 +221,130 @@ def test_strict_read_missing_required_column_raises(tmp_path):
         store.list_signals_in_range_strict(*WINDOW, db_path=db_path)
 
 
+# --------------------------------------------------------------------------- #
+# WAL-mode DBs (Issue #71 review, Major 2)
+#
+# A read-only (mode=ro) connection never changes the DB's content or schema and
+# never creates the DB -- but SQLite itself may create/use the -shm
+# shared-memory sidecar for a WAL-mode DB even read-only. Whether a sidecar
+# appears is SQLite-version-dependent, so no test here asserts that sidecars
+# are (or are not) created; the guarantees tested are: WAL DBs are readable,
+# content/schema stay unchanged, and a DB directory SQLite cannot write to
+# turns into a runtime error instead of a silent zero-row day.
+# --------------------------------------------------------------------------- #
+
+def _make_wal_db(db_path) -> None:
+    """A valid WAL-mode paper_signals DB with one 2026-07-13 row, all closed."""
+    store.init_db(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.close()
+    store.save_signal(_make_signal(created_at_utc="2026-07-13T10:00:00Z"), db_path=db_path)
+
+
+def _copy_wal_db_without_shm(tmp_path) -> pathlib.Path:
+    """A WAL DB copy whose -wal sidecar exists but whose -shm does not.
+
+    A holder connection keeps the source's -wal alive (SQLite deletes it when
+    the last connection closes); the main file and -wal are then copied without
+    the -shm, mimicking e.g. an rsync'd live DB.
+    """
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    src = src_dir / "paper_signals.sqlite3"
+    store.init_db(src)
+    connection = sqlite3.connect(src)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.close()
+    holder = sqlite3.connect(src)
+    holder.execute("SELECT COUNT(*) FROM paper_signals").fetchone()
+    try:
+        store.save_signal(_make_signal(created_at_utc="2026-07-13T10:00:00Z"), db_path=src)
+        wal = src_dir / "paper_signals.sqlite3-wal"
+        assert wal.exists(), "test setup: expected a live -wal sidecar"
+        dst_dir = tmp_path / "dst"
+        dst_dir.mkdir()
+        shutil.copy2(src, dst_dir / src.name)
+        shutil.copy2(wal, dst_dir / wal.name)
+    finally:
+        holder.close()
+    return dst_dir / src.name
+
+
+def _db_fingerprint(db_path):
+    """Logical schema + row content, for change detection independent of WAL
+    checkpointing (raw file bytes are not stable for a WAL DB)."""
+    connection = sqlite3.connect(db_path)
+    try:
+        schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        rows = connection.execute("SELECT * FROM paper_signals ORDER BY signal_id").fetchall()
+    finally:
+        connection.close()
+    return schema, rows
+
+
+def test_strict_read_works_on_a_wal_mode_db(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    _make_wal_db(db_path)
+
+    rows = store.list_signals_in_range_strict(*WINDOW, db_path=db_path)
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "USDJPY"
+
+
+def test_strict_read_wal_sidecar_present_without_shm(tmp_path):
+    db_path = _copy_wal_db_without_shm(tmp_path)
+    assert not (db_path.parent / (db_path.name + "-shm")).exists()
+
+    # The directory is writable, so SQLite can build whatever WAL bookkeeping
+    # it needs; the un-checkpointed WAL row must be visible. Deliberately no
+    # assertion on whether a -shm was (re)created -- that is SQLite's business.
+    rows = store.list_signals_in_range_strict(*WINDOW, db_path=db_path)
+    assert len(rows) == 1
+
+
+def test_strict_read_leaves_wal_db_content_and_schema_unchanged(tmp_path):
+    db_path = tmp_path / "paper_signals.sqlite3"
+    _make_wal_db(db_path)
+    before = _db_fingerprint(db_path)
+
+    store.list_signals_in_range_strict(*WINDOW, db_path=db_path)
+    assert _db_fingerprint(db_path) == before
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root bypasses filesystem permissions, so a chmod-based unwritable directory cannot be simulated",
+)
+def test_strict_read_wal_db_in_unwritable_directory_is_a_runtime_error(tmp_path):
+    db_path = _copy_wal_db_without_shm(tmp_path)
+    db_dir = db_path.parent
+    db_dir.chmod(0o500)  # main DB readable, but SQLite cannot create -shm here
+    try:
+        with pytest.raises(store.PaperSignalDbError):
+            store.list_signals_in_range_strict(*WINDOW, db_path=db_path)
+    finally:
+        db_dir.chmod(0o755)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root bypasses filesystem permissions, so a chmod-based unwritable directory cannot be simulated",
+)
+def test_cli_wal_db_in_unwritable_directory_exits_nonzero_with_stderr(tmp_path, capsys):
+    db_path = _copy_wal_db_without_shm(tmp_path)
+    db_dir = db_path.parent
+    db_dir.chmod(0o500)
+    try:
+        rc = cli.main(["--date", "2026-07-13", "--timezone", "UTC", "--db-path", str(db_path)])
+    finally:
+        db_dir.chmod(0o755)
+    assert rc == cli.EXIT_RUNTIME_ERROR
+    assert "paper signal DB" in capsys.readouterr().err
+
+
 @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="chmod-based denial needs a non-root POSIX user")
 def test_strict_read_unreadable_db_raises(tmp_path):
     db_path = _empty_db(tmp_path)
@@ -344,6 +470,33 @@ def test_unwritable_output_exits_nonzero(tmp_path, capsys):
     ])
     assert rc == cli.EXIT_RUNTIME_ERROR
     assert "could not write report" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-mode semantics required")
+def test_report_file_mode_is_0600_for_new_and_overwritten_files(tmp_path):
+    # Issue #71 review: reports are owner-only (0600) by spec -- read by the
+    # operational user the service runs as. A re-run over an older file with
+    # looser permissions must also end at 0600 (atomic replace, not in-place).
+    db_path = _empty_db(tmp_path)
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    report_path = out_dir / "paper_signal_2026-07-13.md"
+    report_path.write_text("old report\n", encoding="utf-8")
+    report_path.chmod(0o644)
+    argv = [
+        "--date", "2026-07-13", "--timezone", "UTC",
+        "--db-path", str(db_path), "--format", "markdown", "--output-dir", str(out_dir),
+    ]
+
+    assert cli.main(argv) == 0
+    assert stat.S_IMODE(report_path.stat().st_mode) == cli.REPORT_FILE_MODE == 0o600
+
+    # And a brand-new file (no predecessor) gets the same mode.
+    fresh = out_dir / "paper_signal_2026-07-14.md"
+    assert cli.main(["--date", "2026-07-14", "--timezone", "UTC",
+                     "--db-path", str(db_path), "--format", "markdown",
+                     "--output-dir", str(out_dir)]) == 0
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
 
 
 def test_output_dir_text_format_uses_txt_extension(tmp_path):

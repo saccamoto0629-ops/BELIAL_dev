@@ -4,12 +4,14 @@
 Reads one day's stored Paper Signals and prints (or writes) a symbol / timeframe
 / direction / market-state / strategy breakdown. Read-only and side-effect-free:
 it never writes the signal DB, never sends a Discord notification, and never
-touches a broker / Execution API -- the only thing it may write is the optional
-``--output`` / ``--output-dir`` file. All aggregation/rendering lives in
-``daily_report``; the store read is
-``paper_signal_store.list_signals_in_range_strict`` (read-only URI connection --
-it can never create or write the DB). This module is only argument parsing +
-wiring, so it stays import-light
+touches a broker / Execution API -- the only file it deliberately writes is the
+optional ``--output`` / ``--output-dir`` report file. All
+aggregation/rendering lives in ``daily_report``; the store read is
+``paper_signal_store.list_signals_in_range_strict`` (read-only URI connection:
+it never creates the DB nor changes its content/schema -- though for a
+WAL-mode DB, SQLite itself may create/use the ``-shm`` sidecar even
+read-only, see that function's docstring). This module is only argument
+parsing + wiring, so it stays import-light
 (no pandas / requests / signal_generator), suitable for a daily cron/systemd run.
 
 Issue #71 (scheduled run): ``--previous-day`` reports on yesterday *in the
@@ -79,6 +81,13 @@ REPORT_FILENAME_SUFFIXES = {
     daily_report.FORMAT_MARKDOWN: ".md",
     daily_report.FORMAT_TEXT: ".txt",
 }
+
+# Report files are owner-only (0600): they are read by the same operational
+# user the systemd service runs as (see docs/operations/operations.md).
+# mkstemp() already creates the temp file 0600; pinning it explicitly makes the
+# mode a spec, and a same-day re-run over an older file with looser
+# permissions still ends at 0600 after the atomic replace.
+REPORT_FILE_MODE = 0o600
 
 
 def _now(tz: ZoneInfo) -> datetime:
@@ -249,7 +258,8 @@ def _write_report_file(output_path: Path, content: str) -> None:
     The report is written to a temp file in the destination directory and then
     ``os.replace``d over the target, so a crash or full disk mid-write can never
     leave a truncated ``paper_signal_YYYY-MM-DD.md`` -- the previous complete
-    file (or no file) remains. Same-day re-runs therefore overwrite safely.
+    file (or no file) remains. Same-day re-runs therefore overwrite safely, and
+    the result always ends up with :data:`REPORT_FILE_MODE` permissions.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -258,6 +268,7 @@ def _write_report_file(output_path: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
             tmp_file.write(content)
+        os.chmod(tmp_name, REPORT_FILE_MODE)
         os.replace(tmp_name, output_path)
     except OSError:
         with suppress(OSError):
