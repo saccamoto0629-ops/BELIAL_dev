@@ -15,6 +15,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | [docs/operations/](docs/operations/README.md) | 環境変数、起動手順、dry-run方針、systemd運用 |
 | [Strategy 定義仕様](docs/architecture/strategy_definition.md) | Strategy ごとの可変設定を外部ファイルへ切り出すためのスキーマ・エラー方針(Issue #52 設計) |
 | [docs/development/](docs/development/README.md) | Issue / PR 運用ルール |
+| [Agent Skills](docs/development/agent-skills.md) | AIエージェント(Claude Code / Codex)向け Issue 実装 Skill の配置・利用方法(Issue #86) |
 | [v1.4.1 リリースノート](docs/development/reports/v1.4.1_release_notes.md) | タグ作成前に作成された候補スナップショット。`v1.4.1` タグは後に作成済み |
 | [docs/testing/](docs/testing/test_specification.md) | テスト方針、レイヤー別テスト観点、重要テストケースとpytestの対応 |
 
