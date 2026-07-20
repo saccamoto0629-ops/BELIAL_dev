@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
+import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -47,24 +48,18 @@ def validate_target(raw_target: str, *, repo_root: Path | None = None) -> Path:
     """Resolve and validate one cleanup directory without creating it."""
     if not raw_target or not raw_target.strip():
         raise ValueError("target path is empty")
-
     target = Path(raw_target).expanduser()
     if not target.is_absolute():
         raise ValueError(f"target must be an absolute path: {raw_target!r}")
-
     resolved = target.resolve(strict=False)
-    root = Path(resolved.anchor)
-    if resolved == root:
+    if resolved == Path(resolved.anchor):
         raise ValueError(f"refusing filesystem root target: {resolved}")
-
     effective_repo_root = (repo_root or _repo_root()).resolve(strict=False)
     if resolved == effective_repo_root:
         raise ValueError(f"refusing repository root target: {resolved}")
-
-    # Avoid broad top-level targets such as /opt, /var, /home, /tmp or /mnt.
+    # Reject broad paths such as /opt, /var, /home, /tmp and /mnt.
     if len(resolved.parts) < 4:
         raise ValueError(f"target is too broad: {resolved}")
-
     return resolved
 
 
@@ -78,8 +73,7 @@ def iter_candidates(target: Path, *, cutoff_epoch: float) -> Iterable[tuple[Path
                 if not entry.name.lower().endswith(".png"):
                     continue
                 stat_result = entry.stat(follow_symlinks=False)
-                # Files exactly on the boundary are retained. Only strictly older
-                # files are candidates.
+                # Exactly on the boundary is retained; only strictly older files go.
                 if stat_result.st_mtime >= cutoff_epoch:
                     continue
                 yield Path(entry.path), stat_result.st_size
@@ -98,7 +92,6 @@ def cleanup_targets(
 ) -> CleanupResult:
     if retention_days < 0:
         raise ValueError("retention days must be zero or greater")
-
     result = CleanupResult()
     cutoff_epoch = (time.time() if now_epoch is None else now_epoch) - retention_days * 86400
 
@@ -109,10 +102,8 @@ def cleanup_targets(
             result.error_count += 1
             print(f"ERROR invalid target {raw_target!r}: {exc}", file=sys.stderr)
             continue
-
         result.target_count += 1
         print(f"TARGET path={target} retention_days={retention_days:g} dry_run={str(dry_run).lower()}")
-
         if not target.exists():
             result.warning_count += 1
             print(f"WARNING target does not exist: {target}", file=sys.stderr)
@@ -123,25 +114,18 @@ def cleanup_targets(
             continue
 
         try:
-            candidates = iter_candidates(target, cutoff_epoch=cutoff_epoch)
-            for path, size in candidates:
+            for path, size in iter_candidates(target, cutoff_epoch=cutoff_epoch):
                 if size < 0:
                     result.error_count += 1
                     continue
-
                 result.candidate_count += 1
                 result.candidate_bytes += size
-                action = "WOULD_DELETE" if dry_run else "DELETE"
-                print(f"{action} bytes={size} path={path}")
-
+                print(f"{'WOULD_DELETE' if dry_run else 'DELETE'} bytes={size} path={path}")
                 if dry_run:
                     continue
-
                 try:
-                    # Recheck immediately before deletion to reduce races and
-                    # reject a file replaced by a symlink after enumeration.
                     current = path.lstat()
-                    if path.is_symlink() or not path.is_file():
+                    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
                         raise OSError("candidate changed type before deletion")
                     if current.st_mtime >= cutoff_epoch:
                         print(f"SKIP refreshed file path={path}")
@@ -155,7 +139,6 @@ def cleanup_targets(
         except OSError as exc:
             result.error_count += 1
             print(f"ERROR scan failed target={target}: {exc}", file=sys.stderr)
-
     return result
 
 
@@ -177,18 +160,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Delete files older than this many days (default {DEFAULT_RETENTION_DAYS:g}).",
     )
     parser.add_argument("--dry-run", action="store_true", help="List candidates without deleting files.")
-    parser.add_argument(
-        "--lock-file",
-        default=None,
-        help=f"Advisory lock file path (default {DEFAULT_LOCK_FILE}).",
-    )
+    parser.add_argument("--lock-file", default=None, help=f"Advisory lock file (default {DEFAULT_LOCK_FILE}).")
     return parser.parse_args(argv)
 
 
 def _resolve_targets(args: argparse.Namespace) -> list[str]:
-    targets = list(args.target)
-    if not targets:
-        targets = _split_env_targets(os.environ.get(ENV_TARGETS, ""))
+    targets = list(args.target) or _split_env_targets(os.environ.get(ENV_TARGETS, ""))
     if not targets:
         raise ValueError(f"no targets configured; use --target or {ENV_TARGETS}")
     return targets
@@ -204,6 +181,16 @@ def _resolve_retention_days(args: argparse.Namespace) -> float:
         raise ValueError(f"invalid {ENV_RETENTION_DAYS}: {raw!r}") from exc
 
 
+def _print_summary(result: CleanupResult, *, dry_run: bool) -> None:
+    print(
+        "SUMMARY "
+        f"targets={result.target_count} candidates={result.candidate_count} "
+        f"candidate_bytes={result.candidate_bytes} deleted={result.deleted_count} "
+        f"deleted_bytes={result.deleted_bytes} warnings={result.warning_count} "
+        f"errors={result.error_count} dry_run={str(dry_run).lower()}"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
@@ -213,38 +200,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR {exc}", file=sys.stderr)
         return 2
 
-    lock_file = args.lock_file or os.environ.get(ENV_LOCK_FILE, DEFAULT_LOCK_FILE)
-    lock_path = Path(lock_file)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # A dry-run cannot delete, so it deliberately avoids even creating a lock
+    # file or its parent directory. This keeps the mode fully side-effect free.
+    if args.dry_run:
+        try:
+            result = cleanup_targets(targets, retention_days=retention_days, dry_run=True)
+        except ValueError as exc:
+            print(f"ERROR {exc}", file=sys.stderr)
+            return 2
+        _print_summary(result, dry_run=True)
+        return 1 if result.error_count else 0
 
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+    lock_path = Path(args.lock_file or os.environ.get(ENV_LOCK_FILE, DEFAULT_LOCK_FILE))
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = lock_path.open("a+", encoding="utf-8")
+    except OSError as exc:
+        print(f"ERROR cannot open lock file {lock_path}: {exc}", file=sys.stderr)
+        return 1
+
+    with lock_handle:
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(f"WARNING cleanup already running; lock={lock_path}", file=sys.stderr)
             return 0
-
         try:
-            result = cleanup_targets(
-                targets,
-                retention_days=retention_days,
-                dry_run=args.dry_run,
-            )
+            result = cleanup_targets(targets, retention_days=retention_days, dry_run=False)
         except ValueError as exc:
             print(f"ERROR {exc}", file=sys.stderr)
             return 2
 
-    print(
-        "SUMMARY "
-        f"targets={result.target_count} "
-        f"candidates={result.candidate_count} "
-        f"candidate_bytes={result.candidate_bytes} "
-        f"deleted={result.deleted_count} "
-        f"deleted_bytes={result.deleted_bytes} "
-        f"warnings={result.warning_count} "
-        f"errors={result.error_count} "
-        f"dry_run={str(args.dry_run).lower()}"
-    )
+    _print_summary(result, dry_run=False)
     return 1 if result.error_count else 0
 
 
