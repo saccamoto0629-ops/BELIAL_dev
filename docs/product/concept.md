@@ -56,7 +56,7 @@ BELIAL は、いきなり実売買へ進まない。まず市場を観測し、�
 - **Paper Signal は entry / exit を決めない。** 仮説の記録・通知だけを行う。
 - **Paper Execution は仮説を仮想約定・仮想ポジション・仮想損益へ変換する。** 実装済み(`paper-execution/`)だが、生成するのは仮想レコードのみである。
 - **Backtest は過去データ上の再生・評価に徹する。** リアルタイムの執行フローには介在しない独立した Validation レイヤーである。
-- **Live Execution は未実装であり、設計上も完全に別レイヤーとして扱う。** Paper Execution のコード・データ・設定を実注文経路に転用しない。
+- **Live Execution は未実装であり、設計上も完全に別レイヤーとして扱う。** Paper Execution のコード・データ・設定を実注文経路に転用しない。将来の Live Execution に向けた Broker 境界(共通インターフェースと外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に定義済みだが、これは境界の定義のみであり、実発注・OANDA Adapter・Live Execution 本体は未実装のままである([Broker Interface](../architecture/broker_interface.md))。
 
 ## レイヤー分離
 
@@ -88,7 +88,7 @@ Execution
 | Strategy / Method | 観測・分類情報から候補を生成・評価するルール。Paper Signal の現行ルールはコード実装、外部 Strategy 定義(YAML)は現在 Backtest 経路のみで使用 | 実装済み: `paper-signal/signal_generator.py`, `backtest/strategy_definition.py` |
 | Hypothesis / Paper Signal | Strategy / Method の評価結果を paper_only の仮説レコードとして生成・保存する。entry / exit は判断しない | 実装済み: `paper-signal/signal_generator.py`, `paper_signal_store.py` |
 | Execution (Paper Execution) | Paper Signal を入力に、時間進行に沿って仮想Entry・仮想ポジション管理・SL / TP / Exit 判定・仮想損益計算を行う | **実装済み**: `paper-execution/`(設計は [Paper Execution](../architecture/paper_execution.md)。Issue #49 設計、#50 / #51 実装)。Broker API・実注文は含まない |
-| Execution (Live Execution) | Broker API による実注文・実約定・実ポジション管理 | 未実装(将来・非スコープ) |
+| Execution (Live Execution) | Broker API による実注文・実約定・実ポジション管理 | 未実装(将来・非スコープ)。Broker 境界(interface / 共通モデル / FakeBroker)のみ Issue #73 で `broker/` に定義済み |
 | Persistence | 各コンポーネントが独立した SQLite を所有する。初期化・既知migration・schema検証の保証範囲はstoreごとに異なる | 実装済み: `chart_collector.py`, `market_bias_store.py`, `paper_signal_store.py`, `backtest_store.py`, `position_store.py`。詳細は [Architecture](../architecture/architecture.md#sqlite-schema-validation--migration) |
 
 Backtest はこの直列フローには含まれない独立した **Validation レイヤー(検証基盤)** であり、過去のローソク足で Strategy / Execution ルールを遡及再生・評価する。Backtest と Paper Execution の役割差、および両者が共有するルールは [Architecture](../architecture/architecture.md#backtest-と-paper-execution-の役割差) を参照。

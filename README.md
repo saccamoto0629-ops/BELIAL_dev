@@ -32,6 +32,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | `market-watch/` | ローソク足取得、指標計算、Chart Snapshot、イベントAlert | [market-watch/README.md](market-watch/README.md) |
 | `paper-signal/` | Market Bias + Chart Snapshot から `paper_only` 仮説を生成 | [paper-signal/README.md](paper-signal/README.md) |
 | `paper-execution/` | Paper Signal を入力に仮想ポジションを Open / Close し仮想損益を記録(仮想約定のみ。Broker API・実注文なし) | [Paper Execution 設計](docs/architecture/paper_execution.md) |
+| `broker/` | 将来の Live Execution 用の Broker 境界(共通インターフェース・共通モデル)と、外部通信しないテストダブル FakeBroker(Issue #73)。実発注・OANDA Adapter・Live Execution は未実装のまま | [broker/README.md](broker/README.md) / [設計](docs/architecture/broker_interface.md) |
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 

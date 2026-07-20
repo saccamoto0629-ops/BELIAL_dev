@@ -1,0 +1,122 @@
+# Broker Interface / FakeBroker(Issue #73)
+
+将来の **Live Execution** に向けた Broker 境界の定義と、外部通信を一切行わないテストダブル **FakeBroker** の仕様。実装は `broker/`(明示的な Python package。`__init__.py` あり)にあり、リポジトリルートから通常の package import で利用する(PR #87)。
+
+```python
+from broker.broker_interface import Broker
+from broker.broker_models import OrderRequest, OrderResult
+from broker.fake_broker import FakeBroker
+```
+
+> **重要な位置づけ**
+>
+> - Broker interface / FakeBroker は**将来の Live Execution 用の基盤(境界の定義)**である。
+> - FakeBroker は**外部通信しないテストダブル**である。ネットワーク・実DB・Discord・S3・sleep・乱数を使わない。
+> - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、本境界を使わない・使わせない。
+> - **実発注・OANDA Adapter・Safety Gate・Live Execution runner は未実装**である。FakeBroker が存在しても Live Execution が実装済みになったわけではない。
+
+## 依存方向
+
+```text
+Strategy / Paper Signal
+    ↓
+(将来の) Execution use case
+    ↓
+Broker interface / 共通モデル   ← broker/broker_interface.py, broker/broker_models.py
+    ↑
+FakeBroker                      ← broker/fake_broker.py(テストダブル)
+    ↑
+(将来の) OANDA Adapter          ← 未実装
+```
+
+- Strategy / Paper Signal / Paper Execution から FakeBroker・将来の OANDA 実装を**直接 import しない**(`broker/tests/test_broker_interface.py` が回帰として固定)。
+- FakeBroker と将来の Adapter は Broker interface に依存する。逆方向の依存はない。
+
+## Broker interface(`broker_interface.py`)
+
+`typing.Protocol`(`runtime_checkable`、構造的型付け)。実装側に継承関係を要求しない。
+
+> **runtime check の限界(PR #87)**: `runtime_checkable` な Protocol の `isinstance()` は**必要な属性(メソッド)が存在すること**しか確認せず、引数型・戻り値型の適合は保証しない。本リポジトリは mypy / pyright 等の静的型検査を実行していないため、**シグネチャ適合を保証する仕組みはない**。`broker/tests/` の振る舞いテストが確認するのは FakeBroker の具体的な挙動のみであり、将来の Adapter 実装は自前のテスト(および必要なら型検査)で適合を確認する必要がある。
+
+| 操作 | メソッド | 戻り値 |
+|---|---|---|
+| 注文送信 | `submit_order(request: OrderRequest)` | `OrderResult` |
+| 注文キャンセル | `cancel_order(client_order_id: str)` | `OrderResult` |
+| 注文照会 | `get_order(client_order_id: str)` | `OrderResult` |
+| ポジション照会 | `get_positions()` | `tuple[PositionInfo, ...]` |
+| 口座状態照会 | `get_account_state()` | `AccountState` |
+
+境界のキーは**呼び出し側が生成する `client_order_id`**。Broker が採番する `broker_order_id` は結果側にのみ現れる(意味の異なる ID を同一フィールドに混在させない)。Adapter は内部で自 Broker の注文 ID へマッピングする。
+
+## 共通モデル(`broker_models.py`)
+
+すべて `dataclass(frozen=True)` + `Enum` + `Decimal`(価格・数量・金額)+ timezone-aware UTC `datetime`。Paper Execution の float / TypedDict 規約は既存レイヤーのものであり、本境界は新規設計として Decimal を採用する(Issue #73)。
+
+- `OrderRequest` — client_order_id / symbol / side / order_type(MARKET, LIMIT)/ quantity / limit_price / created_at_utc。生成時に検証(`BrokerInvalidRequestError`)。
+- `OrderResult` — 注文スナップショット。`requested_quantity` / `filled_quantity` / `remaining_quantity`(= requested − filled を検証)、`requested_price` と `average_fill_price` / `fills`(約定明細)を**別々に保持**し、約定価格の乖離(`price_deviation`)をテストで比較できる。構築時のクロスフィールド検証(`ValueError`): LIMIT は `requested_price` 必須・MARKET は `None` 必須、`pending`(Broker 未確認)は `broker_order_id` 禁止、`fill_id` は snapshot 内で一意(重複 fill による同一約定の二重計上を構築時に拒否。更新時も追加 fill の ID 重複を検証)。
+- `Fill` — 約定明細(fill_id / price / quantity / filled_at_utc)。
+- `PositionInfo` / `AccountState` — Broker 側スナップショット。
+- Broker 固有フィールドは共通モデルへ**漏らさない**。Broker 固有レスポンス → 共通モデルの変換は将来の Adapter 内部で完結させる。
+
+### 注文状態(`OrderState`)
+
+```text
+pending → accepted → partially_filled → filled
+   |          |            |
+   |          |            +→ cancelled / unknown
+   |          +→ cancelled / rejected / unknown
+   +→ (accepted / partially_filled / filled / cancelled / rejected / unknown)
+
+unknown → (accepted / partially_filled / filled / cancelled / rejected)  ※後続照会で解決
+terminal = filled / cancelled / rejected(再遷移なし)
+```
+
+- `unknown` は**通信タイムアウト等で最終状態が確認できない**ケース専用。Broker 側で受理された可能性を否定できないため、「未発注」「拒否」へ安易に確定しない。`rejected`(Broker の確定的拒否)とは別状態。
+- **`unknown` の契約(PR #87)**: `unknown` が限定するのは「Broker 側の確定が取れていない」ことであり、約定量ではない。`unknown` スナップショットは**既知の fill を保持できる**(0 件・部分・要求全量のいずれも可。`0 <= filled_quantity <= requested_quantity`、fills 合計との一致は他状態と同じく検証される)。`broker_order_id` は有無どちらも許容。`unknown` が禁じるのは最終結果の断定のみで、後続照会で確定状態へ解決するまで `filled` / `rejected` / 「未発注」へ確定してはならない。
+- 遷移の閉集合は `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` が固定する。
+- **同一状態の更新(PR #87)**: Broker polling は同じスナップショットを繰り返し観測するため、`validate_order_state_transition(old, new)` は **`old == new` を全状態で許可**する(terminal 含む。`filled → filled` は許可、`filled → cancelled` は引き続き拒否)。`ORDER_STATE_TRANSITIONS` は「異なる状態への変更」のみを列挙する。
+- **スナップショット更新の不変条件(PR #87)**: 状態ペアの検証に加え、`validate_order_result_update(old, new)` が更新の**内容**を検証する。(1) `client_order_id` / `symbol` / `side` / `order_type` / `requested_quantity` / `requested_price` は更新前後で不変、(2) `filled_quantity` は単調非減少・`remaining_quantity` は単調非増加、(3) `old.fills` は `new.fills` の prefix としてすべて保持(削除・並べ替え・同一 `fill_id` の内容変更を禁止。追加 fill が既存 `fill_id` を再利用することも禁止)、(4) `broker_order_id` は `None → 値` のみ許可(`値 → None`、`値A → 値B` は禁止)、(5) `updated_at_utc` は全更新で単調非減少、(6) **terminal 状態の same-state 再観測は `updated_at_utc` 以外の全フィールドが不変**(確定済みの `average_fill_price` や `reject_reason` を後から書き換えることはできない)。**UNKNOWN の解決先は new 自体の構築 invariant と更新不変条件の両方**を満たす必要がある — 例: 部分約定を保持した `unknown` は `partially_filled` / `filled` / `cancelled` へは解決できるが `accepted` / `rejected` へは戻れず、全量 fill を保持した `unknown` は `filled` のみへ解決できる。型不正は `BrokerInvalidRequestError`、不変条件違反は `ValueError`。FakeBroker のキャンセル経路もこの検証を通る。
+
+### エラー方針(例外 + Result の組み合わせ)
+
+- Broker の**確定的な業務回答**(受理 / 約定 / 部分約定 / 拒否)は `OrderResult` の状態として**返す**。拒否は `OrderState.REJECTED` + `reject_reason`。
+- **インフラ障害・操作失敗**は `BrokerErrorCode` を持つ型付き例外として**送出する**(文字列判定をさせない): `BrokerTimeoutError`(timeout。注文状態は `unknown` に)/ `BrokerCommunicationError`(communication failure。リクエスト未到達)/ `BrokerCancellationError`(cancellation failure)/ `BrokerInvalidRequestError`(invalid request)/ `BrokerOrderNotFoundError`(not found)。
+- **注文拒否(rejected)とタイムアウト、通信障害はそれぞれ別に区別される**(拒否=確定状態、タイムアウト=`unknown`、通信失敗=未到達)。
+- **検証の境界(PR #87)**: caller / adapter から渡された**フィールド・型の不正**(enum の代わりの生文字列、tuple でない fills、空の reject_reason 等)は `BrokerInvalidRequestError`、**モデル内部の整合性違反**(数量の算術、状態×fill の制約、reject_reason と状態の対応)は `ValueError`。
+
+## FakeBroker(`fake_broker.py`)
+
+インメモリ・決定的なテストダブル。`client_order_id` 単位で Scripted Scenario を注入する(汎用シナリオエンジンではない)。
+
+```python
+broker = FakeBroker()
+broker.script_order("c-1", FillImmediately(price=Decimal("2400.5")))   # 即時約定(価格乖離の注入も可)
+broker.script_order("c-2", StayPending())                               # 未約定(accepted のまま)
+broker.script_order("c-3", PartiallyFill(fills=((Decimal("2400"), Decimal("3")),)))  # 部分約定
+broker.script_order("c-4", RejectOrder(reason="insufficient margin"))   # 拒否
+broker.script_order("c-5", TimeoutOrder())                              # タイムアウト(即時再現・実待機なし)
+broker.script_order("c-6", FailCommunication())                         # 通信失敗(注文は記録されない)
+broker.script_cancel("c-2", FailCancellation())                         # キャンセル失敗
+broker.set_positions([...]); broker.set_account_state(...)              # 照会結果の注入
+```
+
+- 未スクリプト注文は `default_script`(既定: 指値価格で即時全量約定)。約定価格の選択は truthiness ではなく明示的な `is not None` 判定(`script.price` → `request.limit_price` → `default_fill_price` の順)。
+- **設定ミスは即時に失敗する(PR #87)**: Scenario dataclass は構築時に値を検証し(価格は正の有限 Decimal、reason は非空文字列、`PartiallyFill.fills` は非空 tuple の (Decimal, Decimal) ペア)、設定 API(`script_order` / `script_cancel` / `set_positions` / `set_account_state`)も引数の型を検証する。いずれも `BrokerInvalidRequestError` を送出し、submit / cancel 実行まで設定ミスを遅延させない(注文数量との比較のみ submit 時)。
+- タイムアウトは `BrokerTimeoutError` を**即時に**送出し、注文を `unknown` として記録する(後続の `get_order` で「拒否ではない」ことを検証できる)。sleep・実時間待機・乱数・ネットワークは使わない。時刻は決定的な内部クロック(固定基準時刻 + 連番秒)または注入 `clock` から得る。
+- 単体テストは一時ファイルすら不要のインメモリ動作(`broker/tests/` 参照。socket を無効化した検証あり)。
+
+## Paper Execution との境界
+
+- Paper Execution は保存済み Paper Signal を入力とする独立した仮想執行レイヤーであり、**本境界の追加による変更は一切ない**(FakeBroker への置き換え、Position Store の Broker 照会化、Signal→Broker 直接呼び出しはすべて禁止)。
+- Paper Execution の仮想約定モデル(`position_models.py`: long/short・pending/open/closed/...)と本境界の注文モデル(buy/sell・accepted/filled/...)は**別ドメインの語彙**であり統合しない。
+
+## 将来の OANDA Adapter の拡張点
+
+1. `broker/` 配下(または独立コンポーネント)に Adapter モジュールを追加し、`Broker` Protocol を構造的に実装する。
+2. OANDA 固有のレスポンス→ `broker_models` 共通モデルへの変換は Adapter 内部で完結させ、OANDA 固有フィールドを境界の外へ出さない。
+3. HTTP タイムアウト・接続断は `BrokerTimeoutError` / `BrokerCommunicationError` へマッピングし、タイムアウト後の注文状態は `unknown` として扱う(後続照会・照合で解決)。
+4. 実発注に進む場合も Safety Gate・認証情報管理・再接続・定期照合は本 Issue の非スコープであり、別 Issue で設計する。
+
+## 非スコープ(Issue #73 時点で未実装)
+
+OANDA Demo/Live API 連携、実 HTTP クライアント、実発注、ロット計算、レバレッジ計算、資金管理、Safety Gate、Broker との定期照合、再接続ループ、認証情報管理、Discord 通知、Live Execution runner。

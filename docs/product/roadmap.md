@@ -102,13 +102,14 @@ timer + oneshot 方式の実際のunit配置・有効化はv1.5以降の検討�
 
 - **Paper Execution**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・自動売買・ロット計算は含めない。Issue #49 で最小責務・状態遷移・約定規則を設計([Paper Execution](../architecture/paper_execution.md))、Issue #50 / #51 でデータモデル・保存層および Open / Close 判定エンジンを `paper-execution/` に実装した。
 - **外部Strategy定義(Backtest経路)**: Issue #52〜#54でYAML schema、loader / validator、`--strategy-file` / `--strategy` CLI、および `backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml` を実装した。外部定義を読み込むのは現在Backtest経路のみであり、Paper Signal / Paper Executionが同じ定義を共有する経路は未実装。
+- **Broker interface / FakeBroker(Issue #73)**: 将来の Live Execution に向けた Broker 境界(共通インターフェース・Broker 非依存の共通モデル)と、外部通信を一切行わないテストダブル FakeBroker を `broker/` に実装した([Broker Interface](../architecture/broker_interface.md))。これは**境界の定義のみ**であり、実発注・OANDA Adapter・Safety Gate・Live Execution runner は引き続き未実装・非スコープ。Paper Execution は従来どおり Broker 非依存の仮想執行のままで、この境界を使わない。
 
 **今後の検討:**
 
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
-- Live Execution / Broker API(Pepperoni の実発注担当分。まだ設計しない)
+- Live Execution / Broker API(Pepperoni の実発注担当分。Broker 境界のみ Issue #73 で定義済み。実発注・OANDA Adapter・runner はまだ設計しない)
 - 外部Strategy定義をPaper Signalへ接続し、Live相当のSignal生成とBacktestを同一定義で駆動する共有化
 
 Broker API による実注文・自動売買(Live Execution)は引き続き未実装・非スコープである。実装済みの外部Strategy定義をPaper Signal / Paper Executionへ接続する共有化は、現在のアーキテクチャの一部ではなく将来構想として扱う。
