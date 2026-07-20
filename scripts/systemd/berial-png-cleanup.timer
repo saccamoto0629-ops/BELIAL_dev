@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Berial PNG cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 Asia/Tokyo
+Persistent=true
+RandomizedDelaySec=15m
+Unit=berial-png-cleanup.service
+
+[Install]
+WantedBy=timers.target
