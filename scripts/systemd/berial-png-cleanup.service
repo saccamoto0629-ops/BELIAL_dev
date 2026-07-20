@@ -1,0 +1,22 @@
+[Unit]
+Description=Berial old PNG cleanup
+Documentation=file:/opt/berial/docs/operations/png_cleanup.md
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/berial
+Environment="PYTHONUNBUFFERED=1"
+Environment="PNG_CLEANUP_TARGETS=/opt/berial/market-watch/data/chart_images"
+Environment="PNG_CLEANUP_RETENTION_DAYS=7"
+Environment="PNG_CLEANUP_LOCK_FILE=/tmp/berial-png-cleanup.lock"
+ExecStart=/opt/berial/.venv/bin/python /opt/berial/scripts/cleanup_png.py
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/berial/market-watch/data/chart_images /tmp
