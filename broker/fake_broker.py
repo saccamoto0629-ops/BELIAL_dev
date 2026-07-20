@@ -17,6 +17,10 @@ Behaviour is injected per ``client_order_id`` as a *scripted scenario*
     broker.script_cancel("c-4", FailCancellation(reason="already filled"))
 
 Unscripted orders use ``default_script`` (immediate fill by default).
+Scenario values and configuration-API inputs (``script_order`` /
+``script_cancel`` / ``set_positions`` / ``set_account_state``) are validated
+eagerly — a mis-scripted test fails at configuration time with
+``BrokerInvalidRequestError``, not later inside submit/cancel.
 Timeouts are reproduced immediately as ``BrokerTimeoutError`` — never by
 waiting — and leave the order in ``OrderState.UNKNOWN`` (the broker may have
 accepted it). A communication failure (``FailCommunication``) means the
@@ -33,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable, Union
 
-from broker_models import (
+from .broker_models import (
     AccountState,
     BrokerCancellationError,
     BrokerCommunicationError,
@@ -52,6 +56,32 @@ from broker_models import (
 )
 
 # --- scripted scenarios ------------------------------------------------------
+#
+# Scenario dataclasses validate their own values at CONSTRUCTION time
+# (PR #87), so a mis-scripted test fails at the script_order()/dataclass
+# call, not later inside submit_order()/cancel_order(). All configuration
+# mistakes raise BrokerInvalidRequestError so they are machine-checkable.
+
+
+def _require_valid_price(value, field_name: str) -> None:
+    if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+        raise BrokerInvalidRequestError(
+            f"{field_name} must be a positive finite Decimal, got {value!r}"
+        )
+
+
+def _require_non_empty_reason(value, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise BrokerInvalidRequestError(
+            f"{field_name} must be a non-empty string, got {value!r}"
+        )
+
+
+def _require_id(client_order_id) -> None:
+    if not isinstance(client_order_id, str) or not client_order_id.strip():
+        raise BrokerInvalidRequestError(
+            f"client_order_id must be a non-empty string, got {client_order_id!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -61,6 +91,10 @@ class FillImmediately:
 
     price: Decimal | None = None
 
+    def __post_init__(self) -> None:
+        if self.price is not None:
+            _require_valid_price(self.price, "FillImmediately.price")
+
 
 @dataclass(frozen=True)
 class StayPending:
@@ -69,10 +103,28 @@ class StayPending:
 
 @dataclass(frozen=True)
 class PartiallyFill:
-    """Fill only ``fills`` — a tuple of (price, quantity) pairs whose total
-    must be strictly less than the requested quantity."""
+    """Fill only ``fills`` — a non-empty tuple of (price, quantity) pairs.
+
+    Each price/quantity must be a positive finite Decimal. The comparison
+    against the ORDER quantity happens at submit time: the total must be
+    strictly less than the requested quantity (use ``FillImmediately`` for a
+    full fill)."""
 
     fills: tuple[tuple[Decimal, Decimal], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fills, tuple) or not self.fills:
+            raise BrokerInvalidRequestError(
+                f"PartiallyFill.fills must be a non-empty tuple, got {self.fills!r}"
+            )
+        for entry in self.fills:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise BrokerInvalidRequestError(
+                    f"each PartiallyFill.fills entry must be a (price, quantity) tuple, got {entry!r}"
+                )
+            price, quantity = entry
+            _require_valid_price(price, "PartiallyFill price")
+            _require_valid_price(quantity, "PartiallyFill quantity")
 
 
 @dataclass(frozen=True)
@@ -80,6 +132,9 @@ class RejectOrder:
     """Broker definitively rejects the order (state ``REJECTED``)."""
 
     reason: str = "rejected by broker"
+
+    def __post_init__(self) -> None:
+        _require_non_empty_reason(self.reason, "RejectOrder.reason")
 
 
 @dataclass(frozen=True)
@@ -98,6 +153,10 @@ SubmitScript = Union[
     FillImmediately, StayPending, PartiallyFill, RejectOrder, TimeoutOrder, FailCommunication
 ]
 
+_SUBMIT_SCRIPT_TYPES = (
+    FillImmediately, StayPending, PartiallyFill, RejectOrder, TimeoutOrder, FailCommunication
+)
+
 
 @dataclass(frozen=True)
 class FailCancellation:
@@ -106,8 +165,13 @@ class FailCancellation:
 
     reason: str = "cancellation failed"
 
+    def __post_init__(self) -> None:
+        _require_non_empty_reason(self.reason, "FailCancellation.reason")
+
 
 CancelScript = FailCancellation
+
+_CANCEL_SCRIPT_TYPES = (FailCancellation,)
 
 _CLOCK_BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -132,6 +196,12 @@ class FakeBroker:
         account_state: AccountState | None = None,
         clock: Callable[[], datetime] | None = None,
     ):
+        if default_script is not None and not isinstance(default_script, _SUBMIT_SCRIPT_TYPES):
+            raise BrokerInvalidRequestError(f"invalid default_script {default_script!r}")
+        if default_fill_price is not None:
+            _require_valid_price(default_fill_price, "default_fill_price")
+        if account_state is not None and not isinstance(account_state, AccountState):
+            raise BrokerInvalidRequestError(f"invalid account_state {account_state!r}")
         self._default_script: SubmitScript = default_script or FillImmediately()
         self._default_fill_price = default_fill_price
         self._account_state = account_state or _DEFAULT_ACCOUNT_STATE
@@ -146,19 +216,45 @@ class FakeBroker:
         self.submitted_requests: list[OrderRequest] = []
 
     # --- test-side configuration -------------------------------------------
+    #
+    # Configuration mistakes fail HERE, not later at submit/cancel time, and
+    # always as BrokerInvalidRequestError (PR #87).
 
     def script_order(self, client_order_id: str, script: SubmitScript) -> None:
         """Set the scenario applied when ``client_order_id`` is submitted."""
+        _require_id(client_order_id)
+        if not isinstance(script, _SUBMIT_SCRIPT_TYPES):
+            raise BrokerInvalidRequestError(
+                f"script must be one of {[t.__name__ for t in _SUBMIT_SCRIPT_TYPES]}, got {script!r}"
+            )
         self._submit_scripts[client_order_id] = script
 
     def script_cancel(self, client_order_id: str, script: CancelScript) -> None:
         """Set the scenario applied when ``client_order_id`` is cancelled."""
+        _require_id(client_order_id)
+        if not isinstance(script, _CANCEL_SCRIPT_TYPES):
+            raise BrokerInvalidRequestError(
+                f"script must be one of {[t.__name__ for t in _CANCEL_SCRIPT_TYPES]}, got {script!r}"
+            )
         self._cancel_scripts[client_order_id] = script
 
     def set_positions(self, positions: tuple[PositionInfo, ...] | list[PositionInfo]) -> None:
+        if not isinstance(positions, (tuple, list)):
+            raise BrokerInvalidRequestError(
+                f"positions must be a tuple or list, got {type(positions).__name__}"
+            )
+        for entry in positions:
+            if not isinstance(entry, PositionInfo):
+                raise BrokerInvalidRequestError(
+                    f"every positions entry must be a PositionInfo, got {entry!r}"
+                )
         self._positions = tuple(positions)
 
     def set_account_state(self, state: AccountState) -> None:
+        if not isinstance(state, AccountState):
+            raise BrokerInvalidRequestError(
+                f"state must be an AccountState, got {state!r}"
+            )
         self._account_state = state
 
     # --- deterministic clock ------------------------------------------------
@@ -224,13 +320,14 @@ class FakeBroker:
                 fills=(),
             )
         elif isinstance(script, PartiallyFill):
-            fills = self._build_fills(script.fills)
-            total = sum((f.quantity for f in fills), Decimal(0))
-            if not fills or total >= request.quantity:
-                raise ValueError(
+            total = sum((quantity for _, quantity in script.fills), Decimal(0))
+            if not (0 < total < request.quantity):
+                raise BrokerInvalidRequestError(
                     f"PartiallyFill script must fill 0 < total < requested quantity "
-                    f"({request.quantity}), got {total}"
+                    f"({request.quantity}), got {total}",
+                    client_order_id=request.client_order_id,
                 )
+            fills = self._build_fills(script.fills)
             result = self._result(
                 request,
                 state=OrderState.PARTIALLY_FILLED,
@@ -238,11 +335,19 @@ class FakeBroker:
                 fills=fills,
             )
         elif isinstance(script, FillImmediately):
-            price = script.price or request.limit_price or self._default_fill_price
+            # Explicit None checks — never truthiness, which would silently
+            # skip a (mis-)configured Decimal("0") to a fallback price (PR #87).
+            if script.price is not None:
+                price = script.price
+            elif request.limit_price is not None:
+                price = request.limit_price
+            else:
+                price = self._default_fill_price
             if price is None:
-                raise ValueError(
+                raise BrokerInvalidRequestError(
                     "FillImmediately needs a price: set script.price, use a LIMIT order, "
-                    "or configure FakeBroker(default_fill_price=...)"
+                    "or configure FakeBroker(default_fill_price=...)",
+                    client_order_id=request.client_order_id,
                 )
             fills = (Fill(self._next_fill_id(), price, request.quantity, self._now()),)
             result = self._result(
@@ -251,8 +356,8 @@ class FakeBroker:
                 broker_order_id=self._next_broker_order_id(),
                 fills=fills,
             )
-        else:
-            raise ValueError(f"unknown submit script {script!r}")
+        else:  # unreachable while script_order()/__init__ validate script types
+            raise BrokerInvalidRequestError(f"unknown submit script {script!r}")
 
         self._orders[request.client_order_id] = result
         return result

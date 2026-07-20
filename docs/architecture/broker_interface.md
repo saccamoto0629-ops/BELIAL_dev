@@ -1,6 +1,12 @@
 # Broker Interface / FakeBroker(Issue #73)
 
-将来の **Live Execution** に向けた Broker 境界の定義と、外部通信を一切行わないテストダブル **FakeBroker** の仕様。実装は `broker/` にある。
+将来の **Live Execution** に向けた Broker 境界の定義と、外部通信を一切行わないテストダブル **FakeBroker** の仕様。実装は `broker/`(明示的な Python package。`__init__.py` あり)にあり、リポジトリルートから通常の package import で利用する(PR #87)。
+
+```python
+from broker.broker_interface import Broker
+from broker.broker_models import OrderRequest, OrderResult
+from broker.fake_broker import FakeBroker
+```
 
 > **重要な位置づけ**
 >
@@ -29,6 +35,8 @@ FakeBroker                      ← broker/fake_broker.py(テストダブル)
 ## Broker interface(`broker_interface.py`)
 
 `typing.Protocol`(`runtime_checkable`、構造的型付け)。実装側に継承関係を要求しない。
+
+> **runtime check の限界(PR #87)**: `runtime_checkable` な Protocol の `isinstance()` は**必要な属性(メソッド)が存在すること**しか確認せず、引数型・戻り値型の適合は保証しない。本リポジトリは mypy / pyright 等の静的型検査を実行していないため、シグネチャ適合は `broker/tests/` の振る舞いテストで担保する。
 
 | 操作 | メソッド | 戻り値 |
 |---|---|---|
@@ -64,13 +72,16 @@ terminal = filled / cancelled / rejected(再遷移なし)
 ```
 
 - `unknown` は**通信タイムアウト等で最終状態が確認できない**ケース専用。Broker 側で受理された可能性を否定できないため、「未発注」「拒否」へ安易に確定しない。`rejected`(Broker の確定的拒否)とは別状態。
+- **`unknown` の契約(PR #87)**: `unknown` が限定するのは「Broker 側の確定が取れていない」ことであり、約定量ではない。`unknown` スナップショットは**既知の fill を保持できる**(0 件・部分・要求全量のいずれも可。`0 <= filled_quantity <= requested_quantity`、fills 合計との一致は他状態と同じく検証される)。`broker_order_id` は有無どちらも許容。`unknown` が禁じるのは最終結果の断定のみで、後続照会で確定状態へ解決するまで `filled` / `rejected` / 「未発注」へ確定してはならない。
 - 遷移の閉集合は `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` が固定する。
+- **同一状態の更新(PR #87)**: Broker polling は同じスナップショットを繰り返し観測するため、`validate_order_state_transition(old, new)` は **`old == new` を全状態で許可**する(terminal 含む。`filled → filled` は許可、`filled → cancelled` は引き続き拒否)。`ORDER_STATE_TRANSITIONS` は「異なる状態への変更」のみを列挙する。
 
 ### エラー方針(例外 + Result の組み合わせ)
 
 - Broker の**確定的な業務回答**(受理 / 約定 / 部分約定 / 拒否)は `OrderResult` の状態として**返す**。拒否は `OrderState.REJECTED` + `reject_reason`。
 - **インフラ障害・操作失敗**は `BrokerErrorCode` を持つ型付き例外として**送出する**(文字列判定をさせない): `BrokerTimeoutError`(timeout。注文状態は `unknown` に)/ `BrokerCommunicationError`(communication failure。リクエスト未到達)/ `BrokerCancellationError`(cancellation failure)/ `BrokerInvalidRequestError`(invalid request)/ `BrokerOrderNotFoundError`(not found)。
 - **注文拒否(rejected)とタイムアウト、通信障害はそれぞれ別に区別される**(拒否=確定状態、タイムアウト=`unknown`、通信失敗=未到達)。
+- **検証の境界(PR #87)**: caller / adapter から渡された**フィールド・型の不正**(enum の代わりの生文字列、tuple でない fills、空の reject_reason 等)は `BrokerInvalidRequestError`、**モデル内部の整合性違反**(数量の算術、状態×fill の制約、reject_reason と状態の対応)は `ValueError`。
 
 ## FakeBroker(`fake_broker.py`)
 
@@ -88,7 +99,8 @@ broker.script_cancel("c-2", FailCancellation())                         # キャ
 broker.set_positions([...]); broker.set_account_state(...)              # 照会結果の注入
 ```
 
-- 未スクリプト注文は `default_script`(既定: 指値価格で即時全量約定)。
+- 未スクリプト注文は `default_script`(既定: 指値価格で即時全量約定)。約定価格の選択は truthiness ではなく明示的な `is not None` 判定(`script.price` → `request.limit_price` → `default_fill_price` の順)。
+- **設定ミスは即時に失敗する(PR #87)**: Scenario dataclass は構築時に値を検証し(価格は正の有限 Decimal、reason は非空文字列、`PartiallyFill.fills` は非空 tuple の (Decimal, Decimal) ペア)、設定 API(`script_order` / `script_cancel` / `set_positions` / `set_account_state`)も引数の型を検証する。いずれも `BrokerInvalidRequestError` を送出し、submit / cancel 実行まで設定ミスを遅延させない(注文数量との比較のみ submit 時)。
 - タイムアウトは `BrokerTimeoutError` を**即時に**送出し、注文を `unknown` として記録する(後続の `get_order` で「拒否ではない」ことを検証できる)。sleep・実時間待機・乱数・ネットワークは使わない。時刻は決定的な内部クロック(固定基準時刻 + 連番秒)または注入 `clock` から得る。
 - 単体テストは一時ファイルすら不要のインメモリ動作(`broker/tests/` 参照。socket を無効化した検証あり)。
 

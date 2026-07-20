@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from broker_models import AccountState, OrderRequest, OrderResult, PositionInfo
+from .broker_models import AccountState, OrderRequest, OrderResult, PositionInfo
 
 
 @runtime_checkable

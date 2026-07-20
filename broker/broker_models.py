@@ -142,6 +142,15 @@ class OrderState(enum.Enum):
                     broker may or may not hold the order; NOT terminal — a
                     later query / reconciliation resolves it. Deliberately a
                     separate state from ``REJECTED``.
+
+    UNKNOWN contract (Issue #73 / PR #87): "unknown" qualifies the BROKER
+    CONFIRMATION, not the fill amount. An UNKNOWN snapshot may therefore
+    carry any *known-so-far* fills — none, partial, or even full requested
+    quantity (fills observed before confirmation was lost) — as long as
+    ``0 <= filled_quantity <= requested_quantity`` and the fills sum matches,
+    and ``broker_order_id`` may be present or absent. What UNKNOWN never
+    asserts is a final outcome: it must not be collapsed into "not placed",
+    "rejected" or "filled" until a later query resolves it.
     """
 
     PENDING = "pending"
@@ -157,9 +166,13 @@ TERMINAL_ORDER_STATES: frozenset[OrderState] = frozenset(
     {OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED}
 )
 
-# The authoritative order-state transition map. UNKNOWN can be resolved to any
-# concrete state by a later query; terminal states are never left again.
-# PARTIALLY_FILLED -> PARTIALLY_FILLED is allowed (another partial fill).
+# The authoritative order-state CHANGE map: which *different* states an order
+# may move to. UNKNOWN can be resolved to any concrete state by a later query;
+# terminal states are never left again. Same-state updates (re-observing the
+# same snapshot, e.g. broker polling, or another partial fill while
+# PARTIALLY_FILLED) are NOT state changes and are always allowed by
+# ``validate_order_state_transition`` — including for terminal states
+# (FILLED -> FILLED is a re-observation, FILLED -> CANCELLED stays forbidden).
 ORDER_STATE_TRANSITIONS: dict[OrderState, frozenset[OrderState]] = {
     OrderState.PENDING: frozenset(
         {
@@ -182,7 +195,6 @@ ORDER_STATE_TRANSITIONS: dict[OrderState, frozenset[OrderState]] = {
     ),
     OrderState.PARTIALLY_FILLED: frozenset(
         {
-            OrderState.PARTIALLY_FILLED,
             OrderState.FILLED,
             OrderState.CANCELLED,
             OrderState.UNKNOWN,
@@ -204,7 +216,20 @@ ORDER_STATE_TRANSITIONS: dict[OrderState, frozenset[OrderState]] = {
 
 
 def validate_order_state_transition(old: OrderState, new: OrderState) -> None:
-    """Raise ValueError unless ``old -> new`` is in the Issue #73 transition map."""
+    """Raise ValueError unless ``old -> new`` is an allowed update (Issue #73).
+
+    Same-state updates (``old is new``) are always allowed, for EVERY state
+    including terminal ones: broker polling re-observes the same snapshot,
+    and a PARTIALLY_FILLED order may take further partial fills. Only a
+    *change* of state is checked against ``ORDER_STATE_TRANSITIONS`` — so
+    e.g. FILLED -> FILLED passes while FILLED -> CANCELLED raises.
+    """
+    if not isinstance(old, OrderState) or not isinstance(new, OrderState):
+        raise BrokerInvalidRequestError(
+            f"states must be OrderState members, got {old!r} -> {new!r}"
+        )
+    if old is new:
+        return
     allowed = ORDER_STATE_TRANSITIONS[old]
     if new not in allowed:
         raise ValueError(
@@ -315,12 +340,25 @@ class OrderResult:
     SEPARATELY so tests can compare the requested price against the actual
     execution price (price deviation / slippage).
 
-    Consistency invariants are enforced at construction (ValueError):
-    fills must sum to ``filled_quantity``; each state constrains
+    Validation boundary (PR #87): malformed FIELDS — wrong types coming from
+    a caller/adapter, e.g. a raw string instead of an enum member, a list
+    instead of a fills tuple, an empty ``reject_reason`` — raise
+    ``BrokerInvalidRequestError``. CROSS-FIELD consistency violations —
+    quantity arithmetic, state x fill constraints, ``reject_reason`` present
+    for the wrong state — raise ``ValueError`` (internal model invariants).
+
+    Invariants: fills must sum to ``filled_quantity``; each state constrains
     ``filled_quantity`` (see ``__post_init__``); ``reject_reason`` exists
-    exactly for REJECTED. ``average_fill_price`` is not required to equal the
-    recomputed weighted average exactly (a real broker may round), but must
-    be present iff any fill exists.
+    exactly for REJECTED and is then a non-empty string.
+    ``average_fill_price`` is not required to equal the recomputed weighted
+    average exactly (a real broker may round), but must be present iff any
+    fill exists.
+
+    UNKNOWN contract: an UNKNOWN snapshot may carry any known-so-far fills —
+    none, partial, or full requested quantity — with or without a
+    ``broker_order_id`` (see ``OrderState``). UNKNOWN constrains nothing
+    beyond the generic quantity invariants, because it asserts only that the
+    broker-side outcome is unconfirmed.
     """
 
     client_order_id: str
@@ -339,9 +377,25 @@ class OrderResult:
     reject_reason: str | None = None
 
     def __post_init__(self) -> None:
+        # --- field/type validation (caller-supplied data) -> BrokerInvalidRequestError
         _require_non_empty_str(self.client_order_id, "client_order_id")
         if self.broker_order_id is not None:
             _require_non_empty_str(self.broker_order_id, "broker_order_id")
+        if not isinstance(self.state, OrderState):
+            raise BrokerInvalidRequestError(f"state must be an OrderState, got {self.state!r}")
+        if not isinstance(self.side, OrderSide):
+            raise BrokerInvalidRequestError(f"side must be an OrderSide, got {self.side!r}")
+        if not isinstance(self.order_type, OrderType):
+            raise BrokerInvalidRequestError(
+                f"order_type must be an OrderType, got {self.order_type!r}"
+            )
+        if not isinstance(self.fills, tuple):
+            raise BrokerInvalidRequestError(f"fills must be a tuple, got {type(self.fills).__name__}")
+        for entry in self.fills:
+            if not isinstance(entry, Fill):
+                raise BrokerInvalidRequestError(f"every fills entry must be a Fill, got {entry!r}")
+        if self.reject_reason is not None:
+            _require_non_empty_str(self.reject_reason, "reject_reason")
         _require_non_empty_str(self.symbol, "symbol")
         _require_positive_decimal(self.requested_quantity, "requested_quantity")
         _require_decimal(self.filled_quantity, "filled_quantity")

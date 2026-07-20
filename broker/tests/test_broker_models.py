@@ -1,16 +1,11 @@
 """Issue #73: broker-agnostic common models — enums, invariants, transitions, errors."""
 
-import pathlib
-import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
-BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(BASE_DIR))
-
-import broker_models as m  # noqa: E402
+from broker import broker_models as m
 
 UTC_NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -64,9 +59,36 @@ def test_timeout_outcome_is_a_distinct_state_from_rejected():
     assert m.OrderState.REJECTED in m.TERMINAL_ORDER_STATES
 
 
-def test_terminal_states_have_no_outgoing_transitions():
+def test_terminal_states_allow_no_state_change():
+    # The map records state CHANGES only; same-state re-observation is
+    # handled by the validator (see below).
     for state in m.TERMINAL_ORDER_STATES:
         assert m.ORDER_STATE_TRANSITIONS[state] == frozenset()
+
+
+@pytest.mark.parametrize("state", list(m.OrderState))
+def test_same_state_update_is_always_allowed(state):
+    # PR #87 contract: broker polling re-observes the same snapshot, so
+    # old == new passes for EVERY state, terminal ones included.
+    m.validate_order_state_transition(state, state)
+
+
+@pytest.mark.parametrize(
+    "terminal", sorted(m.TERMINAL_ORDER_STATES, key=lambda s: s.value)
+)
+def test_terminal_states_still_reject_any_different_state(terminal):
+    for new in m.OrderState:
+        if new is terminal:
+            continue
+        with pytest.raises(ValueError):
+            m.validate_order_state_transition(terminal, new)
+
+
+def test_transition_validator_rejects_non_enum_inputs():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.validate_order_state_transition("filled", m.OrderState.FILLED)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.validate_order_state_transition(m.OrderState.FILLED, "filled")
 
 
 def test_unknown_can_be_resolved_to_any_concrete_state():
@@ -240,6 +262,29 @@ def test_order_result_rejects_inconsistent_snapshots(overrides):
         make_result(**overrides)
 
 
+def test_order_result_rejects_wrong_field_types_as_invalid_request():
+    # PR #87: type-malformed fields from a caller/adapter raise the typed
+    # BrokerInvalidRequestError (cross-field inconsistencies stay ValueError).
+    cases = [
+        {"state": "filled"},
+        {"side": "buy"},
+        {"order_type": "market"},
+        {"fills": []},                      # list instead of tuple
+        {"fills": (object(),)},             # non-Fill entry
+        {"reject_reason": ""},
+        {"reject_reason": "   "},
+    ]
+    for overrides in cases:
+        with pytest.raises(m.BrokerInvalidRequestError):
+            make_result(**overrides)
+
+
+# --- UNKNOWN contract (PR #87) ----------------------------------------------
+# "unknown" qualifies the broker CONFIRMATION, not the fill amount: an
+# UNKNOWN snapshot may hold no fills, partial fills, or even the full
+# requested quantity (observed before confirmation was lost), with or
+# without a broker_order_id. It only refuses to assert a final outcome.
+
 def test_unknown_state_result_is_representable_with_zero_fills():
     # After a timeout the outcome is unknown: no fills, no broker_order_id,
     # but the order is NOT rejected and NOT confirmed absent.
@@ -253,6 +298,40 @@ def test_unknown_state_result_is_representable_with_zero_fills():
     )
     assert result.state is m.OrderState.UNKNOWN
     assert result.state is not m.OrderState.REJECTED
+
+
+def test_unknown_state_may_carry_known_partial_fills():
+    fills = (m.Fill("f-1", Decimal("2400"), Decimal("4"), UTC_NOW),)
+    result = make_result(
+        state=m.OrderState.UNKNOWN,
+        filled_quantity=Decimal("4"),
+        remaining_quantity=Decimal("6"),
+        average_fill_price=Decimal("2400"),
+        fills=fills,
+    )
+    assert result.filled_quantity == Decimal("4")
+
+
+def test_unknown_state_may_carry_a_full_quantity_fill():
+    # Fully-filled-as-far-as-we-saw, but broker confirmation was lost:
+    # still UNKNOWN, not FILLED, until a later query resolves it.
+    result = make_result(state=m.OrderState.UNKNOWN)
+    assert result.filled_quantity == result.requested_quantity
+    assert result.state is m.OrderState.UNKNOWN
+
+
+def test_unknown_state_broker_order_id_is_optional_either_way():
+    with_id = make_result(state=m.OrderState.UNKNOWN)
+    without_id = make_result(
+        state=m.OrderState.UNKNOWN,
+        broker_order_id=None,
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal("10"),
+        average_fill_price=None,
+        fills=(),
+    )
+    assert with_id.broker_order_id == "B-1"
+    assert without_id.broker_order_id is None
 
 
 # --- position / account -----------------------------------------------------

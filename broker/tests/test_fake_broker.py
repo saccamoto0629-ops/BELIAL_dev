@@ -9,17 +9,15 @@ state transitions / no external communication.
 import ast
 import pathlib
 import socket
-import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
-BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(BASE_DIR))
+from broker import broker_models as m
+from broker import fake_broker as fb
 
-import broker_models as m  # noqa: E402
-import fake_broker as fb  # noqa: E402
+PACKAGE_DIR = pathlib.Path(fb.__file__).resolve().parent
 
 UTC_NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -103,8 +101,8 @@ def test_partial_fill_keeps_quantities_and_fill_details():
 def test_partial_fill_script_must_be_strictly_partial():
     broker = fb.FakeBroker()
     broker.script_order("c-1", fb.PartiallyFill(fills=((Decimal("2400"), Decimal("10")),)))
-    with pytest.raises(ValueError):
-        broker.submit_order(make_request())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request())  # total == requested: not partial
 
 
 # --- 拒否 (definitive broker rejection) --------------------------------------
@@ -308,8 +306,135 @@ def test_cancel_after_cancel_is_an_invalid_transition_and_fails():
 
 def test_market_fill_without_any_price_source_is_a_scripting_error():
     broker = fb.FakeBroker()  # no default_fill_price
-    with pytest.raises(ValueError):
+    with pytest.raises(m.BrokerInvalidRequestError):
         broker.submit_order(make_request(order_type=m.OrderType.MARKET))
+
+
+# --- Scenario 構築時検証 (PR #87) ---------------------------------------------
+
+@pytest.mark.parametrize(
+    "price",
+    [Decimal("0"), Decimal("-1"), Decimal("NaN"), Decimal("Infinity"), 2400.5],
+)
+def test_fill_immediately_rejects_invalid_prices_at_construction(price):
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FillImmediately(price=price)
+
+
+def test_fill_immediately_accepts_none_and_positive_decimal():
+    assert fb.FillImmediately().price is None
+    assert fb.FillImmediately(price=Decimal("2400.5")).price == Decimal("2400.5")
+
+
+@pytest.mark.parametrize(
+    "fills",
+    [
+        (),                                            # empty
+        [(Decimal("2400"), Decimal("1"))],             # list, not tuple
+        ((Decimal("0"), Decimal("1")),),               # price 0
+        ((Decimal("2400"), Decimal("0")),),            # quantity 0
+        ((Decimal("2400"), Decimal("-1")),),           # negative quantity
+        ((Decimal("2400"),),),                         # not a 2-tuple
+        (("2400", Decimal("1")),),                     # non-Decimal price
+        ((Decimal("2400"), 1.0),),                     # float quantity
+        (object(),),                                   # garbage entry
+    ],
+)
+def test_partially_fill_rejects_invalid_fills_at_construction(fills):
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.PartiallyFill(fills=fills)
+
+
+@pytest.mark.parametrize("reason", ["", " ", "   "])
+def test_reject_order_and_fail_cancellation_require_a_reason(reason):
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.RejectOrder(reason=reason)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FailCancellation(reason=reason)
+
+
+# --- 設定APIの検証 (PR #87) ---------------------------------------------------
+
+def test_script_order_rejects_empty_id_and_wrong_script_type():
+    broker = fb.FakeBroker()
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_order("", fb.StayPending())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_order("c-1", object())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_order("c-1", fb.FailCancellation())  # cancel script on submit side
+
+
+def test_script_cancel_rejects_empty_id_and_wrong_script_type():
+    broker = fb.FakeBroker()
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_cancel("", fb.FailCancellation())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_cancel("c-1", object())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_cancel("c-1", fb.StayPending())  # submit script on cancel side
+
+
+def test_a_rejected_cancel_script_cannot_be_silently_ignored():
+    # Registering an invalid cancel script fails eagerly, so it can never be
+    # "ignored" at cancel time and let the cancel succeed by accident.
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    broker.submit_order(make_request())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.script_cancel("c-1", object())
+    # the bad script was NOT registered; a properly scripted failure still works
+    broker.script_cancel("c-1", fb.FailCancellation())
+    with pytest.raises(m.BrokerCancellationError):
+        broker.cancel_order("c-1")
+
+
+def test_set_positions_rejects_non_position_entries_and_wrong_container():
+    broker = fb.FakeBroker()
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_positions([object()])
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_positions("not-a-collection")
+    assert broker.get_positions() == ()  # nothing was applied
+
+
+def test_set_account_state_rejects_non_account_state():
+    broker = fb.FakeBroker()
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_account_state(object())
+    assert broker.get_account_state().currency == "USD"  # default untouched
+
+
+def test_constructor_validates_default_script_and_price():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FakeBroker(default_script=object())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FakeBroker(default_fill_price=Decimal("0"))
+
+
+# --- cancel と状態遷移の境界 (PR #87) -----------------------------------------
+
+def test_cancel_of_an_unknown_state_order_resolves_it_to_cancelled():
+    # UNKNOWN -> CANCELLED is an allowed resolution of the unconfirmed state.
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.TimeoutOrder())
+    with pytest.raises(m.BrokerTimeoutError):
+        broker.submit_order(make_request())
+    cancelled = broker.cancel_order("c-1")
+    assert cancelled.state is m.OrderState.CANCELLED
+
+
+@pytest.mark.parametrize(
+    "script",
+    [fb.RejectOrder(reason="no"), None],  # None -> default immediate fill
+)
+def test_cancel_of_any_terminal_state_fails(script):
+    broker = fb.FakeBroker()
+    if script is not None:
+        broker.script_order("c-1", script)
+    broker.submit_order(make_request())
+    with pytest.raises(m.BrokerCancellationError):
+        broker.cancel_order("c-1")
 
 
 # --- 外部通信・副作用が発生しないこと -----------------------------------------
@@ -323,9 +448,11 @@ FORBIDDEN_IMPORTS = {
 }
 
 
-@pytest.mark.parametrize("module_name", ["broker_models", "broker_interface", "fake_broker"])
+@pytest.mark.parametrize(
+    "module_name", ["__init__", "broker_models", "broker_interface", "fake_broker"]
+)
 def test_broker_modules_import_no_network_db_or_time_modules(module_name):
-    source = (BASE_DIR / f"{module_name}.py").read_text(encoding="utf-8")
+    source = (PACKAGE_DIR / f"{module_name}.py").read_text(encoding="utf-8")
     imported = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):

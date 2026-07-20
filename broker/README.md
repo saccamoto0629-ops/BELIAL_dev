@@ -2,6 +2,14 @@
 
 将来の **Live Execution** に向けた Broker 境界(Issue #73)。**実発注は行わない。外部通信も行わない。**
 
+明示的な Python package。リポジトリルートから import する:
+
+```python
+from broker.broker_interface import Broker
+from broker.broker_models import OrderRequest, OrderResult
+from broker.fake_broker import FakeBroker
+```
+
 | ファイル | 内容 |
 |---|---|
 | `broker_interface.py` | Broker 共通インターフェース(`Protocol`): 注文送信 / キャンセル / 注文照会 / ポジション照会 / 口座状態照会 |
@@ -14,5 +22,6 @@
 - Broker interface / FakeBroker は**将来の Live Execution 用の基盤**であり、FakeBroker が存在しても **Live Execution が実装済みになったわけではない**。
 - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、このパッケージを使わない。
 - 実発注・OANDA Adapter・Safety Gate は**未実装**。
+- `runtime_checkable` Protocol の `isinstance()` は属性の存在確認のみ(シグネチャ・型の適合は保証しない)。本リポジトリは静的型検査(mypy / pyright)を実行していないため、適合は `tests/` の振る舞いテストで担保する。
 
 設計の詳細は [docs/architecture/broker_interface.md](../docs/architecture/broker_interface.md) を参照。
