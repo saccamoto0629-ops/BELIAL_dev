@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      # The five component suites are run as separate pytest processes -- the
+      # The six component suites are run as separate pytest processes -- the
       # project has no root pytest config / conftest.py, and each test file
       # sets up its own sys.path. Separate steps keep component namespaces
       # isolated and make a failing component obvious from the step name.
@@ -60,6 +60,11 @@ jobs:
 
       - name: Run paper-execution tests
         run: python -m pytest paper-execution/tests -q
+
+      # Issue #73: broker boundary for the future Live Execution layer.
+      # In-memory only -- no network, no DB, no tmp files.
+      - name: Run broker tests
+        run: python -m pytest broker/tests -q
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot
