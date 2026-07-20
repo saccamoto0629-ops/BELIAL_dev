@@ -421,6 +421,13 @@ class OrderResult:
             raise ValueError(
                 f"fills sum {fills_total} does not match filled_quantity {self.filled_quantity}"
             )
+        # A duplicated fill_id would double-count the same execution while
+        # still passing the quantity-sum check, so IDs must be unique per
+        # snapshot (PR #87).
+        fill_ids = [f.fill_id for f in self.fills]
+        if len(fill_ids) != len(set(fill_ids)):
+            duplicates = sorted({fid for fid in fill_ids if fill_ids.count(fid) > 1})
+            raise ValueError(f"fill_id values must be unique within a snapshot: {duplicates}")
         if (self.average_fill_price is None) != (not self.fills):
             raise ValueError("average_fill_price must be present iff fills is non-empty")
         if self.average_fill_price is not None:
@@ -540,12 +547,17 @@ def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
             "old fills must be preserved unchanged as a prefix of new fills "
             "(no removal, reordering, or alteration of an existing fill_id)"
         )
-    old_fill_ids = {f.fill_id for f in old.fills}
+    # Each appended fill joins the seen-ID set, so a duplicate among the
+    # appended fills themselves is caught here too (construction already
+    # enforces per-snapshot uniqueness; this keeps the update validator
+    # self-sufficient).
+    seen_fill_ids = {f.fill_id for f in old.fills}
     for appended in new.fills[len(old.fills):]:
-        if appended.fill_id in old_fill_ids:
+        if appended.fill_id in seen_fill_ids:
             raise ValueError(
                 f"appended fill reuses existing fill_id {appended.fill_id!r}"
             )
+        seen_fill_ids.add(appended.fill_id)
 
     if old.broker_order_id is not None and new.broker_order_id != old.broker_order_id:
         raise ValueError(

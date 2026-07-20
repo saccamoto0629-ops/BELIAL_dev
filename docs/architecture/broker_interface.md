@@ -53,7 +53,7 @@ FakeBroker                      ← broker/fake_broker.py(テストダブル)
 すべて `dataclass(frozen=True)` + `Enum` + `Decimal`(価格・数量・金額)+ timezone-aware UTC `datetime`。Paper Execution の float / TypedDict 規約は既存レイヤーのものであり、本境界は新規設計として Decimal を採用する(Issue #73)。
 
 - `OrderRequest` — client_order_id / symbol / side / order_type(MARKET, LIMIT)/ quantity / limit_price / created_at_utc。生成時に検証(`BrokerInvalidRequestError`)。
-- `OrderResult` — 注文スナップショット。`requested_quantity` / `filled_quantity` / `remaining_quantity`(= requested − filled を検証)、`requested_price` と `average_fill_price` / `fills`(約定明細)を**別々に保持**し、約定価格の乖離(`price_deviation`)をテストで比較できる。構築時のクロスフィールド検証(`ValueError`): LIMIT は `requested_price` 必須・MARKET は `None` 必須、`pending`(Broker 未確認)は `broker_order_id` 禁止。
+- `OrderResult` — 注文スナップショット。`requested_quantity` / `filled_quantity` / `remaining_quantity`(= requested − filled を検証)、`requested_price` と `average_fill_price` / `fills`(約定明細)を**別々に保持**し、約定価格の乖離(`price_deviation`)をテストで比較できる。構築時のクロスフィールド検証(`ValueError`): LIMIT は `requested_price` 必須・MARKET は `None` 必須、`pending`(Broker 未確認)は `broker_order_id` 禁止、`fill_id` は snapshot 内で一意(重複 fill による同一約定の二重計上を構築時に拒否。更新時も追加 fill の ID 重複を検証)。
 - `Fill` — 約定明細(fill_id / price / quantity / filled_at_utc)。
 - `PositionInfo` / `AccountState` — Broker 側スナップショット。
 - Broker 固有フィールドは共通モデルへ**漏らさない**。Broker 固有レスポンス → 共通モデルの変換は将来の Adapter 内部で完結させる。

@@ -427,6 +427,44 @@ def test_unknown_with_a_full_fill_resolves_only_to_filled():
             m.validate_order_result_update(old, candidate)
 
 
+def test_snapshot_construction_rejects_duplicate_fill_ids():
+    # Two fills sharing one fill_id sum to the right quantity but would
+    # double-count the same execution — rejected at construction.
+    duplicated = (
+        m.Fill("same-fill", Decimal("2400"), Decimal("5"), UTC_NOW),
+        m.Fill("same-fill", Decimal("2400"), Decimal("5"), UTC_NOW),
+    )
+    with pytest.raises(ValueError):
+        make_result(
+            average_fill_price=Decimal("2400"), fills=duplicated,
+        )
+
+
+def test_unknown_resolution_cannot_smuggle_in_duplicate_fill_ids():
+    # The reviewer's repro: UNKNOWN with no fills resolving to FILLED whose
+    # two fills share a fill_id. The FILLED snapshot itself is now
+    # unconstructible, so the double-counted update can never be validated.
+    old = unknown_zero_fill()
+    with pytest.raises(ValueError):
+        make_result(
+            state=m.OrderState.FILLED,
+            average_fill_price=Decimal("2400"),
+            fills=(
+                m.Fill("same-fill", Decimal("2400"), Decimal("5"), UTC_NOW),
+                m.Fill("same-fill", Decimal("2400"), Decimal("5"), UTC_NOW),
+            ),
+        )
+    # a well-formed resolution with distinct IDs still passes
+    distinct = (
+        m.Fill("f-a", Decimal("2400"), Decimal("5"), UTC_NOW),
+        m.Fill("f-b", Decimal("2400"), Decimal("5"), UTC_NOW),
+    )
+    m.validate_order_result_update(
+        old,
+        make_result(average_fill_price=Decimal("2400"), fills=distinct),
+    )
+
+
 def test_update_rejects_fill_regression_removal_and_alteration():
     old = unknown_partial_fill()
     # fill 数量後退 (same fill_id, smaller quantity)

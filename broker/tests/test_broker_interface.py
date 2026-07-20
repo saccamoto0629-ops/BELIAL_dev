@@ -17,26 +17,43 @@ from broker import broker_interface, fake_broker
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _dynamic_import_names(tree: ast.AST) -> set[str]:
-    """Local names bound to ``importlib.import_module`` via
-    ``from importlib import import_module [as alias]``."""
-    names = {"__import__", "import_module"}
+def _dynamic_import_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Names that actually refer to importlib machinery in this module.
+
+    Returns ``(function_names, module_names)``: local names bound to
+    ``importlib.import_module`` via ``from importlib import import_module
+    [as alias]``, and local names bound to the ``importlib`` module itself
+    via ``import importlib [as alias]`` / ``import importlib.<sub>``. An
+    unrelated user-defined ``import_module`` function or a
+    ``loader.import_module(...)`` call therefore does NOT match."""
+    function_names: set[str] = {"__import__"}
+    module_names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "importlib":
             for alias in node.names:
                 if alias.name == "import_module":
-                    names.add(alias.asname or alias.name)
-    return names
+                    function_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib" or alias.name.startswith("importlib."):
+                    module_names.add(alias.asname or alias.name.split(".")[0])
+    return function_names, module_names
 
 
-def _is_dynamic_import_call(node: ast.Call, dynamic_names: set[str]) -> bool:
+def _is_dynamic_import_call(
+    node: ast.Call, function_names: set[str], module_names: set[str]
+) -> bool:
     """True for ``__import__(...)``, ``importlib.import_module(...)`` and
-    aliased ``import_module`` calls."""
+    calls through names genuinely bound to importlib's import_module."""
     func = node.func
     if isinstance(func, ast.Name):
-        return func.id in dynamic_names
+        return func.id in function_names
     if isinstance(func, ast.Attribute):
-        return func.attr in ("__import__", "import_module")
+        return (
+            func.attr == "import_module"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in module_names
+        )
     return False
 
 
@@ -52,7 +69,7 @@ def _imported_modules(source: str) -> set[str]:
     silently missing a broker import)."""
     imported = set()
     tree = ast.parse(source)
-    dynamic_names = _dynamic_import_names(tree)
+    function_names, module_names = _dynamic_import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
@@ -62,7 +79,9 @@ def _imported_modules(source: str) -> set[str]:
             # relative "from . import x" style also names the module via alias
             if node.module is None:
                 imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.Call) and _is_dynamic_import_call(node, dynamic_names):
+        elif isinstance(node, ast.Call) and _is_dynamic_import_call(
+            node, function_names, module_names
+        ):
             target = node.args[0] if node.args else None
             if isinstance(target, ast.Constant) and isinstance(target.value, str):
                 imported.add(target.value)
@@ -132,6 +151,21 @@ def test_imported_modules_helper_detects_dynamic_imports():
     assert "broker_models" in imported
     assert "broker" in imported
     assert "<dynamic-import:non-literal>" in imported
+
+
+def test_imported_modules_helper_ignores_unrelated_import_module_names():
+    # A user-defined function or an attribute on a non-importlib object that
+    # happens to be called "import_module" is NOT a dynamic import and must
+    # not trip the conservative non-literal marker.
+    source = (
+        "def import_module(name):\n"
+        "    return name\n"
+        "import_module(variable)\n"
+        "loader.import_module(variable)\n"
+    )
+    imported = _imported_modules(source)
+    assert "<dynamic-import:non-literal>" not in imported
+    assert imported == set()
 
 
 def test_no_upstream_component_imports_the_broker_layer():
