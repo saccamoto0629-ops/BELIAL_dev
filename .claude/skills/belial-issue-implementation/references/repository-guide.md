@@ -46,6 +46,66 @@ python -m pytest broker/tests -q
 - paper-execution は CI に Windows ジョブがある(SQLite ファイルハンドル / snapshot cleanup)。Windows 固有の副作用に触れる変更では Windows での挙動を考慮する。
 - CI はこの 6 スイートに加えて、リポジトリルートからの `broker` パッケージ import smoke test を実行する。
 
+## 影響マトリクス評価項目
+
+SKILL.md §3 が要求する評価項目。変更ごとに全項目を `Relevant`(確認内容と影響)/ `Not relevant`(非該当の根拠)/ `Unknown`(未確認事項と残るリスク)のいずれかで記録する。根拠なしの省略は不可。
+
+| # | 評価項目 |
+|---|---|
+| 1 | 所有コンポーネント(どのコンポーネントの責務か) |
+| 2 | Concept / Architecture 上の所有レイヤー |
+| 3 | caller / 呼び出し元(コード・テスト・docs・CI・scripts) |
+| 4 | callee / 呼び出し先(変更対象が依存する側) |
+| 5 | 外部 I/O 境界(Discord / S3 / 外部 API / ネットワーク) |
+| 6 | SQLite またはその他の永続化 |
+| 7 | DB 作成・更新・migration・schema validation |
+| 8 | read-only 経路(存在しない DB・ファイルを作成しないか) |
+| 9 | Discord 通知 |
+| 10 | state ファイル |
+| 11 | S3 |
+| 12 | 環境変数・設定ファイル(`.env.example` / `config.toml` 等) |
+| 13 | CLI 引数と終了コード |
+| 14 | systemd・常駐 Bot・定期実行(timer) |
+| 15 | 既存 DB・既存データとの後方互換性 |
+| 16 | 既存運用コマンド・起動導線 |
+| 17 | エラー処理(異常系を成功扱いへ丸めていないか) |
+| 18 | Paper Signal / Paper Execution / Backtest / Live Execution の責務境界 |
+| 19 | 秘密情報の扱い(Webhook URL / API key / token) |
+| 20 | dry-run の無副作用保証 |
+
+## 横断契約の要点(正は docs。本文をここへ複製しない)
+
+| 契約 | 参照先 |
+|---|---|
+| store は所有コンポーネント以外の DB を migration しない | `docs/architecture/architecture.md`「SQLite schema validation / migration」 |
+| read-only 処理(dry-run の schema probe・レポート等)は存在しない DB・ファイルを作成しない | 同上 + 「dry-run 方針」 |
+| dry-run で DB 作成・migration・Discord 送信・state 更新・S3 アップロードを行わない | `docs/architecture/architecture.md`「dry-run 方針」、`docs/operations/operations.md` |
+| 読み取りエラー・schema 不正を成功扱いしない(cycle failure として計上) | `docs/architecture/architecture.md`「dry-run 方針」 |
+| Paper Signal は仮説、Paper Execution は仮想執行、Backtest は検証基盤 | `docs/product/concept.md`「設計思想」「レイヤー分離」 |
+| Live Execution は未実装・非スコープ | `docs/product/concept.md`「非スコープ」 |
+| 既存の運用導線(起動コマンド・systemd・CLI)を壊さない | `docs/operations/operations.md`「起動方式 / 本番運用」 |
+
+## docs / Skill 変更の直接検証チェックリスト
+
+docs / Skill のみの変更では、pytest ではなく以下を第 1 段階の直接検証として全項目確認し、結果を PR へ記録する。
+
+- [ ] YAML frontmatter の構文が正しい(Skill の場合)
+- [ ] 必須 frontmatter 項目(`name`, `description`)が存在し、`name` がディレクトリ名と一致する
+- [ ] 相対リンクがすべて解決できる
+- [ ] 参照先ファイル・ディレクトリが実在する(文中の backtick パス含む)
+- [ ] 相対パスの起点(ファイル位置基準か repo ルート基準か)が正しい
+- [ ] Markdown code fence が開閉対で整合している
+- [ ] 見出し構造(レベルの飛び・重複)が壊れていない
+- [ ] 既存 docs・Skill 内との重複記述を増やしていない
+- [ ] 既存 docs 本文の過剰な複製がない(要点と参照先に留まっている)
+- [ ] Claude Code 側の配置(`.claude/skills/<name>/SKILL.md`)・利用方法の記述が正確
+- [ ] Codex 側の配置・利用方法の記述が正確(`AGENTS.md` 経由の参照であり、ネイティブ Skill selector 登録ではない)
+- [ ] シンボリックリンクを使う場合は実体と Windows / Linux / GitHub 互換性を確認(不使用ならファイル mode が通常ファイルであること)
+- [ ] 変更ファイルが Markdown / Skill / developer docs に限定されている
+- [ ] 実行コード・Bot・DB・workflow(`.github/workflows/`)に差分がない(`git diff` で確認)
+
+リポジトリに Markdown lint / link checker は**現在存在しない**(`.markdownlint*`・pre-commit 設定なし、CI は pytest のみ)。存在しない間は、上記を手動またはスクリプトで検査し、実施内容を PR に記録する。lint が導入されたらそれを実行する。
+
 ## 影響範囲調査のコマンド例
 
 ```bash

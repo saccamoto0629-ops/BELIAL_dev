@@ -23,7 +23,7 @@ AGENTS.md                         # リポジトリルート。全エージェ�
 ## 利用方法
 
 - **Claude Code**: 追加設定は不要。BELIAL_dev の Issue 実装・修正タスクで Skill が自動発動する。明示的に使う場合はプロンプトで Skill 名 `belial-issue-implementation` を指定する。
-- **Codex**: リポジトリルートで起動すれば `AGENTS.md` が自動で読み込まれ、Issue 実装タスクの開始時に `.claude/skills/belial-issue-implementation/SKILL.md` を読むよう誘導される。読み込まれない場合はプロンプトで同パスの読み込みを指示する。
+- **Codex**: リポジトリルートで起動すれば `AGENTS.md` が自動で読み込まれ、Issue 実装タスクの開始時に `.claude/skills/belial-issue-implementation/SKILL.md` を読むよう誘導される。読み込まれない場合はプロンプトで同パスの読み込みを指示する。なお、Codex のネイティブ Skill 探索場所は `.agents/skills/` であり、本 Skill はそこへ複製していないため **Codex の Skill selector には自動登録されない**(`AGENTS.md` 経由の明示参照方式)。これは重複コピーによる二重管理を避けるための意図的な構成であり、ネイティブ登録が必要になった場合の対応は別 Issue で判断する。
 - **その他のエージェント / 人間**: SKILL.md は通常の Markdown なので、そのままチェックリストとして読める。
 
 ## docs と Skill の責務差
@@ -45,7 +45,7 @@ Skill には docs の本文を複製しない。Skill はどの docs をいつ�
 
 ## 導入時の試行記録(Issue #86)
 
-作成した Skill を、直近の完了済み Issue #73 / PR #87(Broker interface と FakeBroker の追加)へ後追い適用して確認した。
+作成した Skill を、**open の [Issue #73](https://github.com/saccamoto0629-ops/BELIAL_dev/issues/73) に対する merged の [PR #87](https://github.com/saccamoto0629-ops/BELIAL_dev/pull/87)**(Broker interface と FakeBroker の追加)へ後追い適用して確認した。試行時点の GitHub 上の状態は Issue #73 = open、PR #87 = merged であり、Skill 試行は PR #87 の実装内容とレビュー履歴(4 ラウンドの review submissions)を対象にした。Issue #73 を close するかどうかは運用判断であり、この試行の対象外とする(試行が勝手に Issue を close することはない)。
 
 | 確認項目 | 結果 |
 |---|---|

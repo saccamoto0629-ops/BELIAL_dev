@@ -9,8 +9,14 @@ BELIAL_dev の GitHub Issue を実装・修正するときの共通手順。Clau
 
 ## 発動条件
 
-- **対象**: BELIAL_dev の GitHub Issue の実装・修正、および対応する PR のレビュー指摘対応。
-- **対象外**: Issue に紐づかない質問応答、docs の誤字修正などの自明な単発変更(ただし PR を作る場合は本 Skill の PR 記載形式に従う)。
+- **対象**: BELIAL_dev の GitHub Issue の実装・修正。レビュー指摘(review submissions / inline threads / conversation comments)を受けて実装を修正する作業を含む。
+- **非発動(原則対象外)**:
+  - 単なる質問・説明への回答
+  - コード変更を伴わない純粋なレビュー
+  - 実装を伴わない独立した CI 原因調査
+  - PR 作成・push だけの作業
+  - Issue 実装と無関係なリポジトリ案内
+  - ただし、これらから実装・修正作業へ移行した時点で本 Skill の対象になる。また PR を作る場合は本 Skill の PR 記載形式に従う。
 
 ## 大原則
 
@@ -26,10 +32,37 @@ BELIAL_dev の GitHub Issue を実装・修正するときの共通手順。Clau
 
 ## 実装フロー
 
+### 0. 実装前ゲート: 対象 Issue・PR・レビュー履歴の解決(必須)
+
+このゲートを完了するまで実装・変更へ着手しない。
+
+**対象 Issue の解決**(上から順に試す):
+
+1. ユーザーが Issue 番号 / URL を提示していればそれを使う。
+2. 現在の branch に紐づく PR があれば、その linked issue / closing issue / PR 本文から対象 Issue を解決する。
+3. コミットメッセージ・branch 名・PR 本文・GitHub 上の関連付けから対象 Issue を探索する。
+4. それでも一意に特定できない場合は、**推測で実装へ進まない**。候補と根拠を挙げて不明点として明示し、確認を求める(それが不可能な状況では、採用した解釈と根拠を PR 本文へ明記する)。
+
+Issue 番号が提示されていなくても機械的に停止はせず、2〜3 で合理的に解決できる場合は探索して特定する。
+
+**現在 PR の確認**: 現在の branch に紐づく既存 PR がある場合、実装前に以下を必ず読む。**レビュー指摘対応では、対象 PR と未解決 review thread を読まずに変更へ着手しない。**
+
+- PR 本文、変更差分、全コミット
+- review submissions、未解決 inline review thread、解決済み thread のうち今回変更に関係するもの
+- conversation comments
+- CI 結果または既知の失敗状況
+- linked issue / closing issue
+
+**関連 Issue・前提 Issue の探索**: Issue 本文中の明示リンクに限定せず、以下から探索する。ただし無制限に過去 Issue を読むのではなく、**今回の仕様・互換性・前提条件へ影響するものに絞る**。
+
+- GitHub の linked issue / development relation
+- PR 本文・コミットの Issue 参照
+- 同一コンポーネントの変更履歴(直近のマージ済み PR のレビュー指摘を含む。繰り返し指摘されている観点は今回へ先回りで適用する)
+- 対象コード・docs 内の Issue 参照、直前の前提実装、変更対象の設計経緯
+
 ### 1. Issue の把握
 
 - Issue 本文・受け入れ条件・非スコープを全部読む。
-- Issue 本文からリンクされた関連 Issue / PR を辿る。同じコンポーネントの直近のマージ済み PR のレビューコメントを確認し、繰り返し指摘されている観点(型検証、import 構成、副作用境界など)を今回の実装に先回りで適用する。
 - 受け入れ条件が曖昧な場合は、勝手に解釈を固定せず、解釈を PR 本文に明記する。
 
 ### 2. 関連ドキュメントの選定
@@ -38,37 +71,52 @@ BELIAL_dev の GitHub Issue を実装・修正するときの共通手順。Clau
 - 変更対象コンポーネントの README と `docs/architecture/` 配下の個別設計書を読む。コンポーネントとドキュメントの対応表は [references/repository-guide.md](references/repository-guide.md) を参照。
 - テストへ影響する場合は `docs/testing/test_specification.md` の該当レイヤーの観点を確認する。
 
-### 3. 影響範囲調査
+### 3. 影響範囲調査(影響マトリクス必須)
 
-- 変更するモジュール・関数・定数・環境変数・DB テーブルごとに、リポジトリ全体を grep して呼び出し元・参照元を列挙する(コード、テスト、docs、`.github/workflows/`、`scripts/` を含む)。
+- 変更するモジュール・関数・定数・環境変数・DB テーブルごとに、リポジトリ全体を grep して**呼び出し元と呼び出し先の双方向**で参照を列挙する(コード、テスト、docs、`.github/workflows/`、`scripts/` を含む)。
+- **影響マトリクス**: 変更ごとに、[references/repository-guide.md](references/repository-guide.md) の「影響マトリクス評価項目」の**全項目**を次の 3 値で評価し、記録する。
+  - `Relevant`: 確認した内容と影響
+  - `Not relevant`: 非該当と判断した**根拠**
+  - `Unknown`: 未確認事項と残るリスク
+  - 「関係なさそうなので省略」は不可。全項目を深掘りする必要はないが、非該当にも根拠を残す。結果は PR 本文の Changed files / affected components と Known limitations の根拠にする。
 - DB スキーマに触れる場合は、`docs/architecture/architecture.md` の「SQLite schema validation / migration」を読み、該当 store の migration 方式(rebuild / additive / 冪等 ALTER)に合わせる。
 - 共有される境界(他コンポーネントから import されるモジュール)を変更・追加する場合は、リポジトリルートからの import 可否をテストで固定する。テスト専用の `sys.path` 操作で import 問題を隠さない。
-- 調査結果(影響ファイル一覧)は PR 本文の Changed files / affected components の根拠にする。
 
 ### 4. 実装
 
 - 最小差分で実装し、周辺コードのスタイル・命名・コメント密度に合わせる。
-- **横断ルールチェックリスト**(該当するものを必ず確認。詳細は各 docs が正):
+- **横断ルールチェックリスト**(該当するものを必ず確認。詳細・参照先は [references/repository-guide.md](references/repository-guide.md) の「横断契約の要点」、正は各 docs):
   - [ ] dry-run(`--dry-run` / `dry_run=True`)で Discord 送信・DB 作成/更新/migration・S3 アップロード・state 更新が発生しない
   - [ ] DB は所有コンポーネントの store 層だけが書く。他コンポーネントの DB を migration しない
-  - [ ] DB の関連付けは ID を主とし、時刻は補助情報(時刻のみで関連付けない)
-  - [ ] 時刻は tz-aware UTC で保存・比較する
+  - [ ] read-only 経路(dry-run の schema probe、レポート、照会系)が存在しない DB・ファイルを新規作成しない
+  - [ ] 読み取りエラー・schema 不正・通知失敗などの異常系を成功扱いへ丸めない
+  - [ ] 既存 DB・既存データとの後方互換(migration 方式・既存行の扱い)と、既存の運用コマンド・起動導線(CLI 引数・終了コード・systemd・常駐 Bot)を壊さない
+  - [ ] DB の関連付けは ID を主とし、時刻は補助情報(時刻のみで関連付けない)。時刻は tz-aware UTC で保存・比較する
   - [ ] 共通モデル・状態機械を追加/変更する場合、型・enum・クロスフィールドの不変条件を `__post_init__` 等で検証し、不正値の拒否をテストで固定する
   - [ ] 状態遷移契約(terminal 状態の不変性など)は docstring の宣言と実装・テストを一致させる。宣言した不変条件はフィールド単位で網羅的に検証する
   - [ ] Webhook URL・API key・token の実値をコード・docs・`.env.example` に書かない
-  - [ ] Live Execution 領域(実発注・ロット計算・売買推奨文言)へ踏み込まない
+  - [ ] Paper Signal(仮説)/ Paper Execution(仮想執行)/ Backtest(検証基盤)の責務を混同せず、Live Execution 領域(実発注・ロット計算・売買推奨文言)へ踏み込まない
 
-### 5. テスト
+### 5. テスト・検証(変更種別ごと)
 
-実行方針: **対象テスト → 関連テスト → 全体テスト** の順で段階的に広げる。
+**コード変更時** — 対象 → 関連 → 全体の順で段階的に広げる:
 
 1. **対象**: 変更したコンポーネントのスイート(例: `python -m pytest paper-execution/tests -q`)。
-2. **関連**: 影響範囲調査で参照元が見つかった他コンポーネントのスイート。
-3. **全体**: 6 スイートすべて。ルートに pytest 設定はなく、**ディレクトリ単位で個別に**実行する(コマンド一覧は [references/repository-guide.md](references/repository-guide.md))。
+2. **関連**: 影響マトリクスで参照が見つかった他コンポーネントのスイート。
+3. **全体**: 6 スイート(コマンド一覧は [references/repository-guide.md](references/repository-guide.md)。ルートに pytest 設定はなく、ディレクトリ単位で個別に実行)。実行要否は下の「全体 pytest の要否」で判断する。
 
 - 新規動作は正常系・異常系・境界値のテストを追加する。外部 API / Discord / S3 / 実 DB へは到達させない(Mock / tmp_path / monkeypatch)。
 - Windows 固有の副作用(SQLite ファイルハンドル等)に触れる場合は CI の Windows ジョブ対象かを確認する。
-- **実行しなかったスイートがある場合は、その理由を PR 本文に明記する。**「全部通った」とだけ書いて省略しない。失敗したテストは失敗のまま報告し、成功と偽らない。
+
+**docs / Skill のみの変更時** — pytest は変更成果物を検証しない。第 1 段階の直接検証として、[references/repository-guide.md](references/repository-guide.md) の「docs / Skill 変更の直接検証チェックリスト」(frontmatter 構文・必須項目、相対リンクと参照パスの実在・起点、code fence・見出し構造、重複・docs 本文の複製、Claude Code / Codex の配置整合、シンボリックリンク、差分が Markdown / Skill / developer docs に限定されコード・Bot・DB・workflow に差分がないこと)を全項目実施する。リポジトリに Markdown lint / link checker が存在しない場合は、存在しないことと代替として実施した検査内容を PR へ記録する。
+
+**全体 pytest の要否** — 常に固定で必須にはしない。以下で判断し、**実行・非実行のどちらでも理由を PR 本文に記載する**:
+
+- 実行する: 実行コードに変更がある / import・package 構造に影響する / 設定・テスト収集・共通 fixture に影響する / CI や既存方針として要求される / 変更リスクに対して追加確認が有効
+- 省略可: docs / Skill のみで runtime へ影響しない(理由を明記)
+- 全体 pytest を実行した場合も、それだけで docs / Skill 固有の直接検証を代替しない。
+
+**共通**: 実行しなかったスイート・検査がある場合は、その理由を PR 本文に明記する。「全部通った」とだけ書いて省略しない。失敗したテストは失敗のまま報告し、成功と偽らない。
 
 ### 6. docs 更新要否の確認
 
@@ -80,14 +128,16 @@ BELIAL_dev の GitHub Issue を実装・修正するときの共通手順。Clau
 PR 本文には最低限、以下の項目をこの順で記載する。テンプレートは [references/pr-template.md](references/pr-template.md) を使う。
 
 1. Summary
-2. Changed files / affected components
-3. Tests executed and results
+2. Changed files / affected components(影響マトリクスの結果を反映)
+3. Tests executed and results(docs / Skill 変更時は直接検証の内容、全体 pytest の実行/非実行の理由を含む)
 4. Documentation impact
 5. Known limitations / remaining work
 6. Issue との対応関係(受け入れ条件ごとの充足状況)
 
 ## 禁止事項
 
+- §0 の実装前ゲート(対象 Issue の解決、現在 PR・未解決 thread の確認)を完了せずに実装へ着手すること。
+- 影響マトリクスの項目を根拠の記録なしに省略すること。
 - 本 Skill へ docs の本文(仕様)を複製すること。
 - Issue のスコープ外の機能追加・リファクタリング(気づいた問題は Issue 提案として報告する)。
 - dry-run の無副作用保証を破る変更。
