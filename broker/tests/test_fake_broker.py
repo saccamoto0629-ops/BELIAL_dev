@@ -412,6 +412,15 @@ def test_constructor_validates_default_script_and_price():
         fb.FakeBroker(default_fill_price=Decimal("0"))
 
 
+def test_constructor_rejects_a_non_callable_clock():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FakeBroker(clock=object())
+    # a callable clock is accepted and actually used
+    broker = fb.FakeBroker(clock=lambda: UTC_NOW)
+    result = broker.submit_order(make_request())
+    assert result.updated_at_utc == UTC_NOW
+
+
 # --- cancel と状態遷移の境界 (PR #87) -----------------------------------------
 
 def test_cancel_of_an_unknown_state_order_resolves_it_to_cancelled():

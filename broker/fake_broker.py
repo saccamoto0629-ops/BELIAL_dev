@@ -202,6 +202,10 @@ class FakeBroker:
             _require_valid_price(default_fill_price, "default_fill_price")
         if account_state is not None and not isinstance(account_state, AccountState):
             raise BrokerInvalidRequestError(f"invalid account_state {account_state!r}")
+        if clock is not None and not callable(clock):
+            raise BrokerInvalidRequestError(
+                f"clock must be a callable returning a datetime, got {clock!r}"
+            )
         self._default_script: SubmitScript = default_script or FillImmediately()
         self._default_fill_price = default_fill_price
         self._account_state = account_state or _DEFAULT_ACCOUNT_STATE

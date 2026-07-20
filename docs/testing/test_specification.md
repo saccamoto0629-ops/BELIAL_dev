@@ -48,7 +48,7 @@ python -m pytest broker/tests -q
 
 CI(#32)では最低限この6スイートを継続実行することを想定する(現行の `.github/workflows/ci.yml` は6スイートすべてを実行している)。テストは外部ネットワーク・実DB・実S3・実Discordに到達しない(§4–§5)。
 
-現状のテスト件数(`def test_` 実数、目安):backtest 128 / market-watch 127 / news-feed-bot 117 / paper-signal 89 / paper-execution 91 / broker 86(Issue #73 / PR #87)。
+現状のテスト件数(`def test_` 実数、目安):backtest 128 / market-watch 127 / news-feed-bot 117 / paper-signal 89 / paper-execution 91 / broker 94(Issue #73 / PR #87)。
 
 ---
 
@@ -64,7 +64,7 @@ CI(#32)では最低限この6スイートを継続実行することを想定す
 | Backtest | `backtest/{runner,warmup,summary,report,backtest_store,backtest_models}.py` | 境界分離・future leak禁止・skip・DB保存・集計 | `test_warmup.py`, `test_runner.py`, `test_backtest_engine.py` ほか |
 | Paper Execution | `paper-execution/{execution_engine,execution_runner,position_store,position_models,execution_profile,paper_execution_notifier}.py` | Entry / Close判定の決定論、`state × terminal_reason` 閉集合、`signal_id` 冪等、schema migration(positions table rebuild / v1→v3 additive / v2 prototype→v3 outbox rebuild / 実制約検証 + behavioral probe / migration rollback)、strict read、dry-run無副作用(WAL/rollback-journal DB のファイル完全不変を hash/mtime で検証)、Discord通知 **Transactional Outbox**(遷移+enqueue の atomicity、enqueue失敗時の position rollback、commit後・HTTP前クラッシュからの再送、claim/lease による並行runner排他=HTTP 1回、lease期限切れ回収、at-least-once=success記録失敗時の同一Event ID重複、本文生成・None/Unicode、timeout/429/5xx/connection error 分類、dead-letter継続検知、Webhook未設定滞留、batch limit、outbox永続化failureは`failures`・配送failureは`notification_failures`) | `paper-execution/tests/test_*.py` |
 | 副作用境界 | 各store / uploader | 一時DB利用、dry-run抑止、run/signalの分離DB、FK/重複ID | `test_*_store.py`, `test_chart_alert_context.py` |
-| Broker境界(将来のLive Execution用。Issue #73 / PR #87) | `broker/{__init__,broker_models,broker_interface,fake_broker}.py` | 共通モデル不変条件(Decimal・UTC・数量整合・フィールド型不正は`BrokerInvalidRequestError`/整合性違反は`ValueError`)、注文状態遷移の閉集合(timeout後の`unknown`は`rejected`と別状態。`unknown`は既知fill保持可。同一状態更新は全状態で許可)、スナップショット更新不変条件(`validate_order_result_update`: 識別/要求フィールド不変・fill単調性・fills prefix保持・`broker_order_id`はNone→値のみ・terminal same-state再観測の内容改変拒否・UNKNOWN解決先の二重検証)、型付きBrokerエラー分類、FakeBrokerのScripted Scenario(即時/未/部分約定・拒否・timeout・通信失敗・キャンセル成功/失敗・約定価格乖離・各照会)とScenario/設定APIの構築時検証、外部通信ゼロ(AST import走査+socket無効化)、Paper Signal / Paper Execution / Backtest(Strategy関連)がBroker層をimportしないこと(rglob+AST)、リポジトリルートからのpackage import(subprocess検証)。インメモリのみ(tmp_path不要) | `broker/tests/test_*.py` |
+| Broker境界(将来のLive Execution用。Issue #73 / PR #87) | `broker/{__init__,broker_models,broker_interface,fake_broker}.py` | 共通モデル不変条件(Decimal・UTC・数量整合・フィールド型不正は`BrokerInvalidRequestError`/整合性違反は`ValueError`)、注文状態遷移の閉集合(timeout後の`unknown`は`rejected`と別状態。`unknown`は既知fill保持可。同一状態更新は全状態で許可)、スナップショット更新不変条件(`validate_order_result_update`: 識別/要求フィールド不変・fill単調性・fills prefix保持・`broker_order_id`はNone→値のみ・`updated_at_utc`単調非減少・terminal same-state再観測は`updated_at_utc`以外全フィールド不変・UNKNOWN解決先の二重検証)、構築時クロスフィールド検証(LIMITは`requested_price`必須/MARKETはNone必須/`pending`は`broker_order_id`禁止)、型付きBrokerエラー分類、FakeBrokerのScripted Scenario(即時/未/部分約定・拒否・timeout・通信失敗・キャンセル成功/失敗・約定価格乖離・各照会)とScenario/設定APIの構築時検証、外部通信ゼロ(AST import走査+socket無効化)、Paper Signal / Paper Execution / Backtest(Strategy関連)がBroker層をimportしないこと(rglob+AST)、リポジトリルートからのpackage import(subprocess検証)。インメモリのみ(tmp_path不要) | `broker/tests/test_*.py` |
 
 補足:
 - Market Bias は**時点参照(point-in-time)**が肝。`get_market_bias_as_of()` は評価時刻より**後**のレコードを返してはならない(§6 SE系)。

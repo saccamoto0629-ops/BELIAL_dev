@@ -45,7 +45,7 @@ Design decisions (Issue #73):
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
 
@@ -426,6 +426,17 @@ class OrderResult:
         if self.average_fill_price is not None:
             _require_positive_decimal(self.average_fill_price, "average_fill_price")
 
+        # --- cross-field consistency (ValueError) ---
+        # Adapter translation mistakes must be caught at construction: the
+        # requested price exists exactly for LIMIT orders, and PENDING means
+        # "no broker acknowledgement yet", so no broker_order_id can exist.
+        if self.order_type is OrderType.LIMIT and self.requested_price is None:
+            raise ValueError("LIMIT order results require a requested_price")
+        if self.order_type is OrderType.MARKET and self.requested_price is not None:
+            raise ValueError("MARKET order results must have requested_price=None")
+        if self.state is OrderState.PENDING and self.broker_order_id is not None:
+            raise ValueError("pending means no broker acknowledgement yet: broker_order_id must be None")
+
         state, filled = self.state, self.filled_quantity
         if state in (OrderState.PENDING, OrderState.ACCEPTED, OrderState.REJECTED) and filled != 0:
             raise ValueError(f"state {state.value!r} requires filled_quantity == 0, got {filled}")
@@ -493,6 +504,10 @@ def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
       existing ``fill_id``
     - ``broker_order_id`` may go ``None -> value`` (broker ack arrived);
       ``value -> None`` and ``value A -> value B`` are forbidden
+    - ``updated_at_utc`` is monotonically non-decreasing for every update
+    - a same-state re-observation of a TERMINAL state must be identical in
+      every field except ``updated_at_utc`` — a settled fill price or a
+      reject reason can never be rewritten afterwards
 
     Type-malformed inputs raise ``BrokerInvalidRequestError``; invariant
     violations raise ``ValueError`` (same boundary as ``OrderResult``).
@@ -537,6 +552,25 @@ def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
             f"broker_order_id may only go from None to a value, never "
             f"{old.broker_order_id!r} -> {new.broker_order_id!r}"
         )
+
+    if new.updated_at_utc < old.updated_at_utc:
+        raise ValueError(
+            f"updated_at_utc must not go backwards: "
+            f"{old.updated_at_utc.isoformat()} -> {new.updated_at_utc.isoformat()}"
+        )
+
+    if old.state is new.state and old.state in TERMINAL_ORDER_STATES:
+        # A terminal outcome is settled: re-observation may only refresh the
+        # timestamp, never the content (average_fill_price, reject_reason,
+        # fills, IDs, ... are all frozen).
+        for spec in fields(OrderResult):
+            if spec.name == "updated_at_utc":
+                continue
+            if getattr(old, spec.name) != getattr(new, spec.name):
+                raise ValueError(
+                    f"terminal same-state re-observation must not change "
+                    f"{spec.name}: {getattr(old, spec.name)!r} -> {getattr(new, spec.name)!r}"
+                )
 
 
 # --- position / account models ---------------------------------------------

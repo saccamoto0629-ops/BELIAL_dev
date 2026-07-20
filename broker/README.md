@@ -22,6 +22,6 @@ from broker.fake_broker import FakeBroker
 - Broker interface / FakeBroker は**将来の Live Execution 用の基盤**であり、FakeBroker が存在しても **Live Execution が実装済みになったわけではない**。
 - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、このパッケージを使わない。
 - 実発注・OANDA Adapter・Safety Gate は**未実装**。
-- `runtime_checkable` Protocol の `isinstance()` は属性の存在確認のみ(シグネチャ・型の適合は保証しない)。本リポジトリは静的型検査(mypy / pyright)を実行していないため、適合は `tests/` の振る舞いテストで担保する。
+- `runtime_checkable` Protocol の `isinstance()` は属性の存在確認のみ(シグネチャ・型の適合は保証しない)。本リポジトリは静的型検査(mypy / pyright)を実行しておらず、シグネチャ適合を保証する仕組みはない。`tests/` の振る舞いテストが確認するのは FakeBroker の挙動のみで、将来の Adapter は自前のテストで適合を確認する。
 
 設計の詳細は [docs/architecture/broker_interface.md](../docs/architecture/broker_interface.md) を参照。

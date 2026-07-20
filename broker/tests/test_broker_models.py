@@ -497,6 +497,66 @@ def test_broker_order_id_may_only_go_from_none_to_a_value():
         )
 
 
+def test_result_construction_rejects_order_type_price_mismatch():
+    # LIMIT results must carry the requested price; MARKET results must not.
+    with pytest.raises(ValueError):
+        make_result(requested_price=None)  # LIMIT without requested_price
+    with pytest.raises(ValueError):
+        make_result(
+            order_type=m.OrderType.MARKET, requested_price=Decimal("10"),
+        )
+
+
+def test_result_construction_rejects_pending_with_a_broker_order_id():
+    def pending(broker_order_id):
+        return make_result(
+            state=m.OrderState.PENDING, broker_order_id=broker_order_id,
+            filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+            average_fill_price=None, fills=(),
+        )
+
+    assert pending(None).broker_order_id is None
+    with pytest.raises(ValueError):
+        pending("B-1")  # PENDING means no broker acknowledgement yet
+
+
+def test_updated_at_must_not_go_backwards_and_may_advance():
+    old = accepted_zero_fill(updated_at_utc=UTC_NOW)
+    m.validate_order_result_update(
+        old, accepted_zero_fill(updated_at_utc=UTC_NOW + timedelta(seconds=1))
+    )
+    m.validate_order_result_update(old, accepted_zero_fill(updated_at_utc=UTC_NOW))
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            old, accepted_zero_fill(updated_at_utc=UTC_NOW - timedelta(seconds=1))
+        )
+
+
+def test_terminal_reobservation_rejects_a_lone_average_price_change():
+    # Same fills, same everything — ONLY average_fill_price rewritten:
+    # a settled fill price must never change after the fact.
+    filled = make_result()
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            filled, make_result(average_fill_price=Decimal("2400.75"))
+        )
+
+
+def test_terminal_reobservation_rejects_a_lone_reject_reason_change():
+    old = rejected_zero_fill()
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            old, rejected_zero_fill(reject_reason="different story")
+        )
+
+
+def test_terminal_reobservation_allows_only_a_fresh_timestamp():
+    filled = make_result()
+    m.validate_order_result_update(
+        filled, make_result(updated_at_utc=UTC_NOW + timedelta(seconds=5))
+    )
+
+
 def test_terminal_same_state_reobservation_must_not_change_content():
     filled = make_result()
     # identical re-observation (fresh timestamp) is fine

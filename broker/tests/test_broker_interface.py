@@ -3,8 +3,10 @@
 NOTE on the runtime Protocol check: ``@runtime_checkable`` ``isinstance()``
 only verifies that the required ATTRIBUTES exist — it does NOT verify
 argument or return types. This repository runs no static type checker
-(mypy / pyright), so full signature conformance is asserted by the
-behavioural tests in ``test_fake_broker.py``, not by ``isinstance``.
+(mypy / pyright), so nothing here GUARANTEES signature conformance for any
+implementation. The behavioural tests in ``test_fake_broker.py`` exercise
+FakeBroker's concrete behaviour only; a future adapter gets no conformance
+check from this suite and needs its own tests (and/or a type checker).
 """
 
 import ast
@@ -15,11 +17,43 @@ from broker import broker_interface, fake_broker
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def _dynamic_import_names(tree: ast.AST) -> set[str]:
+    """Local names bound to ``importlib.import_module`` via
+    ``from importlib import import_module [as alias]``."""
+    names = {"__import__", "import_module"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _is_dynamic_import_call(node: ast.Call, dynamic_names: set[str]) -> bool:
+    """True for ``__import__(...)``, ``importlib.import_module(...)`` and
+    aliased ``import_module`` calls."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in dynamic_names
+    if isinstance(func, ast.Attribute):
+        return func.attr in ("__import__", "import_module")
+    return False
+
+
 def _imported_modules(source: str) -> set[str]:
     """All module names imported by ``source`` (AST-based; ignores docstrings
-    and comments)."""
+    and comments).
+
+    Covers static ``import`` / ``from ... import`` AND the dynamic forms
+    ``importlib.import_module("x")`` / ``__import__("x")``. A dynamic import
+    whose target is not a string literal cannot be resolved statically, so it
+    is reported conservatively as ``<dynamic-import:non-literal>`` (no scanned
+    component uses dynamic imports today, so this fails loudly instead of
+    silently missing a broker import)."""
     imported = set()
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    dynamic_names = _dynamic_import_names(tree)
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -28,6 +62,12 @@ def _imported_modules(source: str) -> set[str]:
             # relative "from . import x" style also names the module via alias
             if node.module is None:
                 imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Call) and _is_dynamic_import_call(node, dynamic_names):
+            target = node.args[0] if node.args else None
+            if isinstance(target, ast.Constant) and isinstance(target.value, str):
+                imported.add(target.value)
+            else:
+                imported.add("<dynamic-import:non-literal>")
     return imported
 
 
@@ -70,8 +110,28 @@ def test_interface_module_does_not_depend_on_fake_broker_or_adapters():
 
 
 # Old flat-module spellings kept forbidden so a stale sys.path-style import
-# cannot sneak back in alongside the package form.
-FORBIDDEN_BROKER_MODULES = {"broker", "broker_interface", "broker_models", "fake_broker"}
+# cannot sneak back in alongside the package form. The non-literal marker
+# makes an unresolvable dynamic import fail the scan conservatively.
+FORBIDDEN_BROKER_MODULES = {
+    "broker", "broker_interface", "broker_models", "fake_broker",
+    "<dynamic-import:non-literal>",
+}
+
+
+def test_imported_modules_helper_detects_dynamic_imports():
+    source = (
+        "import importlib\n"
+        "importlib.import_module('broker.fake_broker')\n"
+        "__import__('broker_models')\n"
+        "from importlib import import_module as im\n"
+        "im('broker')\n"
+        "importlib.import_module(some_variable)\n"
+    )
+    imported = _imported_modules(source)
+    assert "broker.fake_broker" in imported
+    assert "broker_models" in imported
+    assert "broker" in imported
+    assert "<dynamic-import:non-literal>" in imported
 
 
 def test_no_upstream_component_imports_the_broker_layer():

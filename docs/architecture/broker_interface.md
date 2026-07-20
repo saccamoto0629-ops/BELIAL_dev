@@ -36,7 +36,7 @@ FakeBroker                      ← broker/fake_broker.py(テストダブル)
 
 `typing.Protocol`(`runtime_checkable`、構造的型付け)。実装側に継承関係を要求しない。
 
-> **runtime check の限界(PR #87)**: `runtime_checkable` な Protocol の `isinstance()` は**必要な属性(メソッド)が存在すること**しか確認せず、引数型・戻り値型の適合は保証しない。本リポジトリは mypy / pyright 等の静的型検査を実行していないため、シグネチャ適合は `broker/tests/` の振る舞いテストで担保する。
+> **runtime check の限界(PR #87)**: `runtime_checkable` な Protocol の `isinstance()` は**必要な属性(メソッド)が存在すること**しか確認せず、引数型・戻り値型の適合は保証しない。本リポジトリは mypy / pyright 等の静的型検査を実行していないため、**シグネチャ適合を保証する仕組みはない**。`broker/tests/` の振る舞いテストが確認するのは FakeBroker の具体的な挙動のみであり、将来の Adapter 実装は自前のテスト(および必要なら型検査)で適合を確認する必要がある。
 
 | 操作 | メソッド | 戻り値 |
 |---|---|---|
@@ -53,7 +53,7 @@ FakeBroker                      ← broker/fake_broker.py(テストダブル)
 すべて `dataclass(frozen=True)` + `Enum` + `Decimal`(価格・数量・金額)+ timezone-aware UTC `datetime`。Paper Execution の float / TypedDict 規約は既存レイヤーのものであり、本境界は新規設計として Decimal を採用する(Issue #73)。
 
 - `OrderRequest` — client_order_id / symbol / side / order_type(MARKET, LIMIT)/ quantity / limit_price / created_at_utc。生成時に検証(`BrokerInvalidRequestError`)。
-- `OrderResult` — 注文スナップショット。`requested_quantity` / `filled_quantity` / `remaining_quantity`(= requested − filled を検証)、`requested_price` と `average_fill_price` / `fills`(約定明細)を**別々に保持**し、約定価格の乖離(`price_deviation`)をテストで比較できる。
+- `OrderResult` — 注文スナップショット。`requested_quantity` / `filled_quantity` / `remaining_quantity`(= requested − filled を検証)、`requested_price` と `average_fill_price` / `fills`(約定明細)を**別々に保持**し、約定価格の乖離(`price_deviation`)をテストで比較できる。構築時のクロスフィールド検証(`ValueError`): LIMIT は `requested_price` 必須・MARKET は `None` 必須、`pending`(Broker 未確認)は `broker_order_id` 禁止。
 - `Fill` — 約定明細(fill_id / price / quantity / filled_at_utc)。
 - `PositionInfo` / `AccountState` — Broker 側スナップショット。
 - Broker 固有フィールドは共通モデルへ**漏らさない**。Broker 固有レスポンス → 共通モデルの変換は将来の Adapter 内部で完結させる。
@@ -75,7 +75,7 @@ terminal = filled / cancelled / rejected(再遷移なし)
 - **`unknown` の契約(PR #87)**: `unknown` が限定するのは「Broker 側の確定が取れていない」ことであり、約定量ではない。`unknown` スナップショットは**既知の fill を保持できる**(0 件・部分・要求全量のいずれも可。`0 <= filled_quantity <= requested_quantity`、fills 合計との一致は他状態と同じく検証される)。`broker_order_id` は有無どちらも許容。`unknown` が禁じるのは最終結果の断定のみで、後続照会で確定状態へ解決するまで `filled` / `rejected` / 「未発注」へ確定してはならない。
 - 遷移の閉集合は `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` が固定する。
 - **同一状態の更新(PR #87)**: Broker polling は同じスナップショットを繰り返し観測するため、`validate_order_state_transition(old, new)` は **`old == new` を全状態で許可**する(terminal 含む。`filled → filled` は許可、`filled → cancelled` は引き続き拒否)。`ORDER_STATE_TRANSITIONS` は「異なる状態への変更」のみを列挙する。
-- **スナップショット更新の不変条件(PR #87)**: 状態ペアの検証に加え、`validate_order_result_update(old, new)` が更新の**内容**を検証する。(1) `client_order_id` / `symbol` / `side` / `order_type` / `requested_quantity` / `requested_price` は更新前後で不変、(2) `filled_quantity` は単調非減少・`remaining_quantity` は単調非増加、(3) `old.fills` は `new.fills` の prefix としてすべて保持(削除・並べ替え・同一 `fill_id` の内容変更を禁止。追加 fill が既存 `fill_id` を再利用することも禁止)、(4) `broker_order_id` は `None → 値` のみ許可(`値 → None`、`値A → 値B` は禁止)。この不変条件は **terminal 状態の same-state 再観測にも適用**され(`filled → filled` で内容改変は不可)、**UNKNOWN の解決先は new 自体の構築 invariant と更新不変条件の両方**を満たす必要がある — 例: 部分約定を保持した `unknown` は `partially_filled` / `filled` / `cancelled` へは解決できるが `accepted` / `rejected` へは戻れず、全量 fill を保持した `unknown` は `filled` のみへ解決できる。型不正は `BrokerInvalidRequestError`、不変条件違反は `ValueError`。FakeBroker のキャンセル経路もこの検証を通る。
+- **スナップショット更新の不変条件(PR #87)**: 状態ペアの検証に加え、`validate_order_result_update(old, new)` が更新の**内容**を検証する。(1) `client_order_id` / `symbol` / `side` / `order_type` / `requested_quantity` / `requested_price` は更新前後で不変、(2) `filled_quantity` は単調非減少・`remaining_quantity` は単調非増加、(3) `old.fills` は `new.fills` の prefix としてすべて保持(削除・並べ替え・同一 `fill_id` の内容変更を禁止。追加 fill が既存 `fill_id` を再利用することも禁止)、(4) `broker_order_id` は `None → 値` のみ許可(`値 → None`、`値A → 値B` は禁止)、(5) `updated_at_utc` は全更新で単調非減少、(6) **terminal 状態の same-state 再観測は `updated_at_utc` 以外の全フィールドが不変**(確定済みの `average_fill_price` や `reject_reason` を後から書き換えることはできない)。**UNKNOWN の解決先は new 自体の構築 invariant と更新不変条件の両方**を満たす必要がある — 例: 部分約定を保持した `unknown` は `partially_filled` / `filled` / `cancelled` へは解決できるが `accepted` / `rejected` へは戻れず、全量 fill を保持した `unknown` は `filled` のみへ解決できる。型不正は `BrokerInvalidRequestError`、不変条件違反は `ValueError`。FakeBroker のキャンセル経路もこの検証を通る。
 
 ### エラー方針(例外 + Result の組み合わせ)
 
