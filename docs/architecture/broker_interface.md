@@ -75,6 +75,7 @@ terminal = filled / cancelled / rejected(再遷移なし)
 - **`unknown` の契約(PR #87)**: `unknown` が限定するのは「Broker 側の確定が取れていない」ことであり、約定量ではない。`unknown` スナップショットは**既知の fill を保持できる**(0 件・部分・要求全量のいずれも可。`0 <= filled_quantity <= requested_quantity`、fills 合計との一致は他状態と同じく検証される)。`broker_order_id` は有無どちらも許容。`unknown` が禁じるのは最終結果の断定のみで、後続照会で確定状態へ解決するまで `filled` / `rejected` / 「未発注」へ確定してはならない。
 - 遷移の閉集合は `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` が固定する。
 - **同一状態の更新(PR #87)**: Broker polling は同じスナップショットを繰り返し観測するため、`validate_order_state_transition(old, new)` は **`old == new` を全状態で許可**する(terminal 含む。`filled → filled` は許可、`filled → cancelled` は引き続き拒否)。`ORDER_STATE_TRANSITIONS` は「異なる状態への変更」のみを列挙する。
+- **スナップショット更新の不変条件(PR #87)**: 状態ペアの検証に加え、`validate_order_result_update(old, new)` が更新の**内容**を検証する。(1) `client_order_id` / `symbol` / `side` / `order_type` / `requested_quantity` / `requested_price` は更新前後で不変、(2) `filled_quantity` は単調非減少・`remaining_quantity` は単調非増加、(3) `old.fills` は `new.fills` の prefix としてすべて保持(削除・並べ替え・同一 `fill_id` の内容変更を禁止。追加 fill が既存 `fill_id` を再利用することも禁止)、(4) `broker_order_id` は `None → 値` のみ許可(`値 → None`、`値A → 値B` は禁止)。この不変条件は **terminal 状態の same-state 再観測にも適用**され(`filled → filled` で内容改変は不可)、**UNKNOWN の解決先は new 自体の構築 invariant と更新不変条件の両方**を満たす必要がある — 例: 部分約定を保持した `unknown` は `partially_filled` / `filled` / `cancelled` へは解決できるが `accepted` / `rejected` へは戻れず、全量 fill を保持した `unknown` は `filled` のみへ解決できる。型不正は `BrokerInvalidRequestError`、不変条件違反は `ValueError`。FakeBroker のキャンセル経路もこの検証を通る。
 
 ### エラー方針(例外 + Result の組み合わせ)
 

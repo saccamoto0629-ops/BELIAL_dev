@@ -51,7 +51,7 @@ from .broker_models import (
     OrderType,
     PositionInfo,
     TERMINAL_ORDER_STATES,
-    validate_order_state_transition,
+    validate_order_result_update,
     weighted_average_price,
 )
 
@@ -377,7 +377,6 @@ class FakeBroker:
                 f"cannot cancel order in terminal state {current.state.value!r}",
                 client_order_id=client_order_id,
             )
-        validate_order_state_transition(current.state, OrderState.CANCELLED)
         cancelled = OrderResult(
             client_order_id=current.client_order_id,
             broker_order_id=current.broker_order_id,
@@ -393,6 +392,8 @@ class FakeBroker:
             updated_at_utc=self._now(),
             fills=current.fills,
         )
+        # Full update validation (state pair + content invariants, PR #87)
+        validate_order_result_update(current, cancelled)
         self._orders[client_order_id] = cancelled
         return cancelled
 

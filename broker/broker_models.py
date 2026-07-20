@@ -456,6 +456,89 @@ class OrderResult:
         return self.average_fill_price - self.requested_price
 
 
+# Snapshot fields that identify the order and its request; they must never
+# change between successive snapshots of the same order.
+_IMMUTABLE_RESULT_FIELDS = (
+    "client_order_id",
+    "symbol",
+    "side",
+    "order_type",
+    "requested_quantity",
+    "requested_price",
+)
+
+
+def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
+    """Raise unless ``new`` is a legal successor snapshot of ``old`` (PR #87).
+
+    ``validate_order_state_transition`` checks only the state pair; this
+    validator checks the CONTENT of the update. It applies to every update,
+    including same-state re-observations of terminal states (a FILLED order
+    re-observed as FILLED must not change content), and to resolutions of
+    UNKNOWN (the resolved ``new`` must satisfy both its own construction
+    invariants and these update invariants — so e.g. an UNKNOWN snapshot
+    holding partial fills can resolve to PARTIALLY_FILLED / FILLED /
+    CANCELLED but never back to ACCEPTED / REJECTED, and an UNKNOWN snapshot
+    holding the full requested quantity can only resolve to FILLED).
+
+    Invariants:
+
+    - identity/request fields (``client_order_id`` / ``symbol`` / ``side`` /
+      ``order_type`` / ``requested_quantity`` / ``requested_price``) are
+      unchanged
+    - ``filled_quantity`` is monotonically non-decreasing,
+      ``remaining_quantity`` monotonically non-increasing
+    - ``old.fills`` is preserved as a prefix of ``new.fills`` — no fill is
+      removed, reordered or altered, and an appended fill never reuses an
+      existing ``fill_id``
+    - ``broker_order_id`` may go ``None -> value`` (broker ack arrived);
+      ``value -> None`` and ``value A -> value B`` are forbidden
+
+    Type-malformed inputs raise ``BrokerInvalidRequestError``; invariant
+    violations raise ``ValueError`` (same boundary as ``OrderResult``).
+    """
+    if not isinstance(old, OrderResult) or not isinstance(new, OrderResult):
+        raise BrokerInvalidRequestError(
+            f"both snapshots must be OrderResult instances, got {old!r} -> {new!r}"
+        )
+    validate_order_state_transition(old.state, new.state)
+
+    for field_name in _IMMUTABLE_RESULT_FIELDS:
+        if getattr(old, field_name) != getattr(new, field_name):
+            raise ValueError(
+                f"{field_name} must not change between snapshots: "
+                f"{getattr(old, field_name)!r} -> {getattr(new, field_name)!r}"
+            )
+
+    if new.filled_quantity < old.filled_quantity:
+        raise ValueError(
+            f"filled_quantity must not decrease: {old.filled_quantity} -> {new.filled_quantity}"
+        )
+    if new.remaining_quantity > old.remaining_quantity:
+        raise ValueError(
+            f"remaining_quantity must not increase: "
+            f"{old.remaining_quantity} -> {new.remaining_quantity}"
+        )
+
+    if new.fills[: len(old.fills)] != old.fills:
+        raise ValueError(
+            "old fills must be preserved unchanged as a prefix of new fills "
+            "(no removal, reordering, or alteration of an existing fill_id)"
+        )
+    old_fill_ids = {f.fill_id for f in old.fills}
+    for appended in new.fills[len(old.fills):]:
+        if appended.fill_id in old_fill_ids:
+            raise ValueError(
+                f"appended fill reuses existing fill_id {appended.fill_id!r}"
+            )
+
+    if old.broker_order_id is not None and new.broker_order_id != old.broker_order_id:
+        raise ValueError(
+            f"broker_order_id may only go from None to a value, never "
+            f"{old.broker_order_id!r} -> {new.broker_order_id!r}"
+        )
+
+
 # --- position / account models ---------------------------------------------
 
 

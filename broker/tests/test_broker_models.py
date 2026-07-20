@@ -320,6 +320,203 @@ def test_unknown_state_may_carry_a_full_quantity_fill():
     assert result.state is m.OrderState.UNKNOWN
 
 
+# --- validate_order_result_update (PR #87 Major 2) ---------------------------
+# Snapshot-to-snapshot update invariants: identity/request fields frozen,
+# monotonic fill progress, old fills preserved as a prefix, broker_order_id
+# only None -> value. Applies to terminal same-state re-observations and to
+# every resolution of UNKNOWN.
+
+PARTIAL_FILLS = (m.Fill("f-1", Decimal("2400"), Decimal("4"), UTC_NOW),)
+
+
+def unknown_zero_fill(**overrides):
+    kwargs = dict(
+        state=m.OrderState.UNKNOWN, broker_order_id=None,
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+        average_fill_price=None, fills=(),
+    )
+    kwargs.update(overrides)
+    return make_result(**kwargs)
+
+
+def unknown_partial_fill(**overrides):
+    kwargs = dict(
+        state=m.OrderState.UNKNOWN, broker_order_id=None,
+        filled_quantity=Decimal("4"), remaining_quantity=Decimal("6"),
+        average_fill_price=Decimal("2400"), fills=PARTIAL_FILLS,
+    )
+    kwargs.update(overrides)
+    return make_result(**kwargs)
+
+
+def unknown_full_fill(**overrides):
+    return make_result(state=m.OrderState.UNKNOWN, **overrides)
+
+
+def accepted_zero_fill(**overrides):
+    kwargs = dict(
+        state=m.OrderState.ACCEPTED, broker_order_id="B-1",
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+        average_fill_price=None, fills=(),
+    )
+    kwargs.update(overrides)
+    return make_result(**kwargs)
+
+
+def rejected_zero_fill(**overrides):
+    kwargs = dict(
+        state=m.OrderState.REJECTED, broker_order_id=None,
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+        average_fill_price=None, fills=(), reject_reason="rejected",
+    )
+    kwargs.update(overrides)
+    return make_result(**kwargs)
+
+
+def test_update_validator_rejects_non_order_result_inputs():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.validate_order_result_update(object(), make_result())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.validate_order_result_update(make_result(), "snapshot")
+
+
+def test_unknown_with_zero_fills_can_resolve_to_accepted_or_rejected():
+    m.validate_order_result_update(unknown_zero_fill(), accepted_zero_fill())
+    m.validate_order_result_update(unknown_zero_fill(), rejected_zero_fill())
+
+
+def test_unknown_with_partial_fills_can_resolve_to_fill_progress_states():
+    old = unknown_partial_fill()
+    m.validate_order_result_update(
+        old, unknown_partial_fill(state=m.OrderState.PARTIALLY_FILLED, broker_order_id="B-1"),
+    )
+    full_fills = PARTIAL_FILLS + (m.Fill("f-2", Decimal("2401"), Decimal("6"), UTC_NOW),)
+    m.validate_order_result_update(
+        old,
+        make_result(
+            state=m.OrderState.FILLED,
+            average_fill_price=m.weighted_average_price(full_fills),
+            fills=full_fills,
+        ),
+    )
+    m.validate_order_result_update(
+        old, unknown_partial_fill(state=m.OrderState.CANCELLED),
+    )
+
+
+def test_unknown_with_partial_fills_cannot_resolve_to_accepted_or_rejected():
+    # ACCEPTED / REJECTED require zero fills by construction, so any legal
+    # candidate snapshot violates filled-quantity monotonicity here.
+    old = unknown_partial_fill()
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(old, accepted_zero_fill())
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(old, rejected_zero_fill())
+
+
+def test_unknown_with_a_full_fill_resolves_only_to_filled():
+    old = unknown_full_fill()
+    m.validate_order_result_update(old, make_result())  # FILLED: allowed
+    for candidate in (
+        accepted_zero_fill(),
+        rejected_zero_fill(),
+        unknown_partial_fill(state=m.OrderState.PARTIALLY_FILLED, broker_order_id="B-1"),
+        unknown_partial_fill(state=m.OrderState.CANCELLED),
+    ):
+        with pytest.raises(ValueError):
+            m.validate_order_result_update(old, candidate)
+
+
+def test_update_rejects_fill_regression_removal_and_alteration():
+    old = unknown_partial_fill()
+    # fill 数量後退 (same fill_id, smaller quantity)
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            old,
+            unknown_partial_fill(
+                filled_quantity=Decimal("2"), remaining_quantity=Decimal("8"),
+                fills=(m.Fill("f-1", Decimal("2400"), Decimal("2"), UTC_NOW),),
+            ),
+        )
+    # fill 削除
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(old, unknown_zero_fill())
+    # fill 改変 (same fill_id, different price, same total quantity)
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            old,
+            unknown_partial_fill(
+                average_fill_price=Decimal("2500"),
+                fills=(m.Fill("f-1", Decimal("2500"), Decimal("4"), UTC_NOW),),
+            ),
+        )
+    # appended fill must not reuse an existing fill_id
+    reused = PARTIAL_FILLS + (m.Fill("f-1", Decimal("2401"), Decimal("2"), UTC_NOW),)
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            old,
+            unknown_partial_fill(
+                filled_quantity=Decimal("6"), remaining_quantity=Decimal("4"),
+                average_fill_price=m.weighted_average_price(reused), fills=reused,
+            ),
+        )
+
+
+def test_update_rejects_identity_and_request_field_changes():
+    old = unknown_partial_fill()
+    for overrides in (
+        {"client_order_id": "c-2"},
+        {"symbol": "EURUSD"},
+        {"side": m.OrderSide.SELL},
+        {"order_type": m.OrderType.MARKET, "requested_price": None},
+        {"requested_price": Decimal("2500")},
+    ):
+        with pytest.raises(ValueError):
+            m.validate_order_result_update(old, unknown_partial_fill(**overrides))
+    with pytest.raises(ValueError):  # requested_quantity change
+        m.validate_order_result_update(
+            old,
+            unknown_partial_fill(
+                requested_quantity=Decimal("20"), remaining_quantity=Decimal("16"),
+            ),
+        )
+
+
+def test_broker_order_id_may_only_go_from_none_to_a_value():
+    m.validate_order_result_update(
+        unknown_zero_fill(), accepted_zero_fill(),  # None -> "B-1"
+    )
+    accepted = accepted_zero_fill()
+    with pytest.raises(ValueError):  # value -> None
+        m.validate_order_result_update(
+            accepted, unknown_zero_fill(),
+        )
+    with pytest.raises(ValueError):  # value A -> value B
+        m.validate_order_result_update(
+            accepted, accepted_zero_fill(broker_order_id="B-2"),
+        )
+
+
+def test_terminal_same_state_reobservation_must_not_change_content():
+    filled = make_result()
+    # identical re-observation (fresh timestamp) is fine
+    m.validate_order_result_update(filled, make_result(updated_at_utc=UTC_NOW))
+    # content alteration under the same terminal state is rejected
+    altered_fills = (m.Fill("f-1", Decimal("2500"), Decimal("10"), UTC_NOW),)
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            filled,
+            make_result(average_fill_price=Decimal("2500"), fills=altered_fills),
+        )
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(filled, make_result(symbol="EURUSD"))
+    # and a terminal state still never moves to a different state
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            filled, unknown_partial_fill(state=m.OrderState.CANCELLED)
+        )
+
+
 def test_unknown_state_broker_order_id_is_optional_either_way():
     with_id = make_result(state=m.OrderState.UNKNOWN)
     without_id = make_result(
