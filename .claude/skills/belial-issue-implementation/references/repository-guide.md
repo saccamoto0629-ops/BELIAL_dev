@@ -68,7 +68,7 @@ SKILL.md §3 が要求する評価項目。変更ごとに全項目を `Relevant
 | 14 | systemd・常駐 Bot・定期実行(timer) |
 | 15 | 既存 DB・既存データとの後方互換性 |
 | 16 | 既存運用コマンド・起動導線 |
-| 17 | エラー処理(異常系を成功扱いへ丸めていないか) |
+| 17 | エラー処理(異常を握り潰していないか。failure channel への記録・終了コード・再送は所有 docs の失敗種別ごとの契約に従っているか) |
 | 18 | Paper Signal / Paper Execution / Backtest / Live Execution の責務境界 |
 | 19 | 秘密情報の扱い(Webhook URL / API key / token) |
 | 20 | dry-run の無副作用保証 |
@@ -80,7 +80,8 @@ SKILL.md §3 が要求する評価項目。変更ごとに全項目を `Relevant
 | store は所有コンポーネント以外の DB を migration しない | `docs/architecture/architecture.md`「SQLite schema validation / migration」 |
 | read-only 処理(dry-run の schema probe・レポート等)は存在しない DB・ファイルを作成しない | 同上 + 「dry-run 方針」 |
 | dry-run で DB 作成・migration・Discord 送信・state 更新・S3 アップロードを行わない | `docs/architecture/architecture.md`「dry-run 方針」、`docs/operations/operations.md` |
-| 読み取りエラー・schema 不正を成功扱いしない(cycle failure として計上) | `docs/architecture/architecture.md`「dry-run 方針」 |
+| dry-run・strict read の読み取りエラー・schema 不正を成功扱いしない(cycle failure として計上) | `docs/architecture/architecture.md`「dry-run 方針」 |
+| 異常系の failure channel・終了コード・再送・状態維持は失敗種別ごとに所有 docs と回帰テストの契約に従う(delivery 失敗と data-plane / outbox 失敗を同一視しない) | `docs/architecture/paper_execution.md`(失敗分類)、`docs/operations/operations.md`「Paper Execution 通知 outbox の運用」 |
 | Paper Signal は仮説、Paper Execution は仮想執行、Backtest は検証基盤 | `docs/product/concept.md`「設計思想」「レイヤー分離」 |
 | Live Execution は未実装・非スコープ | `docs/product/concept.md`「非スコープ」 |
 | 既存の運用導線(起動コマンド・systemd・CLI)を壊さない | `docs/operations/operations.md`「起動方式 / 本番運用」 |
