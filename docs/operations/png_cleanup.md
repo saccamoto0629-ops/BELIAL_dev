@@ -50,7 +50,8 @@ cd /opt/berial
 
 /opt/berial/.venv/bin/python scripts/cleanup_png.py \
   --target /opt/berial/market-watch/data/chart_images \
-  --retention-days 7
+  --retention-days 7 \
+  --lock-file /opt/berial/market-watch/data/chart_images/.berial-png-cleanup.lock
 ```
 
 環境変数でも指定できる。
@@ -58,10 +59,13 @@ cd /opt/berial
 ```bash
 export PNG_CLEANUP_TARGETS=/opt/berial/market-watch/data/chart_images
 export PNG_CLEANUP_RETENTION_DAYS=7
+export PNG_CLEANUP_LOCK_FILE=/opt/berial/market-watch/data/chart_images/.berial-png-cleanup.lock
 /opt/berial/.venv/bin/python /opt/berial/scripts/cleanup_png.py
 ```
 
-通常実行は `flock` を使い、既定 `/tmp/berial-png-cleanup.lock` で多重起動を抑止する。別プロセスが実行中なら warning を出して削除せず正常終了する。一部のファイル削除に失敗しても残りは継続し、最後に非0終了する。cleanup失敗は Market Watch 常駐サービスへ伝播しない。
+通常実行は `flock` で多重起動を抑止する。別プロセスが実行中なら warning を出して削除せず正常終了する。一部のファイル削除に失敗しても残りは継続し、最後に非0終了する。cleanup失敗は Market Watch 常駐サービスへ伝播しない。
+
+**lock file の場所に注意**: 既定は `/tmp/berial-png-cleanup.lock` だが、systemd service は `PrivateTmp=true` で専用 `/tmp` を持つため、`/tmp` の lock では timer 実行と手動実行の排他にならない。service は対象ディレクトリ内の `/opt/berial/market-watch/data/chart_images/.berial-png-cleanup.lock` を使うので、**手動で削除を実行するときは上記のとおり `--lock-file` で同じパスを指定する**(dotfile であり `*.png` ではないため cleanup 自身は削除しない)。dry-run は削除しないため lock を取得しない。cleanup は lock file の親ディレクトリを作成しない(存在しなければエラー終了する)。
 
 ## systemd timer の導入
 
@@ -139,10 +143,11 @@ cd /opt/berial
   --retention-days 1 \
   --dry-run
 
-# 2. 1日より古いPNGだけ削除
+# 2. 1日より古いPNGだけ削除(timer 実行との排他のため service と同じ lock を指定)
 /opt/berial/.venv/bin/python scripts/cleanup_png.py \
   --target /opt/berial/market-watch/data/chart_images \
-  --retention-days 1
+  --retention-days 1 \
+  --lock-file /opt/berial/market-watch/data/chart_images/.berial-png-cleanup.lock
 
 # 3. 空き容量と結果を確認
 df -h /

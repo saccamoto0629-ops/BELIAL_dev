@@ -211,9 +211,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_summary(result, dry_run=True)
         return 1 if result.error_count else 0
 
+    # The lock file's parent directory is never created here: this command must
+    # not create directories anywhere (a lock inside a missing target directory
+    # would otherwise silently materialise that directory). A missing parent is
+    # reported as an error instead.
     lock_path = Path(args.lock_file or os.environ.get(ENV_LOCK_FILE, DEFAULT_LOCK_FILE))
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_handle = lock_path.open("a+", encoding="utf-8")
     except OSError as exc:
         print(f"ERROR cannot open lock file {lock_path}: {exc}", file=sys.stderr)

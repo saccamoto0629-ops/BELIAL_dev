@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import os
 import sys
@@ -130,3 +131,140 @@ def test_repository_root_is_rejected(tmp_path: Path) -> None:
     repo_root.mkdir(parents=True)
     with pytest.raises(ValueError):
         cleanup_png.validate_target(str(repo_root), repo_root=repo_root)
+
+
+def test_empty_directory_yields_no_candidates(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+
+    result = cleanup_png.cleanup_targets(
+        [str(target)], retention_days=1, dry_run=False, now_epoch=200_000.0, repo_root=tmp_path / "repo"
+    )
+
+    assert result.candidate_count == 0
+    assert result.deleted_count == 0
+    assert result.error_count == 0
+
+
+def test_partial_delete_failure_continues_and_is_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing unlink must not stop the run: the rest is still deleted and
+    the failure stays visible in error_count (Issue #67)."""
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    stuck = target / "stuck.png"
+    other = target / "other.png"
+    _write(stuck, b"stuck", 1.0)
+    _write(other, b"other", 1.0)
+
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name == "stuck.png":
+            raise PermissionError(13, "unlink not permitted", str(self))
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    result = cleanup_png.cleanup_targets(
+        [str(target)], retention_days=1, dry_run=False, now_epoch=200_000.0, repo_root=tmp_path / "repo"
+    )
+
+    assert result.error_count == 1
+    assert result.deleted_count == 1
+    assert stuck.exists()
+    assert not other.exists()
+
+
+def _main_args(target: Path, lock: Path, *extra: str) -> list[str]:
+    return ["--target", str(target), "--retention-days", "1", "--lock-file", str(lock), *extra]
+
+
+def test_main_dry_run_creates_no_lock_file_or_directory(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    old_png = target / "old.png"
+    _write(old_png, b"png", 1.0)
+    lock = tmp_path / "locks" / "cleanup.lock"
+
+    exit_code = cleanup_png.main(_main_args(target, lock, "--dry-run"))
+
+    assert exit_code == 0
+    assert old_png.exists()
+    assert not lock.exists()
+    assert not lock.parent.exists()
+
+
+def test_main_deletes_and_exits_zero(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    old_png = target / "old.png"
+    _write(old_png, b"png", 1.0)
+    lock = target / ".cleanup.lock"
+
+    exit_code = cleanup_png.main(_main_args(target, lock))
+
+    assert exit_code == 0
+    assert not old_png.exists()
+    assert lock.exists()
+
+
+def test_main_exits_nonzero_on_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    stuck = target / "stuck.png"
+    other = target / "other.png"
+    _write(stuck, b"stuck", 1.0)
+    _write(other, b"other", 1.0)
+
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name == "stuck.png":
+            raise PermissionError(13, "unlink not permitted", str(self))
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    exit_code = cleanup_png.main(_main_args(target, tmp_path / "deep" / "cleanup.lock"))
+
+    assert exit_code == 1
+    assert stuck.exists()
+    assert not other.exists()
+
+
+def test_main_with_lock_already_held_deletes_nothing_and_exits_zero(tmp_path: Path) -> None:
+    """Concurrent runs must not race on the same files: the loser of the flock
+    exits 0 without deleting anything (Issue #67 多重起動)."""
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    old_png = target / "old.png"
+    _write(old_png, b"png", 1.0)
+    lock = tmp_path / "deep" / "cleanup.lock"
+
+    with lock.open("a+", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        exit_code = cleanup_png.main(_main_args(target, lock))
+
+    assert exit_code == 0
+    assert old_png.exists()
+
+
+def test_main_does_not_create_missing_lock_parent_directory(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    old_png = target / "old.png"
+    _write(old_png, b"png", 1.0)
+    lock = tmp_path / "missing" / "cleanup.lock"
+
+    exit_code = cleanup_png.main(_main_args(target, lock))
+
+    assert exit_code == 1
+    assert old_png.exists()
+    assert not lock.parent.exists()
+
+
+def test_main_without_targets_exits_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(cleanup_png.ENV_TARGETS, raising=False)
+    assert cleanup_png.main([]) == 2

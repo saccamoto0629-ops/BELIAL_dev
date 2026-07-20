@@ -1,4 +1,13 @@
 [Unit]
+# Berial old-PNG cleanup, oneshot (Issue #67). Triggered daily by
+# berial-png-cleanup.timer; deletes only direct-child regular *.png files
+# older than PNG_CLEANUP_RETENTION_DAYS in PNG_CLEANUP_TARGETS. Never
+# recursive, never follows symlinks, fail-closed on dangerous paths.
+#
+# Copy/adapt this template to /etc/systemd/system/berial-png-cleanup.service,
+# then: systemctl daemon-reload && systemctl enable --now berial-png-cleanup.timer
+# (enable the TIMER, not this service; starting the service runs one cleanup now).
+# See docs/operations/png_cleanup.md for deploy/verify/stop steps.
 Description=Berial old PNG cleanup
 Documentation=file:/opt/berial/docs/operations/png_cleanup.md
 
@@ -10,13 +19,31 @@ WorkingDirectory=/opt/berial
 Environment="PYTHONUNBUFFERED=1"
 Environment="PNG_CLEANUP_TARGETS=/opt/berial/market-watch/data/chart_images"
 Environment="PNG_CLEANUP_RETENTION_DAYS=7"
-Environment="PNG_CLEANUP_LOCK_FILE=/tmp/berial-png-cleanup.lock"
+# The advisory flock lives INSIDE the target directory, not in /tmp:
+# PrivateTmp=true gives this service its own /tmp, so a /tmp lock could never
+# exclude a concurrent manual run (see docs/operations/png_cleanup.md, which
+# passes the same path via --lock-file). The dotfile is not *.png, so the
+# cleanup itself never deletes it. The directory is created by market-watch
+# chart rendering; if it does not exist yet, this unit fails visibly instead
+# of creating it.
+Environment="PNG_CLEANUP_LOCK_FILE=/opt/berial/market-watch/data/chart_images/.berial-png-cleanup.lock"
 ExecStart=/opt/berial/.venv/bin/python /opt/berial/scripts/cleanup_png.py
+# stdout/stderr to the journal (journalctl -u berial-png-cleanup).
+StandardOutput=journal
+StandardError=journal
+# Low priority: disk cleanup must not compete with the resident bots.
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+# Sandbox: read-only system, no home access, writes limited to the chart
+# image directory (PNG deletion + lock file) and the private /tmp.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/berial/market-watch/data/chart_images /tmp
+# Deliberately no Restart=: a failing oneshot must stay failed until the next
+# timer run instead of looping; cleanup failure never touches the bots.
+
+# No [Install] section on purpose: this unit is started by its timer (or
+# manually) and is not enabled on its own.
