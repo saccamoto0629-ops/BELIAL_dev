@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "cleanup_png.py"
 SPEC = importlib.util.spec_from_file_location("cleanup_png", MODULE_PATH)
 assert SPEC and SPEC.loader
 cleanup_png = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = cleanup_png
 SPEC.loader.exec_module(cleanup_png)
 
 
