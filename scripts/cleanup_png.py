@@ -94,6 +94,28 @@ def validate_target(raw_target: str, *, repo_root: Path | None = None) -> Path:
     return normalized
 
 
+def _open_target_dir(target: Path) -> int:
+    """Open a validated target directory by walking it component by component.
+
+    Every component is opened with ``O_DIRECTORY | O_NOFOLLOW`` relative to
+    the previously opened directory FD, so a component swapped to a symlink
+    AFTER validate_target() ran still cannot be followed (opening the full
+    path string in one call would only protect the final component). Raises
+    OSError: ENOENT for a missing target, ELOOP for a symlink component,
+    ENOTDIR for a non-directory component.
+    """
+    fd = os.open(target.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in target.parts[1:]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
 def iter_candidates(
     target: Path, dir_fd: int, *, cutoff_epoch: float
 ) -> Iterable[tuple[str, os.stat_result | None]]:
@@ -141,20 +163,19 @@ def cleanup_targets(
             continue
         result.target_count += 1
         print(f"TARGET path={_display(target)} retention_days={retention_days:g} dry_run={str(dry_run).lower()}")
-        if not target.exists():
+
+        # Pin the directory via a component-wise O_NOFOLLOW walk (no
+        # exists()/is_dir() path re-resolution beforehand -- a missing target
+        # is detected as ENOENT from the walk itself). All scanning/deletion
+        # below go through the returned FD, so neither a symlink swapped into
+        # any path component after validation nor a concurrent rename of the
+        # path can redirect the run.
+        try:
+            dir_fd = _open_target_dir(target)
+        except FileNotFoundError:
             result.warning_count += 1
             print(f"WARNING target does not exist: {_display(target)}", file=sys.stderr)
             continue
-        if not target.is_dir():
-            result.error_count += 1
-            print(f"ERROR target is not a directory: {_display(target)}", file=sys.stderr)
-            continue
-
-        # Pin the directory: O_NOFOLLOW refuses a symlinked target even if it
-        # appeared after validation, and all scanning/deletion below go through
-        # this FD, so a concurrent rename of the path cannot redirect the run.
-        try:
-            dir_fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError as exc:
             result.error_count += 1
             print(f"ERROR cannot open target {_display(target)}: {exc}", file=sys.stderr)
@@ -292,9 +313,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_handle:
-        if not stat.S_ISREG(os.fstat(lock_handle.fileno()).st_mode):
+        # A pre-existing lock entry is only trusted if it is a plain,
+        # un-hardlinked regular file owned by this user: O_CREAT applies the
+        # 0600 mode to NEW files only, so a squatted world-writable file (whose
+        # owner could unlink/recreate it mid-run and break the exclusion) must
+        # be rejected, and a too-open mode on our own older lock is tightened.
+        lock_stat = os.fstat(lock_handle.fileno())
+        if not stat.S_ISREG(lock_stat.st_mode):
             print(f"ERROR lock file is not a regular file: {_display(lock_path)}", file=sys.stderr)
             return 1
+        if lock_stat.st_uid != os.geteuid():
+            print(
+                f"ERROR lock file owned by another user (uid {lock_stat.st_uid}): {_display(lock_path)}",
+                file=sys.stderr,
+            )
+            return 1
+        if lock_stat.st_nlink != 1:
+            print(
+                f"ERROR lock file has {lock_stat.st_nlink} links, expected 1: {_display(lock_path)}",
+                file=sys.stderr,
+            )
+            return 1
+        if lock_stat.st_mode & 0o077:
+            os.fchmod(lock_handle.fileno(), 0o600)
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

@@ -63,7 +63,7 @@ export PNG_CLEANUP_RETENTION_DAYS=7
 
 通常実行は `flock` で多重起動を抑止する。別プロセスが実行中なら warning を出して削除せず正常終了する。一部のファイル削除に失敗しても残りは継続し、最後に非0終了する。cleanup失敗は Market Watch 常駐サービスへ伝播しない。
 
-**lock の共有**: lock は既定 `/tmp/berial-png-cleanup.lock` を service・手動実行の双方が使うため、追加指定なしで排他になる。service に `PrivateTmp=` を設定しないのは意図的で、private `/tmp` では timer 実行と手動実行の flock が別ファイルになり排他にならないためである。lock は `O_NOFOLLOW`・mode 0600 で開き、symlink だった場合や親ディレクトリ不存在時はエラー終了する。cleanup は lock を含めディレクトリを一切作成しない。dry-run は削除しないため lock を取得しない。
+**lock の共有**: lock は既定 `/tmp/berial-png-cleanup.lock` を service・手動実行の双方が使うため、追加指定なしで排他になる。service に `PrivateTmp=` を設定しないのは意図的で、private `/tmp` では timer 実行と手動実行の flock が別ファイルになり排他にならないためである。lock は `O_NOFOLLOW`・mode 0600 で開き、symlink だった場合や親ディレクトリ不存在時はエラー終了する。既存 lock は実行ユーザー所有・link 数 1 の regular file のみ受理し(他ユーザー所有・hardlink は拒否)、permission が広い場合は 0600 へ矯正する。cleanup は lock を含めディレクトリを一切作成しない。dry-run は削除しないため lock を取得しない。
 
 ## systemd timer の導入
 

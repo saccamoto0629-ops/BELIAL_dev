@@ -410,6 +410,104 @@ def test_main_missing_target_warns_and_exits_zero(tmp_path: Path) -> None:
     assert not missing.exists()
 
 
+def test_parent_swapped_to_symlink_after_validation_is_not_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even when a parent component becomes a symlink AFTER validate_target()
+    accepted the path, the component-wise O_NOFOLLOW walk must refuse to open
+    the redirected directory (single-shot open would only guard the leaf)."""
+    outside = tmp_path / "outside" / "deep" / "chart_images"
+    outside.mkdir(parents=True)
+    victim = outside / "victim.png"
+    _write(victim, b"outside", 1.0)
+    target = tmp_path / "config" / "deep" / "chart_images"
+    target.mkdir(parents=True)
+
+    real_validate = cleanup_png.validate_target
+
+    def racing_validate(raw_target: str, *, repo_root: Path | None = None) -> Path:
+        validated = real_validate(raw_target, repo_root=repo_root)
+        (tmp_path / "config").rename(tmp_path / "config.saved")
+        try:
+            (tmp_path / "config").symlink_to(tmp_path / "outside")
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+        return validated
+
+    monkeypatch.setattr(cleanup_png, "validate_target", racing_validate)
+    result = cleanup_png.cleanup_targets(
+        [str(target)], retention_days=1, dry_run=False, now_epoch=200_000.0, repo_root=tmp_path / "repo"
+    )
+
+    assert result.deleted_count == 0
+    assert result.error_count == 1
+    assert victim.exists()
+
+
+def test_target_that_is_a_regular_file_is_an_error(tmp_path: Path) -> None:
+    parent = tmp_path / "deep" / "data"
+    parent.mkdir(parents=True)
+    target = parent / "chart_images"
+    target.write_bytes(b"not a directory")
+
+    result = cleanup_png.cleanup_targets(
+        [str(target)], retention_days=1, dry_run=False, now_epoch=200_000.0, repo_root=tmp_path / "repo"
+    )
+
+    assert result.error_count == 1
+    assert result.warning_count == 0
+    assert target.exists()
+
+
+def test_main_hardlinked_lock_file_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    png = target / "old.png"
+    _write(png, b"png", 1.0)
+    lock = tmp_path / "cleanup.lock"
+    lock.touch()
+    os.link(lock, tmp_path / "cleanup.lock.hard")
+
+    exit_code = cleanup_png.main(_main_args(target, lock))
+
+    assert exit_code == 1
+    assert png.exists()
+
+
+def test_main_lock_owned_by_another_user_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    png = target / "old.png"
+    _write(png, b"png", 1.0)
+    lock = tmp_path / "cleanup.lock"
+    lock.touch()
+    try:
+        os.chown(lock, os.geteuid() + 1, -1)
+    except (PermissionError, OSError):
+        pytest.skip("changing file ownership requires privileges")
+
+    exit_code = cleanup_png.main(_main_args(target, lock))
+
+    assert exit_code == 1
+    assert png.exists()
+
+
+def test_main_tightens_mode_of_existing_lock_file(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "chart_images"
+    target.mkdir(parents=True)
+    png = target / "old.png"
+    _write(png, b"png", 1.0)
+    lock = tmp_path / "cleanup.lock"
+    lock.touch()
+    lock.chmod(0o666)
+
+    exit_code = cleanup_png.main(_main_args(target, lock))
+
+    assert exit_code == 0
+    assert not png.exists()
+    assert (lock.stat().st_mode & 0o777) == 0o600
+
+
 def test_main_symlinked_lock_file_is_rejected(tmp_path: Path) -> None:
     target = tmp_path / "deep" / "chart_images"
     target.mkdir(parents=True)
