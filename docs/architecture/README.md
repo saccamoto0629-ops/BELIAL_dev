@@ -17,3 +17,7 @@ BELIAL の設計資料を置く。
 - [Broker Interface / FakeBroker](broker_interface.md)(Issue #73): 将来の Live Execution に向けた
   Broker 境界(共通インターフェース・共通モデル)と、外部通信を一切行わないテストダブル FakeBroker。
   実装は `broker/`。実発注・OANDA Adapter・Live Execution は未実装のまま。
+- [Execution Request / Order Persistence](execution_request.md)(Issue #74): Strategy / Signal から
+  将来の Live Execution ユースケースへ渡す ExecutionRequest モデルと、注文状態・状態履歴の SQLite
+  永続化基盤。注文状態は既存 `broker.OrderState` を唯一の正として再利用する。実装は `execution/`。
+  Live Execution 本体・Broker API Adapter・実注文・Safety Gate・reconciliation runner は未実装のまま。

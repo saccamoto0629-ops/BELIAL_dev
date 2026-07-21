@@ -14,6 +14,7 @@ market-watch/data/
 paper-signal/data/
 paper-execution/data/
 backtest/data/
+execution/data/
 **/*.json.tmp
 .pytest_cache/
 **/.pytest_cache/

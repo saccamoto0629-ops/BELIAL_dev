@@ -12,6 +12,7 @@ BELIAL Issue 実装時に参照するコンポーネント・ドキュメント�
 | paper-execution | `paper-execution/` | (なし。設計書を参照) | `paper_execution.md` | `paper-execution/tests/` | `paper_positions.sqlite3` |
 | backtest | `backtest/` | `backtest/strategies/README.md`(Strategy 定義) | `strategy_definition.md`、実行方法は `docs/backtest.md` | `backtest/tests/` | (backtest 結果 DB。`backtest_store.py` 参照) |
 | broker | `broker/` | `broker/README.md` | `broker_interface.md` | `broker/tests/` | なし(インメモリのみ) |
+| execution | `execution/` | `execution/README.md` | `execution_request.md` | `execution/tests/` | `execution_orders.sqlite3`(将来のLive Execution用永続化基盤。Issue #74) |
 
 全体像・DB 構成・データ連携は `docs/architecture/architecture.md`、責務レイヤーと非スコープは `docs/product/concept.md` が正。
 
@@ -30,7 +31,7 @@ BELIAL Issue 実装時に参照するコンポーネント・ドキュメント�
 
 ## テストスイート実行コマンド
 
-ルートに `pytest.ini` / `conftest.py` / `pyproject.toml` は存在しない。**ディレクトリ単位で個別に**実行する(CI `.github/workflows/ci.yml` と同じ 6 スイート)。
+ルートに `pytest.ini` / `conftest.py` / `pyproject.toml` は存在しない。**ディレクトリ単位で個別に**実行する(CI `.github/workflows/ci.yml` と同じ 7 スイート)。
 
 ```bash
 python -m pytest backtest/tests -q
@@ -39,12 +40,13 @@ python -m pytest news-feed-bot/tests -q
 python -m pytest paper-signal/tests -q
 python -m pytest paper-execution/tests -q
 python -m pytest broker/tests -q
+python -m pytest execution/tests -q
 ```
 
 - 依存は repo ルートの `requirements.txt`(`python -m pip install -r requirements.txt`)。
 - テストは外部ネットワーク・実 DB・実 S3・実 Discord に到達してはならない。
 - paper-execution は CI に Windows ジョブがある(SQLite ファイルハンドル / snapshot cleanup)。Windows 固有の副作用に触れる変更では Windows での挙動を考慮する。
-- CI はこの 6 スイートに加えて、リポジトリルートからの `broker` パッケージ import smoke test を実行する。
+- CI はこの 7 スイートに加えて、リポジトリルートからの `broker` / `execution` パッケージ import smoke test を実行する。
 
 ## 影響マトリクス評価項目
 
