@@ -26,49 +26,58 @@ state machine; it is a separate ``submission_phase`` column:
                     accepted / partially_filled / filled / cancelled /
                     rejected). Derived, never regresses.
 
-Snapshot persistence (PR #91 review, Major 1): every broker observation that
-carries a full ``OrderResult`` is persisted COMPLETELY -- the latest snapshot
-is serialized to JSON (Decimals as canonical strings, datetimes as UTC ISO
-strings, fills included) in ``last_order_result_json``, committed in the SAME
-transaction as the current-row update and the history row. On every
-result-bearing update the store deserializes the DB snapshot and runs
-``validate_order_result_update(db_snapshot, new)`` -- so a stale in-memory
-snapshot can never erase known fills, roll back ``filled_quantity`` /
-``remaining_quantity``, drop ``broker_order_id``, or rewind ``updated_at_utc``,
-even across a process restart. A caller-supplied ``previous_result`` is only
-accepted when it EQUALS the DB snapshot. State-only updates
-(:func:`record_order_state`) are restricted to the one case where no full
-``OrderResult`` exists by construction: recording UNKNOWN after a submit /
-query whose outcome was lost (e.g. ``BrokerTimeoutError``).
+Snapshot persistence, HISTORY-ANCHORED (PR #91 review r1 Major 1 / r2 Major 1):
+every broker observation that carries a full ``OrderResult`` is serialized
+losslessly to canonical JSON (Decimals as canonical strings, datetimes as UTC
+ISO strings, fills included, keys sorted) and written to BOTH
 
-``broker_order_id`` is UNIQUE across the WHOLE table (PR #91 review,
-Major 3): one broker order can never be attached to two execution requests;
-a conflicting update rolls back the current-row update and the history append
-together and raises :class:`ExecutionOrderConflictError`.
+- ``execution_orders.last_order_result_json`` (the current row), and
+- ``execution_order_state_history.order_result_json`` on the history row
+  recording that observation,
+
+in the SAME transaction. The history side is the ANCHOR: on every restore and
+every update the current row's snapshot must be byte-identical to the
+snapshot on the LAST snapshot-bearing history row, consecutive history
+snapshots must satisfy ``validate_order_result_update`` pairwise, each
+history snapshot must agree with its own history row (state, broker id --
+compared symmetrically, NULL included -- and timestamp) and with the stored
+intent, and ``broker_order_id`` must follow the NULL -> value -> same-value
+chain across ALL history rows. Rewriting the current row alone (state,
+broker id or snapshot) therefore always fails restore-time validation --
+including while the tracked state is UNKNOWN, which is deliberately NOT an
+escape hatch: a state-only UNKNOWN never touches the snapshot, so the
+current snapshot must still equal the latest anchored one.
+
+Update contract: the ``old`` side of ``validate_order_result_update`` is the
+ANCHORED DB snapshot -- never an in-memory copy -- so known fills /
+quantities / broker IDs / timestamps cannot be rolled back by a stale
+caller, even right after a process restart. A caller-supplied
+``previous_result`` is accepted only when it equals the anchored snapshot.
+State-only updates (:func:`record_order_state`) are restricted to the one
+state that exists precisely because no full ``OrderResult`` could be
+obtained: UNKNOWN (e.g. ``BrokerTimeoutError``); a state-only update may
+CONFIRM the stored ``broker_order_id`` but can never introduce or change one
+-- broker IDs are only ever learned from full ``OrderResult`` snapshots.
+
+``broker_order_id`` is UNIQUE across the WHOLE table (PR #91 review Major 3):
+one broker order can never be attached to two execution requests. The
+constraint guards writes; restore additionally scans the whole table and
+refuses to restore ANY row while a duplicate exists (a corrupted /
+constraint-stripped DB must not be readable back into use).
+
+Every public API -- reads included -- follows one flow (PR #91 review r2
+Major 3): open the DB, VERIFY the schema, start a transaction, then
+restore/update rows. A DB whose schema fails verification is never read
+from and never written to.
 
 UNKNOWN handling (Issue #74): ``unknown`` is stored as-is and keeps the phase
 at ``submitting`` -- the broker may or may not hold the order. UNKNOWN rows
 are query targets (:func:`list_unknown_orders`); they are resolved ONLY by
-recording a later observation through the normal validated update path. A
-state-only UNKNOWN does NOT touch the last full snapshot, so a later
-resolution is still validated against the fills known before the outcome was
-lost. This store never converts UNKNOWN into "not placed" / "rejected" /
+recording a later observation through the normal validated update path.
+This store never converts UNKNOWN into "not placed" / "rejected" /
 "retryable", and re-submission is not modelled at all: ``client_order_id``
 is bound 1:1 to the request and immutable (see ``execution_models`` for the
 ID design).
-
-Update contract (every state update, one ``BEGIN IMMEDIATE`` transaction):
-
-- transition validated by ``validate_order_state_transition``; content
-  validated by ``validate_order_result_update`` against the DB snapshot
-  whenever one exists,
-- current-row update, snapshot update and history append commit atomically
-  (all or nothing; a UNIQUE ``broker_order_id`` conflict rolls back all),
-- ``broker_order_id`` may go NULL -> value once and is then immutable
-  (a state-only observation that omits it keeps the stored value; a
-  DIFFERENT value -- or dropping it from a full snapshot -- is refused),
-- ``updated_at_utc`` is monotonically non-decreasing,
-- terminal states are never left (enforced by the broker transition table).
 
 Same-state re-observation (PR #87 contract): allowed for every state,
 terminal included. Design decision for persistence: a same-state
@@ -77,30 +86,34 @@ re-observation IS recorded -- it refreshes ``updated_at_utc`` /
 observations leave an audit trail. Callers that do not want history rows for
 polling no-ops simply skip calling the store.
 
-History rows record ``previous_state`` (NULL for the first entry, i.e.
-created -> pending), ``new_state``, ``reason``, ``broker_order_id`` as of the
-change, and ``changed_at_utc``.
-
-Schema management (PR #91 review, Major 2): :func:`init_db` is idempotent,
-but "current" is decided by FULL structural verification, never by column
-names alone -- ``PRAGMA user_version``, the complete normalized CREATE SQL of
-both tables (all NOT NULL / UNIQUE / CHECK / FK constraints), the required
-indexes, and the absence of unexpected tables are all checked. A partial
-schema (one table missing), a constraint-less lookalike, or a foreign DB
-fails with :class:`ExecutionSchemaError` WITHOUT modifying the file -- this
-is a brand-new, never-released component, so there is deliberately no
+Schema management (PR #91 review Major 2): :func:`init_db` creates the
+schema only into a PRISTINE database -- zero objects in ``sqlite_master``
+AND ``user_version = 0``. Anything else (a version-only DB, a
+metadata-only DB, a partial schema, a constraint-less lookalike, a foreign
+DB) fails with :class:`ExecutionSchemaError` WITHOUT modifying the file --
+brand-new, never-released component, so there is deliberately no
 legacy-migration path and nothing is auto-completed or silently rebuilt.
-Key invariants (non-empty IDs / reasons, UTC suffix, MARKET/LIMIT x
-requested_price, state x broker_order_id) are additionally enforced by DB
-CHECK constraints as a second guard under the application-level validation.
+Verification never trusts column names or the ``sqlite_master`` SQL text
+alone: it compares the schema version, the complete normalized CREATE SQL,
+AND a structural signature built from ``PRAGMA table_info`` /
+``index_list`` / ``index_info`` / ``foreign_key_list`` against a pristine
+reference schema, and requires the absence of unexpected tables / indexes.
+``execution_request_id`` is explicitly ``NOT NULL`` (a plain TEXT PRIMARY
+KEY on a rowid table would admit NULLs) and the orders table is WITHOUT
+ROWID. Key invariants (non-empty IDs / reasons, UTC suffix, MARKET/LIMIT x
+``requested_price``, state x ``broker_order_id``) are additionally enforced
+by DB CHECK constraints as a second guard under the application-level
+validation.
 
-Restore-time integrity (PR #91 review, Major 2): every read that returns an
-order re-validates what it loads -- enum membership, UTC parseability,
-non-empty IDs / reasons, the current/history chain (first entry is
-created -> pending, links are gapless, every pair is a legal transition, the
-last entry matches the current row), phase consistency, and the snapshot
-JSON (round-trips into a valid ``OrderResult`` that belongs to this order).
-A DB edited out-of-band into an inconsistent state raises
+Restore-time integrity: every read re-validates what it loads -- enum
+membership, UTC parseability, non-empty IDs / reasons, the current/history
+chain (first entry is created -> pending, links are gapless, every pair is a
+legal transition, the last entry matches the current row), phase
+consistency, the broker-id chain, the snapshot anchoring described above,
+and the DB-wide broker-id uniqueness scan. Snapshot JSON is parsed
+STRICTLY: the top-level key set and each fill's key set must match the
+expected sets exactly (unknown fields are rejected). A DB edited
+out-of-band into an inconsistent state raises
 :class:`ExecutionIntegrityError` instead of being trusted. Read helpers
 never create the DB file (dry-run safe) and never swallow read errors on an
 existing file.
@@ -188,15 +201,43 @@ _HISTORY_COLUMNS: tuple[str, ...] = (
     "new_state",
     "reason",
     "broker_order_id",
+    "order_result_json",
     "changed_at_utc",
 )
 REQUIRED_ORDER_COLUMNS: frozenset[str] = frozenset(_ORDER_COLUMNS)
 REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
 
-SCHEMA_VERSION = 1
+# v1: initial PR #91 schema (snapshot on the current row only).
+# v2 (PR #91 review r2): snapshot anchored on history rows
+#     (history.order_result_json), NOT NULL + WITHOUT ROWID on the orders
+#     primary key. No migration path -- pre-release component; a v1 DB fails
+#     verification loudly.
+SCHEMA_VERSION = 2
 
 # AUTOINCREMENT bookkeeping table SQLite creates itself.
 _ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
+
+# Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
+# match EXACTLY -- unknown fields are rejected, missing fields are rejected.
+_RESULT_JSON_KEYS: frozenset[str] = frozenset(
+    {
+        "client_order_id",
+        "broker_order_id",
+        "state",
+        "symbol",
+        "side",
+        "order_type",
+        "requested_quantity",
+        "filled_quantity",
+        "remaining_quantity",
+        "requested_price",
+        "average_fill_price",
+        "updated_at_utc",
+        "reject_reason",
+        "fills",
+    }
+)
+_FILL_JSON_KEYS: frozenset[str] = frozenset({"fill_id", "price", "quantity", "filled_at_utc"})
 
 
 class ExecutionStoreError(RuntimeError):
@@ -237,7 +278,7 @@ def _parse_utc(text: str) -> datetime:
     return value
 
 
-# --- schema (full CREATE SQL is the verification reference) ------------------
+# --- schema (full CREATE SQL + PRAGMA signature are the references) ----------
 
 
 def _enum_values_sql(values) -> str:
@@ -247,7 +288,9 @@ def _enum_values_sql(values) -> str:
 def _create_orders_table_sql() -> str:
     """Full current schema. Decimals are stored as canonical TEXT (never REAL:
     live-order arithmetic must not pick up float error, Issue #73/#74). The
-    CHECKs mirror the application-level invariants as a second guard."""
+    CHECKs mirror the application-level invariants as a second guard.
+    NOT NULL on the PRIMARY KEY is explicit (a rowid-table TEXT PRIMARY KEY
+    would admit NULLs) and the table is WITHOUT ROWID."""
     sides = _enum_values_sql(OrderSide)
     types = _enum_values_sql(OrderType)
     states = _enum_values_sql(OrderState)
@@ -255,7 +298,7 @@ def _create_orders_table_sql() -> str:
     broker_ack = "', '".join(sorted(s.value for s in _STATES_REQUIRING_BROKER_ID))
     return f"""
         CREATE TABLE {ORDERS_TABLE} (
-            execution_request_id TEXT PRIMARY KEY CHECK (trim(execution_request_id) <> ''),
+            execution_request_id TEXT PRIMARY KEY NOT NULL CHECK (trim(execution_request_id) <> ''),
             signal_id TEXT NOT NULL CHECK (trim(signal_id) <> ''),
             strategy_id TEXT NOT NULL CHECK (trim(strategy_id) <> ''),
             symbol TEXT NOT NULL CHECK (trim(symbol) <> ''),
@@ -277,7 +320,7 @@ def _create_orders_table_sql() -> str:
             CHECK ((submission_phase = '{PHASE_CREATED}') = (order_state IS NULL)),
             CHECK ((order_type = '{OrderType.LIMIT.value}') = (requested_price IS NOT NULL)),
             CHECK (order_state IS NULL OR order_state NOT IN ('{broker_ack}') OR broker_order_id IS NOT NULL)
-        )
+        ) WITHOUT ROWID
     """
 
 
@@ -293,6 +336,7 @@ def _create_history_table_sql() -> str:
             new_state TEXT NOT NULL CHECK (new_state IN ('{states}')),
             reason TEXT NOT NULL CHECK (trim(reason) <> ''),
             broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
+            order_result_json TEXT CHECK (order_result_json IS NULL OR trim(order_result_json) <> ''),
             changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00')
         )
     """
@@ -322,41 +366,60 @@ def _normalized_sql(sql) -> str:
     return " ".join(str(sql or "").lower().split())
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
-    connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.row_factory = sqlite3.Row
-    return connection
+def _create_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(_create_orders_table_sql())
+    connection.execute(_create_history_table_sql())
+    for create_sql in _create_index_sql().values():
+        connection.execute(create_sql)
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-@contextmanager
-def _immediate_txn(db_path: Path):
-    """One explicit ``BEGIN IMMEDIATE ... COMMIT`` transaction (ROLLBACK on error)."""
-    with closing(_connect(db_path)) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield connection
-            connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
+def _structure_signature(connection: sqlite3.Connection) -> dict:
+    """Structural signature from the live schema objects (PR #91 r2 Minor 2).
+
+    Built from ``PRAGMA table_info`` / ``index_list`` / ``index_info`` /
+    ``foreign_key_list`` -- so verification does not rest on the
+    ``sqlite_master`` SQL text alone."""
+    signature: dict = {}
+    for table in (ORDERS_TABLE, HISTORY_TABLE):
+        signature[f"table_info:{table}"] = [
+            tuple(row) for row in connection.execute(f"PRAGMA table_info({table})")
+        ]
+        signature[f"foreign_keys:{table}"] = [
+            tuple(row) for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        ]
+        index_entries = []
+        for index_row in connection.execute(f"PRAGMA index_list({table})"):
+            # (seq, name, unique, origin, partial)
+            columns = [
+                tuple(info)
+                for info in connection.execute(f"PRAGMA index_info({index_row[1]})")
+            ]
+            index_entries.append((index_row[1], index_row[2], index_row[3], index_row[4], columns))
+        signature[f"indexes:{table}"] = sorted(index_entries)
+    return signature
 
 
-def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
-    row = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
-    ).fetchone()
-    return row is not None
+_EXPECTED_SIGNATURE_CACHE: dict | None = None
+
+
+def _expected_signature() -> dict:
+    """Signature of a pristine reference schema (built once, in memory)."""
+    global _EXPECTED_SIGNATURE_CACHE
+    if _EXPECTED_SIGNATURE_CACHE is None:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            _create_schema(connection)
+            _EXPECTED_SIGNATURE_CACHE = _structure_signature(connection)
+    return _EXPECTED_SIGNATURE_CACHE
 
 
 def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
     """Full structural verification; raises :class:`ExecutionSchemaError`.
 
-    Never trusts column names alone: the schema version, the COMPLETE
-    normalized CREATE SQL of both tables (so every NOT NULL / UNIQUE / CHECK /
-    FK constraint is verified), the required indexes, and the absence of
-    unexpected tables are all checked. Read-only -- makes no change to the DB.
+    Checks the schema version, the complete normalized CREATE SQL of both
+    tables and both indexes, the PRAGMA-derived structural signature against
+    a pristine reference schema, and the absence of unexpected tables or
+    indexes. Read-only -- makes no change to the DB.
     """
     problems: list[str] = []
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -364,7 +427,7 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
         problems.append(f"user_version is {version}, expected {SCHEMA_VERSION}")
 
     tables = {
-        row["name"]: row["sql"]
+        row[0]: row[1]
         for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
     }
     expected = _expected_tables()
@@ -380,9 +443,9 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
             )
 
     indexes = {
-        row["name"]: row["sql"]
+        row[0]: row[1]
         for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'index'")
-        if not row["name"].startswith("sqlite_autoindex_")
+        if not row[0].startswith("sqlite_autoindex_")
     }
     for name, create_sql in _create_index_sql().items():
         if name not in indexes:
@@ -392,6 +455,12 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
     for name in sorted(set(indexes) - set(_create_index_sql())):
         problems.append(f"unexpected index {name!r} present")
 
+    if not problems and _structure_signature(connection) != _expected_signature():
+        problems.append(
+            "live PRAGMA structure (table_info/index_list/index_info/foreign_key_list) "
+            "differs from the reference schema"
+        )
+
     if problems:
         raise ExecutionSchemaError(
             f"execution DB at {db_path} failed schema verification; refusing to touch it: "
@@ -399,49 +468,108 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
+def _assert_no_duplicate_broker_ids(connection: sqlite3.Connection) -> None:
+    """DB-wide broker_order_id uniqueness scan (PR #91 review Major 3).
+
+    The UNIQUE constraint guards writes; this scan additionally refuses to
+    RESTORE anything from a DB that somehow holds duplicates (e.g. a
+    constraint-stripped copy). NULLs are not duplicates of each other.
+    """
+    duplicates = [
+        row[0]
+        for row in connection.execute(
+            f"SELECT broker_order_id FROM {ORDERS_TABLE} WHERE broker_order_id IS NOT NULL "
+            "GROUP BY broker_order_id HAVING COUNT(*) > 1"
+        )
+    ]
+    if duplicates:
+        raise ExecutionIntegrityError(
+            f"broker_order_id values assigned to more than one execution order: {duplicates}; "
+            "refusing to restore from this DB"
+        )
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+    connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+@contextmanager
+def _verified_txn(db_path: Path):
+    """The single write flow: open -> BEGIN IMMEDIATE -> verify schema ->
+    duplicate scan -> row work -> COMMIT (ROLLBACK on any error)."""
+    with closing(_connect(db_path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _verify_schema(connection, db_path)
+            _assert_no_duplicate_broker_ids(connection)
+            yield connection
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+
+@contextmanager
+def _verified_read(db_path: Path):
+    """The single read flow: open -> BEGIN (consistent view) -> verify schema
+    -> duplicate scan -> row restore. Always rolled back (reads write nothing)."""
+    with closing(_connect(db_path)) as connection:
+        connection.execute("BEGIN")
+        try:
+            _verify_schema(connection, db_path)
+            _assert_no_duplicate_broker_ids(connection)
+            yield connection
+        finally:
+            connection.execute("ROLLBACK")
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Create the Issue #74 schema, or verify an existing one; idempotent.
 
-    - Fresh DB (neither of our tables present, no foreign tables): create both
-      tables, both indexes, and stamp ``PRAGMA user_version`` in one
-      transaction.
-    - Anything already present: FULL structural verification
-      (:func:`_verify_schema`). A partial schema, a constraint-less lookalike,
-      a wrong version, or a foreign table raises
-      :class:`ExecutionSchemaError` WITHOUT modifying the DB -- brand-new
-      component, brand-new DB, so there is no legacy-migration or
-      auto-completion path.
+    - PRISTINE DB only (PR #91 review r2 Major 2): the schema is created only
+      when ``sqlite_master`` holds ZERO objects AND ``user_version`` is 0. A
+      version-only DB, a metadata-only DB (e.g. a stray ``sqlite_sequence``),
+      or any other object present means this is NOT a fresh DB.
+    - Anything else: FULL structural verification (:func:`_verify_schema`).
+      A partial schema, a constraint-less lookalike, a wrong version, or a
+      foreign table raises :class:`ExecutionSchemaError` WITHOUT modifying
+      the DB -- brand-new component, brand-new DB, so there is no
+      legacy-migration or auto-completion path.
     """
     db_path = Path(db_path) if db_path is not None else execution_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with _immediate_txn(db_path) as connection:
-        ours_present = [t for t in _expected_tables() if _table_exists(connection, t)]
-        if not ours_present:
-            foreign = [
-                row["name"]
-                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-                if row["name"] not in _ALLOWED_EXTRA_TABLES
-            ]
-            if foreign:
-                raise ExecutionSchemaError(
-                    f"DB at {db_path} contains foreign tables {sorted(foreign)}; "
-                    "refusing to create the execution schema in it"
-                )
-            connection.execute(_create_orders_table_sql())
-            connection.execute(_create_history_table_sql())
-            for create_sql in _create_index_sql().values():
-                connection.execute(create_sql)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        else:
-            _verify_schema(connection, db_path)
+    with closing(_connect(db_path)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            objects = connection.execute("SELECT name FROM sqlite_master").fetchall()
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if not objects:
+                if version != 0:
+                    raise ExecutionSchemaError(
+                        f"DB at {db_path} is empty but carries user_version {version}; "
+                        "not a pristine DB -- refusing to initialize it"
+                    )
+                _create_schema(connection)
+            else:
+                _verify_schema(connection, db_path)
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
 
 
 # --- OrderResult snapshot serialization --------------------------------------
 
 
 def _result_to_json(result: OrderResult) -> str:
-    """Serialize a full snapshot losslessly: Decimals as canonical strings,
-    datetimes as UTC ISO strings, fills in order."""
+    """Serialize a full snapshot losslessly and canonically: Decimals as
+    canonical strings, datetimes as UTC ISO strings, fills in order, keys
+    sorted -- so identical snapshots serialize to identical bytes and the
+    history anchor can be compared as a string."""
     def dec(value):
         return None if value is None else str(value)
 
@@ -475,9 +603,24 @@ def _result_to_json(result: OrderResult) -> str:
 
 
 def _result_from_json(text: str) -> OrderResult:
-    """Rebuild the snapshot; ``OrderResult`` construction re-runs every
-    invariant, so a tampered snapshot fails loudly instead of being trusted."""
+    """Rebuild the snapshot STRICTLY (PR #91 r2 Minor 1): the top-level key
+    set and each fill's key set must match the expected sets exactly, and
+    ``OrderResult`` construction re-runs every invariant -- a tampered or
+    extended snapshot fails loudly instead of being trusted."""
     data = json.loads(text)
+    if not isinstance(data, dict) or set(data) != _RESULT_JSON_KEYS:
+        raise ValueError(
+            f"snapshot JSON keys {sorted(data) if isinstance(data, dict) else type(data).__name__} "
+            f"do not match the expected set {sorted(_RESULT_JSON_KEYS)}"
+        )
+    if not isinstance(data["fills"], list):
+        raise ValueError("snapshot JSON 'fills' must be a list")
+    for entry in data["fills"]:
+        if not isinstance(entry, dict) or set(entry) != _FILL_JSON_KEYS:
+            raise ValueError(
+                f"snapshot fill keys {sorted(entry) if isinstance(entry, dict) else type(entry).__name__} "
+                f"do not match the expected set {sorted(_FILL_JSON_KEYS)}"
+            )
 
     def dec(value):
         return None if value is None else Decimal(value)
@@ -540,11 +683,54 @@ def _validate_request_columns(row: dict) -> None:
         raise _integrity(request_id, f"unparseable stored value: {exc}") from exc
 
 
+def _validate_history_snapshot(row: dict, entry: dict, snapshot: OrderResult) -> None:
+    """One snapshot-bearing history row must agree with itself and the intent.
+
+    broker_order_id is compared SYMMETRICALLY, NULL included: the snapshot's
+    broker id and the history row's broker id must be exactly equal.
+    """
+    request_id = row["execution_request_id"]
+    if snapshot.state.value != entry["new_state"]:
+        raise _integrity(
+            request_id,
+            f"history row {entry['history_id']} snapshot state {snapshot.state.value!r} "
+            f"does not match its new_state {entry['new_state']!r}",
+        )
+    if snapshot.broker_order_id != entry["broker_order_id"]:
+        raise _integrity(
+            request_id,
+            f"history row {entry['history_id']} snapshot broker_order_id "
+            f"{snapshot.broker_order_id!r} does not match its broker_order_id "
+            f"{entry['broker_order_id']!r}",
+        )
+    if _iso(snapshot.updated_at_utc) != entry["changed_at_utc"]:
+        raise _integrity(
+            request_id,
+            f"history row {entry['history_id']} snapshot timestamp does not match changed_at_utc",
+        )
+    if snapshot.client_order_id != row["client_order_id"]:
+        raise _integrity(request_id, "snapshot client_order_id does not match the order")
+    stored_requested_price = (
+        None if row["requested_price"] is None else Decimal(row["requested_price"])
+    )
+    if (
+        snapshot.symbol != row["symbol"]
+        or snapshot.side.value != row["side"]
+        or snapshot.order_type.value != row["order_type"]
+        or snapshot.requested_quantity != Decimal(row["quantity"])
+        or snapshot.requested_price != stored_requested_price
+    ):
+        raise _integrity(request_id, "snapshot identity fields do not match the stored request")
+
+
 def _validate_bundle(row: dict, history: list[dict]) -> None:
-    """Cross-validate the current row, its history chain and its snapshot.
+    """Cross-validate the current row, its history chain and the snapshot anchor.
 
     Restore-time guard (PR #91 review): a DB edited out-of-band into an
-    inconsistent state must be rejected on load, not trusted.
+    inconsistent state must be rejected on load, not trusted. The full
+    OrderResult is anchored to the LAST snapshot-bearing HISTORY row, so
+    rewriting the current row alone is always detected -- the tracked state
+    being UNKNOWN is not an exception.
     """
     request_id = row["execution_request_id"]
     _validate_request_columns(row)
@@ -558,6 +744,8 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
     if phase == PHASE_CREATED:
         if row["last_order_result_json"] is not None:
             raise _integrity(request_id, "created order carries an order-result snapshot")
+        if row["broker_order_id"] is not None:
+            raise _integrity(request_id, "created order carries a broker_order_id")
         return
 
     try:
@@ -565,8 +753,11 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
     except ValueError as exc:
         raise _integrity(request_id, str(exc)) from exc
 
-    # history chain: gapless links, legal transitions, sane content
+    # history chain: gapless links, legal transitions, broker-id chain,
+    # snapshot anchoring, sane content
     previous: dict | None = None
+    previous_snapshot: OrderResult | None = None
+    last_snapshot_json: str | None = None
     for entry in history:
         try:
             new_state = OrderState(entry["new_state"])
@@ -583,6 +774,10 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
                     "first history row must be the created -> pending entry, got "
                     f"{entry['previous_state']!r} -> {entry['new_state']!r}",
                 )
+            if entry["broker_order_id"] is not None:
+                raise _integrity(
+                    request_id, "the created -> pending entry cannot carry a broker_order_id"
+                )
         else:
             if entry["previous_state"] != previous["new_state"]:
                 raise _integrity(
@@ -598,6 +793,44 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
                 raise _integrity(
                     request_id, f"history row {entry['history_id']} goes back in time"
                 )
+            # broker-id chain: NULL -> value once, then the same value forever
+            prior_broker = previous["broker_order_id"]
+            if prior_broker is not None and entry["broker_order_id"] != prior_broker:
+                raise _integrity(
+                    request_id,
+                    f"history row {entry['history_id']} changes broker_order_id "
+                    f"{prior_broker!r} -> {entry['broker_order_id']!r}",
+                )
+
+        if entry["order_result_json"] is None:
+            # snapshot-less rows are exactly: the initial pending entry and
+            # state-only UNKNOWN records -- nothing else may lack a snapshot
+            if previous is not None and new_state is not OrderState.UNKNOWN:
+                raise _integrity(
+                    request_id,
+                    f"history row {entry['history_id']} ({new_state.value!r}) lacks the "
+                    "order-result snapshot that produced it",
+                )
+        else:
+            try:
+                snapshot = _result_from_json(entry["order_result_json"])
+            except Exception as exc:
+                raise _integrity(
+                    request_id,
+                    f"history row {entry['history_id']} snapshot is invalid: {exc}",
+                ) from exc
+            _validate_history_snapshot(row, entry, snapshot)
+            if previous_snapshot is not None:
+                try:
+                    validate_order_result_update(previous_snapshot, snapshot)
+                except ValueError as exc:
+                    raise _integrity(
+                        request_id,
+                        f"history row {entry['history_id']} snapshot violates the "
+                        f"update contract against the prior snapshot: {exc}",
+                    ) from exc
+            previous_snapshot = snapshot
+            last_snapshot_json = entry["order_result_json"]
         previous = entry
 
     last = history[-1]
@@ -620,6 +853,17 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
             f"changed_at_utc {last['changed_at_utc']!r}",
         )
 
+    # THE ANCHOR (PR #91 r2 Major 1): the current row's snapshot must be
+    # byte-identical to the last snapshot recorded in history -- UNKNOWN
+    # included. Swapping the current row's snapshot for an older one is
+    # therefore always detected against the append-validated history.
+    if row["last_order_result_json"] != last_snapshot_json:
+        raise _integrity(
+            request_id,
+            "current last_order_result_json does not match the last snapshot anchored "
+            "in the state history",
+        )
+
     confirmed_seen = any(h["new_state"] in {s.value for s in _CONFIRMED_STATES} for h in history)
     if (phase == PHASE_SUBMITTED) != confirmed_seen:
         raise _integrity(
@@ -629,58 +873,24 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
     if row["last_state_reason"] is None or not str(row["last_state_reason"]).strip():
         raise _integrity(request_id, "last_state_reason is empty for a submitted-phase order")
 
-    snapshot_text = row["last_order_result_json"]
-    if snapshot_text is None:
-        return
-    try:
-        snapshot = _result_from_json(snapshot_text)
-    except Exception as exc:  # malformed JSON or a snapshot violating OrderResult invariants
-        raise _integrity(request_id, f"stored order-result snapshot is invalid: {exc}") from exc
-    if snapshot.client_order_id != row["client_order_id"]:
-        raise _integrity(request_id, "snapshot client_order_id does not match the order")
-    if (
-        snapshot.symbol != row["symbol"]
-        or snapshot.side.value != row["side"]
-        or snapshot.order_type.value != row["order_type"]
-        or snapshot.requested_quantity != Decimal(row["quantity"])
-        or (snapshot.requested_price is None) != (row["requested_price"] is None)
-        or (
-            snapshot.requested_price is not None
-            and snapshot.requested_price != Decimal(row["requested_price"])
-        )
-    ):
-        raise _integrity(request_id, "snapshot identity fields do not match the stored request")
-    # the only legal way for the tracked state to diverge from the snapshot's
-    # state is a later state-only UNKNOWN (which never touches the snapshot)
-    if snapshot.state is not current_state and current_state is not OrderState.UNKNOWN:
-        raise _integrity(
-            request_id,
-            f"snapshot state {snapshot.state.value!r} inconsistent with current "
-            f"order_state {current_state.value!r}",
-        )
-    if snapshot.broker_order_id is not None and snapshot.broker_order_id != row["broker_order_id"]:
-        raise _integrity(request_id, "snapshot broker_order_id does not match the order")
-    if _parse_utc(row["updated_at_utc"]) < snapshot.updated_at_utc:
-        raise _integrity(request_id, "updated_at_utc is older than the stored snapshot")
 
-
-def _read_bundle(db_path: Path, execution_request_id: str) -> tuple[dict, list[dict]] | None:
-    """Load one order row + its full history in ONE connection and validate."""
-    if not db_path.exists():
-        return None
-    with closing(_connect(db_path)) as connection:
-        row = connection.execute(
-            f"SELECT * FROM {ORDERS_TABLE} WHERE execution_request_id = ?",
+def _fetch_and_validate(
+    connection: sqlite3.Connection, execution_request_id: str
+) -> tuple[dict, list[dict]] | None:
+    """Load one order row + its full history in the CALLER's transaction and
+    validate the bundle. Returns None only when neither exists."""
+    row = connection.execute(
+        f"SELECT * FROM {ORDERS_TABLE} WHERE execution_request_id = ?",
+        (execution_request_id,),
+    ).fetchone()
+    history = [
+        dict(h)
+        for h in connection.execute(
+            f"SELECT * FROM {HISTORY_TABLE} WHERE execution_request_id = ? "
+            "ORDER BY history_id ASC",
             (execution_request_id,),
-        ).fetchone()
-        history = [
-            dict(h)
-            for h in connection.execute(
-                f"SELECT * FROM {HISTORY_TABLE} WHERE execution_request_id = ? "
-                "ORDER BY history_id ASC",
-                (execution_request_id,),
-            ).fetchall()
-        ]
+        ).fetchall()
+    ]
     if row is None:
         if history:
             raise _integrity(execution_request_id, "history rows exist without an order row")
@@ -688,6 +898,14 @@ def _read_bundle(db_path: Path, execution_request_id: str) -> tuple[dict, list[d
     row = dict(row)
     _validate_bundle(row, history)
     return row, history
+
+
+def _anchored_snapshot(history: list[dict]) -> OrderResult | None:
+    """The last snapshot anchored in history (validated by _validate_bundle)."""
+    for entry in reversed(history):
+        if entry["order_result_json"] is not None:
+            return _result_from_json(entry["order_result_json"])
+    return None
 
 
 # --- write paths -------------------------------------------------------------
@@ -742,7 +960,7 @@ def create_execution_order(
         f"INSERT INTO {ORDERS_TABLE} ({', '.join(_ORDER_COLUMNS)}) "
         f"VALUES ({', '.join('?' for _ in _ORDER_COLUMNS)})"
     )
-    with _immediate_txn(db_path) as connection:
+    with _verified_txn(db_path) as connection:
         try:
             connection.execute(insert_sql, tuple(record[col] for col in _ORDER_COLUMNS))
         except sqlite3.IntegrityError as exc:
@@ -768,13 +986,13 @@ def _existing_db_path(db_path: Path | None, execution_request_id: str) -> Path:
     return db_path
 
 
-def _load_row_for_update(connection: sqlite3.Connection, execution_request_id: str) -> dict:
-    row = connection.execute(
-        f"SELECT * FROM {ORDERS_TABLE} WHERE execution_request_id = ?", (execution_request_id,)
-    ).fetchone()
-    if row is None:
+def _require_bundle_for_update(
+    connection: sqlite3.Connection, execution_request_id: str
+) -> tuple[dict, list[dict]]:
+    bundle = _fetch_and_validate(connection, execution_request_id)
+    if bundle is None:
         raise ExecutionOrderNotFoundError(f"no execution order with id {execution_request_id!r}")
-    return dict(row)
+    return bundle
 
 
 def _append_history(
@@ -785,18 +1003,20 @@ def _append_history(
     new_state: OrderState,
     reason: str,
     broker_order_id: str | None,
+    order_result_json: str | None,
     changed_at_utc: datetime,
 ) -> None:
     connection.execute(
         f"INSERT INTO {HISTORY_TABLE} "
-        "(execution_request_id, previous_state, new_state, reason, broker_order_id, changed_at_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(execution_request_id, previous_state, new_state, reason, broker_order_id, "
+        "order_result_json, changed_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             execution_request_id,
             None if previous_state is None else previous_state.value,
             new_state.value,
             reason,
             broker_order_id,
+            order_result_json,
             _iso(changed_at_utc),
         ),
     )
@@ -821,8 +1041,8 @@ def mark_submitting(
     _require_non_empty_str(reason, "reason")
     _require_utc(changed_at_utc, "changed_at_utc")
     db_path = _existing_db_path(db_path, execution_request_id)
-    with _immediate_txn(db_path) as connection:
-        row = _load_row_for_update(connection, execution_request_id)
+    with _verified_txn(db_path) as connection:
+        row, _history = _require_bundle_for_update(connection, execution_request_id)
         if row["submission_phase"] != PHASE_CREATED:
             raise ValueError(
                 f"execution order {execution_request_id!r} is in phase "
@@ -851,6 +1071,7 @@ def mark_submitting(
             new_state=OrderState.PENDING,
             reason=reason,
             broker_order_id=None,
+            order_result_json=None,
             changed_at_utc=changed_at_utc,
         )
     return _require_get(execution_request_id, db_path=db_path)
@@ -867,10 +1088,10 @@ def _apply_state_update(
     result_json: str | None,
 ) -> None:
     """Shared tail of both update paths: phase derivation + current-row UPDATE
-    + history INSERT, inside the caller's transaction. A UNIQUE violation
-    (DB-wide ``broker_order_id``, PR #91 Major 3) surfaces as
-    :class:`ExecutionOrderConflictError`; the caller's transaction rolls back
-    the whole update, history row included."""
+    + history INSERT (snapshot anchored on the history row too), inside the
+    caller's transaction. A UNIQUE violation (DB-wide ``broker_order_id``,
+    PR #91 Major 3) surfaces as :class:`ExecutionOrderConflictError`; the
+    caller's transaction rolls back the whole update, history row included."""
     execution_request_id = row["execution_request_id"]
     current_state = OrderState(row["order_state"])
     phase = row["submission_phase"]
@@ -899,6 +1120,7 @@ def _apply_state_update(
             new_state=new_state,
             reason=reason,
             broker_order_id=effective_broker_id,
+            order_result_json=result_json,
             changed_at_utc=changed_at_utc,
         )
     except sqlite3.IntegrityError as exc:
@@ -909,43 +1131,21 @@ def _apply_state_update(
         ) from exc
 
 
-def _common_update_checks(
-    row: dict,
-    *,
-    new_state: OrderState,
-    changed_at_utc: datetime,
-    broker_order_id: str | None,
-) -> str | None:
-    """Transition + broker-id + timestamp invariants shared by both update
-    paths. Returns the effective broker_order_id to store."""
+def _check_transition_and_time(
+    row: dict, *, new_state: OrderState, changed_at_utc: datetime
+) -> None:
     execution_request_id = row["execution_request_id"]
     if row["submission_phase"] == PHASE_CREATED:
         raise ValueError(
             f"execution order {execution_request_id!r} has no submit attempt yet "
             f"(phase {PHASE_CREATED!r}); call mark_submitting first"
         )
-    current_state = OrderState(row["order_state"])
-    validate_order_state_transition(current_state, new_state)
-
-    stored_broker_id = row["broker_order_id"]
-    if broker_order_id is None:
-        effective_broker_id = stored_broker_id
-    elif stored_broker_id is not None and broker_order_id != stored_broker_id:
-        raise ValueError(
-            f"broker_order_id is immutable once set: "
-            f"{stored_broker_id!r} -> {broker_order_id!r} refused"
-        )
-    else:
-        effective_broker_id = broker_order_id
-    if new_state in _STATES_REQUIRING_BROKER_ID and effective_broker_id is None:
-        raise ValueError(f"state {new_state.value!r} requires a broker_order_id")
-
+    validate_order_state_transition(OrderState(row["order_state"]), new_state)
     if _parse_utc(row["updated_at_utc"]) > changed_at_utc:
         raise ValueError(
             f"updated_at_utc must not go backwards: {row['updated_at_utc']} -> "
             f"{_iso(changed_at_utc)}"
         )
-    return effective_broker_id
 
 
 def record_order_state(
@@ -965,16 +1165,16 @@ def record_order_state(
     snapshot-less API accepts (PR #91 review, Major 1). Every other
     observation carries a broker snapshot and must go through
     :func:`record_order_result`, where the full PR #87 content contract is
-    enforced against the DB snapshot. A state-only UNKNOWN never touches the
-    stored snapshot, so the fills known before the outcome was lost keep
-    guarding any later resolution.
+    enforced against the anchored DB snapshot. A state-only UNKNOWN never
+    touches the stored snapshot, so the fills known before the outcome was
+    lost keep guarding any later resolution.
 
-    The transition is validated with ``validate_order_state_transition``;
-    the current-row update and the history append commit atomically.
-    ``broker_order_id=None`` keeps the stored value; a different non-NULL
-    value than the stored one is refused. ``changed_at_utc`` must not precede
-    the stored ``updated_at_utc``. Same-state re-observations (UNKNOWN ->
-    UNKNOWN) are allowed and recorded (see the module docstring).
+    ``broker_order_id`` may only CONFIRM the stored value (or be ``None`` =
+    "not part of this observation"): broker IDs are only ever learned from
+    full ``OrderResult`` snapshots, so a state-only update can neither
+    introduce nor change one. ``changed_at_utc`` must not precede the stored
+    ``updated_at_utc``. Same-state re-observations (UNKNOWN -> UNKNOWN) are
+    allowed and recorded (see the module docstring).
     """
     if not isinstance(new_state, OrderState):
         raise ValueError(f"new_state must be an OrderState, got {new_state!r}")
@@ -989,18 +1189,22 @@ def record_order_state(
     if broker_order_id is not None:
         _require_non_empty_str(broker_order_id, "broker_order_id")
     db_path = _existing_db_path(db_path, execution_request_id)
-    with _immediate_txn(db_path) as connection:
-        row = _load_row_for_update(connection, execution_request_id)
-        effective_broker_id = _common_update_checks(
-            row, new_state=new_state, changed_at_utc=changed_at_utc, broker_order_id=broker_order_id
-        )
+    with _verified_txn(db_path) as connection:
+        row, _history = _require_bundle_for_update(connection, execution_request_id)
+        if broker_order_id is not None and broker_order_id != row["broker_order_id"]:
+            raise ValueError(
+                f"a state-only update may only confirm the stored broker_order_id "
+                f"{row['broker_order_id']!r}, got {broker_order_id!r}; broker IDs are "
+                "only learned from full OrderResult snapshots"
+            )
+        _check_transition_and_time(row, new_state=new_state, changed_at_utc=changed_at_utc)
         _apply_state_update(
             connection,
             row,
             new_state=new_state,
             reason=reason,
             changed_at_utc=changed_at_utc,
-            effective_broker_id=effective_broker_id,
+            effective_broker_id=row["broker_order_id"],
             result_json=None,
         )
     return _require_get(execution_request_id, db_path=db_path)
@@ -1018,19 +1222,25 @@ def record_order_result(
 
     The authoritative update path (PR #91 review, Major 1):
 
+    - the whole stored bundle (row + history + anchor) is validated FIRST, so
+      a tampered DB is refused before it can influence the update,
     - the snapshot must belong to this order (``client_order_id`` and every
       identity/request field must match the stored intent),
-    - the DB-stored previous snapshot -- not any in-memory copy -- is ALWAYS
-      used as the ``old`` side of ``validate_order_result_update``, so known
+    - the HISTORY-ANCHORED previous snapshot -- never an in-memory copy -- is
+      ALWAYS the ``old`` side of ``validate_order_result_update``, so known
       fills / quantities / broker IDs / timestamps can never be rolled back
       by a stale caller, even right after a process restart,
     - a caller-supplied ``previous_result`` is accepted only when it equals
-      the DB snapshot (guards the caller's own staleness assumptions),
+      the anchored snapshot (guards the caller's own staleness assumptions),
     - the transition is additionally validated against the CURRENT tracked
       state (which may be a state-only UNKNOWN recorded after the snapshot),
-    - the snapshot JSON, the current row and the history row commit in ONE
-      transaction; a DB-wide ``broker_order_id`` uniqueness conflict rolls
-      all of it back (:class:`ExecutionOrderConflictError`).
+    - ``broker_order_id`` follows NULL -> value once, then immutable; a full
+      snapshot must carry the known id itself (dropping it to NULL is
+      refused),
+    - the snapshot (current row AND history row), the state and the history
+      entry commit in ONE transaction; a DB-wide ``broker_order_id``
+      uniqueness conflict rolls all of it back
+      (:class:`ExecutionOrderConflictError`).
     """
     if not isinstance(result, OrderResult):
         raise ValueError(f"result must be an OrderResult, got {result!r}")
@@ -1038,8 +1248,8 @@ def record_order_result(
         raise ValueError(f"previous_result must be an OrderResult, got {previous_result!r}")
     _require_non_empty_str(reason, "reason")
     db_path = _existing_db_path(db_path, execution_request_id)
-    with _immediate_txn(db_path) as connection:
-        row = _load_row_for_update(connection, execution_request_id)
+    with _verified_txn(db_path) as connection:
+        row, history = _require_bundle_for_update(connection, execution_request_id)
 
         if result.client_order_id != row["client_order_id"]:
             raise ValueError(
@@ -1061,31 +1271,29 @@ def record_order_result(
                 f"request {execution_request_id!r}"
             )
 
-        db_snapshot = (
-            None
-            if row["last_order_result_json"] is None
-            else _result_from_json(row["last_order_result_json"])
-        )
+        db_snapshot = _anchored_snapshot(history)
         if previous_result is not None and previous_result != db_snapshot:
             raise ValueError(
-                "previous_result does not match the snapshot stored in the DB; refusing to "
-                "validate an update against a stale in-memory snapshot"
+                "previous_result does not match the snapshot anchored in the DB; refusing "
+                "to validate an update against a stale in-memory snapshot"
             )
         if db_snapshot is not None:
             validate_order_result_update(db_snapshot, result)
 
-        # A full snapshot must carry the known broker id itself: silently
-        # keeping the stored value would desynchronize row and snapshot.
+        # broker id: NULL -> value once, then immutable; a full snapshot must
+        # carry the known id itself (row and snapshot must stay in lockstep).
         if row["broker_order_id"] is not None and result.broker_order_id != row["broker_order_id"]:
             raise ValueError(
                 f"broker_order_id is immutable once set: "
                 f"{row['broker_order_id']!r} -> {result.broker_order_id!r} refused"
             )
-        effective_broker_id = _common_update_checks(
-            row,
-            new_state=result.state,
-            changed_at_utc=result.updated_at_utc,
-            broker_order_id=result.broker_order_id,
+        effective_broker_id = (
+            row["broker_order_id"] if result.broker_order_id is None else result.broker_order_id
+        )
+        if result.state in _STATES_REQUIRING_BROKER_ID and effective_broker_id is None:
+            raise ValueError(f"state {result.state.value!r} requires a broker_order_id")
+        _check_transition_and_time(
+            row, new_state=result.state, changed_at_utc=result.updated_at_utc
         )
         _apply_state_update(
             connection,
@@ -1102,12 +1310,16 @@ def record_order_result(
 # --- read helpers -----------------------------------------------------------
 # A missing DB file returns the empty/None default WITHOUT creating the file
 # (dry-run safe). An error on an EXISTING file propagates -- never masked as
-# "no data". Every returned order is re-validated (restore-time integrity).
+# "no data". Every read verifies the schema, scans for DB-wide broker-id
+# duplicates, and re-validates the bundle it restores.
 
 
 def get_execution_order(execution_request_id: str, *, db_path: Path | None = None) -> dict | None:
     db_path = Path(db_path) if db_path is not None else execution_db_path()
-    bundle = _read_bundle(db_path, execution_request_id)
+    if not db_path.exists():
+        return None
+    with _verified_read(db_path) as connection:
+        bundle = _fetch_and_validate(connection, execution_request_id)
     return None if bundle is None else bundle[0]
 
 
@@ -1151,7 +1363,8 @@ def load_order_result(
     execution_request_id: str, *, db_path: Path | None = None
 ) -> OrderResult | None:
     """Rebuild the latest full broker snapshot (None while none was recorded,
-    e.g. before the first broker response or after only state-only records)."""
+    e.g. before the first broker response or after only state-only records).
+    The bundle validation guarantees it equals the history-anchored snapshot."""
     row = get_execution_order(execution_request_id, db_path=db_path)
     if row is None or row["last_order_result_json"] is None:
         return None
@@ -1161,7 +1374,10 @@ def load_order_result(
 def get_state_history(execution_request_id: str, *, db_path: Path | None = None) -> list[dict]:
     """All state-history rows for one order, oldest first (validated)."""
     db_path = Path(db_path) if db_path is not None else execution_db_path()
-    bundle = _read_bundle(db_path, execution_request_id)
+    if not db_path.exists():
+        return []
+    with _verified_read(db_path) as connection:
+        bundle = _fetch_and_validate(connection, execution_request_id)
     return [] if bundle is None else bundle[1]
 
 
@@ -1176,7 +1392,8 @@ def list_unknown_orders(*, db_path: Path | None = None) -> list[dict]:
     db_path = Path(db_path) if db_path is not None else execution_db_path()
     if not db_path.exists():
         return []
-    with closing(_connect(db_path)) as connection:
+    rows = []
+    with _verified_read(db_path) as connection:
         ids = [
             row["execution_request_id"]
             for row in connection.execute(
@@ -1185,9 +1402,8 @@ def list_unknown_orders(*, db_path: Path | None = None) -> list[dict]:
                 (OrderState.UNKNOWN.value,),
             ).fetchall()
         ]
-    rows = []
-    for request_id in ids:
-        bundle = _read_bundle(db_path, request_id)
-        if bundle is not None:
-            rows.append(bundle[0])
+        for request_id in ids:
+            bundle = _fetch_and_validate(connection, request_id)
+            if bundle is not None:
+                rows.append(bundle[0])
     return rows

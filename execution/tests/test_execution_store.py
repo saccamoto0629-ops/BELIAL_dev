@@ -4,6 +4,7 @@ All DBs live under pytest's tmp_path. No network, no Discord, no S3, no
 sleep, no real orders anywhere in this suite.
 """
 
+import json
 import sqlite3
 import threading
 from contextlib import closing
@@ -660,6 +661,31 @@ def test_broker_order_id_cannot_be_replaced_or_dropped(db_path):
         "exec-1", OrderState.UNKNOWN, reason="query lost", changed_at_utc=at(3), db_path=db_path
     )
     assert row["broker_order_id"] == "B-1"
+    # ...and may confirm it, but never change it
+    row = store.record_order_state(
+        "exec-1",
+        OrderState.UNKNOWN,
+        reason="query lost again",
+        broker_order_id="B-1",
+        changed_at_utc=at(4),
+        db_path=db_path,
+    )
+    assert row["broker_order_id"] == "B-1"
+
+
+def test_state_only_update_cannot_introduce_a_broker_order_id(db_path):
+    # broker IDs are only learned from full OrderResult snapshots: a
+    # state-only UNKNOWN on an order that has none may not invent one.
+    submit(db_path)
+    with pytest.raises(ValueError, match="only confirm"):
+        store.record_order_state(
+            "exec-1",
+            OrderState.UNKNOWN,
+            reason="timeout",
+            broker_order_id="B-NEW",
+            changed_at_utc=at(2),
+            db_path=db_path,
+        )
 
 
 def test_broker_order_id_is_unique_across_orders_and_conflicts_roll_back_fully(db_path):
@@ -735,21 +761,22 @@ def test_unknown_order_id_raises_not_found(db_path):
 # --- atomicity of current-state update + history append ----------------------
 
 
-def test_state_update_and_history_append_are_atomic(db_path):
+def test_state_update_and_history_append_are_atomic(db_path, monkeypatch):
     submit_and_accept(db_path)
-    with closing(sqlite3.connect(db_path)) as connection:
-        connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} RENAME TO {store.HISTORY_TABLE}_gone")
-        connection.commit()
+    real_append = store._append_history
+
+    def failing_append(*args, **kwargs):
+        # the current-row UPDATE has already run inside this transaction;
+        # failing the history INSERT must roll everything back together
+        raise sqlite3.OperationalError("injected history failure")
+
+    monkeypatch.setattr(store, "_append_history", failing_append)
     filled = make_result(
         OrderState.FILLED, filled="10", fills=(fill("f-1", "10", 3),), updated_at=at(3)
     )
     with pytest.raises(sqlite3.OperationalError):
         store.record_order_result("exec-1", filled, reason="fill", db_path=db_path)
-    with closing(sqlite3.connect(db_path)) as connection:
-        connection.execute(
-            f"ALTER TABLE {store.HISTORY_TABLE}_gone RENAME TO {store.HISTORY_TABLE}"
-        )
-        connection.commit()
+    monkeypatch.setattr(store, "_append_history", real_append)
     # the failed history append rolled the current-state + snapshot update back too
     row = store.get_execution_order("exec-1", db_path=db_path)
     assert row["order_state"] == OrderState.ACCEPTED.value
@@ -757,6 +784,255 @@ def test_state_update_and_history_append_are_atomic(db_path):
     assert store.load_order_result("exec-1", db_path=db_path) == make_result(OrderState.ACCEPTED)
     states = [h["new_state"] for h in store.get_state_history("exec-1", db_path=db_path)]
     assert states == ["pending", "accepted"]
+
+
+# --- schema initial-state gate (PR #91 r2 Major 2) ---------------------------
+
+
+def test_init_db_rejects_a_version_only_db_without_touching_it(db_path):
+    # a DB with user_version set but zero objects is NOT pristine: it must
+    # not be silently initialized as a fresh DB.
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_init_db_rejects_a_metadata_only_db(db_path):
+    # only sqlite metadata (sqlite_sequence) left behind -- e.g. a half-wiped
+    # DB -- is not pristine either.
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE seed (id INTEGER PRIMARY KEY AUTOINCREMENT, x TEXT)")
+        connection.execute("INSERT INTO seed (x) VALUES ('y')")
+        connection.execute("DROP TABLE seed")
+        connection.commit()
+        leftovers = [
+            row[0] for row in connection.execute("SELECT name FROM sqlite_master").fetchall()
+        ]
+    assert leftovers == ["sqlite_sequence"]  # precondition for this scenario
+    before = schema_dump(db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+    assert schema_dump(db_path) == before
+
+
+def test_null_execution_request_id_is_rejected_by_the_schema(db_path):
+    store.init_db(db_path)
+    insert_sql = (
+        f"INSERT INTO {store.ORDERS_TABLE} ({', '.join(store._ORDER_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in store._ORDER_COLUMNS)})"
+    )
+    values = {
+        "execution_request_id": None,
+        "signal_id": "sig",
+        "strategy_id": "strat",
+        "symbol": "XAUUSD",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "10",
+        "requested_price": "2400",
+        "stop_loss_price": None,
+        "take_profit_price": None,
+        "requested_at_utc": T0.isoformat(),
+        "client_order_id": "c-null",
+        "submission_phase": "created",
+        "order_state": None,
+        "broker_order_id": None,
+        "last_state_reason": None,
+        "last_order_result_json": None,
+        "created_at_utc": T0.isoformat(),
+        "updated_at_utc": T0.isoformat(),
+    }
+    with closing(sqlite3.connect(db_path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(insert_sql, tuple(values[c] for c in store._ORDER_COLUMNS))
+
+
+def test_index_replaced_with_a_different_definition_is_rejected(db_path):
+    store.init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(f"DROP INDEX {store._ORDERS_STATE_INDEX}")
+        connection.execute(
+            f"CREATE INDEX {store._ORDERS_STATE_INDEX} ON {store.ORDERS_TABLE} (symbol)"
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+
+
+# --- read APIs verify the schema too (PR #91 r2 Major 3) ----------------------
+
+
+def test_reads_refuse_a_constraint_less_schema(db_path):
+    # a lookalike schema without constraints may hold data the real schema
+    # forbids (e.g. duplicate broker ids); reads must refuse it up front.
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"CREATE TABLE {store.ORDERS_TABLE} "
+            f"({', '.join(f'{c} TEXT' for c in store._ORDER_COLUMNS)})"
+        )
+        connection.execute(
+            f"CREATE TABLE {store.HISTORY_TABLE} "
+            f"({', '.join(f'{c} TEXT' for c in store._HISTORY_COLUMNS)})"
+        )
+        for request_id, broker_id in (("exec-1", "B-SAME"), ("exec-2", "B-SAME")):
+            connection.execute(
+                f"INSERT INTO {store.ORDERS_TABLE} (execution_request_id, broker_order_id) "
+                "VALUES (?, ?)",
+                (request_id, broker_id),
+            )
+        connection.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.get_execution_order("exec-1", db_path=db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.list_unknown_orders(db_path=db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.get_state_history("exec-1", db_path=db_path)
+
+
+def test_duplicate_broker_ids_are_rejected_by_the_restore_scan():
+    # unit-level check of the DB-wide duplicate scan itself (a well-formed
+    # schema cannot even hold duplicates, so the scan is exercised directly).
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.execute(
+            f"CREATE TABLE {store.ORDERS_TABLE} (execution_request_id TEXT, broker_order_id TEXT)"
+        )
+        for request_id, broker_id in (
+            ("exec-1", "B-SAME"),
+            ("exec-2", "B-SAME"),
+            ("exec-3", None),
+            ("exec-4", None),
+        ):
+            connection.execute(
+                f"INSERT INTO {store.ORDERS_TABLE} VALUES (?, ?)", (request_id, broker_id)
+            )
+        with pytest.raises(store.ExecutionIntegrityError, match="B-SAME"):
+            store._assert_no_duplicate_broker_ids(connection)
+        # NULLs are not duplicates of each other
+        connection.execute(
+            f"DELETE FROM {store.ORDERS_TABLE} WHERE execution_request_id = 'exec-2'"
+        )
+        store._assert_no_duplicate_broker_ids(connection)
+
+
+# --- history-anchored snapshots (PR #91 r2 Major 1) ---------------------------
+
+
+def _swap_current_row(db_path, set_sql, params=()):
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"UPDATE {store.ORDERS_TABLE} SET {set_sql} WHERE execution_request_id = 'exec-1'",
+            params,
+        )
+        connection.commit()
+
+
+def accepted_then_partial_then_unknown(db_path):
+    """ACCEPTED -> PARTIALLY_FILLED(f-1) -> state-only UNKNOWN; returns the
+    stale ACCEPTED snapshot JSON as an attacker would replay it."""
+    submit_and_accept(db_path)
+    accepted_json = store.get_execution_order("exec-1", db_path=db_path)["last_order_result_json"]
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
+    )
+    store.record_order_result("exec-1", partial, reason="partial", db_path=db_path)
+    store.record_order_state(
+        "exec-1", OrderState.UNKNOWN, reason="query timed out", changed_at_utc=at(4), db_path=db_path
+    )
+    return accepted_json
+
+
+def test_swapping_the_current_snapshot_back_is_detected_even_while_unknown(db_path):
+    # THE r2 Major 1 scenario: history holds ...PARTIALLY_FILLED(f-1)->UNKNOWN
+    # but the current row's snapshot is swapped back to the stale ACCEPTED.
+    # UNKNOWN is not an escape hatch: the anchor comparison must fail.
+    accepted_json = accepted_then_partial_then_unknown(db_path)
+    _swap_current_row(db_path, "last_order_result_json = ?", (accepted_json,))
+    with pytest.raises(store.ExecutionIntegrityError, match="anchored"):
+        store.get_execution_order("exec-1", db_path=db_path)
+    # and the fill-losing resolution the swap was meant to enable is refused
+    # too, because writes validate the bundle before using any snapshot
+    rejected = make_result(OrderState.REJECTED, reject_reason="never placed", updated_at=at(5))
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.record_order_result("exec-1", rejected, reason="resolved", db_path=db_path)
+
+
+def test_tampering_the_current_broker_id_is_detected(db_path):
+    submit_and_accept(db_path)
+    _swap_current_row(db_path, "broker_order_id = 'B-EVIL'")
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_execution_order("exec-1", db_path=db_path)
+
+
+def test_tampering_a_history_snapshot_is_detected(db_path):
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"UPDATE {store.HISTORY_TABLE} SET order_result_json = "
+            "replace(order_result_json, '\"filled_quantity\": \"0\"', "
+            "'\"filled_quantity\": \"5\"') WHERE new_state = 'accepted'"
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_state_history("exec-1", db_path=db_path)
+
+
+def test_stripping_a_snapshot_from_a_confirmed_history_row_is_detected(db_path):
+    # only the initial pending entry and state-only UNKNOWN rows may lack a
+    # snapshot; a confirmed observation without one is corruption.
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"UPDATE {store.HISTORY_TABLE} SET order_result_json = NULL "
+            "WHERE new_state = 'accepted'"
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_execution_order("exec-1", db_path=db_path)
+
+
+def test_snapshot_json_with_unknown_fields_is_rejected(db_path):
+    # PR #91 r2 Minor 1: strict key sets, top-level and per-fill.
+    submit_and_accept(db_path)
+    row = store.get_execution_order("exec-1", db_path=db_path)
+    tampered = json.loads(row["last_order_result_json"])
+    tampered["surprise"] = True
+    tampered_json = json.dumps(tampered, sort_keys=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        # keep the anchor consistent: tamper BOTH copies identically, so only
+        # the strict key validation can catch it
+        connection.execute(
+            f"UPDATE {store.ORDERS_TABLE} SET last_order_result_json = ? "
+            "WHERE execution_request_id = 'exec-1'",
+            (tampered_json,),
+        )
+        connection.execute(
+            f"UPDATE {store.HISTORY_TABLE} SET order_result_json = ? "
+            "WHERE new_state = 'accepted'",
+            (tampered_json,),
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError, match="snapshot"):
+        store.get_execution_order("exec-1", db_path=db_path)
+
+
+def test_snapshot_fill_with_unknown_fields_is_rejected():
+    base = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
+    )
+    data = json.loads(store._result_to_json(base))
+    data["fills"][0]["note"] = "extra"
+    with pytest.raises(ValueError, match="fill keys"):
+        store._result_from_json(json.dumps(data, sort_keys=True))
+    data = json.loads(store._result_to_json(base))
+    del data["fills"][0]["price"]
+    with pytest.raises(ValueError, match="fill keys"):
+        store._result_from_json(json.dumps(data, sort_keys=True))
 
 
 # --- restore-time integrity validation (PR #91 Major 2) ----------------------

@@ -12,7 +12,7 @@ from execution import execution_store
 | ファイル | 内容 |
 |---|---|
 | `execution_models.py` | `ExecutionRequest`(immutable dataclass + `Decimal` + UTC): BELIAL 内部の発注意図。`to_order_request()` で `broker.OrderRequest` へ変換する唯一の経路 |
-| `execution_store.py` | SQLite 永続化(`execution_orders` + `execution_order_state_history`): 送信フェーズ(created / submitting / submitted)、Broker 注文状態、**最新の完全な OrderResult snapshot(JSON)**、状態変更理由、broker_order_id(**DB 全体で UNIQUE**)、UNKNOWN 照会対象の抽出。current・snapshot・履歴は同一トランザクションで更新し、更新は DB 上の snapshot を old とした `validate_order_result_update()` で常時検証する。schema は完全構造検証(不一致は DB 無変更で失敗)、復元時も chain / enum / UTC / snapshot 整合を再検証 |
+| `execution_store.py` | SQLite 永続化(`execution_orders` + `execution_order_state_history`): 送信フェーズ(created / submitting / submitted)、Broker 注文状態、**最新の完全な OrderResult snapshot(JSON。history 行へ anchor)**、状態変更理由、broker_order_id(**DB 全体で UNIQUE**)、UNKNOWN 照会対象の抽出。current・snapshot・履歴は同一トランザクションで更新し、更新は **history に anchor された snapshot** を old とした `validate_order_result_update()` で常時検証する。全 read / write 経路が「open → schema 完全構造検証 → トランザクション → restore / update」で動作し(不一致は DB 無変更で失敗)、復元時も chain / enum / UTC / snapshot anchor / broker_order_id 重複を再検証 |
 | `tests/` | `python -m pytest execution/tests -q`(`tmp_path` 配下の SQLite のみ。外部通信・Discord・S3・sleep・実注文なし) |
 
 ## 位置づけ(誤解しないこと)
