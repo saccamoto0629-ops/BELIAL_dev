@@ -3,15 +3,18 @@
 Same approach as ``test_systemd_units.py`` (whose parser helpers are reused):
 parse ``scripts/systemd/berial-png-cleanup.{service,timer}`` as plain text and
 pin the properties the Issue's acceptance depends on -- oneshot service run by
-an explicit user, journal logging, sandbox that only allows writing the chart
-image directory (and private /tmp), a lock file that is shared with manual
-runs (NOT under /tmp, because ``PrivateTmp=true`` would make a /tmp lock
-useless for mutual exclusion), and a daily persistent Asia/Tokyo timer.
-Live-systemd checks (``systemd-analyze verify``, enable/trigger) stay manual
-steps in docs/operations/png_cleanup.md.
+an explicit user, journal logging, a sandbox that only allows writing the
+chart image directory and /tmp (with "-" on the chart directory so a missing
+target stays a runtime WARNING instead of a namespace failure), a lock file
+shared with manual CLI runs (the script's /tmp default, which requires that
+PrivateTmp is NOT enabled -- a private /tmp would defeat the mutual
+exclusion), and a daily persistent Asia/Tokyo timer. Live-systemd checks
+(``systemd-analyze verify``, enable/trigger) stay manual steps in
+docs/operations/png_cleanup.md.
 """
 
 import pathlib
+import re
 
 from test_systemd_units import _parse_unit, _single, _values
 
@@ -66,28 +69,38 @@ def test_service_sandbox_limits_writes_to_chart_images_and_tmp():
     assert _single(sections, "Service", "ProtectSystem") == "strict"
     assert _single(sections, "Service", "ProtectHome").lower() == "true"
     assert _single(sections, "Service", "NoNewPrivileges").lower() == "true"
-    write_paths = _single(sections, "Service", "ReadWritePaths").split()
-    assert set(write_paths) <= {"/opt/berial/market-watch/data/chart_images", "/tmp"}
+    raw_paths = _single(sections, "Service", "ReadWritePaths").split()
+    assert {path.lstrip("-") for path in raw_paths} <= {
+        "/opt/berial/market-watch/data/chart_images",
+        "/tmp",
+    }
+    # "-" keeps a missing chart_images directory from failing namespace setup,
+    # so the script can report the missing target as a WARNING and exit 0
+    # (Issue #67) instead of never starting.
+    assert "-/opt/berial/market-watch/data/chart_images" in raw_paths
 
 
 def test_service_targets_are_inside_the_writable_sandbox():
     sections = _parse_unit(SERVICE_FILE)
-    write_paths = _single(sections, "Service", "ReadWritePaths").split()
+    write_paths = [path.lstrip("-") for path in _single(sections, "Service", "ReadWritePaths").split()]
     for target in _env_value(sections, "PNG_CLEANUP_TARGETS").split(":"):
         assert target in write_paths, f"target {target} must be in ReadWritePaths"
 
 
-def test_service_lock_file_is_shared_and_not_under_private_tmp():
+def test_service_lock_is_the_cli_default_and_tmp_is_not_private():
     sections = _parse_unit(SERVICE_FILE)
-    assert _single(sections, "Service", "PrivateTmp").lower() == "true"
     lock_file = _env_value(sections, "PNG_CLEANUP_LOCK_FILE")
-    # With PrivateTmp=true a /tmp lock can never exclude a concurrent manual
-    # run, so the lock must live in a shared writable directory -- and it must
-    # not look like a cleanup candidate itself.
-    assert not lock_file.startswith("/tmp/")
+    # Manual CLI runs and the timer must contend on the SAME flock, so the
+    # service pins the script's default lock path...
+    source = (REPO_ROOT / "scripts" / "cleanup_png.py").read_text(encoding="utf-8")
+    match = re.search(r'^DEFAULT_LOCK_FILE = "([^"]+)"$', source, re.MULTILINE)
+    assert match, "cleanup_png.py must define DEFAULT_LOCK_FILE"
+    assert lock_file == match.group(1)
     assert not lock_file.endswith(".png")
-    write_paths = _single(sections, "Service", "ReadWritePaths").split()
-    assert any(lock_file.startswith(path + "/") for path in write_paths)
+    # ...and must not remap /tmp into a private namespace, which would give
+    # the service its own lock file and defeat the mutual exclusion.
+    for value in _values(sections, "Service", "PrivateTmp"):
+        assert value.lower() != "true", "PrivateTmp would namespace the /tmp lock away from manual runs"
 
 
 def test_timer_fires_daily_0320_tokyo_and_is_persistent():
