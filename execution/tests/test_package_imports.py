@@ -61,7 +61,7 @@ def test_paper_and_observation_layers_never_import_the_execution_package():
 def test_execution_package_only_depends_on_stdlib_and_broker():
     allowed = {
         "annotations", "ast", "contextlib", "dataclasses", "datetime", "decimal",
-        "enum", "os", "pathlib", "sqlite3", "broker", "execution", "__future__",
+        "enum", "json", "os", "pathlib", "sqlite3", "broker", "execution", "__future__",
     }
     for path in (REPO_ROOT / "execution").glob("*.py"):
         names = _imported_top_level_names(path)

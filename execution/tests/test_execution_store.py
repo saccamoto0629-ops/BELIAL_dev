@@ -1,10 +1,11 @@
-"""Issue #74: SQLite persistence for execution requests and order state.
+"""Issue #74 / PR #91 review: SQLite persistence for execution requests and order state.
 
 All DBs live under pytest's tmp_path. No network, no Discord, no S3, no
 sleep, no real orders anywhere in this suite.
 """
 
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -40,6 +41,39 @@ def make_request(request_id="exec-1", **overrides):
     return ExecutionRequest(**kwargs)
 
 
+def fill(fill_id, quantity, seconds):
+    return Fill(
+        fill_id=fill_id,
+        price=Decimal("2400.00"),
+        quantity=Decimal(quantity),
+        filled_at_utc=at(seconds),
+    )
+
+
+def make_result(state, request_id="exec-1", *, broker_order_id="B-1", filled="0",
+                fills=(), updated_at=None, reject_reason=None, **overrides):
+    fills = tuple(fills)
+    filled_quantity = Decimal(filled)
+    kwargs = dict(
+        client_order_id=f"client-{request_id}",
+        broker_order_id=broker_order_id,
+        state=state,
+        symbol="XAUUSD",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        requested_quantity=Decimal("10"),
+        filled_quantity=filled_quantity,
+        remaining_quantity=Decimal("10") - filled_quantity,
+        requested_price=Decimal("2400.00"),
+        average_fill_price=Decimal("2400.00") if fills else None,
+        updated_at_utc=updated_at or at(2),
+        fills=fills,
+        reject_reason=reject_reason,
+    )
+    kwargs.update(overrides)
+    return OrderResult(**kwargs)
+
+
 @pytest.fixture
 def db_path(tmp_path):
     return tmp_path / "execution_orders.sqlite3"
@@ -55,20 +89,32 @@ def create_order(db_path, request_id="exec-1", client_order_id=None, **overrides
     )
 
 
-def submit_and_accept(db_path, request_id="exec-1", broker_order_id="B-1"):
+def submit(db_path, request_id="exec-1"):
     create_order(db_path, request_id)
-    store.mark_submitting(request_id, reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
-    return store.record_order_state(
+    return store.mark_submitting(
+        request_id, reason="submit attempt", changed_at_utc=at(1), db_path=db_path
+    )
+
+
+def submit_and_accept(db_path, request_id="exec-1", broker_order_id="B-1"):
+    submit(db_path, request_id)
+    return store.record_order_result(
         request_id,
-        OrderState.ACCEPTED,
+        make_result(OrderState.ACCEPTED, request_id, broker_order_id=broker_order_id),
         reason="broker accepted",
-        broker_order_id=broker_order_id,
-        changed_at_utc=at(2),
         db_path=db_path,
     )
 
 
-# --- schema init / idempotency ----------------------------------------------
+def schema_dump(db_path):
+    with closing(sqlite3.connect(db_path)) as connection:
+        return sorted(
+            (row[0], row[1], row[2])
+            for row in connection.execute("SELECT type, name, sql FROM sqlite_master")
+        )
+
+
+# --- schema init / full verification (PR #91 Major 2) ------------------------
 
 
 def test_init_db_is_idempotent_and_stamps_the_schema_version(db_path):
@@ -90,12 +136,121 @@ def test_init_db_after_writes_keeps_existing_rows(db_path):
     assert store.get_execution_order("exec-1", db_path=db_path) is not None
 
 
-def test_init_db_rejects_an_existing_table_with_missing_columns(db_path):
+def test_init_db_rejects_a_constraint_less_lookalike_schema_without_touching_it(db_path):
+    # same table/column names, but no CHECK / UNIQUE / FK / NOT NULL constraints
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"CREATE TABLE {store.ORDERS_TABLE} "
+            f"({', '.join(f'{c} TEXT' for c in store._ORDER_COLUMNS)})"
+        )
+        connection.execute(
+            f"CREATE TABLE {store.HISTORY_TABLE} "
+            f"({', '.join(f'{c} TEXT' for c in store._HISTORY_COLUMNS)})"
+        )
+        connection.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+        connection.commit()
+    before = schema_dump(db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+    assert schema_dump(db_path) == before  # schema mismatch never modifies the DB
+
+
+def test_init_db_rejects_a_partial_schema_and_does_not_autocomplete_it(db_path):
+    store.init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(f"DROP TABLE {store.HISTORY_TABLE}")
+        connection.commit()
+    before = schema_dump(db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+    assert schema_dump(db_path) == before  # the missing table is NOT silently recreated
+
+
+def test_init_db_rejects_a_missing_columns_table(db_path):
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(f"CREATE TABLE {store.ORDERS_TABLE} (execution_request_id TEXT)")
         connection.commit()
     with pytest.raises(store.ExecutionSchemaError):
         store.init_db(db_path)
+
+
+def test_init_db_refuses_to_create_the_schema_inside_a_foreign_db(db_path):
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE candles (ts TEXT)")
+        connection.commit()
+    before = schema_dump(db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+    assert schema_dump(db_path) == before
+
+
+def test_init_db_rejects_an_unexpected_extra_table_next_to_ours(db_path):
+    store.init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE stray (x TEXT)")
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+
+
+def test_init_db_rejects_a_wrong_schema_version(db_path):
+    store.init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("PRAGMA user_version = 99")
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+
+
+def test_db_check_constraints_actually_fire(db_path):
+    # second guard under the application-level validation: empty IDs, bad
+    # enums, non-UTC timestamps and broker-id-less ACCEPTED are rejected by
+    # the DB itself even when inserted out-of-band.
+    store.init_db(db_path)
+    insert_sql = (
+        f"INSERT INTO {store.ORDERS_TABLE} ({', '.join(store._ORDER_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in store._ORDER_COLUMNS)})"
+    )
+
+    def row(**overrides):
+        record = {
+            "execution_request_id": "x-1",
+            "signal_id": "sig",
+            "strategy_id": "strat",
+            "symbol": "XAUUSD",
+            "side": "buy",
+            "order_type": "limit",
+            "quantity": "10",
+            "requested_price": "2400",
+            "stop_loss_price": None,
+            "take_profit_price": None,
+            "requested_at_utc": T0.isoformat(),
+            "client_order_id": "c-x-1",
+            "submission_phase": "created",
+            "order_state": None,
+            "broker_order_id": None,
+            "last_state_reason": None,
+            "last_order_result_json": None,
+            "created_at_utc": T0.isoformat(),
+            "updated_at_utc": T0.isoformat(),
+        }
+        record.update(overrides)
+        return tuple(record[c] for c in store._ORDER_COLUMNS)
+
+    bad_rows = [
+        row(execution_request_id="  "),                       # empty ID
+        row(side="long"),                                     # bad enum
+        row(requested_at_utc="2026-07-20T12:00:00"),          # not UTC-suffixed
+        row(order_type="market", requested_price="2400"),     # MARKET x price
+        row(order_type="limit", requested_price=None),        # LIMIT without price
+        row(submission_phase="created", order_state="pending"),          # phase x state
+        row(submission_phase="submitted", order_state="accepted",
+            last_state_reason="r"),                           # accepted without broker id
+    ]
+    with closing(sqlite3.connect(db_path)) as connection:
+        for bad in bad_rows:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(insert_sql, bad)
 
 
 # --- initial record save / restore ------------------------------------------
@@ -108,12 +263,14 @@ def test_created_order_round_trips_request_and_metadata(db_path):
     assert row["client_order_id"] == "client-exec-1"
     assert row["broker_order_id"] is None
     assert row["last_state_reason"] is None
+    assert row["last_order_result_json"] is None
     assert row["created_at_utc"] == row["updated_at_utc"] == T0.isoformat()
 
     restored = store.load_execution_request("exec-1", db_path=db_path)
     assert restored == make_request()
     assert isinstance(restored.quantity, Decimal)
     assert restored.requested_at_utc.tzinfo is not None
+    assert store.load_order_result("exec-1", db_path=db_path) is None
 
 
 def test_duplicate_execution_request_id_is_a_conflict(db_path):
@@ -132,10 +289,7 @@ def test_duplicate_client_order_id_is_a_conflict(db_path):
 
 
 def test_mark_submitting_starts_broker_state_tracking_at_pending(db_path):
-    create_order(db_path)
-    row = store.mark_submitting(
-        "exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path
-    )
+    row = submit(db_path)
     assert row["submission_phase"] == store.PHASE_SUBMITTING
     assert row["order_state"] == OrderState.PENDING.value
     assert row["last_state_reason"] == "submit attempt"
@@ -147,94 +301,214 @@ def test_mark_submitting_starts_broker_state_tracking_at_pending(db_path):
 
 
 def test_mark_submitting_is_entered_exactly_once(db_path):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
+    submit(db_path)
     with pytest.raises(ValueError):
         store.mark_submitting("exec-1", reason="again", changed_at_utc=at(2), db_path=db_path)
 
 
-def test_record_order_state_requires_a_submit_attempt_first(db_path):
+def test_two_racing_connections_yield_exactly_one_successful_update(db_path):
+    # PR #91 review: two connections racing for the same created -> submitting
+    # transition are serialized by BEGIN IMMEDIATE; exactly one wins.
+    create_order(db_path)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def attempt(worker):
+        barrier.wait()
+        try:
+            store.mark_submitting(
+                "exec-1", reason=f"submit by {worker}", changed_at_utc=at(1), db_path=db_path
+            )
+            outcomes.append(("ok", worker))
+        except ValueError:
+            outcomes.append(("lost", worker))
+
+    threads = [threading.Thread(target=attempt, args=(w,)) for w in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(o[0] for o in outcomes) == ["lost", "ok"]
+    assert len(store.get_state_history("exec-1", db_path=db_path)) == 1
+
+
+def test_record_apis_require_a_submit_attempt_first(db_path):
     create_order(db_path)
     with pytest.raises(ValueError):
         store.record_order_state(
-            "exec-1",
-            OrderState.ACCEPTED,
-            reason="broker accepted",
-            broker_order_id="B-1",
-            changed_at_utc=at(1),
-            db_path=db_path,
+            "exec-1", OrderState.UNKNOWN, reason="lost", changed_at_utc=at(1), db_path=db_path
+        )
+    with pytest.raises(ValueError):
+        store.record_order_result(
+            "exec-1", make_result(OrderState.ACCEPTED), reason="accepted", db_path=db_path
         )
 
 
-# --- broker-side observations -----------------------------------------------
+# --- state-only API restriction (PR #91 Major 1) ------------------------------
 
 
-def test_accepted_observation_is_stored_with_broker_order_id(db_path):
-    row = submit_and_accept(db_path)
-    assert row["order_state"] == OrderState.ACCEPTED.value
-    assert row["broker_order_id"] == "B-1"
-    assert row["submission_phase"] == store.PHASE_SUBMITTED
-    assert row["last_state_reason"] == "broker accepted"
-
-
-def test_accepted_requires_a_broker_order_id(db_path):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(
+    "state",
+    [s for s in OrderState if s is not OrderState.UNKNOWN],
+)
+def test_record_order_state_is_restricted_to_unknown(db_path, state):
+    submit(db_path)
+    with pytest.raises(ValueError, match="record_order_result"):
         store.record_order_state(
             "exec-1",
-            OrderState.ACCEPTED,
-            reason="broker accepted",
+            state,
+            reason="state only",
+            broker_order_id="B-1",
             changed_at_utc=at(2),
             db_path=db_path,
         )
 
 
+# --- broker-side observations (full snapshots) --------------------------------
+
+
+def test_accepted_observation_is_stored_with_broker_order_id_and_snapshot(db_path):
+    row = submit_and_accept(db_path)
+    assert row["order_state"] == OrderState.ACCEPTED.value
+    assert row["broker_order_id"] == "B-1"
+    assert row["submission_phase"] == store.PHASE_SUBMITTED
+    assert row["last_state_reason"] == "broker accepted"
+    snapshot = store.load_order_result("exec-1", db_path=db_path)
+    assert snapshot == make_result(OrderState.ACCEPTED)
+
+
 def test_accepted_to_partially_filled_to_filled(db_path):
     submit_and_accept(db_path)
-    row = store.record_order_state(
-        "exec-1",
-        OrderState.PARTIALLY_FILLED,
-        reason="partial fill 3/10",
-        changed_at_utc=at(3),
-        db_path=db_path,
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
     )
+    row = store.record_order_result("exec-1", partial, reason="partial fill 3/10", db_path=db_path)
     assert row["order_state"] == OrderState.PARTIALLY_FILLED.value
-    row = store.record_order_state(
-        "exec-1", OrderState.FILLED, reason="fully filled", changed_at_utc=at(4), db_path=db_path
+    full = make_result(
+        OrderState.FILLED,
+        filled="10",
+        fills=(fill("f-1", "3", 3), fill("f-2", "7", 4)),
+        updated_at=at(4),
     )
+    row = store.record_order_result("exec-1", full, reason="fully filled", db_path=db_path)
     assert row["order_state"] == OrderState.FILLED.value
     states = [h["new_state"] for h in store.get_state_history("exec-1", db_path=db_path)]
     assert states == ["pending", "accepted", "partially_filled", "filled"]
+    snapshot = store.load_order_result("exec-1", db_path=db_path)
+    assert [f.fill_id for f in snapshot.fills] == ["f-1", "f-2"]
 
 
 def test_accepted_to_rejected(db_path):
     submit_and_accept(db_path)
-    row = store.record_order_state(
-        "exec-1",
-        OrderState.REJECTED,
-        reason="rejected by broker",
-        changed_at_utc=at(3),
-        db_path=db_path,
+    result = make_result(
+        OrderState.REJECTED, reject_reason="insufficient margin", updated_at=at(3)
     )
+    row = store.record_order_result("exec-1", result, reason="rejected by broker", db_path=db_path)
     assert row["order_state"] == OrderState.REJECTED.value
     assert row["last_state_reason"] == "rejected by broker"
+    assert store.load_order_result("exec-1", db_path=db_path).reject_reason == "insufficient margin"
 
 
 def test_accepted_to_cancelled(db_path):
     submit_and_accept(db_path)
-    row = store.record_order_state(
-        "exec-1", OrderState.CANCELLED, reason="cancelled", changed_at_utc=at(3), db_path=db_path
-    )
+    result = make_result(OrderState.CANCELLED, updated_at=at(3))
+    row = store.record_order_result("exec-1", result, reason="cancelled", db_path=db_path)
     assert row["order_state"] == OrderState.CANCELLED.value
+
+
+def test_result_for_another_client_order_is_rejected(db_path):
+    submit(db_path)
+    alien = make_result(OrderState.ACCEPTED, client_order_id="client-someone-else")
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", alien, reason="accepted", db_path=db_path)
+
+
+def test_result_with_mismatching_request_identity_is_rejected(db_path):
+    submit(db_path)
+    wrong_symbol = make_result(OrderState.ACCEPTED, symbol="EURUSD")
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", wrong_symbol, reason="accepted", db_path=db_path)
+    wrong_quantity = make_result(
+        OrderState.ACCEPTED, requested_quantity=Decimal("5"), remaining_quantity=Decimal("5")
+    )
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", wrong_quantity, reason="accepted", db_path=db_path)
+
+
+# --- stale-snapshot protection (PR #91 Major 1) -------------------------------
+
+
+def test_stale_snapshot_cannot_erase_a_known_fill(db_path):
+    # ACCEPTED -> PARTIALLY_FILLED(f-1) -> a caller holding the stale ACCEPTED
+    # snapshot submits PARTIALLY_FILLED carrying only f-2: the DB snapshot is
+    # the old side of validate_order_result_update, so f-1 cannot vanish.
+    submit_and_accept(db_path)
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
+    )
+    store.record_order_result("exec-1", partial, reason="partial", db_path=db_path)
+    stale_view = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-2", "3", 4),), updated_at=at(4)
+    )
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", stale_view, reason="poll", db_path=db_path)
+    snapshot = store.load_order_result("exec-1", db_path=db_path)
+    assert [f.fill_id for f in snapshot.fills] == ["f-1"]
+
+
+def test_previous_result_must_match_the_db_snapshot(db_path):
+    stale_accepted = make_result(OrderState.ACCEPTED)
+    submit_and_accept(db_path)
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
+    )
+    store.record_order_result("exec-1", partial, reason="partial", db_path=db_path)
+    # consistent continuation, but validated against a STALE previous_result
+    grown = make_result(
+        OrderState.PARTIALLY_FILLED,
+        filled="6",
+        fills=(fill("f-1", "3", 3), fill("f-2", "3", 4)),
+        updated_at=at(4),
+    )
+    with pytest.raises(ValueError, match="previous_result"):
+        store.record_order_result(
+            "exec-1", grown, reason="poll", previous_result=stale_accepted, db_path=db_path
+        )
+    # the matching DB snapshot is accepted
+    row = store.record_order_result(
+        "exec-1", grown, reason="poll", previous_result=partial, db_path=db_path
+    )
+    assert row["order_state"] == OrderState.PARTIALLY_FILLED.value
+
+
+def test_update_validation_still_works_after_a_restart(db_path):
+    # every store call opens a fresh connection, so this IS the restart case:
+    # the old snapshot comes from the DB, not from any in-memory state.
+    submit_and_accept(db_path)
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
+    )
+    store.record_order_result("exec-1", partial, reason="partial", db_path=db_path)
+    fill_less_filled = make_result(OrderState.FILLED, filled="10", fills=(fill("f-9", "10", 5),),
+                                   updated_at=at(5))
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", fill_less_filled, reason="poll", db_path=db_path)
+    # the legal continuation still lands
+    proper = make_result(
+        OrderState.FILLED,
+        filled="10",
+        fills=(fill("f-1", "3", 3), fill("f-2", "7", 5)),
+        updated_at=at(5),
+    )
+    row = store.record_order_result("exec-1", proper, reason="filled", db_path=db_path)
+    assert row["order_state"] == OrderState.FILLED.value
 
 
 # --- UNKNOWN handling --------------------------------------------------------
 
 
 def test_unconfirmed_submit_outcome_is_stored_as_unknown(db_path):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
+    submit(db_path)
     row = store.record_order_state(
         "exec-1",
         OrderState.UNKNOWN,
@@ -249,8 +523,7 @@ def test_unconfirmed_submit_outcome_is_stored_as_unknown(db_path):
 
 def test_list_unknown_orders_returns_exactly_the_query_targets(db_path):
     # exec-1 UNKNOWN, exec-2 ACCEPTED, exec-3 still created
-    create_order(db_path, "exec-1")
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
+    submit(db_path, "exec-1")
     store.record_order_state(
         "exec-1", OrderState.UNKNOWN, reason="timeout", changed_at_utc=at(2), db_path=db_path
     )
@@ -264,33 +537,52 @@ def test_list_unknown_orders_returns_exactly_the_query_targets(db_path):
 
 
 @pytest.mark.parametrize(
-    "target,broker_order_id",
+    "target,extra",
     [
-        (OrderState.ACCEPTED, "B-1"),
-        (OrderState.PARTIALLY_FILLED, "B-1"),
-        (OrderState.FILLED, "B-1"),
-        (OrderState.CANCELLED, None),
-        (OrderState.REJECTED, None),
+        (OrderState.ACCEPTED, {}),
+        (OrderState.PARTIALLY_FILLED, {"filled": "3", "fills": (fill("f-1", "3", 3),)}),
+        (OrderState.FILLED, {"filled": "10", "fills": (fill("f-1", "10", 3),)}),
+        (OrderState.CANCELLED, {}),
+        (OrderState.REJECTED, {"reject_reason": "rejected"}),
     ],
 )
-def test_unknown_resolves_to_any_allowed_concrete_state(db_path, target, broker_order_id):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
+def test_unknown_resolves_to_any_allowed_concrete_state(db_path, target, extra):
+    submit(db_path)
     store.record_order_state(
         "exec-1", OrderState.UNKNOWN, reason="timeout", changed_at_utc=at(2), db_path=db_path
     )
-    row = store.record_order_state(
-        "exec-1",
-        target,
-        reason="resolved by query",
-        broker_order_id=broker_order_id,
-        changed_at_utc=at(3),
-        db_path=db_path,
-    )
+    result = make_result(target, updated_at=at(3), **extra)
+    row = store.record_order_result("exec-1", result, reason="resolved by query", db_path=db_path)
     assert row["order_state"] == target.value
     assert row["execution_request_id"] not in [
         r["execution_request_id"] for r in store.list_unknown_orders(db_path=db_path)
     ]
+
+
+def test_unknown_resolution_cannot_lose_known_fills(db_path):
+    # fills observed before the outcome was lost keep guarding the resolution:
+    # the snapshot survives the state-only UNKNOWN, so a resolution to a
+    # fill-less CANCELLED or to REJECTED is refused.
+    submit_and_accept(db_path)
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
+    )
+    store.record_order_result("exec-1", partial, reason="partial", db_path=db_path)
+    store.record_order_state(
+        "exec-1", OrderState.UNKNOWN, reason="query timed out", changed_at_utc=at(4), db_path=db_path
+    )
+    fill_less_cancel = make_result(OrderState.CANCELLED, updated_at=at(5))
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", fill_less_cancel, reason="resolved", db_path=db_path)
+    rejected = make_result(OrderState.REJECTED, reject_reason="never placed", updated_at=at(5))
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", rejected, reason="resolved", db_path=db_path)
+    # a resolution that keeps the known fill is accepted
+    proper = make_result(
+        OrderState.CANCELLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(5)
+    )
+    row = store.record_order_result("exec-1", proper, reason="resolved", db_path=db_path)
+    assert row["order_state"] == OrderState.CANCELLED.value
 
 
 # --- invalid transitions / invariants ---------------------------------------
@@ -299,78 +591,118 @@ def test_unknown_resolves_to_any_allowed_concrete_state(db_path, target, broker_
 @pytest.mark.parametrize(
     "terminal,extra",
     [
-        (OrderState.FILLED, {"broker_order_id": "B-1"}),
+        (OrderState.FILLED, {"filled": "10", "fills": (fill("f-1", "10", 3),)}),
         (OrderState.CANCELLED, {}),
-        (OrderState.REJECTED, {}),
+        (OrderState.REJECTED, {"reject_reason": "rejected"}),
     ],
 )
 def test_terminal_states_are_never_left(db_path, terminal, extra):
     submit_and_accept(db_path)
-    store.record_order_state(
-        "exec-1", terminal, reason="terminal", changed_at_utc=at(3), db_path=db_path, **extra
+    store.record_order_result(
+        "exec-1", make_result(terminal, updated_at=at(3), **extra), reason="terminal",
+        db_path=db_path,
     )
-    for other in OrderState:
+    with pytest.raises(ValueError):
+        store.record_order_state(
+            "exec-1", OrderState.UNKNOWN, reason="illegal", changed_at_utc=at(4), db_path=db_path
+        )
+    for other, other_extra in [
+        (OrderState.ACCEPTED, {}),
+        (OrderState.CANCELLED, {}),
+        (OrderState.FILLED, {"filled": "10", "fills": (fill("f-1", "10", 3),)}),
+    ]:
         if other is terminal:
             continue
         with pytest.raises(ValueError):
-            store.record_order_state(
+            store.record_order_result(
                 "exec-1",
-                other,
+                make_result(other, updated_at=at(4), **other_extra),
                 reason="illegal",
-                broker_order_id="B-1",
-                changed_at_utc=at(4),
                 db_path=db_path,
             )
     assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == terminal.value
 
 
-def test_broker_order_id_cannot_be_replaced(db_path):
+def test_terminal_same_state_reobservation_is_allowed_and_recorded(db_path):
+    submit_and_accept(db_path)
+    filled = make_result(
+        OrderState.FILLED, filled="10", fills=(fill("f-1", "10", 3),), updated_at=at(3)
+    )
+    store.record_order_result("exec-1", filled, reason="filled", db_path=db_path)
+    before = len(store.get_state_history("exec-1", db_path=db_path))
+    reobserved = make_result(
+        OrderState.FILLED, filled="10", fills=(fill("f-1", "10", 3),), updated_at=at(4)
+    )
+    row = store.record_order_result("exec-1", reobserved, reason="poll re-observed", db_path=db_path)
+    assert row["updated_at_utc"] == at(4).isoformat()
+    assert len(store.get_state_history("exec-1", db_path=db_path)) == before + 1
+
+
+def test_broker_order_id_cannot_be_replaced_or_dropped(db_path):
     submit_and_accept(db_path, broker_order_id="B-1")
     with pytest.raises(ValueError):
-        store.record_order_state(
+        store.record_order_result(
             "exec-1",
-            OrderState.PARTIALLY_FILLED,
-            reason="partial",
-            broker_order_id="B-OTHER",
-            changed_at_utc=at(3),
+            make_result(OrderState.ACCEPTED, broker_order_id="B-OTHER", updated_at=at(3)),
+            reason="poll",
             db_path=db_path,
         )
-    # an observation omitting the broker id keeps the stored value
+    # a full snapshot silently dropping the known broker id is refused too
+    with pytest.raises(ValueError):
+        store.record_order_result(
+            "exec-1",
+            make_result(OrderState.CANCELLED, broker_order_id=None, updated_at=at(3)),
+            reason="poll",
+            db_path=db_path,
+        )
+    # a state-only UNKNOWN omitting the broker id keeps the stored value
     row = store.record_order_state(
-        "exec-1",
-        OrderState.PARTIALLY_FILLED,
-        reason="partial",
-        changed_at_utc=at(3),
-        db_path=db_path,
+        "exec-1", OrderState.UNKNOWN, reason="query lost", changed_at_utc=at(3), db_path=db_path
     )
     assert row["broker_order_id"] == "B-1"
 
 
-def test_updated_at_utc_must_not_go_backwards(db_path):
-    submit_and_accept(db_path)  # updated_at is at(2)
-    with pytest.raises(ValueError):
-        store.record_order_state(
-            "exec-1",
-            OrderState.FILLED,
-            reason="stale observation",
-            changed_at_utc=at(1),
+def test_broker_order_id_is_unique_across_orders_and_conflicts_roll_back_fully(db_path):
+    # PR #91 Major 3: one broker order can never be attached to two requests;
+    # the losing update must leave NO trace (current row, history, snapshot).
+    submit_and_accept(db_path, "exec-1", broker_order_id="B-SAME")
+    submit(db_path, "exec-2")
+    before_row = store.get_execution_order("exec-2", db_path=db_path)
+    before_history = store.get_state_history("exec-2", db_path=db_path)
+    with pytest.raises(store.ExecutionOrderConflictError):
+        store.record_order_result(
+            "exec-2",
+            make_result(OrderState.ACCEPTED, "exec-2", broker_order_id="B-SAME"),
+            reason="accepted",
             db_path=db_path,
         )
+    assert store.get_execution_order("exec-2", db_path=db_path) == before_row
+    assert store.get_state_history("exec-2", db_path=db_path) == before_history
+    assert store.load_order_result("exec-2", db_path=db_path) is None
+
+
+def test_updated_at_utc_must_not_go_backwards(db_path):
+    submit_and_accept(db_path)  # updated_at is at(2)
+    stale = make_result(
+        OrderState.FILLED, filled="10", fills=(fill("f-1", "10", 1),), updated_at=at(1)
+    )
+    with pytest.raises(ValueError):
+        store.record_order_result("exec-1", stale, reason="stale observation", db_path=db_path)
     create_order(db_path, "exec-2")
     with pytest.raises(ValueError):
         store.mark_submitting(
-            "exec-2", reason="submit attempt", changed_at_utc=T0 - timedelta(seconds=1), db_path=db_path
+            "exec-2", reason="submit attempt", changed_at_utc=T0 - timedelta(seconds=1),
+            db_path=db_path,
         )
 
 
 def test_same_state_reobservation_is_allowed_and_recorded(db_path):
     submit_and_accept(db_path)
     before = len(store.get_state_history("exec-1", db_path=db_path))
-    row = store.record_order_state(
+    row = store.record_order_result(
         "exec-1",
-        OrderState.ACCEPTED,
+        make_result(OrderState.ACCEPTED, updated_at=at(3)),
         reason="poll re-observed accepted",
-        changed_at_utc=at(3),
         db_path=db_path,
     )
     assert row["order_state"] == OrderState.ACCEPTED.value
@@ -394,6 +726,10 @@ def test_unknown_order_id_raises_not_found(db_path):
         store.record_order_state(
             "missing", OrderState.UNKNOWN, reason="x", changed_at_utc=at(1), db_path=db_path
         )
+    with pytest.raises(store.ExecutionOrderNotFoundError):
+        store.record_order_result(
+            "missing", make_result(OrderState.ACCEPTED, "missing"), reason="x", db_path=db_path
+        )
 
 
 # --- atomicity of current-state update + history append ----------------------
@@ -404,97 +740,74 @@ def test_state_update_and_history_append_are_atomic(db_path):
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} RENAME TO {store.HISTORY_TABLE}_gone")
         connection.commit()
+    filled = make_result(
+        OrderState.FILLED, filled="10", fills=(fill("f-1", "10", 3),), updated_at=at(3)
+    )
     with pytest.raises(sqlite3.OperationalError):
-        store.record_order_state(
-            "exec-1", OrderState.FILLED, reason="fill", changed_at_utc=at(3), db_path=db_path
-        )
+        store.record_order_result("exec-1", filled, reason="fill", db_path=db_path)
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(
             f"ALTER TABLE {store.HISTORY_TABLE}_gone RENAME TO {store.HISTORY_TABLE}"
         )
         connection.commit()
-    # the failed history append rolled the current-state update back too
+    # the failed history append rolled the current-state + snapshot update back too
     row = store.get_execution_order("exec-1", db_path=db_path)
     assert row["order_state"] == OrderState.ACCEPTED.value
     assert row["updated_at_utc"] == at(2).isoformat()
+    assert store.load_order_result("exec-1", db_path=db_path) == make_result(OrderState.ACCEPTED)
     states = [h["new_state"] for h in store.get_state_history("exec-1", db_path=db_path)]
     assert states == ["pending", "accepted"]
 
 
-# --- record_order_result (OrderResult convenience path) ----------------------
+# --- restore-time integrity validation (PR #91 Major 2) ----------------------
 
 
-def make_result(state, *, filled="0", fills=(), broker_order_id="B-1", updated_at=None, **overrides):
-    fills = tuple(fills)
-    kwargs = dict(
-        client_order_id="client-exec-1",
-        broker_order_id=broker_order_id,
-        state=state,
-        symbol="XAUUSD",
-        side=OrderSide.BUY,
-        order_type=OrderType.LIMIT,
-        requested_quantity=Decimal("10"),
-        filled_quantity=Decimal(filled),
-        remaining_quantity=Decimal("10") - Decimal(filled),
-        requested_price=Decimal("2400.00"),
-        average_fill_price=None if not fills else Decimal("2400.00"),
-        updated_at_utc=updated_at or at(3),
-        fills=fills,
-    )
-    kwargs.update(overrides)
-    return OrderResult(**kwargs)
-
-
-def test_record_order_result_persists_state_and_broker_id_from_the_snapshot(db_path):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
-    result = make_result(OrderState.ACCEPTED)
-    row = store.record_order_result("exec-1", result, reason="submit returned", db_path=db_path)
-    assert row["order_state"] == OrderState.ACCEPTED.value
-    assert row["broker_order_id"] == "B-1"
-    assert row["updated_at_utc"] == at(3).isoformat()
-
-
-def test_record_order_result_rejects_a_snapshot_for_another_client_order(db_path):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
-    result = make_result(OrderState.ACCEPTED, client_order_id="client-someone-else")
-    with pytest.raises(ValueError):
-        store.record_order_result("exec-1", result, reason="submit returned", db_path=db_path)
-
-
-def test_record_order_result_enforces_the_full_update_contract_when_given_both_snapshots(db_path):
-    create_order(db_path)
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
-    fill = Fill(fill_id="f-1", price=Decimal("2400"), quantity=Decimal("3"), filled_at_utc=at(2))
-    previous = make_result(OrderState.PARTIALLY_FILLED, filled="3", fills=(fill,), updated_at=at(2))
-    store.record_order_result("exec-1", previous, reason="partial", db_path=db_path)
-    # content-level violation: the previously observed fill disappears
-    regressed = make_result(OrderState.PARTIALLY_FILLED, filled="3", fills=(
-        Fill(fill_id="f-2", price=Decimal("2400"), quantity=Decimal("3"), filled_at_utc=at(3)),
-    ), updated_at=at(4))
-    with pytest.raises(ValueError):
-        store.record_order_result(
-            "exec-1", regressed, reason="poll", previous_result=previous, db_path=db_path
+def test_restore_rejects_a_current_state_that_contradicts_the_history_chain(db_path):
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"UPDATE {store.ORDERS_TABLE} SET order_state = 'filled' "
+            "WHERE execution_request_id = 'exec-1'"
         )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_execution_order("exec-1", db_path=db_path)
+
+
+def test_restore_rejects_a_broken_history_chain(db_path):
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"DELETE FROM {store.HISTORY_TABLE} WHERE new_state = 'pending'"
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_state_history("exec-1", db_path=db_path)
+
+
+def test_restore_rejects_a_tampered_snapshot(db_path):
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"UPDATE {store.ORDERS_TABLE} SET last_order_result_json = "
+            "replace(last_order_result_json, '\"filled_quantity\": \"0\"', "
+            "'\"filled_quantity\": \"5\"') WHERE execution_request_id = 'exec-1'"
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.load_order_result("exec-1", db_path=db_path)
 
 
 # --- restart / restore -------------------------------------------------------
 
 
 def test_everything_restores_after_the_db_is_reopened(db_path):
-    create_order(db_path, "exec-1")
-    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
-    store.record_order_state(
-        "exec-1",
-        OrderState.ACCEPTED,
-        reason="broker accepted",
-        broker_order_id="B-1",
-        changed_at_utc=at(2),
-        db_path=db_path,
+    submit_and_accept(db_path, "exec-1")
+    partial = make_result(
+        OrderState.PARTIALLY_FILLED, filled="3", fills=(fill("f-1", "3", 3),), updated_at=at(3)
     )
-    create_order(db_path, "exec-2")
-    store.mark_submitting("exec-2", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
+    store.record_order_result("exec-1", partial, reason="partial fill", db_path=db_path)
+    submit(db_path, "exec-2")
     store.record_order_state(
         "exec-2", OrderState.UNKNOWN, reason="submit timed out", changed_at_utc=at(2), db_path=db_path
     )
@@ -507,15 +820,21 @@ def test_everything_restores_after_the_db_is_reopened(db_path):
     assert restored == make_request("exec-1")
 
     row = store.get_execution_order("exec-1", db_path=db_path)
-    assert row["order_state"] == OrderState.ACCEPTED.value
+    assert row["order_state"] == OrderState.PARTIALLY_FILLED.value
     assert row["broker_order_id"] == "B-1"
-    assert row["last_state_reason"] == "broker accepted"
+    assert row["last_state_reason"] == "partial fill"
     assert row["submission_phase"] == store.PHASE_SUBMITTED
+
+    snapshot = store.load_order_result("exec-1", db_path=db_path)
+    assert snapshot == partial
+    assert isinstance(snapshot.filled_quantity, Decimal)
+    assert snapshot.fills[0].filled_at_utc.tzinfo is not None
 
     history = store.get_state_history("exec-1", db_path=db_path)
     assert [(h["previous_state"], h["new_state"], h["reason"]) for h in history] == [
         (None, "pending", "submit attempt"),
         ("pending", "accepted", "broker accepted"),
+        ("accepted", "partially_filled", "partial fill"),
     ]
 
     unknown = store.list_unknown_orders(db_path=db_path)
@@ -528,6 +847,7 @@ def test_everything_restores_after_the_db_is_reopened(db_path):
 def test_reads_on_a_missing_db_return_empty_and_create_nothing(db_path):
     assert store.get_execution_order("exec-1", db_path=db_path) is None
     assert store.load_execution_request("exec-1", db_path=db_path) is None
+    assert store.load_order_result("exec-1", db_path=db_path) is None
     assert store.get_state_history("exec-1", db_path=db_path) == []
     assert store.list_unknown_orders(db_path=db_path) == []
     assert not db_path.exists()
@@ -539,5 +859,9 @@ def test_updates_on_a_missing_db_raise_not_found_and_create_nothing(db_path):
     with pytest.raises(store.ExecutionOrderNotFoundError):
         store.record_order_state(
             "exec-1", OrderState.UNKNOWN, reason="x", changed_at_utc=at(1), db_path=db_path
+        )
+    with pytest.raises(store.ExecutionOrderNotFoundError):
+        store.record_order_result(
+            "exec-1", make_result(OrderState.ACCEPTED), reason="x", db_path=db_path
         )
     assert not db_path.exists()

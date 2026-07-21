@@ -143,7 +143,7 @@ Persistence の責務は各コンポーネントの store 層が持つ。他コ�
 - `paper-signal/paper_signal_store.py`: classification / `target_candle_utc` / `market_state` など既知の不足列を冪等に追加し、既知値をbackfillする。基本列の型・NOT NULL・PRIMARY KEYを含む既存schema全体の完全性検証ではない。
 - `market-watch/chart_collector.py`: テーブルを `CREATE TABLE IF NOT EXISTS` で初期化し、`chart_snapshots` などの一部既知列を追加する。全テーブル・全制約の完全性検証ではない。
 - `news-feed-bot/market_bias_store.py`: `CREATE TABLE/INDEX IF NOT EXISTS` による初期化が中心であり、既存schemaの型・制約を完全検証またはmigrationする仕組みではない。
-- `execution/execution_store.py`(Issue #74): `init_db()` は冪等(CHECK / UNIQUE / NOT NULL / FK 制約付きで作成し `PRAGMA user_version` を刻印)。新規コンポーネント・新規DBのため legacy migration 経路は持たず、既存テーブルが期待スキーマと一致しない場合は明示的に失敗する(黙って rebuild・再作成しない)。読み取り経路は存在しないDBファイルを作成しない。
+- `execution/execution_store.py`(Issue #74 / PR #91): `init_db()` は冪等だが、「current」の判定は列名ではなく**完全な構造検証**(`PRAGMA user_version` + 両テーブルの正規化 CREATE SQL 全体 = NOT NULL / UNIQUE / CHECK / FK + 必須 index + 予期しないテーブルの不在)で行う。新規コンポーネント・新規DBのため legacy migration 経路は持たず、partial schema・制約欠損テーブル・他コンポーネントのDBは **DB を変更せず**明示的に失敗する(自動補完・黙った rebuild をしない)。読み取り経路は存在しないDBファイルを作成せず、復元時に current / history chain・enum・UTC・reason・snapshot 整合を再検証する。
 - **dry-run では DB作成・migration を行わない**(Paper Execution は読み取り専用のスキーマ確認のみ行う)。
 
 ## dry-run 方針
