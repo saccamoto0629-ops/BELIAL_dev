@@ -378,6 +378,10 @@ journalctl -u berial-paper-signal -f        # または ./scripts/logs.sh signal
 
 > `scripts/restart_all.sh` は上記 unit が **未配備でも** 後続 unit の restart を止めず、失敗を報告して非0で終了する(POSIX sh)。この unit を配備するまで `berial-paper-signal.service` の restart は失敗する点に注意。
 
+## PNG cleanup timer(Issue #67)
+
+EC2 ローカルに残る Chart Snapshot PNG(`/opt/berial/market-watch/data/chart_images` 直下)を毎日 03:20 Asia/Tokyo に削除する oneshot timer。テンプレートは `scripts/systemd/berial-png-cleanup.{service,timer}`。対象・保持期間・dry-run・手動/緊急 cleanup・導入/停止・ディスク使用量確認の手順は [png_cleanup.md](png_cleanup.md) を正とする。日次レポート timer と同じ理由(`Persistent=true` の追い付き実行)で `restart_all.sh` には**組み込まない**。
+
 ---
 ## Berial systemd helper scripts
 

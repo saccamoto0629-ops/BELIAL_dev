@@ -1,0 +1,28 @@
+[Unit]
+# Daily trigger for berial-png-cleanup.service (Issue #67): every day at
+# 03:20 Asia/Tokyo (quiet hours, after the 00:10 daily-report timer), with up
+# to 15 minutes of random delay to avoid a fixed-time IO spike.
+#
+# The "<time> Asia/Tokyo" OnCalendar suffix needs systemd >= 235 (Ubuntu
+# 18.04+). Verify on the target host with:
+#   systemd-analyze calendar '*-*-* 03:20:00 Asia/Tokyo'
+# If unsupported, replace with the fixed-UTC equivalent (JST has no DST):
+#   OnCalendar=*-*-* 18:20:00 UTC
+#
+# Copy to /etc/systemd/system/ next to berial-png-cleanup.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now berial-png-cleanup.timer
+# Deliberately not part of scripts/restart_all.sh: re-activating a Persistent
+# timer that missed its schedule can start the service immediately.
+Description=Run Berial PNG cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 Asia/Tokyo
+# If the host was down at 03:20, run once as soon as possible after boot
+# instead of skipping the day.
+Persistent=true
+RandomizedDelaySec=15m
+Unit=berial-png-cleanup.service
+
+[Install]
+WantedBy=timers.target

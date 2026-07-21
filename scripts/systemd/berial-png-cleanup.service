@@ -1,0 +1,53 @@
+[Unit]
+# Berial old-PNG cleanup, oneshot (Issue #67). Triggered daily by
+# berial-png-cleanup.timer; deletes only direct-child regular *.png files
+# older than PNG_CLEANUP_RETENTION_DAYS in PNG_CLEANUP_TARGETS. Never
+# recursive, never follows symlinks (symlink path components are rejected and
+# the directory is pinned via O_DIRECTORY|O_NOFOLLOW), fail-closed on
+# dangerous paths. A missing target directory is a WARNING and exit 0.
+#
+# Copy/adapt this template to /etc/systemd/system/berial-png-cleanup.service,
+# then: systemctl daemon-reload && systemctl enable --now berial-png-cleanup.timer
+# (enable the TIMER, not this service; starting the service runs one cleanup now).
+# See docs/operations/png_cleanup.md for deploy/verify/stop steps.
+Description=Berial old PNG cleanup
+Documentation=file:/opt/berial/docs/operations/png_cleanup.md
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/berial
+Environment="PYTHONUNBUFFERED=1"
+Environment="PNG_CLEANUP_TARGETS=/opt/berial/market-watch/data/chart_images"
+Environment="PNG_CLEANUP_RETENTION_DAYS=7"
+# Shared advisory flock: same path as the script's default, so manual runs
+# (docs/operations/png_cleanup.md) and this timer exclude each other with no
+# extra flags, and the lock does not depend on the target directory existing.
+# Deliberately NO PrivateTmp= here: a private /tmp would give this service a
+# namespace-local lock file and defeat that mutual exclusion. The script opens
+# the lock with O_NOFOLLOW / mode 0600 and never creates directories, so a
+# symlinked or squatted /tmp entry fails visibly instead of being followed.
+Environment="PNG_CLEANUP_LOCK_FILE=/tmp/berial-png-cleanup.lock"
+ExecStart=/opt/berial/.venv/bin/python /opt/berial/scripts/cleanup_png.py
+# stdout/stderr to the journal (journalctl -u berial-png-cleanup).
+StandardOutput=journal
+StandardError=journal
+# Low priority: disk cleanup must not compete with the resident bots.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Sandbox: read-only system, no home access, writes limited to the chart
+# image directory (PNG deletion) and /tmp (lock file). The "-" prefix keeps a
+# missing chart_images directory from failing namespace setup, so the script
+# still starts and reports the missing target as a WARNING with exit 0
+# (Issue #67) instead of never running.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=-/opt/berial/market-watch/data/chart_images /tmp
+# Deliberately no Restart=: a failing oneshot must stay failed until the next
+# timer run instead of looping; cleanup failure never touches the bots.
+
+# No [Install] section on purpose: this unit is started by its timer (or
+# manually) and is not enabled on its own.
