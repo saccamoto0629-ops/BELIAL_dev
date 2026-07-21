@@ -1141,3 +1141,260 @@ def test_updates_on_a_missing_db_raise_not_found_and_create_nothing(db_path):
             "exec-1", make_result(OrderState.ACCEPTED), reason="x", db_path=db_path
         )
     assert not db_path.exists()
+
+
+# --- trigger / view detection (PR #91 r3 Major 1) -----------------------------
+
+
+def full_db_state(db_path):
+    """Complete logical DB content: schema objects, version, and every row of
+    both tables -- for asserting a failed API call changed NOTHING."""
+    with closing(sqlite3.connect(db_path)) as connection:
+        state = {
+            "schema": sorted(
+                tuple(row)
+                for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
+            ),
+            "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
+        }
+        for table in (store.ORDERS_TABLE, store.HISTORY_TABLE):
+            state[table] = sorted(
+                tuple(row) for row in connection.execute(f"SELECT * FROM {table}")
+            )
+    return state
+
+
+EVIL_SCHEMA_OBJECTS = {
+    "after_update_trigger_deletes_history": (
+        f"CREATE TRIGGER evil_wipe AFTER UPDATE ON {store.ORDERS_TABLE} BEGIN "
+        f"DELETE FROM {store.HISTORY_TABLE} "
+        "WHERE execution_request_id = OLD.execution_request_id; END"
+    ),
+    "before_update_trigger_rewrites_values": (
+        f"CREATE TRIGGER evil_rewrite BEFORE UPDATE ON {store.ORDERS_TABLE} BEGIN "
+        f"UPDATE {store.HISTORY_TABLE} SET reason = 'tampered'; END"
+    ),
+    "after_insert_trigger_adds_history_rows": (
+        f"CREATE TRIGGER evil_extra AFTER INSERT ON {store.HISTORY_TABLE} BEGIN "
+        f"INSERT INTO {store.HISTORY_TABLE} (execution_request_id, previous_state, "
+        "new_state, reason, broker_order_id, order_result_json, changed_at_utc) "
+        "VALUES (NEW.execution_request_id, NEW.new_state, 'unknown', 'evil', "
+        "NULL, NULL, NEW.changed_at_utc); END"
+    ),
+    "view_over_orders": f"CREATE VIEW evil_view AS SELECT * FROM {store.ORDERS_TABLE}",
+}
+
+
+def _install(db_path, ddl):
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(ddl)
+        connection.commit()
+
+
+@pytest.mark.parametrize("evil_ddl", list(EVIL_SCHEMA_OBJECTS.values()), ids=list(EVIL_SCHEMA_OBJECTS))
+def test_unexpected_triggers_and_views_are_rejected_by_every_api_without_any_write(
+    db_path, evil_ddl
+):
+    # PR #91 r3 Major 1: schema verification diffs the COMPLETE sqlite_master
+    # object set, so a trigger or view of any kind fails every public API up
+    # front -- reads and writes alike -- and the DB file is not touched.
+    submit_and_accept(db_path)
+    _install(db_path, evil_ddl)
+    before_bytes = db_path.read_bytes()
+    before_state = full_db_state(db_path)
+    cancelled = make_result(OrderState.CANCELLED, updated_at=at(3))
+    api_calls = [
+        lambda: store.init_db(db_path),
+        lambda: store.get_execution_order("exec-1", db_path=db_path),
+        lambda: store.load_execution_request("exec-1", db_path=db_path),
+        lambda: store.load_order_result("exec-1", db_path=db_path),
+        lambda: store.get_state_history("exec-1", db_path=db_path),
+        lambda: store.list_unknown_orders(db_path=db_path),
+        lambda: store.mark_submitting(
+            "exec-1", reason="again", changed_at_utc=at(3), db_path=db_path
+        ),
+        lambda: store.record_order_state(
+            "exec-1", OrderState.UNKNOWN, reason="lost", changed_at_utc=at(3), db_path=db_path
+        ),
+        lambda: store.record_order_result("exec-1", cancelled, reason="cancel", db_path=db_path),
+        lambda: create_order(db_path, "exec-2"),
+    ]
+    for api_call in api_calls:
+        with pytest.raises(store.ExecutionSchemaError):
+            api_call()
+    assert db_path.read_bytes() == before_bytes
+    assert full_db_state(db_path) == before_state
+
+
+def test_r3_major_repro_history_wiping_trigger_cannot_corrupt_a_cancel(db_path):
+    # The exact r3 Major 1 reproduction: ACCEPTED is stored, then a trigger
+    # is installed that wipes this request's history on any orders UPDATE.
+    # Before this fix record_order_result(CANCELLED) committed the corrupted
+    # state and only the post-commit restore raised ExecutionIntegrityError.
+    # Now the trigger is detected up front: the call fails with
+    # ExecutionSchemaError and current/history/snapshot are untouched.
+    submit_and_accept(db_path)
+    _install(db_path, EVIL_SCHEMA_OBJECTS["after_update_trigger_deletes_history"])
+    before = full_db_state(db_path)
+    cancelled = make_result(OrderState.CANCELLED, updated_at=at(3))
+    with pytest.raises(store.ExecutionSchemaError):
+        store.record_order_result("exec-1", cancelled, reason="cancel", db_path=db_path)
+    assert full_db_state(db_path) == before
+    # dropping the foreign trigger restores the DB to a valid schema: the
+    # very same update then succeeds with the full history intact
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("DROP TRIGGER evil_wipe")
+        connection.commit()
+    row = store.record_order_result("exec-1", cancelled, reason="cancel", db_path=db_path)
+    assert row["order_state"] == OrderState.CANCELLED.value
+    states = [h["new_state"] for h in store.get_state_history("exec-1", db_path=db_path)]
+    assert states == ["pending", "accepted", "cancelled"]
+
+
+MID_TXN_SIDE_EFFECTS = {
+    "deletes_history": (
+        f"DELETE FROM {store.HISTORY_TABLE} "
+        "WHERE execution_request_id = OLD.execution_request_id;"
+    ),
+    "tampers_prior_history": (
+        f"UPDATE {store.HISTORY_TABLE} SET reason = 'tampered' WHERE new_state = 'accepted';"
+    ),
+    "rewrites_current_row": (
+        f"UPDATE {store.ORDERS_TABLE} SET last_state_reason = 'tampered' "
+        "WHERE execution_request_id = OLD.execution_request_id;"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "side_effect", list(MID_TXN_SIDE_EFFECTS.values()), ids=list(MID_TXN_SIDE_EFFECTS)
+)
+def test_side_effects_inside_the_write_transaction_roll_back_before_commit(
+    db_path, monkeypatch, side_effect
+):
+    # Defense in depth for r3 Major 1: even a side effect that appears AFTER
+    # schema verification (simulated by installing a trigger mid-transaction,
+    # right after the verify step) must be caught by the pre-commit bundle
+    # re-validation and rolled back -- corrupted state is never committed,
+    # and a failed API call leaves current/history/snapshot exactly as-is.
+    submit_and_accept(db_path)
+    before = full_db_state(db_path)
+    real_verify = store._verify_schema
+
+    def verify_then_install_trigger(connection, path):
+        real_verify(connection, path)
+        connection.execute(
+            f"CREATE TRIGGER evil AFTER UPDATE ON {store.ORDERS_TABLE} BEGIN {side_effect} END"
+        )
+
+    monkeypatch.setattr(store, "_verify_schema", verify_then_install_trigger)
+    cancelled = make_result(OrderState.CANCELLED, updated_at=at(3))
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.record_order_result("exec-1", cancelled, reason="cancel", db_path=db_path)
+    monkeypatch.undo()
+    assert full_db_state(db_path) == before
+    # with the side effect gone, the very same update commits cleanly
+    row = store.record_order_result("exec-1", cancelled, reason="cancel", db_path=db_path)
+    assert row["order_state"] == OrderState.CANCELLED.value
+
+
+# --- equivalent-DDL tolerance (PR #91 r3 Minor 1) -----------------------------
+
+
+def _write_schema(db_path, orders_sql, history_sql=None, index_sqls=None):
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(orders_sql)
+        connection.execute(history_sql if history_sql is not None else store._create_history_table_sql())
+        for sql in index_sqls if index_sqls is not None else store._create_index_sql().values():
+            connection.execute(sql)
+        connection.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+        connection.commit()
+
+
+def test_equivalent_ddl_with_quoted_identifiers_and_cosmetic_differences_is_accepted(db_path):
+    # PR #91 r3 Minor 1: SQLite-equivalent DDL -- quoted table / column
+    # names, collapsed whitespace, lowercased keywords, a redundant extra
+    # paren pair around a CHECK expression, a trailing comment -- must NOT be
+    # rejected: PRAGMA structure and token-normalized DDL both match.
+    orders_sql = store._create_orders_table_sql()
+    column_def = "signal_id TEXT NOT NULL CHECK (trim(signal_id) <> '')"
+    assert column_def in orders_sql
+    orders_sql = orders_sql.replace(
+        column_def, '"signal_id" TEXT NOT NULL CHECK ((trim("signal_id") <> \'\'))', 1
+    )
+    orders_sql = orders_sql.replace(
+        f"CREATE TABLE {store.ORDERS_TABLE}", f'CREATE TABLE "{store.ORDERS_TABLE}"', 1
+    )
+    # collapse all whitespace/newlines and lowercase every keyword (string
+    # literals in this DDL are lowercase already, so .lower() is equivalence-
+    # preserving here)
+    orders_sql = " ".join(orders_sql.split()).lower()
+    history_sql = store._create_history_table_sql() + " -- audit trail of state changes"
+    index_sqls = [
+        f'create index "{store._ORDERS_STATE_INDEX}" on "{store.ORDERS_TABLE}" '
+        "(order_state, updated_at_utc)",
+        store._create_index_sql()[store._HISTORY_REQUEST_INDEX],
+    ]
+    _write_schema(db_path, orders_sql, history_sql, index_sqls)
+    store.init_db(db_path)  # verification accepts the equivalent schema
+    # and the full normal workflow runs against it
+    submit_and_accept(db_path)
+    row = store.get_execution_order("exec-1", db_path=db_path)
+    assert row["order_state"] == OrderState.ACCEPTED.value
+    assert [h["new_state"] for h in store.get_state_history("exec-1", db_path=db_path)] == [
+        "pending",
+        "accepted",
+    ]
+
+
+ORDERS_DDL_DEGRADATIONS = {
+    "check_removed": ("CHECK (trim(signal_id) <> '')", ""),
+    "check_expression_altered": (
+        "requested_at_utc LIKE '%+00:00'",
+        "requested_at_utc LIKE '%'",
+    ),
+    "check_literal_altered": (
+        "CHECK (trim(signal_id) <> '')",
+        "CHECK (trim(signal_id) <> ' ')",
+    ),
+    "check_literal_case_changed": ("'created'", "'CREATED'"),
+    "not_null_removed": ("signal_id TEXT NOT NULL", "signal_id TEXT"),
+    "unique_removed": ("client_order_id TEXT NOT NULL UNIQUE", "client_order_id TEXT NOT NULL"),
+    "without_rowid_removed": (") WITHOUT ROWID", ")"),
+}
+
+
+@pytest.mark.parametrize(
+    "needle, replacement",
+    list(ORDERS_DDL_DEGRADATIONS.values()),
+    ids=list(ORDERS_DDL_DEGRADATIONS),
+)
+def test_degraded_orders_ddl_is_still_rejected(db_path, needle, replacement):
+    # the tolerant comparison must stay strict about SEMANTIC differences:
+    # missing/altered CHECKs (PRAGMA-invisible -- only the token comparison
+    # can catch them), dropped NOT NULL / UNIQUE / WITHOUT ROWID.
+    orders_sql = store._create_orders_table_sql()
+    assert needle in orders_sql
+    _write_schema(db_path, orders_sql.replace(needle, replacement, 1))
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.get_execution_order("exec-1", db_path=db_path)
+
+
+def test_history_foreign_key_removed_is_rejected(db_path):
+    history_sql = store._create_history_table_sql()
+    needle = f"REFERENCES {store.ORDERS_TABLE} (execution_request_id)"
+    assert needle in history_sql
+    _write_schema(db_path, store._create_orders_table_sql(), history_sql.replace(needle, "", 1))
+    with pytest.raises(store.ExecutionSchemaError):
+        store.init_db(db_path)
+
+
+def test_dropped_index_is_rejected(db_path):
+    store.init_db(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(f"DROP INDEX {store._HISTORY_REQUEST_INDEX}")
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.get_execution_order("exec-1", db_path=db_path)

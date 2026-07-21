@@ -138,6 +138,14 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 すべての公開 API(読み取り含む)は **「open → schema 検証 → トランザクション → row restore / update」の一連の流れ**で動作する(PR #91 レビュー r2 Major 3)。schema 検証に失敗した DB からは読み取りも書き込みも行われない。さらに書き込みは、更新前に対象注文の **bundle 全体(current 行 + history + anchor)を検証**するため、改竄された DB が更新判断に影響することはない。
 
+**commit 前の write-back 再検証(PR #91 レビュー r3 Major 1)**: schema 検証は書き込みの**前**に走るため、それだけには依存しない。すべての書き込み経路は、current 更新・history 追加を行った**同じトランザクション内で**対象 bundle を再読・再検証してから COMMIT する。
+
+- bundle 全体の整合(current 行・history chain・anchored snapshot・broker_order_id chain・state transition・reason・updated_at・snapshot / current / history 整合)
+- **既存 history 行が 1 行も変更・削除されていないこと**(行単位の完全一致)
+- current 行と追記された history 行が**意図した値と完全一致**していること
+
+いずれかが不一致なら(例: schema 検証をすり抜けた副作用がトランザクション中に発火した場合)`ExecutionIntegrityError` を送出し、**同じトランザクションを rollback** する。破損状態が commit されることはなく、更新 API が失敗を返した場合、DB の current / history / snapshot は呼び出し前と完全一致する。commit 後に初めて検証する経路は存在しない(更新 API の戻り値もトランザクション内で検証済みの行である)。
+
 **`record_order_result`(正の更新経路。PR #91 レビュー Major 1)**:
 
 - snapshot はこの注文に属していなければならない(`client_order_id` と identity / request フィールド全部が保存済みの intent と一致)。
@@ -163,7 +171,10 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - schema version は **v2**(v1 = PR #91 初版。r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加。未リリースのため migration は提供せず、v1 DB は検証で明示的に失敗する)。
 - `init_db()` が schema を**新規作成するのは pristine な DB のみ**(PR #91 レビュー r2 Major 2): `sqlite_master` のオブジェクトが **0 件**かつ `user_version = 0`。**version だけが設定された DB・metadata だけが残った DB(`sqlite_sequence` 等)は新規 DB として扱わず**、DB を変更せずに失敗する。
-- 既存 schema の判定は**列名ではなく完全な構造検証**で行う: `PRAGMA user_version`、両テーブル・両 index の**正規化 CREATE SQL 全体**(NOT NULL / UNIQUE / CHECK / FK をすべて含む)に加え、**`PRAGMA table_info` / `index_list` / `index_info` / `foreign_key_list` から構築した構造 signature** を、pristine な参照 schema(in-memory)と比較する(PR #91 レビュー r2 Minor 2)。**予期しないテーブル・index の存在**も失敗である。
+- 既存 schema の判定は**列名ではなく完全な構造検証**で行う(PR #91 レビュー r2 Minor 2 / r3 Major 1 / r3 Minor 1)。
+  - **sqlite_master 全 object 集合の closed-world 検証(r3 Major 1)**: `type IN ('table','index')` の抽出ではなく、**全 type の object 集合**を pristine な参照 schema(in-memory)の集合と完全一致で比較する。許可される SQLite 内部 object は本 schema 自身が作るもの(AUTOINCREMENT の `sqlite_sequence`、UNIQUE 制約の `sqlite_autoindex_*`)だけを**明示的に**参照集合へ含める。**trigger・view・予期しないテーブル・予期しない index は type を問わずすべて失敗**である(trigger / view は store の背後で行を書き換え・削除できるため、存在自体を拒否する)。
+  - **構造(列・NOT NULL / PK / UNIQUE / FK / index)は PRAGMA signature が正**: `PRAGMA user_version` に加え、`PRAGMA table_info` / `index_list` / `index_info` / `foreign_key_list` から構築した構造 signature を参照 schema と比較する。
+  - **DDL は token 正規化比較(r3 Minor 1)**: `sqlite_master.sql` のバイト一致は要求しない。quoted identifier(`"execution_orders"` 等)・空白 / 改行・keyword の大文字小文字・コメント・冗長な括弧(単一 atom を包む括弧と二重括弧のみ、意味を保存できる collapse に限定)は SQLite 上同値なため吸収する。**設計判断**: CHECK 式のみの抽出比較ではなく DDL 全体の token 比較を選んだ。PRAGMA から見えない意味論は CHECK 式だけでなく `WITHOUT ROWID` / `AUTOINCREMENT` / `COLLATE` 等にも存在し、token 比較はそれらを一括で防御できる。CHECK 式内の**文字列 literal は大文字小文字を保存**して比較し(`'created'` → `'CREATED'` は拒否)、正規化で同値と証明できない差分はすべて不一致として扱う(fail closed。同値だが表記が大きく異なる式の誤拒否は残るが、安全側)。
 - **新規コンポーネント・新規 DB のため legacy migration 経路は存在しない**: partial schema(片側テーブル欠損)・制約欠損の同名テーブル・version 不一致・他コンポーネントの DB は、いずれも **DB を一切変更せず** `ExecutionSchemaError` で明示的に失敗する(自動補完・黙った rebuild をしない)。
 - **復元時の整合検証**(PR #91 レビュー Major 2 / r2 Major 1): 注文を返すすべての読み取りは schema 検証の後、enum 値・UTC・非空 ID / reason・**current / history chain**(先頭は created → pending、リンク欠落なし、各ペアが許可遷移、末尾が current 行と一致)・phase 整合・broker_order_id の chain・**snapshot の history anchor**(上記)を再検証し、帯域外編集で不整合になった DB は `ExecutionIntegrityError` で拒否する。**DB 全体の `broker_order_id` 重複 scan** も読み取り・書き込みの両方で実施し、重複を保持する DB からは一切復元しない(PR #91 レビュー r2 Major 3)。
 - snapshot JSON は**厳格に**解析する(PR #91 レビュー r2 Minor 1): top-level と fills の**キー集合が期待集合と完全一致**しなければならず、未知 field・欠落 field は拒否する。
@@ -183,5 +194,5 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 `python -m pytest execution/tests -q`(`tmp_path` 配下の SQLite のみ。外部通信・Discord・S3・sleep・実注文なし)。
 
 - `test_execution_models.py` — 正常生成、必須 ID 空文字拒否、quantity / price 不正拒否、naive datetime 拒否、MARKET / LIMIT 価格整合、SL / TP 方向整合(一意に保証できる関係のみ)、`to_order_request` 変換(SL / TP が境界を越えないこと)。
-- `test_execution_store.py` — 初期レコード保存・復元、created → submitting(2 接続競合で 1 更新のみ成功を含む)、ACCEPTED 保存、ACCEPTED → PARTIALLY_FILLED → FILLED / REJECTED / CANCELLED、state-only API の UNKNOWN 限定と broker_order_id 新規導入拒否、stale snapshot による fill 消失拒否・`previous_result` と anchored snapshot の一致要求・再起動後も更新検証が機能すること、UNKNOWN 保存・抽出・許可解決・fill を失う解決の拒否、**UNKNOWN 中の current 行 snapshot 差し替え検出(history anchor)**・current 行 broker_order_id 改竄検出・history snapshot 改竄 / 剥離検出、terminal からの不正遷移拒否と terminal same-state 再観測、broker_order_id 差し替え / 欠落拒否と **DB 全体一意性(競合時の全 rollback・復元時重複 scan)**、updated_at 逆行拒否、current + snapshot + history の原子性、**pristine 判定**(version-only DB / metadata-only DB の拒否・無変更)、制約欠損 / partial / 他コンポーネント DB / version 不一致 / index 差し替え schema の拒否(DB 無変更)、**read API の schema 検証**、DB CHECK 制約の発火(NULL PK 含む)、snapshot JSON の未知 field 拒否、DB を開き直した後の完全復元(fills / Decimal / UTC 含む)、init 冪等性、missing DB を作成しないこと。
+- `test_execution_store.py` — 初期レコード保存・復元、created → submitting(2 接続競合で 1 更新のみ成功を含む)、ACCEPTED 保存、ACCEPTED → PARTIALLY_FILLED → FILLED / REJECTED / CANCELLED、state-only API の UNKNOWN 限定と broker_order_id 新規導入拒否、stale snapshot による fill 消失拒否・`previous_result` と anchored snapshot の一致要求・再起動後も更新検証が機能すること、UNKNOWN 保存・抽出・許可解決・fill を失う解決の拒否、**UNKNOWN 中の current 行 snapshot 差し替え検出(history anchor)**・current 行 broker_order_id 改竄検出・history snapshot 改竄 / 剥離検出、terminal からの不正遷移拒否と terminal same-state 再観測、broker_order_id 差し替え / 欠落拒否と **DB 全体一意性(競合時の全 rollback・復元時重複 scan)**、updated_at 逆行拒否、current + snapshot + history の原子性、**pristine 判定**(version-only DB / metadata-only DB の拒否・無変更)、制約欠損 / partial / 他コンポーネント DB / version 不一致 / index 差し替え / index 欠落 schema の拒否(DB 無変更)、**trigger / view の検出**(AFTER UPDATE で history 削除・BEFORE UPDATE で値書き換え・AFTER INSERT で history 追加・view。全公開 API が DB 無変更 = バイト一致で `ExecutionSchemaError`、r3 Major 再現経路の回帰、trigger 削除後は同じ更新が成功)、**schema 検証後にトランザクション内で発火する副作用の commit 前検出と rollback**(history 削除 / 既存 history 改竄 / current 行書き換えの 3 系統、失敗後の current / history / snapshot 完全一致、副作用が無ければ同じ更新が成功)、**同値 DDL の受理**(quoted identifier・空白 / 改行・keyword case・冗長括弧・コメント)と **CHECK 欠損 / CHECK 式変更 / literal 変更・NOT NULL / UNIQUE / FK / WITHOUT ROWID 欠損の拒否**、**read API の schema 検証**、DB CHECK 制約の発火(NULL PK 含む)、snapshot JSON の未知 field 拒否、DB を開き直した後の完全復元(fills / Decimal / UTC 含む)、init 冪等性、missing DB を作成しないこと。
 - `test_package_imports.py` — リポジトリルートからの package import(subprocess)、Paper / Observation レイヤーが execution を import しないこと(AST 走査)、execution が stdlib + broker 以外へ依存しないこと。

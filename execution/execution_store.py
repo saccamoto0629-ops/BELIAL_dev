@@ -93,17 +93,50 @@ metadata-only DB, a partial schema, a constraint-less lookalike, a foreign
 DB) fails with :class:`ExecutionSchemaError` WITHOUT modifying the file --
 brand-new, never-released component, so there is deliberately no
 legacy-migration path and nothing is auto-completed or silently rebuilt.
-Verification never trusts column names or the ``sqlite_master`` SQL text
-alone: it compares the schema version, the complete normalized CREATE SQL,
-AND a structural signature built from ``PRAGMA table_info`` /
-``index_list`` / ``index_info`` / ``foreign_key_list`` against a pristine
-reference schema, and requires the absence of unexpected tables / indexes.
+
+Schema verification (PR #91 review r3 Major 1 + Minor 1) is a closed-world
+diff of the COMPLETE ``sqlite_master`` object set -- every type, triggers
+and views included -- against a pristine reference schema built in memory:
+
+- the reference object set is exhaustive and explicit; the only
+  SQLite-internal objects in it are the ones this schema itself creates
+  (``sqlite_sequence`` from AUTOINCREMENT, ``sqlite_autoindex_*`` from the
+  UNIQUE constraints). ANY other object -- a trigger, a view, an extra
+  table or index, whatever its type -- fails verification, because a
+  trigger/view can rewrite or delete rows behind the store's back.
+- structure (columns, NOT NULL, PK, UNIQUE, FK, indexes) is authoritative
+  from the PRAGMA signature (``table_info`` / ``index_list`` /
+  ``index_info`` / ``foreign_key_list``) compared against the reference.
+- DDL text is compared TOKEN-normalized, not byte-for-byte: quoted
+  identifiers, whitespace / newlines, keyword case, comments and redundant
+  parentheses are cosmetic in SQLite and are absorbed, so an equivalent DDL
+  (e.g. a quoted table name) is accepted. The token comparison is what
+  guards the semantics PRAGMAs cannot see -- CHECK expressions foremost
+  (string literals inside them stay case-sensitive), plus WITHOUT ROWID /
+  AUTOINCREMENT / COLLATE. Token normalization was chosen over CHECK-only
+  extraction precisely because those non-CHECK, DDL-only semantics need
+  guarding too; anything the normalizer cannot prove equivalent stays a
+  mismatch (fails closed).
+
 ``execution_request_id`` is explicitly ``NOT NULL`` (a plain TEXT PRIMARY
 KEY on a rowid table would admit NULLs) and the orders table is WITHOUT
 ROWID. Key invariants (non-empty IDs / reasons, UTC suffix, MARKET/LIMIT x
 ``requested_price``, state x ``broker_order_id``) are additionally enforced
 by DB CHECK constraints as a second guard under the application-level
 validation.
+
+Pre-commit write-back validation (PR #91 review r3 Major 1): schema
+verification runs BEFORE the writes, so every write path additionally
+re-reads the target execution bundle INSIDE the same transaction after
+mutating it and re-validates it BEFORE COMMIT -- full bundle integrity
+(current row, history chain, snapshot anchor, broker-id chain, transitions,
+reason, updated_at), prior history preserved row-for-row, and the current
+row / appended history row holding exactly the intended values. Any
+deviation (e.g. a trigger that somehow slipped past schema verification
+firing mid-transaction) raises :class:`ExecutionIntegrityError` and ROLLS
+BACK the whole transaction: a failed update API call leaves the DB
+byte-for-byte as it was, and corrupted state is never committed. There is
+no path that validates only after COMMIT.
 
 Restore-time integrity: every read re-validates what it loads -- enum
 membership, UTC parseability, non-empty IDs / reasons, the current/history
@@ -213,9 +246,6 @@ REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
 #     primary key. No migration path -- pre-release component; a v1 DB fails
 #     verification loudly.
 SCHEMA_VERSION = 2
-
-# AUTOINCREMENT bookkeeping table SQLite creates itself.
-_ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 
 # Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
 # match EXACTLY -- unknown fields are rejected, missing fields are rejected.
@@ -358,12 +388,127 @@ def _create_index_sql() -> dict[str, str]:
     }
 
 
-def _expected_tables() -> dict[str, str]:
-    return {ORDERS_TABLE: _create_orders_table_sql(), HISTORY_TABLE: _create_history_table_sql()}
+# --- DDL token normalization (PR #91 r3 Minor 1) ------------------------------
+# SQLite treats quoted identifiers, whitespace, keyword case, comments and
+# redundant parentheses as cosmetic; a byte-for-byte sqlite_master.sql
+# comparison would falsely reject an equivalent DDL (e.g. a quoted table
+# name). Comparing normalized token sequences absorbs exactly those
+# differences while still failing closed on everything else -- a missing or
+# altered CHECK expression, a changed string literal (kept case-sensitive),
+# a dropped WITHOUT ROWID all change the token sequence.
+
+_DDL_MULTI_CHAR_OPERATORS = ("<>", "<=", ">=", "==", "!=", "||")
+_DDL_QUOTE_PAIRS = {'"': '"', "`": "`", "[": "]"}
 
 
-def _normalized_sql(sql) -> str:
-    return " ".join(str(sql or "").lower().split())
+def _raw_ddl_tokens(sql: str) -> list[str]:
+    """Lex DDL into tokens: string literals verbatim (case-sensitive), quoted
+    identifiers unquoted + lowercased (identifiers are case-insensitive),
+    bare words lowercased, comments dropped, operators split."""
+    text = str(sql or "")
+    tokens: list[str] = []
+    i, length = 0, len(text)
+    while i < length:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif text.startswith("--", i):
+            newline = text.find("\n", i)
+            i = length if newline == -1 else newline + 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = length if end == -1 else end + 2
+        elif ch == "'":
+            j = i + 1
+            while j < length:
+                if text[j] == "'":
+                    if text.startswith("''", j):
+                        j += 2
+                        continue
+                    break
+                j += 1
+            tokens.append(text[i : j + 1])
+            i = j + 1
+        elif ch in _DDL_QUOTE_PAIRS:
+            close = _DDL_QUOTE_PAIRS[ch]
+            j = i + 1
+            name: list[str] = []
+            while j < length:
+                if text[j] == close:
+                    if close != "]" and text.startswith(close * 2, j):
+                        name.append(close)
+                        j += 2
+                        continue
+                    break
+                name.append(text[j])
+                j += 1
+            tokens.append("".join(name).lower())
+            i = j + 1
+        elif ch.isalnum() or ch == "_":
+            j = i
+            while j < length and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            tokens.append(text[i:j].lower())
+            i = j
+        else:
+            for operator in _DDL_MULTI_CHAR_OPERATORS:
+                if text.startswith(operator, i):
+                    tokens.append(operator)
+                    i += len(operator)
+                    break
+            else:
+                tokens.append(ch)
+                i += 1
+    return tokens
+
+
+def _ddl_tokens(sql: str) -> tuple[str, ...]:
+    """Normalized token sequence with redundant parentheses collapsed.
+
+    Only provably meaning-preserving collapses are applied: a group wrapping
+    exactly one atom loses its parentheses, and doubly-nested groups
+    ``((...))`` lose one level. An unmatched ``)`` stays a literal token, so
+    malformed DDL can never normalize into a prefix of the expected DDL.
+    """
+    stack: list[list] = [[]]
+    for token in _raw_ddl_tokens(sql):
+        if token == "(":
+            stack.append([])
+        elif token == ")" and len(stack) > 1:
+            group = stack.pop()
+            stack[-1].append(group)
+        else:
+            stack[-1].append(token)
+    while len(stack) > 1:  # unclosed "(" -- close implicitly, keep structure
+        group = stack.pop()
+        stack[-1].append(group)
+
+    def simplify(node):
+        if isinstance(node, str):
+            return node
+        children = [simplify(child) for child in node]
+        while len(children) == 1 and isinstance(children[0], list):
+            children = children[0]
+        if len(children) == 1 and isinstance(children[0], str):
+            return children[0]
+        return children
+
+    def flatten(node, out: list[str]) -> None:
+        if isinstance(node, str):
+            out.append(node)
+        else:
+            out.append("(")
+            for child in node:
+                flatten(child, out)
+            out.append(")")
+
+    top = simplify(stack[0]) if stack[0] else []
+    if isinstance(top, str):
+        return (top,)
+    flat: list[str] = []
+    for child in top:
+        flatten(child, flat)
+    return tuple(flat)
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
@@ -400,62 +545,67 @@ def _structure_signature(connection: sqlite3.Connection) -> dict:
     return signature
 
 
-_EXPECTED_SIGNATURE_CACHE: dict | None = None
+_REFERENCE_SCHEMA_CACHE: tuple[dict, dict] | None = None
 
 
-def _expected_signature() -> dict:
-    """Signature of a pristine reference schema (built once, in memory)."""
-    global _EXPECTED_SIGNATURE_CACHE
-    if _EXPECTED_SIGNATURE_CACHE is None:
+def _reference_schema() -> tuple[dict, dict]:
+    """Pristine reference schema, built once in memory.
+
+    Returns ``(objects, signature)``: ``objects`` maps every ``sqlite_master``
+    entry -- SQLite-internal ones included (``sqlite_sequence`` from
+    AUTOINCREMENT, ``sqlite_autoindex_*`` from the UNIQUE constraints) -- as
+    ``(type, name) -> (tbl_name, ddl_tokens | None)``; ``signature`` is the
+    PRAGMA structural signature."""
+    global _REFERENCE_SCHEMA_CACHE
+    if _REFERENCE_SCHEMA_CACHE is None:
         with closing(sqlite3.connect(":memory:")) as connection:
             _create_schema(connection)
-            _EXPECTED_SIGNATURE_CACHE = _structure_signature(connection)
-    return _EXPECTED_SIGNATURE_CACHE
+            objects = {
+                (row[0], row[1]): (row[2], None if row[3] is None else _ddl_tokens(row[3]))
+                for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
+            }
+            _REFERENCE_SCHEMA_CACHE = (objects, _structure_signature(connection))
+    return _REFERENCE_SCHEMA_CACHE
 
 
 def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
     """Full structural verification; raises :class:`ExecutionSchemaError`.
 
-    Checks the schema version, the complete normalized CREATE SQL of both
-    tables and both indexes, the PRAGMA-derived structural signature against
-    a pristine reference schema, and the absence of unexpected tables or
-    indexes. Read-only -- makes no change to the DB.
+    Closed-world check (PR #91 r3 Major 1): the COMPLETE ``sqlite_master``
+    object set -- all types, so triggers and views too -- must exactly equal
+    the pristine reference set; there is no allow-by-type extraction, only an
+    explicit allow-list of the objects this schema itself creates. On top of
+    that: the schema version, the token-normalized DDL of every SQL-bearing
+    object (PR #91 r3 Minor 1 -- cosmetic differences absorbed, CHECK /
+    WITHOUT ROWID / AUTOINCREMENT semantics enforced), and the PRAGMA-derived
+    structural signature (authoritative for columns, NOT NULL, PK, UNIQUE,
+    FK, indexes). Read-only -- makes no change to the DB.
     """
     problems: list[str] = []
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version != SCHEMA_VERSION:
         problems.append(f"user_version is {version}, expected {SCHEMA_VERSION}")
 
-    tables = {
-        row[0]: row[1]
-        for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+    expected_objects, expected_signature = _reference_schema()
+    actual_objects = {
+        (row[0], row[1]): (row[2], row[3])
+        for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
     }
-    expected = _expected_tables()
-    for name in sorted(set(expected) - set(tables)):
-        problems.append(f"table {name!r} is missing")
-    for name in sorted(set(tables) - set(expected) - _ALLOWED_EXTRA_TABLES):
-        problems.append(f"unexpected table {name!r} present")
-    for name, create_sql in expected.items():
-        if name in tables and _normalized_sql(tables[name]) != _normalized_sql(create_sql):
+    for object_type, name in sorted(set(expected_objects) - set(actual_objects)):
+        problems.append(f"{object_type} {name!r} is missing")
+    for object_type, name in sorted(set(actual_objects) - set(expected_objects)):
+        problems.append(f"unexpected {object_type} {name!r} present")
+    for key in sorted(set(actual_objects) & set(expected_objects)):
+        expected_tbl, expected_tokens = expected_objects[key]
+        actual_tbl, actual_sql = actual_objects[key]
+        actual_tokens = None if actual_sql is None else _ddl_tokens(actual_sql)
+        if actual_tbl != expected_tbl or actual_tokens != expected_tokens:
             problems.append(
-                f"table {name!r} does not match the expected schema "
+                f"{key[0]} {key[1]!r} does not match the expected definition "
                 "(constraints missing or altered)"
             )
 
-    indexes = {
-        row[0]: row[1]
-        for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'index'")
-        if not row[0].startswith("sqlite_autoindex_")
-    }
-    for name, create_sql in _create_index_sql().items():
-        if name not in indexes:
-            problems.append(f"index {name!r} is missing")
-        elif _normalized_sql(indexes[name]) != _normalized_sql(create_sql):
-            problems.append(f"index {name!r} does not match the expected definition")
-    for name in sorted(set(indexes) - set(_create_index_sql())):
-        problems.append(f"unexpected index {name!r} present")
-
-    if not problems and _structure_signature(connection) != _expected_signature():
+    if not problems and _structure_signature(connection) != expected_signature:
         problems.append(
             "live PRAGMA structure (table_info/index_list/index_info/foreign_key_list) "
             "differs from the reference schema"
@@ -500,7 +650,9 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 @contextmanager
 def _verified_txn(db_path: Path):
     """The single write flow: open -> BEGIN IMMEDIATE -> verify schema ->
-    duplicate scan -> row work -> COMMIT (ROLLBACK on any error)."""
+    duplicate scan -> row work -> pre-commit write-back validation
+    (:func:`_validate_writeback`, called by every writer) -> COMMIT
+    (ROLLBACK on any error, so a failed write leaves the DB untouched)."""
     with closing(_connect(db_path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -554,6 +706,9 @@ def init_db(db_path: Path | None = None) -> None:
                         "not a pristine DB -- refusing to initialize it"
                     )
                 _create_schema(connection)
+                # pre-commit self-check: the freshly created schema must pass
+                # the same closed-world verification before it is committed
+                _verify_schema(connection, db_path)
             else:
                 _verify_schema(connection, db_path)
             connection.execute("COMMIT")
@@ -908,6 +1063,71 @@ def _anchored_snapshot(history: list[dict]) -> OrderResult | None:
     return None
 
 
+def _validate_writeback(
+    connection: sqlite3.Connection,
+    execution_request_id: str,
+    *,
+    prior_history: list[dict],
+    expected_row: dict,
+    expected_entry: dict | None,
+) -> dict:
+    """Pre-commit re-validation of the written bundle (PR #91 r3 Major 1).
+
+    Schema verification runs BEFORE the row work, so the written outcome
+    itself is re-read INSIDE the same transaction and checked BEFORE COMMIT:
+
+    - full bundle integrity (:func:`_validate_bundle`: current row, history
+      chain, snapshot anchor, broker-id chain, transitions, reason,
+      updated_at),
+    - the prior history rows preserved row-for-row,
+    - the current row holding EXACTLY the intended values,
+    - the appended history row (if any) holding EXACTLY the intended values.
+
+    Any deviation -- e.g. a trigger that slipped past schema verification
+    firing mid-transaction -- raises :class:`ExecutionIntegrityError`, and
+    the caller's transaction ROLLS BACK: corrupted state is never committed.
+    Returns the validated current row, so callers can return it without a
+    separate post-commit read.
+    """
+    bundle = _fetch_and_validate(connection, execution_request_id)
+    if bundle is None:
+        raise _integrity(
+            execution_request_id, "row vanished inside the write transaction before commit"
+        )
+    row, history = bundle
+    if row != expected_row:
+        changed = sorted(
+            field for field in expected_row if row.get(field) != expected_row[field]
+        )
+        raise _integrity(
+            execution_request_id,
+            f"pre-commit check: current row does not hold the intended values "
+            f"(unexpected side effect on {changed}); rolling back",
+        )
+    expected_len = len(prior_history) + (0 if expected_entry is None else 1)
+    if len(history) != expected_len:
+        raise _integrity(
+            execution_request_id,
+            f"pre-commit check: history holds {len(history)} rows, expected {expected_len} "
+            "(unexpected side effect); rolling back",
+        )
+    if history[: len(prior_history)] != prior_history:
+        raise _integrity(
+            execution_request_id,
+            "pre-commit check: pre-existing history rows were modified inside the write "
+            "transaction; rolling back",
+        )
+    if expected_entry is not None:
+        appended = {field: history[-1][field] for field in expected_entry}
+        if appended != expected_entry:
+            raise _integrity(
+                execution_request_id,
+                "pre-commit check: the appended history row does not hold the intended "
+                "values; rolling back",
+            )
+    return row
+
+
 # --- write paths -------------------------------------------------------------
 
 
@@ -968,7 +1188,14 @@ def create_execution_order(
                 f"execution order {request.execution_request_id!r} / client_order_id "
                 f"{client_order_id!r} collides with an existing row: {exc}"
             ) from exc
-    return _require_get(request.execution_request_id, db_path=db_path)
+        created = _validate_writeback(
+            connection,
+            request.execution_request_id,
+            prior_history=[],
+            expected_row=record,
+            expected_entry=None,
+        )
+    return created
 
 
 def _existing_db_path(db_path: Path | None, execution_request_id: str) -> Path:
@@ -1042,7 +1269,7 @@ def mark_submitting(
     _require_utc(changed_at_utc, "changed_at_utc")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
-        row, _history = _require_bundle_for_update(connection, execution_request_id)
+        row, history = _require_bundle_for_update(connection, execution_request_id)
         if row["submission_phase"] != PHASE_CREATED:
             raise ValueError(
                 f"execution order {execution_request_id!r} is in phase "
@@ -1074,24 +1301,49 @@ def mark_submitting(
             order_result_json=None,
             changed_at_utc=changed_at_utc,
         )
-    return _require_get(execution_request_id, db_path=db_path)
+        expected_row = dict(row)
+        expected_row.update(
+            submission_phase=PHASE_SUBMITTING,
+            order_state=OrderState.PENDING.value,
+            last_state_reason=reason,
+            updated_at_utc=_iso(changed_at_utc),
+        )
+        updated = _validate_writeback(
+            connection,
+            execution_request_id,
+            prior_history=history,
+            expected_row=expected_row,
+            expected_entry={
+                "execution_request_id": execution_request_id,
+                "previous_state": None,
+                "new_state": OrderState.PENDING.value,
+                "reason": reason,
+                "broker_order_id": None,
+                "order_result_json": None,
+                "changed_at_utc": _iso(changed_at_utc),
+            },
+        )
+    return updated
 
 
 def _apply_state_update(
     connection: sqlite3.Connection,
     row: dict,
+    history: list[dict],
     *,
     new_state: OrderState,
     reason: str,
     changed_at_utc: datetime,
     effective_broker_id: str | None,
     result_json: str | None,
-) -> None:
+) -> dict:
     """Shared tail of both update paths: phase derivation + current-row UPDATE
-    + history INSERT (snapshot anchored on the history row too), inside the
-    caller's transaction. A UNIQUE violation (DB-wide ``broker_order_id``,
-    PR #91 Major 3) surfaces as :class:`ExecutionOrderConflictError`; the
-    caller's transaction rolls back the whole update, history row included."""
+    + history INSERT (snapshot anchored on the history row too) + pre-commit
+    write-back validation (:func:`_validate_writeback`), inside the caller's
+    transaction. A UNIQUE violation (DB-wide ``broker_order_id``, PR #91
+    Major 3) surfaces as :class:`ExecutionOrderConflictError`; the caller's
+    transaction rolls back the whole update, history row included. Returns
+    the validated post-update row."""
     execution_request_id = row["execution_request_id"]
     current_state = OrderState(row["order_state"])
     phase = row["submission_phase"]
@@ -1129,6 +1381,30 @@ def _apply_state_update(
             f"uniqueness constraint (broker_order_id {effective_broker_id!r} already "
             f"assigned to another order?): {exc}"
         ) from exc
+    expected_row = dict(row)
+    expected_row.update(
+        submission_phase=phase,
+        order_state=new_state.value,
+        broker_order_id=effective_broker_id,
+        last_state_reason=reason,
+        last_order_result_json=keep_json,
+        updated_at_utc=_iso(changed_at_utc),
+    )
+    return _validate_writeback(
+        connection,
+        execution_request_id,
+        prior_history=history,
+        expected_row=expected_row,
+        expected_entry={
+            "execution_request_id": execution_request_id,
+            "previous_state": current_state.value,
+            "new_state": new_state.value,
+            "reason": reason,
+            "broker_order_id": effective_broker_id,
+            "order_result_json": result_json,
+            "changed_at_utc": _iso(changed_at_utc),
+        },
+    )
 
 
 def _check_transition_and_time(
@@ -1190,7 +1466,7 @@ def record_order_state(
         _require_non_empty_str(broker_order_id, "broker_order_id")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
-        row, _history = _require_bundle_for_update(connection, execution_request_id)
+        row, history = _require_bundle_for_update(connection, execution_request_id)
         if broker_order_id is not None and broker_order_id != row["broker_order_id"]:
             raise ValueError(
                 f"a state-only update may only confirm the stored broker_order_id "
@@ -1198,16 +1474,17 @@ def record_order_state(
                 "only learned from full OrderResult snapshots"
             )
         _check_transition_and_time(row, new_state=new_state, changed_at_utc=changed_at_utc)
-        _apply_state_update(
+        updated = _apply_state_update(
             connection,
             row,
+            history,
             new_state=new_state,
             reason=reason,
             changed_at_utc=changed_at_utc,
             effective_broker_id=row["broker_order_id"],
             result_json=None,
         )
-    return _require_get(execution_request_id, db_path=db_path)
+    return updated
 
 
 def record_order_result(
@@ -1295,16 +1572,17 @@ def record_order_result(
         _check_transition_and_time(
             row, new_state=result.state, changed_at_utc=result.updated_at_utc
         )
-        _apply_state_update(
+        updated = _apply_state_update(
             connection,
             row,
+            history,
             new_state=result.state,
             reason=reason,
             changed_at_utc=result.updated_at_utc,
             effective_broker_id=effective_broker_id,
             result_json=_result_to_json(result),
         )
-    return _require_get(execution_request_id, db_path=db_path)
+    return updated
 
 
 # --- read helpers -----------------------------------------------------------
@@ -1321,13 +1599,6 @@ def get_execution_order(execution_request_id: str, *, db_path: Path | None = Non
     with _verified_read(db_path) as connection:
         bundle = _fetch_and_validate(connection, execution_request_id)
     return None if bundle is None else bundle[0]
-
-
-def _require_get(execution_request_id: str, *, db_path: Path) -> dict:
-    row = get_execution_order(execution_request_id, db_path=db_path)
-    if row is None:
-        raise ExecutionOrderNotFoundError(f"no execution order with id {execution_request_id!r}")
-    return row
 
 
 def load_execution_request(
