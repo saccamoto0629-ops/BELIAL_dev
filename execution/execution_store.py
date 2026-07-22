@@ -325,7 +325,7 @@ class ExecutionOrderNotFoundError(ExecutionStoreError):
 
 class ExecutionOrderConflictError(ExecutionStoreError):
     """An insert/update collided with a UNIQUE constraint
-    (execution_request_id / client_order_id / broker_order_id)."""
+    (execution_request_id / signal_id / client_order_id / broker_order_id)."""
 
 
 def execution_db_path() -> Path:
@@ -1244,13 +1244,20 @@ def _validate_writeback(
 # --- write paths -------------------------------------------------------------
 
 
-def _classify_create_conflict(
+def _classify_create_conflicts(
     connection: sqlite3.Connection, record: dict
-) -> tuple[str, dict | None]:
-    """Best-effort classification of an insert conflict for the duplicate
-    suppression log (Issue #76): which UNIQUE key collided and with which
-    existing row. Raw column reads only -- this runs on the failure path and
-    must work even when the existing bundle would fail full validation."""
+) -> list[tuple[str, str, dict]]:
+    """Return every expected UNIQUE collision for a failed create INSERT.
+
+    An ``IntegrityError`` is not necessarily a duplicate (CHECK / NOT NULL
+    and future constraints use the same exception type).  The caller may
+    translate the error to ``ExecutionOrderConflictError`` only when this
+    lookup proves that at least one of the three create-time identity keys
+    already belongs to a persisted row.  Multiple keys can collide with
+    different rows, so retain all matches instead of reporting whichever key
+    happens to be checked first.
+    """
+    conflicts: list[tuple[str, str, dict]] = []
     for column, reason in (
         ("execution_request_id", "execution_request_id is already persisted"),
         ("signal_id", "source signal already produced an execution request"),
@@ -1262,8 +1269,8 @@ def _classify_create_conflict(
             (record[column],),
         ).fetchone()
         if row is not None:
-            return reason, dict(row)
-    return "uniqueness constraint violated", None
+            conflicts.append((column, reason, dict(row)))
+    return conflicts
 
 
 def create_execution_order(
@@ -1326,16 +1333,24 @@ def create_execution_order(
         try:
             connection.execute(insert_sql, tuple(record[col] for col in _ORDER_COLUMNS))
         except sqlite3.IntegrityError as exc:
-            reason, existing = _classify_create_conflict(connection, record)
+            conflicts = _classify_create_conflicts(connection, record)
+            if not conflicts:
+                # CHECK / NOT NULL / FK or an unknown future constraint is a
+                # persistence failure, not successful duplicate suppression.
+                raise
+            reason = "; ".join(item[1] for item in conflicts)
+            existing = conflicts[0][2]
             _LOGGER.warning(
                 "duplicate execution order suppressed: execution_request_id=%s "
                 "signal_id=%s existing_execution_request_id=%s "
-                "existing_submission_phase=%s existing_order_state=%s reason=%s",
+                "existing_submission_phase=%s existing_order_state=%s "
+                "conflicting_keys=%s reason=%s",
                 request.execution_request_id,
                 request.signal_id,
-                None if existing is None else existing["execution_request_id"],
-                None if existing is None else existing["submission_phase"],
-                None if existing is None else existing["order_state"],
+                existing["execution_request_id"],
+                existing["submission_phase"],
+                existing["order_state"],
+                ",".join(item[0] for item in conflicts),
                 reason,
             )
             raise ExecutionOrderConflictError(

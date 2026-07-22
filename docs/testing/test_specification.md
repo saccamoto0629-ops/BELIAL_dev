@@ -49,7 +49,7 @@ python -m pytest execution/tests -q
 
 CI(#32)では最低限この7スイートを継続実行することを想定する(現行の `.github/workflows/ci.yml` は7スイートすべてを実行している)。テストは外部ネットワーク・実DB・実S3・実Discordに到達しない(§4–§5)。
 
-現状のテスト件数(`def test_` 実数、目安):backtest 128 / market-watch 127 / news-feed-bot 117 / paper-signal 89 / paper-execution 91 / broker 101(Issue #73 / PR #87、Issue #75 接続identity追加)/ execution 181(Issue #74 / PR #91、Issue #75 Safety Gate / Live Order Submission、Issue #76 二重発注防止 / idempotency 追加)。
+現状のテスト件数(`def test_` 実数、目安):backtest 128 / market-watch 127 / news-feed-bot 117 / paper-signal 89 / paper-execution 91 / broker 101(Issue #73 / PR #87、Issue #75 接続identity追加)/ execution 189(Issue #74 / PR #91、Issue #75 Safety Gate / Live Order Submission、Issue #76 二重発注防止 / idempotency 追加)。
 
 ---
 

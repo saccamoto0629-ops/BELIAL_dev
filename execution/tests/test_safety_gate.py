@@ -19,6 +19,7 @@ from broker.broker_models import (
     BrokerCommunicationError,
     BrokerConnectionIdentity,
     BrokerTimeoutError,
+    Fill,
     OrderResult,
     OrderSide,
     OrderState,
@@ -1046,6 +1047,44 @@ def accepted_result(client_order_id="client-1"):
     )
 
 
+def result_for_suppressed_state(state):
+    filled = Decimal("0")
+    fills = ()
+    average = None
+    broker_order_id = "B-1" if state in {
+        OrderState.ACCEPTED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+    } else None
+    reject_reason = None
+    if state is OrderState.PARTIALLY_FILLED:
+        filled = Decimal("0.5")
+        fills = (Fill("fill-1", Decimal("150"), filled, NOW),)
+        average = Decimal("150")
+    elif state is OrderState.FILLED:
+        filled = Decimal("1")
+        fills = (Fill("fill-1", Decimal("150"), filled, NOW),)
+        average = Decimal("150")
+    elif state is OrderState.REJECTED:
+        reject_reason = "broker rejected"
+    return OrderResult(
+        client_order_id="client-1",
+        broker_order_id=broker_order_id,
+        state=state,
+        symbol="USD_JPY",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        requested_quantity=Decimal("1"),
+        filled_quantity=filled,
+        remaining_quantity=Decimal("1") - filled,
+        requested_price=None,
+        average_fill_price=average,
+        updated_at_utc=NOW,
+        fills=fills,
+        reject_reason=reject_reason,
+    )
+
+
 def test_same_signal_cannot_register_two_execution_requests(tmp_path):
     # Issue #76: one source signal -> at most one execution request. The
     # second intent (fresh execution_request_id, same signal) is refused by
@@ -1079,6 +1118,102 @@ def test_accepted_request_is_not_resent(tmp_path):
     assert SafetyRejectionCode.DUPLICATE_SUBMISSION in codes(decision)
     assert result is None
     assert broker.submitted_requests == []
+
+
+def test_database_locked_during_mark_submitting_never_reaches_broker(tmp_path, monkeypatch):
+    import sqlite3
+
+    req = request()
+    service, broker, _ = make_service(tmp_path)
+    service.register(req, client_order_id="client-1")
+    order_db = tmp_path / "orders.sqlite3"
+    monkeypatch.setattr(execution_store, "BUSY_TIMEOUT_SECONDS", 0.05)
+
+    blocker = sqlite3.connect(order_db, timeout=0.1, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        decision, result = service.submit(req.execution_request_id, market=market())
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+    assert SafetyRejectionCode.STATE_QUERY_FAILED in codes(decision)
+    assert result is None
+    assert broker.submitted_requests == []
+    row = execution_store.get_execution_order(req.execution_request_id, db_path=order_db)
+    assert row["submission_phase"] == execution_store.PHASE_CREATED
+
+    # Once the unrelated lock is gone, the same still-created intent can win
+    # the atomic transition; no earlier broker attempt occurred.
+    retry_decision, retry_result = service.submit(req.execution_request_id, market=market())
+    assert retry_decision.allowed is True
+    assert retry_result is not None
+    assert len(broker.submitted_requests) == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        OrderState.ACCEPTED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+        OrderState.UNKNOWN,
+        OrderState.CANCELLED,
+        OrderState.REJECTED,
+    ],
+)
+def test_every_attempted_or_final_state_is_not_resent(tmp_path, state):
+    req = request()
+    service, broker, _ = make_service(tmp_path)
+    service.register(req, client_order_id="client-1")
+    order_db = tmp_path / "orders.sqlite3"
+    execution_store.mark_submitting(
+        req.execution_request_id, reason="attempt started", changed_at_utc=NOW, db_path=order_db
+    )
+    if state is OrderState.UNKNOWN:
+        execution_store.record_order_state(
+            req.execution_request_id,
+            state,
+            reason="outcome unknown",
+            changed_at_utc=NOW,
+            db_path=order_db,
+        )
+    else:
+        execution_store.record_order_result(
+            req.execution_request_id,
+            result_for_suppressed_state(state),
+            reason="broker observation",
+            db_path=order_db,
+        )
+
+    decision, result = service.submit(req.execution_request_id, market=market())
+
+    assert SafetyRejectionCode.DUPLICATE_SUBMISSION in codes(decision)
+    assert result is None
+    assert broker.submitted_requests == []
+
+
+def test_restart_immediately_after_mark_submitting_never_resends(tmp_path):
+    req = request()
+    first_service, _, _ = make_service(tmp_path)
+    first_service.register(req, client_order_id="client-1")
+    execution_store.mark_submitting(
+        req.execution_request_id,
+        reason="process stopped before broker call",
+        changed_at_utc=NOW,
+        db_path=tmp_path / "orders.sqlite3",
+    )
+
+    restarted_service, restarted_broker, _ = make_service(tmp_path)
+    decision, result = restarted_service.submit(req.execution_request_id, market=market())
+
+    assert SafetyRejectionCode.DUPLICATE_SUBMISSION in codes(decision)
+    assert result is None
+    assert restarted_broker.submitted_requests == []
+    unresolved = execution_store.list_unresolved_submissions(
+        db_path=tmp_path / "orders.sqlite3"
+    )
+    assert [row["execution_request_id"] for row in unresolved] == [req.execution_request_id]
 
 
 def test_submitted_request_is_not_resent_after_a_service_restart(tmp_path):
@@ -1120,12 +1255,26 @@ def test_unknown_request_is_not_resent_after_a_service_restart(tmp_path):
     assert restarted_broker.submitted_requests == []
 
 
-def test_two_concurrent_services_reach_the_broker_exactly_once(tmp_path):
+def test_two_concurrent_services_reach_the_broker_exactly_once(tmp_path, monkeypatch):
     # Two independent services (separate decision stores, independent SQLite
     # connections -- multi-process equivalent) race to submit the same
     # intent against ONE broker: the created -> submitting transition is won
     # exactly once, so the broker sees exactly one request.
+    class ThreadSafeRequestLog(list):
+        def __init__(self):
+            super().__init__()
+            self.lock = threading.Lock()
+
+        def append(self, item):
+            with self.lock:
+                super().append(item)
+
+        def __len__(self):
+            with self.lock:
+                return super().__len__()
+
     shared_broker = make_broker()
+    shared_broker.submitted_requests = ThreadSafeRequestLog()
     req = request()
     order_db = tmp_path / "orders.sqlite3"
     services = []
@@ -1144,24 +1293,67 @@ def test_two_concurrent_services_reach_the_broker_exactly_once(tmp_path):
     services[0].register(req, client_order_id="client-1")
 
     barrier = threading.Barrier(2)
+    original_evaluate = SafetyGate.evaluate
+
+    def synchronized_evaluate(self, *args, **kwargs):
+        # Both services have already read phase=created and loaded the request.
+        # Release them together immediately before decision persistence and
+        # the atomic mark_submitting race.
+        barrier.wait(timeout=10)
+        return original_evaluate(self, *args, **kwargs)
+
+    monkeypatch.setattr(SafetyGate, "evaluate", synchronized_evaluate)
     outcomes = []
+    errors = []
+    outcome_lock = threading.Lock()
 
     def attempt(service):
-        barrier.wait()
-        outcomes.append(service.submit(req.execution_request_id, market=market()))
+        try:
+            outcome = service.submit(req.execution_request_id, market=market())
+            with outcome_lock:
+                outcomes.append(outcome)
+        except BaseException as exc:
+            with outcome_lock:
+                errors.append(exc)
 
     threads = [threading.Thread(target=attempt, args=(s,)) for s in services]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=15)
 
+    assert all(not t.is_alive() for t in threads)
+    assert errors == []
     submitted = [result for _, result in outcomes if result is not None]
     suppressed = [decision for decision, result in outcomes if result is None]
     assert len(submitted) == 1
     assert len(suppressed) == 1
     assert SafetyRejectionCode.DUPLICATE_SUBMISSION in codes(suppressed[0])
     assert len(shared_broker.submitted_requests) == 1
+
+
+def test_broker_call_holds_no_sqlite_write_transaction(tmp_path):
+    order_db = tmp_path / "orders.sqlite3"
+
+    class LockProbingRequestLog(list):
+        def append(self, item):
+            import sqlite3
+
+            with sqlite3.connect(order_db, timeout=0.1, isolation_level=None) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("ROLLBACK")
+            super().append(item)
+
+    broker = make_broker()
+    broker.submitted_requests = LockProbingRequestLog()
+    service, _, _ = make_service(tmp_path, conn=BrokerConnection(broker=broker))
+    service.register(request(), client_order_id="client-1")
+
+    decision, result = service.submit("exec-1", market=market())
+
+    assert decision.allowed is True
+    assert result is not None
+    assert len(broker.submitted_requests) == 1
 
 
 def test_duplicate_suppression_log_carries_ids_state_and_reason(tmp_path, caplog):

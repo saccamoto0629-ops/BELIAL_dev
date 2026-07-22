@@ -1487,6 +1487,42 @@ def test_duplicate_signal_id_is_a_conflict_and_creates_no_second_row(db_path):
     assert row["execution_request_id"] == "exec-1"
 
 
+def test_create_does_not_misclassify_not_null_failure_as_a_duplicate(db_path):
+    store.init_db(db_path)
+    request = make_request("exec-invalid")
+    # Simulate an invalid object crossing an internal trust boundary after
+    # construction. sqlite3 uses IntegrityError for NOT NULL as well as
+    # UNIQUE, so the store must not turn this into normal duplicate handling.
+    object.__setattr__(request, "signal_id", None)
+
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        store.create_execution_order(
+            request,
+            client_order_id="client-invalid",
+            created_at_utc=T0,
+            db_path=db_path,
+        )
+    assert store.get_execution_order("exec-invalid", db_path=db_path) is None
+
+
+def test_create_reports_all_identity_keys_when_they_collide_with_different_rows(db_path):
+    create_order(db_path, request_id="exec-a", signal_id="sig-a", client_order_id="client-a")
+    create_order(db_path, request_id="exec-b", signal_id="sig-b", client_order_id="client-b")
+
+    with pytest.raises(store.ExecutionOrderConflictError) as caught:
+        create_order(
+            db_path,
+            request_id="exec-a",
+            signal_id="sig-b",
+            client_order_id="client-b",
+        )
+
+    message = str(caught.value)
+    assert "execution_request_id is already persisted" in message
+    assert "source signal already produced an execution request" in message
+    assert "client_order_id is already bound to an execution request" in message
+
+
 def test_duplicate_signal_suppression_is_logged_with_ids_state_and_reason(db_path, caplog):
     create_order(db_path)
     store.mark_submitting("exec-1", reason="submit", changed_at_utc=at(1), db_path=db_path)
@@ -1605,6 +1641,56 @@ def test_migration_with_duplicate_signals_fails_explicitly_and_changes_nothing(d
         store.init_db(db_path)
 
     assert full_db_state(db_path) == before  # no rows deleted, no index, still v2
+
+
+def test_migration_rolls_back_index_and_version_when_post_migration_verification_fails(
+    db_path, monkeypatch
+):
+    create_order(db_path)
+    _downgrade_to_v2(db_path)
+    before = full_db_state(db_path)
+
+    def fail_verification(connection, path):
+        raise store.ExecutionSchemaError("injected post-migration verification failure")
+
+    monkeypatch.setattr(store, "_verify_schema", fail_verification)
+    with pytest.raises(store.ExecutionSchemaError, match="injected"):
+        store.init_db(db_path)
+
+    assert full_db_state(db_path) == before
+
+
+def test_two_connections_can_migrate_the_same_wal_v2_db_concurrently(db_path):
+    create_order(db_path)
+    _downgrade_to_v2(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+
+    barrier = threading.Barrier(2)
+    outcomes = []
+    outcome_lock = threading.Lock()
+
+    def migrate():
+        try:
+            barrier.wait(timeout=10)
+            store.init_db(db_path)
+            outcome = None
+        except BaseException as exc:  # transferred to the main test thread
+            outcome = exc
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=migrate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes == [None, None]
+    after = full_db_state(db_path)
+    assert after["user_version"] == store.SCHEMA_VERSION
+    assert sum(name == store._SIGNAL_UNIQUE_INDEX for _, name, _, _ in after["schema"]) == 1
 
 
 def test_reads_never_migrate_a_v2_db(db_path):
