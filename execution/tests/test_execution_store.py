@@ -537,6 +537,36 @@ def test_list_unknown_orders_returns_exactly_the_query_targets(db_path):
     assert store.list_unknown_orders(db_path=db_path)[0]["order_state"] == "unknown"
 
 
+def test_list_unresolved_submissions_includes_unknown_and_stuck_pending(db_path):
+    # exec-1: UNKNOWN (query target); exec-2: confirmed ACCEPTED (excluded);
+    # exec-3: still created, no submit attempt (excluded); exec-4: submitting/
+    # pending -- the attempt started but no broker observation was ever
+    # recorded (crash before submit, or result + UNKNOWN-fallback both failed;
+    # Issue #75 review r3) -- must stay visible to reconciliation.
+    submit(db_path, "exec-1")
+    store.record_order_state(
+        "exec-1", OrderState.UNKNOWN, reason="timeout", changed_at_utc=at(2), db_path=db_path
+    )
+    submit_and_accept(db_path, "exec-2", broker_order_id="B-2")
+    create_order(db_path, "exec-3")
+    submit(db_path, "exec-4")
+
+    unresolved = store.list_unresolved_submissions(db_path=db_path)
+    assert sorted(row["execution_request_id"] for row in unresolved) == ["exec-1", "exec-4"]
+    by_id = {row["execution_request_id"]: row for row in unresolved}
+    assert by_id["exec-1"]["order_state"] == OrderState.UNKNOWN.value
+    assert by_id["exec-4"]["order_state"] == OrderState.PENDING.value
+    assert by_id["exec-4"]["submission_phase"] == store.PHASE_SUBMITTING
+    # the stuck-pending order is NOT in the unknown-only listing
+    assert [r["execution_request_id"] for r in store.list_unknown_orders(db_path=db_path)] == ["exec-1"]
+
+
+def test_list_unresolved_submissions_never_creates_a_missing_db(tmp_path):
+    missing = tmp_path / "never-created.sqlite3"
+    assert store.list_unresolved_submissions(db_path=missing) == []
+    assert not missing.exists()
+
+
 @pytest.mark.parametrize(
     "target,extra",
     [

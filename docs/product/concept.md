@@ -56,7 +56,7 @@ BELIAL は、いきなり実売買へ進まない。まず市場を観測し、�
 - **Paper Signal は entry / exit を決めない。** 仮説の記録・通知だけを行う。
 - **Paper Execution は仮説を仮想約定・仮想ポジション・仮想損益へ変換する。** 実装済み(`paper-execution/`)だが、生成するのは仮想レコードのみである。
 - **Backtest は過去データ上の再生・評価に徹する。** リアルタイムの執行フローには介在しない独立した Validation レイヤーである。
-- **Live Execution は未実装であり、設計上も完全に別レイヤーとして扱う。** Paper Execution のコード・データ・設定を実注文経路に転用しない。将来の Live Execution に向けた Broker 境界(共通インターフェースと外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に、ExecutionRequest モデルと注文状態・状態履歴の永続化基盤は Issue #74 で `execution/` に定義済みだが、これらは**将来の Live Execution 用のモデル・状態永続化基盤のみ**であり、実発注・Broker API Adapter・Live Execution 本体・Safety Gate・reconciliation runner は未実装のままである([Broker Interface](../architecture/broker_interface.md) / [Execution Request / Order Persistence](../architecture/execution_request.md))。
+- **Live Execution は未実装であり、設計上も完全に別レイヤーとして扱う。** Paper Execution のコード・データ・設定を実注文経路に転用しない。将来の Live Execution に向けた Broker 境界(共通インターフェースと外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に、ExecutionRequest モデルと注文状態・状態履歴の永続化基盤は Issue #74 で、発注前の fail-closed Safety Gate(検証・監査部品)は Issue #75 で `execution/` に定義済みだが、これらは**将来の Live Execution 用のモデル・永続化・検証基盤のみ**であり、実発注・Broker API Adapter・Live Execution 本体・reconciliation runner は未実装のままである([Broker Interface](../architecture/broker_interface.md) / [Execution Request / Order Persistence](../architecture/execution_request.md) / [Safety Gate](../architecture/safety_gate.md))。
 
 ## レイヤー分離
 

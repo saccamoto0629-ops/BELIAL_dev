@@ -34,7 +34,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | `paper-signal/` | Market Bias + Chart Snapshot から `paper_only` 仮説を生成 | [paper-signal/README.md](paper-signal/README.md) |
 | `paper-execution/` | Paper Signal を入力に仮想ポジションを Open / Close し仮想損益を記録(仮想約定のみ。Broker API・実注文なし) | [Paper Execution 設計](docs/architecture/paper_execution.md) |
 | `broker/` | 将来の Live Execution 用の Broker 境界(共通インターフェース・共通モデル)と、外部通信しないテストダブル FakeBroker(Issue #73)。実発注・OANDA Adapter・Live Execution は未実装のまま | [broker/README.md](broker/README.md) / [設計](docs/architecture/broker_interface.md) |
-| `execution/` | 将来の Live Execution 用の ExecutionRequest モデルと注文状態・状態履歴の SQLite 永続化基盤(Issue #74)。注文状態は既存 `broker.OrderState` を再利用。Live Execution 本体・Broker API Adapter・実注文・Safety Gate・reconciliation runner は未実装のまま | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) |
+| `execution/` | 将来の Live Execution 用の ExecutionRequest モデル・注文状態永続化基盤(Issue #74)と、発注前の fail-closed Safety Gate + 判定監査保存(Issue #75)。注文状態は既存 `broker.OrderState` を再利用。Live Execution 本体・Broker API Adapter・実注文・reconciliation runner は未実装のまま | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) / [Safety Gate](docs/architecture/safety_gate.md) |
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 

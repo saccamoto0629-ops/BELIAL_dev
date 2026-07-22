@@ -13,7 +13,7 @@ from broker.fake_broker import FakeBroker
 > - Broker interface / FakeBroker は**将来の Live Execution 用の基盤(境界の定義)**である。
 > - FakeBroker は**外部通信しないテストダブル**である。ネットワーク・実DB・Discord・S3・sleep・乱数を使わない。
 > - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、本境界を使わない・使わせない。
-> - **実発注・OANDA Adapter・Safety Gate・Live Execution runner は未実装**である。FakeBroker が存在しても Live Execution が実装済みになったわけではない。
+> - **実発注・OANDA Adapter・Live Execution runner は未実装**である。FakeBroker が存在しても Live Execution が実装済みになったわけではない。発注前の Safety Gate は Issue #75 で `execution/` に実装済み([Safety Gate](safety_gate.md))だが、Broker 実装からは独立した検証部品であり、本境界には何も追加しない。
 
 ## 依存方向
 
@@ -116,8 +116,8 @@ broker.set_positions([...]); broker.set_account_state(...)              # 照会
 1. `broker/` 配下(または独立コンポーネント)に Adapter モジュールを追加し、`Broker` Protocol を構造的に実装する。
 2. OANDA 固有のレスポンス→ `broker_models` 共通モデルへの変換は Adapter 内部で完結させ、OANDA 固有フィールドを境界の外へ出さない。
 3. HTTP タイムアウト・接続断は `BrokerTimeoutError` / `BrokerCommunicationError` へマッピングし、タイムアウト後の注文状態は `unknown` として扱う(後続照会・照合で解決)。
-4. 実発注に進む場合も Safety Gate・認証情報管理・再接続・定期照合は本 Issue の非スコープであり、別 Issue で設計する。
+4. 実発注に進む場合も認証情報管理・再接続・定期照合は本 Issue の非スコープであり、別 Issue で設計する。発注前の Safety Gate は Issue #75 で `execution/` に実装済みであり、Adapter は Gate のロジックを持たない(送信は `LiveOrderSubmissionService` 経由のみ)。Adapter は自身の**実接続 config に由来する不変の identity** を `connection_identity()`(→ `broker_models.BrokerConnectionIdentity`)で自己申告し、`execution.safety_gate.BROKER_TYPE_BY_MODE` へ型を登録して型付き接続 identity に束縛する(mode / 接続先を接続 config と別に申告する経路は存在しない。[Safety Gate](safety_gate.md))。
 
 ## 非スコープ(Issue #73 時点で未実装)
 
-OANDA Demo/Live API 連携、実 HTTP クライアント、実発注、ロット計算、レバレッジ計算、資金管理、Safety Gate、Broker との定期照合、再接続ループ、認証情報管理、Discord 通知、Live Execution runner。
+OANDA Demo/Live API 連携、実 HTTP クライアント、実発注、ロット計算、レバレッジ計算、資金管理、Broker との定期照合、再接続ループ、認証情報管理、Discord 通知、Live Execution runner。(Safety Gate は Issue #73 時点では非スコープだったが、その後 Issue #75 で `execution/` に実装済み。)

@@ -662,3 +662,18 @@ def test_models_are_immutable():
     req = make_request()
     with pytest.raises(Exception):
         req.quantity = Decimal("99")
+
+
+# --- BrokerConnectionIdentity (Issue #75) ------------------------------------
+
+def test_connection_identity_requires_non_empty_stripped_strings():
+    assert m.BrokerConnectionIdentity(mode="fake", target="fake").mode == "fake"
+    for bad in ("", "  ", None, 7):
+        with pytest.raises(m.BrokerInvalidRequestError):
+            m.BrokerConnectionIdentity(mode=bad, target="fake")
+        with pytest.raises(m.BrokerInvalidRequestError):
+            m.BrokerConnectionIdentity(mode="fake", target=bad)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.BrokerConnectionIdentity(mode=" fake", target="fake")
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.BrokerConnectionIdentity(mode="fake", target="fake ")

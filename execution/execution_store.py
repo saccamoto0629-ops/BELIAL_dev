@@ -1678,3 +1678,45 @@ def list_unknown_orders(*, db_path: Path | None = None) -> list[dict]:
             if bundle is not None:
                 rows.append(bundle[0])
     return rows
+
+
+def list_unresolved_submissions(*, db_path: Path | None = None) -> list[dict]:
+    """Every submission whose broker-side outcome is not yet recorded as a
+    confirmed observation (Issue #75 review r3) -- read-only, additive.
+
+    Two shapes are returned, oldest first:
+
+    - ``order_state = 'unknown'`` -- the classic query targets (same set as
+      :func:`list_unknown_orders`), and
+    - ``submission_phase = 'submitting'`` with ``order_state = 'pending'`` --
+      a submit attempt STARTED but no broker observation was ever recorded:
+      the process died between the transition and the submit call, or the
+      broker answered and both the result persistence and the UNKNOWN
+      fallback failed. The broker may or may not hold such an order, so it
+      must stay visible to reconciliation instead of vanishing behind a
+      persistence error.
+
+    ``created`` intents (no submit attempt) and confirmed observations
+    (phase ``submitted``) are deliberately NOT included. Missing DB -> empty
+    list, file never created; every returned row passed full bundle
+    validation.
+    """
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    rows = []
+    with _verified_read(db_path) as connection:
+        ids = [
+            row["execution_request_id"]
+            for row in connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+                "WHERE order_state = ? OR (submission_phase = ? AND order_state = ?) "
+                "ORDER BY updated_at_utc ASC",
+                (OrderState.UNKNOWN.value, PHASE_SUBMITTING, OrderState.PENDING.value),
+            ).fetchall()
+        ]
+        for request_id in ids:
+            bundle = _fetch_and_validate(connection, request_id)
+            if bundle is not None:
+                rows.append(bundle[0])
+    return rows

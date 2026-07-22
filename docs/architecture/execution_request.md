@@ -10,7 +10,7 @@ from execution import execution_store
 > **重要な位置づけ**
 >
 > - 本コンポーネントは **将来の Live Execution 用のモデル・状態永続化基盤のみ** を実装する。
-> - **Live Execution 本体・Broker API Adapter・実発注・Safety Gate・reconciliation runner は未実装**である。このコンポーネントが存在しても Live Execution が実装済みになったわけではない。
+> - **Live Execution 本体・Broker API Adapter・実発注・reconciliation runner は未実装**である。このコンポーネントが存在しても Live Execution が実装済みになったわけではない。発注前の Safety Gate は Issue #75 で `execution/safety_gate.py` に実装済み([Safety Gate](safety_gate.md))だが、これも検証部品のみで実発注経路は存在しない。
 > - 外部通信・Discord・S3・実注文はこのパッケージのどこにも存在しない。
 > - **Paper Signal / Paper Execution は従来どおり Broker 非依存**であり、本パッケージを import しない・させない(`execution/tests/test_package_imports.py` が回帰として固定)。
 > - 注文状態の唯一の正は既存の `broker.broker_models.OrderState` / `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)である。**本パッケージは注文状態 Enum・遷移表を一切新設しない。**
@@ -163,6 +163,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - UNKNOWN は**そのまま保存**され、phase は `submitting` に留まる。
 - `list_unknown_orders()` が **照会対象**(`order_state = 'unknown'`)を抽出する。
+- `list_unresolved_submissions()`(Issue #75)は、UNKNOWN に加えて **`submitting` phase のまま `pending` に留まる注文**(送信試行後に Broker 観測が一度も記録されないまま停止したケース)も照会対象として返す read-only API。Broker が注文を保持しうる submission が reconciliation の視界から消えないことを保証する([Safety Gate](safety_gate.md))。
 - UNKNOWN の解決は、後続照会の結果(完全な `OrderResult`)を `record_order_result` で記録することによってのみ行われる。許可される解決先は既存遷移表のとおり(accepted / partially_filled / filled / cancelled / rejected)で、**保存済み snapshot の fill を失う解決(例: 部分約定既知のまま fill 無しの CANCELLED / REJECTED へ確定)は `validate_order_result_update()` が拒否**する。
 - store / API は UNKNOWN を「未発注」「拒否」「再送可」へ**自動変換しない**。即時再送可能状態として扱わない。
 - 自動照会 runner・定期 reconciliation は**非スコープ**(未実装)。
@@ -184,7 +185,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - Live Execution runner / ユースケース本体
 - Broker API 実装(OANDA 等の Adapter)・実注文送信・外部通信
-- Safety Gate
+- Safety Gate(その後 Issue #75 で実装済み。[Safety Gate](safety_gate.md) を参照)
 - 自動照会・定期 reconciliation
 - 再送フロー(UNKNOWN の解決は照会結果の記録のみ)
 - Paper Signal / Paper Execution からの接続(両レイヤーは本パッケージを使わない)

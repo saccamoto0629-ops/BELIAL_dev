@@ -21,7 +21,8 @@ from broker.fake_broker import FakeBroker
 
 - Broker interface / FakeBroker は**将来の Live Execution 用の基盤**であり、FakeBroker が存在しても **Live Execution が実装済みになったわけではない**。
 - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、このパッケージを使わない。
-- 実発注・OANDA Adapter・Safety Gate は**未実装**。
+- 実発注・OANDA Adapter は**未実装**。発注前の Safety Gate は Issue #75 で `execution/` に実装済みだが、Broker 実装から独立した検証部品である([Safety Gate 設計](../docs/architecture/safety_gate.md))。
+- Issue #75 で本パッケージに追加されたのは**接続 identity の契約のみ**: `broker_models.BrokerConnectionIdentity` と、各 Broker 実装が自身の構築時接続 config から不変の identity を自己申告する `connection_identity()`(FakeBroker は mode `"fake"` 固定 + 構築時 `connection_target`)。これは Issue #73 の 5 操作 Protocol とは別の契約であり、execution 層の型付き `BrokerConnection` が mode / 接続先を **Broker 実体から導出**するために用いる。将来の Adapter も自身の実接続設定から identity を返す義務を負う。
 - `runtime_checkable` Protocol の `isinstance()` は属性の存在確認のみ(シグネチャ・型の適合は保証しない)。本リポジトリは静的型検査(mypy / pyright)を実行しておらず、シグネチャ適合を保証する仕組みはない。`tests/` の振る舞いテストが確認するのは FakeBroker の挙動のみで、将来の Adapter は自前のテストで適合を確認する。
 
 設計の詳細は [docs/architecture/broker_interface.md](../docs/architecture/broker_interface.md) を参照。
