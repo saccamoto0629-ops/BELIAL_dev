@@ -12,9 +12,12 @@ fails verification), so the two schemas cannot share a file.
 
 Fail-closed contract (Issue #75): :meth:`SQLiteSafetyDecisionStore.record`
 raises on ANY failure -- missing/uninitialized DB, schema mismatch, insert
-failure. ``submit_after_safety_gate`` treats that exception as
-``DECISION_PERSIST_FAILED`` and does not submit, so a broken audit trail can
-never be bypassed silently.
+failure. ``LiveOrderSubmissionService`` (``execution/live_submission.py``)
+treats that exception -- and a failed read-back verification of the recorded
+decision -- as ``DECISION_PERSIST_FAILED`` and does not submit, so a broken
+audit trail can never be bypassed silently. The service also accepts ONLY
+this durable store type: in-memory / no-op recorders cannot enter the
+production submission path.
 
 Schema policy (same stance as ``execution_store``, PR #91): ``initialize()``
 creates the schema only into a PRISTINE database (zero ``sqlite_master``
@@ -270,11 +273,12 @@ def _rejections_from_json(text: str) -> tuple[SafetyRejection, ...]:
 
 
 class SQLiteSafetyDecisionStore:
-    """``SafetyDecisionRecorder`` backed by SQLite (the audit trail).
+    """The DURABLE Safety Gate decision store (the audit trail).
 
     ``record`` raises :class:`SafetyStoreError` subclasses on any failure;
-    the sanctioned submission path converts that into a fail-closed
-    ``DECISION_PERSIST_FAILED`` rejection.
+    the sanctioned submission path (``LiveOrderSubmissionService``) converts
+    that into a fail-closed ``DECISION_PERSIST_FAILED`` rejection and
+    additionally verifies every recorded decision by read-back.
     """
 
     def __init__(self, path: str | Path | None = None):

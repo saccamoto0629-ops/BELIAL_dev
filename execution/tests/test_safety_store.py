@@ -11,10 +11,12 @@ from decimal import Decimal
 
 import pytest
 
-from broker.broker_models import OrderSide, OrderType
+from broker.broker_models import AccountState, OrderSide, OrderType
 from broker.fake_broker import FakeBroker
 from execution.execution_models import ExecutionRequest
+from execution.live_submission import LiveOrderSubmissionService
 from execution.safety_gate import (
+    BrokerConnection,
     ExecutionMode,
     MarketSafetySnapshot,
     SafetyDecision,
@@ -23,7 +25,6 @@ from execution.safety_gate import (
     SafetyRejection,
     SafetyRejectionCode,
     StaticSafetyState,
-    submit_after_safety_gate,
 )
 from execution.safety_store import (
     SafetyIntegrityError,
@@ -269,8 +270,18 @@ def test_db_check_constraints_reject_inconsistent_rows_at_write_time(tmp_path):
 # --- integration with the sanctioned submission path -------------------------
 
 
-def _submit_with_store(store, *, kill_switch=False):
-    broker = FakeBroker(default_fill_price=Decimal("150"))
+def _submit_with_store(store, tmp_path, *, kill_switch=False):
+    broker = FakeBroker(default_fill_price=Decimal("150"), clock=lambda: NOW)
+    broker.set_account_state(
+        AccountState(
+            account_id="fake-account",
+            currency="USD",
+            balance=Decimal("100000"),
+            equity=Decimal("100000"),
+            margin_available=Decimal("100000"),
+            retrieved_at_utc=NOW,
+        )
+    )
     request = ExecutionRequest(
         execution_request_id="exec-flow-1",
         signal_id="signal-1",
@@ -307,23 +318,23 @@ def _submit_with_store(store, *, kill_switch=False):
         market_open=True,
         tradable=True,
     )
-    decision, result = submit_after_safety_gate(
-        request,
-        client_order_id="client-flow-1",
-        broker=broker,
+    service = LiveOrderSubmissionService(
+        connection=BrokerConnection(
+            broker=broker, execution_mode=ExecutionMode.FAKE, connection_target="fake"
+        ),
         gate=gate,
-        recorder=store,
-        market=market,
-        execution_mode=ExecutionMode.FAKE,
-        connection_target="fake",
-        created_at_utc=NOW,
+        decision_store=store,
+        order_db_path=tmp_path / "orders.sqlite3",
+        clock=lambda: NOW,
     )
+    service.register(request, client_order_id="client-flow-1")
+    decision, result = service.submit(request.execution_request_id, market=market)
     return decision, result, broker
 
 
 def test_rejection_audit_survives_a_store_reopen(tmp_path):
     path = tmp_path / "safety.sqlite3"
-    decision, result, broker = _submit_with_store(store_at(tmp_path), kill_switch=True)
+    decision, result, broker = _submit_with_store(store_at(tmp_path), tmp_path, kill_switch=True)
     assert result is None
     assert broker.submitted_requests == []
 
@@ -334,7 +345,7 @@ def test_rejection_audit_survives_a_store_reopen(tmp_path):
 
 def test_allow_audit_survives_a_store_reopen(tmp_path):
     path = tmp_path / "safety.sqlite3"
-    decision, result, broker = _submit_with_store(store_at(tmp_path))
+    decision, result, broker = _submit_with_store(store_at(tmp_path), tmp_path)
     assert decision.allowed is True
     assert result is not None
     assert len(broker.submitted_requests) == 1
@@ -343,7 +354,7 @@ def test_allow_audit_survives_a_store_reopen(tmp_path):
 
 def test_uninitialized_store_fails_closed_through_the_submission_path(tmp_path):
     store = SQLiteSafetyDecisionStore(tmp_path / "never-initialized.sqlite3")
-    decision, result, broker = _submit_with_store(store)
+    decision, result, broker = _submit_with_store(store, tmp_path)
     assert decision.allowed is False
     assert decision.rejection_codes == (SafetyRejectionCode.DECISION_PERSIST_FAILED.value,)
     assert result is None

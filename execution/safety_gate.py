@@ -10,20 +10,27 @@ Design (docs/architecture/safety_gate.md is the authoritative spec):
 - The gate is INDEPENDENT of Strategy and of any Broker adapter: Strategy code
   holds no safety policy, and a broker adapter holds no gate logic. The gate
   depends only on the ``broker`` boundary models and ``ExecutionRequest``.
-- ``submit_after_safety_gate()`` is the ONLY sanctioned submission path: it
-  evaluates, PERSISTS the decision, and calls ``Broker.submit_order()`` only
-  after a positive decision has been recorded. A repository-wide AST test
-  (``execution/tests/test_submission_boundary.py``) pins that no other module
-  calls ``submit_order`` / ``to_order_request`` -- the boundary is enforced
-  structurally, not by caller discipline.
+- This module holds the DECISION layer only: policy, market snapshot,
+  typed connection identity, gate evaluation, decision model. The single
+  sanctioned submission path lives in ``execution/live_submission.py``
+  (``LiveOrderSubmissionService``) and is pinned repository-wide by the AST
+  test ``execution/tests/test_submission_boundary.py`` -- no other module may
+  call ``submit_order`` / ``to_order_request``.
+- Typed connection identity (Issue #75 review r1): mode / target are NOT
+  caller-supplied per-call strings. A :class:`BrokerConnection` binds the
+  broker INSTANCE to its ``ExecutionMode`` and connection target at
+  composition time, and cross-checks the broker's concrete type against the
+  mode: only ``FakeBroker`` may claim ``fake``, and ``demo`` / ``live``
+  connections cannot exist at all until a real adapter type is registered.
+  A FakeBroker claiming ``live`` is therefore unrepresentable, not merely
+  rejected at evaluation time.
 - FAIL-CLOSED: every external lookup (broker positions / account, kill-switch
-  state, decision persistence) that fails, returns garbage, or looks stale
-  produces a machine-readable rejection instead of an implicit allow. An
-  unexpected exception anywhere in evaluation becomes a
-  ``GATE_INTERNAL_ERROR`` rejection in the sanctioned submission path -- there
-  is no exception type or failure cause that falls through to a submit.
-- ALL violations are collected (not first-fail), so one decision carries every
-  rejection code that applied.
+  state) that fails, returns garbage, or looks stale (future-dated or older
+  than ``max_reference_age`` -- account state included) produces a
+  machine-readable rejection instead of an implicit allow.
+- ALL violations are collected (not first-fail) and then DEDUPLICATED by code
+  preserving first-occurrence order, so one decision carries every rejection
+  code that applied, each exactly once.
 - Reference price for SL/TP validation: LIMIT orders use the request's own
   ``requested_price`` (the model already guarantees the SL/TP side relations
   at construction; the gate re-checks as defense in depth). MARKET orders use
@@ -39,31 +46,25 @@ Design (docs/architecture/safety_gate.md is the authoritative spec):
   aggregation / margin-based sizing is deliberately NOT modelled (non-scope,
   Issue #75). Working (partially filled) orders are not counted -- only what
   the broker reports as positions.
-- Execution mode vs connection target is an exact, case-sensitive match
-  against the policy's per-mode allow-list: unknown modes, unknown targets,
-  case or whitespace variations are all rejected.
 """
 
 from __future__ import annotations
 
 import enum
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Callable, Protocol
 
 from broker.broker_interface import Broker
 from broker.broker_models import (
     AccountState,
-    OrderResult,
     OrderSide,
     OrderType,
     PositionInfo,
 )
+from broker.fake_broker import FakeBroker
 from execution.execution_models import ExecutionRequest
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class ExecutionMode(enum.Enum):
@@ -78,6 +79,15 @@ class ExecutionMode(enum.Enum):
     FAKE = "fake"
     DEMO = "demo"
     LIVE = "live"
+
+
+# Typed connection identity registry (Issue #75 review r1): which concrete
+# broker type may claim which execution mode. DEMO / LIVE deliberately have
+# NO entry -- no such adapter exists, so no such connection can be built.
+# A future adapter is added HERE, never by loosening BrokerConnection.
+BROKER_TYPE_BY_MODE: dict[ExecutionMode, type] = {
+    ExecutionMode.FAKE: FakeBroker,
+}
 
 
 class SafetyRejectionCode(enum.Enum):
@@ -106,6 +116,8 @@ class SafetyRejectionCode(enum.Enum):
     DECISION_PERSIST_FAILED = "decision_persist_failed"
     EXECUTION_MODE_MISMATCH = "execution_mode_mismatch"
     GATE_INTERNAL_ERROR = "gate_internal_error"
+    INTENT_NOT_REGISTERED = "intent_not_registered"
+    DUPLICATE_SUBMISSION = "duplicate_submission"
 
 
 def _require_utc(value, field_name: str) -> None:
@@ -118,6 +130,62 @@ def _require_utc(value, field_name: str) -> None:
 def _require_non_empty_str(value, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string, got {value!r}")
+
+
+@dataclass(frozen=True)
+class BrokerConnection:
+    """Typed connection identity: the broker INSTANCE travels together with
+    the execution mode and connection target it was wired for.
+
+    Bound once at composition time -- callers can no longer claim an
+    arbitrary mode/target per call, and the claimed mode is cross-checked
+    against the broker's concrete type via :data:`BROKER_TYPE_BY_MODE`:
+
+    - ``fake`` requires a ``FakeBroker`` instance (subclasses included);
+    - a ``FakeBroker`` can claim nothing but ``fake``;
+    - ``demo`` / ``live`` connections cannot be constructed at all until a
+      real adapter type is registered (fail closed by unrepresentability).
+
+    The target string must be exact (non-empty, no surrounding whitespace);
+    whether it is allowed for the mode stays a policy decision
+    (``SafetyPolicy.allowed_connection_targets``), evaluated by the gate.
+    """
+
+    broker: Broker
+    execution_mode: ExecutionMode
+    connection_target: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution_mode, ExecutionMode):
+            raise ValueError(f"execution_mode must be an ExecutionMode, got {self.execution_mode!r}")
+        _require_non_empty_str(self.connection_target, "connection_target")
+        if self.connection_target != self.connection_target.strip():
+            raise ValueError(
+                f"connection_target {self.connection_target!r} carries surrounding whitespace"
+            )
+        if not isinstance(self.broker, Broker):
+            raise ValueError(f"broker must satisfy the Broker protocol, got {self.broker!r}")
+        expected_type = BROKER_TYPE_BY_MODE.get(self.execution_mode)
+        if expected_type is None:
+            raise ValueError(
+                f"no broker implementation is registered for execution mode "
+                f"{self.execution_mode.value!r}; only "
+                f"{sorted(mode.value for mode in BROKER_TYPE_BY_MODE)} connections can exist yet"
+            )
+        if not isinstance(self.broker, expected_type):
+            raise ValueError(
+                f"execution mode {self.execution_mode.value!r} requires a "
+                f"{expected_type.__name__} instance, got {type(self.broker).__name__}"
+            )
+        claimed_modes = [
+            mode for mode, broker_type in BROKER_TYPE_BY_MODE.items()
+            if isinstance(self.broker, broker_type)
+        ]
+        if claimed_modes != [self.execution_mode]:
+            raise ValueError(
+                f"broker type {type(self.broker).__name__} is not uniquely bound to "
+                f"execution mode {self.execution_mode.value!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -255,15 +323,29 @@ class SafetyRejection:
         _require_non_empty_str(self.message, "message")
 
 
+def dedupe_rejections(rejections: list[SafetyRejection]) -> tuple[SafetyRejection, ...]:
+    """Order-preserving dedup by code: the FIRST occurrence of each code wins
+    (Issue #75 review r1). ``SafetyDecision`` enforces the resulting
+    uniqueness as a construction invariant."""
+    deduped: list[SafetyRejection] = []
+    seen: set[SafetyRejectionCode] = set()
+    for rejection in rejections:
+        if rejection.code not in seen:
+            seen.add(rejection.code)
+            deduped.append(rejection)
+    return tuple(deduped)
+
+
 @dataclass(frozen=True)
 class SafetyDecision:
     """One gate evaluation outcome, as persisted for audit.
 
     ``policy_id`` records which policy configuration produced the decision;
-    ``execution_mode`` / ``connection_target`` record what the caller claimed
-    (None when the claim itself was malformed); ``account_id`` /
-    ``position_count`` record what the broker reported at evaluation time
-    (None when the broker query failed).
+    ``execution_mode`` / ``connection_target`` record the typed connection
+    identity the evaluation ran against; ``account_id`` / ``position_count``
+    record what the broker reported at evaluation time (None when the broker
+    query failed). Rejection codes are unique within one decision
+    (order-preserving dedup, first occurrence wins).
     """
 
     execution_request_id: str
@@ -291,6 +373,11 @@ class SafetyDecision:
             raise ValueError(
                 "allowed decisions must have no rejections; rejected decisions must have at least one"
             )
+        codes = [entry.code for entry in self.rejections]
+        if len(codes) != len(set(codes)):
+            raise ValueError(
+                "rejection codes must be unique within one decision (dedupe_rejections upstream)"
+            )
         for name in ("execution_mode", "connection_target", "account_id"):
             value = getattr(self, name)
             if value is not None:
@@ -313,13 +400,6 @@ class SafetyStateProvider(Protocol):
     def is_kill_switch_enabled(self) -> bool: ...
 
 
-class SafetyDecisionRecorder(Protocol):
-    """Persists a decision; MUST raise on failure (a swallowed persistence
-    failure would defeat the fail-closed contract)."""
-
-    def record(self, decision: SafetyDecision) -> None: ...
-
-
 @dataclass
 class StaticSafetyState:
     """In-memory ``SafetyStateProvider`` (tests / static configuration)."""
@@ -330,24 +410,14 @@ class StaticSafetyState:
         return self.kill_switch_enabled
 
 
-@dataclass
-class InMemorySafetyDecisionRecorder:
-    """In-memory ``SafetyDecisionRecorder`` (tests only -- no audit trail)."""
-
-    decisions: list[SafetyDecision] = field(default_factory=list)
-
-    def record(self, decision: SafetyDecision) -> None:
-        self.decisions.append(decision)
-
-
 class SafetyGate:
     """Evaluate every pre-submit condition and collect ALL rejection reasons.
 
     ``evaluate()`` is pure decision logic plus the broker/state safety
     queries; it performs no submission and no persistence. Caller programming
     errors (wrong argument types, a broken clock) raise ``ValueError`` --
-    inside the sanctioned submission path they are converted to a fail-closed
-    ``GATE_INTERNAL_ERROR`` rejection by :func:`submit_after_safety_gate`.
+    inside the sanctioned submission path (``LiveOrderSubmissionService``)
+    they are converted to a fail-closed ``GATE_INTERNAL_ERROR`` rejection.
     """
 
     def __init__(
@@ -373,13 +443,13 @@ class SafetyGate:
         self,
         request: ExecutionRequest,
         *,
-        broker: Broker,
+        connection: BrokerConnection,
         market: MarketSafetySnapshot,
-        execution_mode: ExecutionMode,
-        connection_target: str,
     ) -> SafetyDecision:
         if not isinstance(request, ExecutionRequest):
             raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
+        if not isinstance(connection, BrokerConnection):
+            raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
         if not isinstance(market, MarketSafetySnapshot):
             raise ValueError(f"market must be a MarketSafetySnapshot, got {market!r}")
         now = self._clock()
@@ -445,32 +515,28 @@ class SafetyGate:
         self._validate_protective_prices(request, market, reject)
 
         # --- execution mode vs connection target -----------------------------
-        # Exact, case-sensitive comparison: unknown modes, unknown targets,
-        # case or whitespace variants are all mismatches (fail closed).
-        mode_value: str | None = None
-        target_value: str | None = None
-        if not isinstance(execution_mode, ExecutionMode):
+        # The connection is a typed identity (broker instance bound to mode +
+        # target at composition time; BrokerConnection cross-checks the
+        # broker's concrete type). Re-verified here as defense in depth, then
+        # the TARGET is checked against the policy allow-list for the mode --
+        # exact, case-sensitive; unknown targets, case or whitespace variants
+        # never match (fail closed).
+        expected_type = BROKER_TYPE_BY_MODE.get(connection.execution_mode)
+        if expected_type is None or not isinstance(connection.broker, expected_type):
             reject(
                 SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
-                f"unknown execution mode {execution_mode!r}",
+                f"broker type {type(connection.broker).__name__} does not match execution "
+                f"mode {connection.execution_mode.value!r}",
             )
-        else:
-            mode_value = execution_mode.value
-        if not isinstance(connection_target, str) or not connection_target.strip():
+        allowed_targets = policy.allowed_connection_targets.get(
+            connection.execution_mode, frozenset()
+        )
+        if connection.connection_target not in allowed_targets:
             reject(
                 SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
-                "connection target is missing or empty",
+                f"connection target {connection.connection_target!r} is not allowed for "
+                f"execution mode {connection.execution_mode.value!r}",
             )
-        else:
-            target_value = connection_target
-        if mode_value is not None and target_value is not None:
-            allowed_targets = policy.allowed_connection_targets.get(execution_mode, frozenset())
-            if connection_target not in allowed_targets:
-                reject(
-                    SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
-                    f"connection target {connection_target!r} is not allowed for "
-                    f"execution mode {mode_value!r}",
-                )
 
         # --- kill switch (absolute: any enabled state rejects every order) ---
         try:
@@ -494,11 +560,8 @@ class SafetyGate:
         positions: tuple[PositionInfo, ...] | None = None
         account: AccountState | None = None
         try:
-            positions = self._reliable_positions(broker.get_positions(), now)
-            raw_account = broker.get_account_state()
-            if not isinstance(raw_account, AccountState):
-                raise TypeError(f"broker returned non-AccountState {raw_account!r}")
-            account = raw_account
+            positions = self._reliable_positions(connection.broker.get_positions(), now)
+            account = self._reliable_account(connection.broker.get_account_state(), now)
         except Exception as exc:
             reject(SafetyRejectionCode.BROKER_QUERY_FAILED, f"broker safety query failed: {exc}")
 
@@ -518,14 +581,15 @@ class SafetyGate:
                     f"{policy.max_positions_account}",
                 )
 
+        deduped = dedupe_rejections(rejections)
         return SafetyDecision(
             execution_request_id=request.execution_request_id,
-            allowed=not rejections,
+            allowed=not deduped,
             checked_at_utc=now,
             policy_id=policy.policy_id,
-            rejections=tuple(rejections),
-            execution_mode=mode_value,
-            connection_target=target_value,
+            rejections=deduped,
+            execution_mode=connection.execution_mode.value,
+            connection_target=connection.connection_target,
             account_id=account.account_id if account is not None else None,
             position_count=len(positions) if positions is not None else None,
         )
@@ -553,6 +617,20 @@ class SafetyGate:
                     f"position snapshot for {position.symbol!r} is stale "
                     f"({position.retrieved_at_utc.isoformat()})"
                 )
+        return raw
+
+    def _reliable_account(self, raw, now: datetime) -> AccountState:
+        """Same reliability bar for the account snapshot (Issue #75 review r1):
+        wrong type, future-dated or stale ``retrieved_at_utc`` -> unreliable
+        -> BROKER_QUERY_FAILED via the caller (fail closed)."""
+        if not isinstance(raw, AccountState):
+            raise TypeError(f"broker returned non-AccountState {raw!r}")
+        if raw.retrieved_at_utc > now:
+            raise ValueError(
+                f"account snapshot is from the future ({raw.retrieved_at_utc.isoformat()})"
+            )
+        if now - raw.retrieved_at_utc > self._policy.max_reference_age:
+            raise ValueError(f"account snapshot is stale ({raw.retrieved_at_utc.isoformat()})")
         return raw
 
     @staticmethod
@@ -594,116 +672,3 @@ class SafetyGate:
                     f"take profit {request.take_profit_price} is not on the winning side of "
                     f"base price {base} for {request.side.value}",
                 )
-
-
-def submit_after_safety_gate(
-    request: ExecutionRequest,
-    *,
-    client_order_id: str,
-    broker: Broker,
-    gate: SafetyGate,
-    recorder: SafetyDecisionRecorder,
-    market: MarketSafetySnapshot,
-    execution_mode: ExecutionMode,
-    connection_target: str,
-    created_at_utc: datetime,
-) -> tuple[SafetyDecision, OrderResult | None]:
-    """The ONLY sanctioned path from an ``ExecutionRequest`` to
-    ``Broker.submit_order()`` (pinned by ``test_submission_boundary.py``).
-
-    Order of operations: evaluate -> persist the decision -> submit only when
-    the PERSISTED decision is an allow. Fail-closed conversions:
-
-    - an unexpected exception during evaluation -> ``GATE_INTERNAL_ERROR``
-      rejection (recorded on a best-effort basis), no submit;
-    - a decision-persistence failure -> ``DECISION_PERSIST_FAILED`` appended
-      to the decision (an allow becomes a rejection), no submit.
-
-    A ``BrokerError`` raised by ``submit_order`` itself propagates to the
-    caller AFTER the allow was recorded -- outcome tracking of a submitted
-    order belongs to ``execution_store`` (Issue #74), not to the gate.
-
-    Logs carry the machine-readable codes; the persisted decision is the
-    authoritative audit record. No secrets are logged.
-    """
-    if not isinstance(request, ExecutionRequest):
-        raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
-    if not isinstance(gate, SafetyGate):
-        raise ValueError(f"gate must be a SafetyGate, got {gate!r}")
-
-    try:
-        decision = gate.evaluate(
-            request,
-            broker=broker,
-            market=market,
-            execution_mode=execution_mode,
-            connection_target=connection_target,
-        )
-    except Exception as exc:
-        # Unexpected failure inside evaluation: never fall through toward a
-        # submit. datetime.now is a last resort -- the gate's own clock may be
-        # exactly what is broken.
-        decision = SafetyDecision(
-            execution_request_id=request.execution_request_id,
-            allowed=False,
-            checked_at_utc=datetime.now(timezone.utc),
-            policy_id=gate.policy_id,
-            rejections=(
-                SafetyRejection(
-                    SafetyRejectionCode.GATE_INTERNAL_ERROR,
-                    f"safety gate evaluation failed unexpectedly: {exc}",
-                ),
-            ),
-            execution_mode=execution_mode.value if isinstance(execution_mode, ExecutionMode) else None,
-            connection_target=connection_target
-            if isinstance(connection_target, str) and connection_target.strip()
-            else None,
-        )
-
-    try:
-        recorder.record(decision)
-    except Exception as exc:
-        decision = SafetyDecision(
-            execution_request_id=decision.execution_request_id,
-            allowed=False,
-            checked_at_utc=decision.checked_at_utc,
-            policy_id=decision.policy_id,
-            rejections=decision.rejections
-            + (
-                SafetyRejection(
-                    SafetyRejectionCode.DECISION_PERSIST_FAILED,
-                    f"safety decision persistence failed: {exc}",
-                ),
-            ),
-            execution_mode=decision.execution_mode,
-            connection_target=decision.connection_target,
-            account_id=decision.account_id,
-            position_count=decision.position_count,
-        )
-        _LOGGER.error(
-            "Safety Gate rejected execution_request_id=%s policy_id=%s codes=%s",
-            decision.execution_request_id,
-            decision.policy_id,
-            decision.rejection_codes,
-        )
-        return decision, None
-
-    if not decision.allowed:
-        _LOGGER.warning(
-            "Safety Gate rejected execution_request_id=%s policy_id=%s codes=%s",
-            decision.execution_request_id,
-            decision.policy_id,
-            decision.rejection_codes,
-        )
-        return decision, None
-
-    _LOGGER.info(
-        "Safety Gate allowed execution_request_id=%s policy_id=%s",
-        decision.execution_request_id,
-        decision.policy_id,
-    )
-    order_request = request.to_order_request(
-        client_order_id=client_order_id,
-        created_at_utc=created_at_utc,
-    )
-    return decision, broker.submit_order(order_request)

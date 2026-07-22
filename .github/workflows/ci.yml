@@ -81,8 +81,9 @@ jobs:
           python -c "from broker.fake_broker import FakeBroker"
           python -c "from execution.execution_models import ExecutionRequest"
           python -c "from execution import execution_store"
-          python -c "from execution.safety_gate import SafetyGate, SafetyPolicy, submit_after_safety_gate"
+          python -c "from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy"
           python -c "from execution.safety_store import SQLiteSafetyDecisionStore"
+          python -c "from execution.live_submission import LiveOrderSubmissionService"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot

@@ -12,8 +12,9 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.execution_models import ExecutionRequest",
     "from execution import execution_store",
     "from execution.execution_store import init_db, create_execution_order",
-    "from execution.safety_gate import SafetyGate, SafetyPolicy, submit_after_safety_gate",
+    "from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy",
     "from execution.safety_store import SQLiteSafetyDecisionStore",
+    "from execution.live_submission import LiveOrderSubmissionService",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /

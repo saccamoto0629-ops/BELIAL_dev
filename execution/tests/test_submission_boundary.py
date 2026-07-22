@@ -1,9 +1,10 @@
-"""Issue #75: the Safety Gate submission boundary is enforced STRUCTURALLY.
+"""Issue #75: the Live Execution submission boundary is enforced STRUCTURALLY.
 
-``submit_after_safety_gate`` must be the only path from an ExecutionRequest to
-``Broker.submit_order``. These AST scans pin, repository-wide, that no other
-module grows a direct ``submit_order`` / ``to_order_request`` call -- so the
-gate cannot be bypassed by "careful callers"; a bypass fails this suite.
+``LiveOrderSubmissionService`` (execution/live_submission.py) must be the only
+path from an ExecutionRequest to ``Broker.submit_order``. These AST scans pin,
+repository-wide, that no other module grows a direct ``submit_order`` /
+``to_order_request`` call -- so the service boundary cannot be bypassed by
+"careful callers"; a bypass fails this suite.
 """
 
 import ast
@@ -12,20 +13,20 @@ import pathlib
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # The only files that may CALL <something>.submit_order(...):
-# - broker/fake_broker.py defines the test double (its submit_order is the
-#   implementation, and it never calls itself);
 # - broker/tests exercise the broker boundary itself (Issue #73);
-# - execution/safety_gate.py holds THE single gated call.
+# - execution/live_submission.py holds THE single gated call.
+# (broker/fake_broker.py only DEFINES submit_order; a def is not a call.)
 SUBMIT_ORDER_ALLOWED = {
     "broker/tests",
-    "execution/safety_gate.py",
+    "execution/live_submission.py",
 }
 
 # The only files that may CALL <something>.to_order_request(...):
-# - execution/safety_gate.py converts AFTER a recorded allow decision;
+# - execution/live_submission.py converts AFTER the decision was durably
+#   recorded, read back, and the created -> submitting transition was won;
 # - execution/tests/test_execution_models.py unit-tests the model itself.
 TO_ORDER_REQUEST_ALLOWED = {
-    "execution/safety_gate.py",
+    "execution/live_submission.py",
     "execution/tests/test_execution_models.py",
 }
 
@@ -69,9 +70,9 @@ def test_to_order_request_is_called_only_by_the_safety_gate_and_model_tests():
     assert _offenders("to_order_request", TO_ORDER_REQUEST_ALLOWED) == []
 
 
-def test_safety_gate_module_holds_exactly_one_submit_order_call():
-    sites = _method_call_sites(REPO_ROOT / "execution" / "safety_gate.py", "submit_order")
+def test_submission_service_holds_exactly_one_submit_order_call():
+    sites = _method_call_sites(REPO_ROOT / "execution" / "live_submission.py", "submit_order")
     assert len(sites) == 1, (
-        "execution/safety_gate.py must hold exactly one Broker.submit_order call "
-        f"(the gated one in submit_after_safety_gate), found lines {sites}"
+        "execution/live_submission.py must hold exactly one Broker.submit_order call "
+        f"(the gated one in LiveOrderSubmissionService.submit), found lines {sites}"
     )

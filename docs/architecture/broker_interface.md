@@ -116,7 +116,7 @@ broker.set_positions([...]); broker.set_account_state(...)              # 照会
 1. `broker/` 配下(または独立コンポーネント)に Adapter モジュールを追加し、`Broker` Protocol を構造的に実装する。
 2. OANDA 固有のレスポンス→ `broker_models` 共通モデルへの変換は Adapter 内部で完結させ、OANDA 固有フィールドを境界の外へ出さない。
 3. HTTP タイムアウト・接続断は `BrokerTimeoutError` / `BrokerCommunicationError` へマッピングし、タイムアウト後の注文状態は `unknown` として扱う(後続照会・照合で解決)。
-4. 実発注に進む場合も認証情報管理・再接続・定期照合は本 Issue の非スコープであり、別 Issue で設計する。発注前の Safety Gate は Issue #75 で `execution/` に実装済みであり、Adapter は Gate のロジックを持たない(送信は `submit_after_safety_gate()` 経由のみ。[Safety Gate](safety_gate.md))。
+4. 実発注に進む場合も認証情報管理・再接続・定期照合は本 Issue の非スコープであり、別 Issue で設計する。発注前の Safety Gate は Issue #75 で `execution/` に実装済みであり、Adapter は Gate のロジックを持たない(送信は `LiveOrderSubmissionService` 経由のみ。Adapter 型は `execution.safety_gate.BROKER_TYPE_BY_MODE` へ登録して型付き接続 identity に束縛する。[Safety Gate](safety_gate.md))。
 
 ## 非スコープ(Issue #73 時点で未実装)
 
