@@ -163,6 +163,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - UNKNOWN は**そのまま保存**され、phase は `submitting` に留まる。
 - `list_unknown_orders()` が **照会対象**(`order_state = 'unknown'`)を抽出する。
+- `list_unresolved_submissions()`(Issue #75)は、UNKNOWN に加えて **`submitting` phase のまま `pending` に留まる注文**(送信試行後に Broker 観測が一度も記録されないまま停止したケース)も照会対象として返す read-only API。Broker が注文を保持しうる submission が reconciliation の視界から消えないことを保証する([Safety Gate](safety_gate.md))。
 - UNKNOWN の解決は、後続照会の結果(完全な `OrderResult`)を `record_order_result` で記録することによってのみ行われる。許可される解決先は既存遷移表のとおり(accepted / partially_filled / filled / cancelled / rejected)で、**保存済み snapshot の fill を失う解決(例: 部分約定既知のまま fill 無しの CANCELLED / REJECTED へ確定)は `validate_order_result_update()` が拒否**する。
 - store / API は UNKNOWN を「未発注」「拒否」「再送可」へ**自動変換しない**。即時再送可能状態として扱わない。
 - 自動照会 runner・定期 reconciliation は**非スコープ**(未実装)。

@@ -16,14 +16,15 @@ Design (docs/architecture/safety_gate.md is the authoritative spec):
   (``LiveOrderSubmissionService``) and is pinned repository-wide by the AST
   test ``execution/tests/test_submission_boundary.py`` -- no other module may
   call ``submit_order`` / ``to_order_request``.
-- Typed connection identity (Issue #75 review r1): mode / target are NOT
-  caller-supplied per-call strings. A :class:`BrokerConnection` binds the
-  broker INSTANCE to its ``ExecutionMode`` and connection target at
-  composition time, and cross-checks the broker's concrete type against the
-  mode: only ``FakeBroker`` may claim ``fake``, and ``demo`` / ``live``
-  connections cannot exist at all until a real adapter type is registered.
-  A FakeBroker claiming ``live`` is therefore unrepresentable, not merely
-  rejected at evaluation time.
+- Typed connection identity (Issue #75 review r1/r3): mode / target are NOT
+  caller-supplied strings at all. Every broker implementation self-reports an
+  immutable ``BrokerConnectionIdentity`` built from its own construction-time
+  configuration (``connection_identity()``); :class:`BrokerConnection`
+  DERIVES mode/target from the instance and cross-checks the broker's
+  concrete type against the mode: only ``FakeBroker`` may claim ``fake``,
+  and ``demo`` / ``live`` connections cannot exist at all until a real
+  adapter type is registered. The gate re-derives the identity at every
+  evaluation, so an identity that drifts after composition fails closed.
 - FAIL-CLOSED: every external lookup (broker positions / account, kill-switch
   state) that fails, returns garbage, or looks stale (future-dated or older
   than ``max_reference_age`` -- account state included) produces a
@@ -51,14 +52,17 @@ Design (docs/architecture/safety_gate.md is the authoritative spec):
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Callable, Protocol
 
 from broker.broker_interface import Broker
 from broker.broker_models import (
     AccountState,
+    BrokerConnectionIdentity,
     OrderSide,
     OrderType,
     PositionInfo,
@@ -132,13 +136,47 @@ def _require_non_empty_str(value, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string, got {value!r}")
 
 
+def derive_connection_identity(broker) -> tuple[ExecutionMode, str]:
+    """Derive (mode, target) from the broker INSTANCE itself (Issue #75
+    review r3): every broker implementation must expose
+    ``connection_identity() -> broker_models.BrokerConnectionIdentity``,
+    built from its own immutable construction-time configuration. Caller-side
+    declarations no longer exist -- an identity claim cannot drift from what
+    the instance actually connects to.
+
+    Raises ``ValueError`` on a missing/broken identity method, a malformed
+    identity object, or an unknown mode (fail closed). The registry
+    cross-check against the concrete type happens in the callers
+    (``BrokerConnection`` construction and ``SafetyGate.evaluate``).
+    """
+    method = getattr(broker, "connection_identity", None)
+    if not callable(method):
+        raise ValueError(
+            f"broker {type(broker).__name__} does not expose connection_identity(); "
+            "every broker usable for submission must self-report its immutable "
+            "connection identity"
+        )
+    identity = method()
+    if not isinstance(identity, BrokerConnectionIdentity):
+        raise ValueError(
+            f"connection_identity() must return a BrokerConnectionIdentity, got {identity!r}"
+        )
+    try:
+        mode = ExecutionMode(identity.mode)
+    except ValueError:
+        raise ValueError(
+            f"broker reports unknown execution mode {identity.mode!r}"
+        ) from None
+    return mode, identity.target
+
+
 @dataclass(frozen=True)
 class BrokerConnection:
-    """Typed connection identity: the broker INSTANCE travels together with
-    the execution mode and connection target it was wired for.
+    """Typed connection identity: mode and target are DERIVED from the broker
+    instance's own ``connection_identity()`` -- they cannot be declared by
+    the caller at all (Issue #75 review r3).
 
-    Bound once at composition time -- callers can no longer claim an
-    arbitrary mode/target per call, and the claimed mode is cross-checked
+    Bound once at composition time, and the derived mode is cross-checked
     against the broker's concrete type via :data:`BROKER_TYPE_BY_MODE`:
 
     - ``fake`` requires a ``FakeBroker`` instance (subclasses included);
@@ -146,46 +184,43 @@ class BrokerConnection:
     - ``demo`` / ``live`` connections cannot be constructed at all until a
       real adapter type is registered (fail closed by unrepresentability).
 
-    The target string must be exact (non-empty, no surrounding whitespace);
-    whether it is allowed for the mode stays a policy decision
-    (``SafetyPolicy.allowed_connection_targets``), evaluated by the gate.
+    Whether the derived target is allowed for the mode stays a policy
+    decision (``SafetyPolicy.allowed_connection_targets``), evaluated by the
+    gate -- which also RE-derives the identity at evaluation time, so an
+    identity that changes after composition fails closed.
     """
 
     broker: Broker
-    execution_mode: ExecutionMode
-    connection_target: str
+    execution_mode: ExecutionMode = field(init=False)
+    connection_target: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.execution_mode, ExecutionMode):
-            raise ValueError(f"execution_mode must be an ExecutionMode, got {self.execution_mode!r}")
-        _require_non_empty_str(self.connection_target, "connection_target")
-        if self.connection_target != self.connection_target.strip():
-            raise ValueError(
-                f"connection_target {self.connection_target!r} carries surrounding whitespace"
-            )
         if not isinstance(self.broker, Broker):
             raise ValueError(f"broker must satisfy the Broker protocol, got {self.broker!r}")
-        expected_type = BROKER_TYPE_BY_MODE.get(self.execution_mode)
+        mode, target = derive_connection_identity(self.broker)
+        expected_type = BROKER_TYPE_BY_MODE.get(mode)
         if expected_type is None:
             raise ValueError(
                 f"no broker implementation is registered for execution mode "
-                f"{self.execution_mode.value!r}; only "
-                f"{sorted(mode.value for mode in BROKER_TYPE_BY_MODE)} connections can exist yet"
+                f"{mode.value!r}; only "
+                f"{sorted(known.value for known in BROKER_TYPE_BY_MODE)} connections can exist yet"
             )
         if not isinstance(self.broker, expected_type):
             raise ValueError(
-                f"execution mode {self.execution_mode.value!r} requires a "
+                f"execution mode {mode.value!r} requires a "
                 f"{expected_type.__name__} instance, got {type(self.broker).__name__}"
             )
         claimed_modes = [
-            mode for mode, broker_type in BROKER_TYPE_BY_MODE.items()
+            known for known, broker_type in BROKER_TYPE_BY_MODE.items()
             if isinstance(self.broker, broker_type)
         ]
-        if claimed_modes != [self.execution_mode]:
+        if claimed_modes != [mode]:
             raise ValueError(
                 f"broker type {type(self.broker).__name__} is not uniquely bound to "
-                f"execution mode {self.execution_mode.value!r}"
+                f"execution mode {mode.value!r}"
             )
+        object.__setattr__(self, "execution_mode", mode)
+        object.__setattr__(self, "connection_target", target)
 
 
 @dataclass(frozen=True)
@@ -240,6 +275,12 @@ class SafetyPolicy:
     runtime surprise. Connection targets are exact case-sensitive strings and
     one target may belong to only one mode (an endpoint that is valid for two
     modes cannot exist).
+
+    DEEP-IMMUTABLE (Issue #75 review r3): the mapping fields are defensively
+    copied at construction and exposed as read-only ``MappingProxyType``
+    views, so mutating the caller's original dict -- or the policy attribute
+    itself -- can never change validated policy content under an unchanged
+    ``policy_id``.
     """
 
     policy_id: str
@@ -249,8 +290,8 @@ class SafetyPolicy:
     max_positions_per_symbol: int
     max_positions_account: int
     max_reference_age: timedelta
-    max_spread_by_symbol: dict[str, Decimal]
-    allowed_connection_targets: dict[ExecutionMode, frozenset[str]]
+    max_spread_by_symbol: Mapping[str, Decimal]
+    allowed_connection_targets: Mapping[ExecutionMode, frozenset[str]]
     require_stop_loss: bool = True
 
     def __post_init__(self) -> None:
@@ -276,8 +317,8 @@ class SafetyPolicy:
                 raise ValueError(f"{name} must be an int >= 0, got {value!r}")
         if not isinstance(self.max_reference_age, timedelta) or self.max_reference_age <= timedelta(0):
             raise ValueError(f"max_reference_age must be a positive timedelta, got {self.max_reference_age!r}")
-        if not isinstance(self.max_spread_by_symbol, dict):
-            raise ValueError("max_spread_by_symbol must be a dict")
+        if not isinstance(self.max_spread_by_symbol, Mapping):
+            raise ValueError("max_spread_by_symbol must be a mapping")
         if set(self.max_spread_by_symbol) != set(self.allowed_symbols):
             raise ValueError(
                 "max_spread_by_symbol keys must exactly cover allowed_symbols; "
@@ -286,8 +327,8 @@ class SafetyPolicy:
         for symbol, spread in self.max_spread_by_symbol.items():
             if not isinstance(spread, Decimal) or not spread.is_finite() or spread < 0:
                 raise ValueError(f"max spread for {symbol!r} must be a non-negative finite Decimal")
-        if not isinstance(self.allowed_connection_targets, dict):
-            raise ValueError("allowed_connection_targets must be a dict")
+        if not isinstance(self.allowed_connection_targets, Mapping):
+            raise ValueError("allowed_connection_targets must be a mapping")
         seen_targets: dict[str, ExecutionMode] = {}
         for mode, targets in self.allowed_connection_targets.items():
             if not isinstance(mode, ExecutionMode):
@@ -307,6 +348,16 @@ class SafetyPolicy:
                 seen_targets[target] = mode
         if not isinstance(self.require_stop_loss, bool):
             raise ValueError(f"require_stop_loss must be a bool, got {self.require_stop_loss!r}")
+        # Defensive deep-copy AFTER validation: the validated content is
+        # frozen behind read-only views, detached from the caller's dicts.
+        object.__setattr__(
+            self, "max_spread_by_symbol", MappingProxyType(dict(self.max_spread_by_symbol))
+        )
+        object.__setattr__(
+            self,
+            "allowed_connection_targets",
+            MappingProxyType(dict(self.allowed_connection_targets)),
+        )
 
 
 @dataclass(frozen=True)
@@ -515,19 +566,38 @@ class SafetyGate:
         self._validate_protective_prices(request, market, reject)
 
         # --- execution mode vs connection target -----------------------------
-        # The connection is a typed identity (broker instance bound to mode +
-        # target at composition time; BrokerConnection cross-checks the
-        # broker's concrete type). Re-verified here as defense in depth, then
-        # the TARGET is checked against the policy allow-list for the mode --
-        # exact, case-sensitive; unknown targets, case or whitespace variants
-        # never match (fail closed).
-        expected_type = BROKER_TYPE_BY_MODE.get(connection.execution_mode)
-        if expected_type is None or not isinstance(connection.broker, expected_type):
+        # The identity is RE-derived from the broker instance itself at
+        # evaluation time (not read from the connection's cached fields): a
+        # broken/missing identity method, an identity that changed since
+        # composition, or a concrete type that no longer matches the mode all
+        # fail closed. The derived TARGET is then checked against the policy
+        # allow-list for the mode -- exact, case-sensitive; unknown targets
+        # and case variants never match.
+        try:
+            derived_mode, derived_target = derive_connection_identity(connection.broker)
+        except Exception as exc:
             reject(
                 SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
-                f"broker type {type(connection.broker).__name__} does not match execution "
-                f"mode {connection.execution_mode.value!r}",
+                f"connection identity could not be derived from the broker: {exc}",
             )
+        else:
+            if (
+                derived_mode is not connection.execution_mode
+                or derived_target != connection.connection_target
+            ):
+                reject(
+                    SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
+                    f"broker identity {derived_mode.value!r}/{derived_target!r} does not "
+                    f"match the composed connection "
+                    f"{connection.execution_mode.value!r}/{connection.connection_target!r}",
+                )
+            expected_type = BROKER_TYPE_BY_MODE.get(derived_mode)
+            if expected_type is None or not isinstance(connection.broker, expected_type):
+                reject(
+                    SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
+                    f"broker type {type(connection.broker).__name__} does not match execution "
+                    f"mode {derived_mode.value!r}",
+                )
         allowed_targets = policy.allowed_connection_targets.get(
             connection.execution_mode, frozenset()
         )

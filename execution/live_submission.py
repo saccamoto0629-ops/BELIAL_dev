@@ -31,16 +31,25 @@ Submission contract (docs/architecture/safety_gate.md):
    ``OrderResult`` via ``record_order_result``; ANY exception from
    ``submit_order`` records state UNKNOWN (conservative: even a
    "communication failure" claim never downgrades to "not placed") and then
-   re-raises to the caller.
+   re-raises to the caller. A FAILURE TO PERSIST a successfully received
+   ``OrderResult`` also falls back to a state-only UNKNOWN record before the
+   failure is re-raised (Issue #75 review r3) -- an order that exists at the
+   broker must stay a query target, never vanish behind a persistence error.
+   Whatever remains stuck (phase ``submitting`` / state ``pending`` after a
+   crash or a double failure) is retrievable via
+   ``execution_store.list_unresolved_submissions()``.
 
 Fail-closed conversions (before any broker call): store lookup failures ->
 ``STATE_QUERY_FAILED``; unregistered intents -> ``INTENT_NOT_REGISTERED``;
 decision persistence or read-back failures -> ``DECISION_PERSIST_FAILED``;
-unexpected exceptions -> ``GATE_INTERNAL_ERROR``. The decision store must be
-the DURABLE ``SQLiteSafetyDecisionStore`` -- in-memory / no-op recorders are
-rejected at construction, so the production path cannot run without an audit
-trail. After the broker was called, failures are NEVER converted into
-synthetic rejections -- they surface loudly (the order may exist).
+unexpected exceptions -> ``GATE_INTERNAL_ERROR``. The audit store is SEALED
+inside the service: the constructor accepts only a filesystem path
+(``decision_db_path``) and instantiates the concrete
+``SQLiteSafetyDecisionStore`` itself -- recorder objects cannot be injected,
+so there is no injection point whose ``record()`` / read-back could be
+overridden to forge persistence. After the broker was called, failures are
+NEVER converted into synthetic rejections -- they surface loudly (the order
+may exist).
 """
 
 from __future__ import annotations
@@ -78,7 +87,7 @@ class LiveOrderSubmissionService:
         *,
         connection: BrokerConnection,
         gate: SafetyGate,
-        decision_store: SQLiteSafetyDecisionStore,
+        decision_db_path: str | Path,
         order_db_path: str | Path,
         clock: Callable[[], datetime],
     ) -> None:
@@ -86,18 +95,24 @@ class LiveOrderSubmissionService:
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
         if not isinstance(gate, SafetyGate):
             raise ValueError(f"gate must be a SafetyGate, got {gate!r}")
-        if not isinstance(decision_store, SQLiteSafetyDecisionStore):
-            # The audit trail must be DURABLE: in-memory / no-op recorders are
-            # structurally excluded from the production submission path.
+        if not isinstance(decision_db_path, (str, Path)):
+            # The audit trail is SEALED inside the service (Issue #75 review
+            # r3): only a filesystem path can be injected, never a recorder
+            # object -- so there is no injectable object whose record() /
+            # read-back could be overridden to forge persistence.
             raise ValueError(
-                "decision_store must be a SQLiteSafetyDecisionStore (durable audit "
-                f"trail), got {type(decision_store).__name__}"
+                "decision_db_path must be a filesystem path (the durable audit store "
+                f"is sealed inside the service), got {type(decision_db_path).__name__}"
+            )
+        if not isinstance(order_db_path, (str, Path)):
+            raise ValueError(
+                f"order_db_path must be a filesystem path, got {type(order_db_path).__name__}"
             )
         if not callable(clock):
             raise ValueError(f"clock must be a callable returning a UTC datetime, got {clock!r}")
         self._connection = connection
         self._gate = gate
-        self._decision_store = decision_store
+        self._decision_store = SQLiteSafetyDecisionStore(Path(decision_db_path))
         self._order_db_path = Path(order_db_path)
         self._clock = clock
 
@@ -160,14 +175,24 @@ class LiveOrderSubmissionService:
         try:
             result = self._connection.broker.submit_order(order_request)
         except Exception as exc:
-            self._record_unknown_outcome(execution_request_id, exc)
+            self._record_unknown_outcome(execution_request_id, exc, context="submit outcome lost")
             raise
-        execution_store.record_order_result(
-            execution_request_id,
-            result,
-            reason=_SUBMIT_REASON,
-            db_path=self._order_db_path,
-        )
+        try:
+            execution_store.record_order_result(
+                execution_request_id,
+                result,
+                reason=_SUBMIT_REASON,
+                db_path=self._order_db_path,
+            )
+        except Exception as exc:
+            # The order EXISTS (the broker answered) but its result could not
+            # be persisted: it must remain a QUERY TARGET (Issue #75 review
+            # r3). Fall back to a state-only UNKNOWN record, then surface the
+            # original failure -- never mask it as a rejection.
+            self._record_unknown_outcome(
+                execution_request_id, exc, context="broker result persistence failed"
+            )
+            raise
         _LOGGER.info(
             "Safety Gate allowed and submitted execution_request_id=%s policy_id=%s "
             "client_order_id=%s state=%s",
@@ -359,23 +384,31 @@ class LiveOrderSubmissionService:
             )
         return decision
 
-    def _record_unknown_outcome(self, execution_request_id: str, exc: Exception) -> None:
-        """The submit call failed AFTER the broker may have seen the order:
-        record UNKNOWN (never "not placed" -- Issue #74) on a best-effort
-        basis; the original exception is re-raised by the caller either way."""
+    def _record_unknown_outcome(
+        self, execution_request_id: str, exc: Exception, *, context: str
+    ) -> None:
+        """The broker may hold (or definitely holds) the order but no result
+        could be persisted: record UNKNOWN (never "not placed" -- Issue #74)
+        on a best-effort basis; the original exception is re-raised by the
+        caller either way. If even this fails (e.g. the order DB itself is
+        down), the order stays at phase ``submitting`` / state ``pending``
+        and is retrievable via
+        ``execution_store.list_unresolved_submissions()``."""
         try:
             execution_store.record_order_state(
                 execution_request_id,
                 OrderState.UNKNOWN,
-                reason=f"submit outcome lost: {exc}",
+                reason=f"{context}: {exc}",
                 changed_at_utc=self._now(),
                 db_path=self._order_db_path,
             )
         except Exception:
             _LOGGER.critical(
-                "failed to record UNKNOWN outcome for execution_request_id=%s after a "
-                "submit failure; resolve via manual reconciliation",
+                "failed to record UNKNOWN outcome for execution_request_id=%s (%s); "
+                "the order remains listed by list_unresolved_submissions(); resolve "
+                "via reconciliation",
                 execution_request_id,
+                context,
             )
 
     def _log_rejection(self, decision: SafetyDecision) -> None:

@@ -27,22 +27,32 @@ service.submit(execution_request_id, market=...)
        (BEGIN IMMEDIATE で直列化。敗者 → duplicate_submission)
     5. 遷移に成功した呼び出しだけが to_order_request() → Broker.submit_order() を実行
     6. 結果を execution store へ記録
-       (OrderResult → record_order_result / submit の例外 → UNKNOWN を記録して re-raise)
+       (OrderResult → record_order_result / submit の例外 → UNKNOWN を記録して re-raise /
+        受領済み OrderResult の保存失敗 → state-only UNKNOWN へフォールバック記録して re-raise)
 ```
 
 - **「呼び出し側が気をつける」設計にはしない**: リポジトリ全体の AST 走査テスト(`execution/tests/test_submission_boundary.py`)が、`submit_order` / `to_order_request` の呼び出しを公認箇所(broker 自身のテストと `live_submission.py` の各 1 箇所)以外に存在させないことを回帰として固定する。
+
+### 迂回防止境界の意味(誤用防止であり、故意回避の防止ではない)
+
+この境界(単一サービス+raw Broker の非公開+AST 回帰テスト)が保証するのは **accidental misuse(誤用)の構造的防止**である: リポジトリ内に Gate を通らない送信コードが追加されれば CI が失敗し、公認経路の外に `submit_order` / `to_order_request` の呼び出し箇所は存在できない。
+
+一方、**deliberate circumvention(故意の回避)— 例えば `getattr` による動的呼び出し・monkeypatch・reflection — を in-process の Python で防止することは言語的に不可能**である。これは本実装固有の限界ではなく、いかなる実行時 capability 方式・封印方式を導入しても、同じ reflection でその機構自体を偽装できる(無限後退)。また、Adapter 側に承認状態の検査を持たせる方式は「Broker Adapter は Safety Gate のロジックを持たない」(Issue #75)および Broker 境界の責務分離(Issue #73)と矛盾するため採らない。
+
+故意回避に対する実効的な境界は、実 Adapter 導入時に**プロセス・運用境界**として設計する(Broker 認証情報を Live Execution runner プロセス以外へ渡さない、Adapter の構築を runner の composition root に限定する、コードレビュー + CI)。これは Live Adapter / runner 設計 Issue(非スコープ)の一部として後続 Issue で扱う。
 - **二重送信防止**: `submit()` は `client_order_id` を受け取らない。使えるのは register 時に固定された保存済みの値だけであり(NOT NULL + UNIQUE + 不変、Issue #74)、同じ意図が新しい broker キーで再送されることは構造的に起きない。送信試行自体も `created → submitting` 遷移(一度きり・`BEGIN IMMEDIATE` 直列化)を獲得した呼び出しに限られる。
 - **UNKNOWN の再送禁止**: timeout・通信失敗を含む submit の例外は UNKNOWN として記録され(「未発注」へ降格しない)、以後の `submit()` は phase≠created により `duplicate_submission` で拒否される。UNKNOWN の解決は後続照会の記録のみ(Issue #74)。
-- **Broker 呼び出し後の失敗は拒否へ変換しない**: 注文が存在しうるため、UNKNOWN 記録の上で例外をそのまま伝播する。結果記録(`record_order_result`)の失敗も隠さず伝播する。
+- **Broker 呼び出し後の失敗は拒否へ変換しない**: 注文が存在しうるため、例外はそのまま伝播する。**受領済み `OrderResult` の保存(`record_order_result`)が失敗した場合も、state-only UNKNOWN へのフォールバック記録を試みてから元例外を re-raise する** — Broker に存在する注文が永続化エラーの陰に消えることはない。フォールバックまで失敗した場合(order DB 全体の障害)は critical ログを残し、注文は phase `submitting` / state `pending` のまま **`execution_store.list_unresolved_submissions()`** で照会対象として取得できる(下記)。
+- **未解決 submission の照会**: `execution_store.list_unresolved_submissions()` は、`state = 'unknown'`(従来の照会対象)に加え、**`phase = 'submitting'` かつ `state = 'pending'`**(遷移獲得後に Broker 観測が一度も記録されないまま停止したケース — 送信前クラッシュ、または結果保存とUNKNOWNフォールバックの二重失敗)を返す read-only API。実注文が存在しうる submission は必ず reconciliation から見える。`created`(送信試行なし)と確定観測済み(phase `submitted`)は含まない。
 
-## 型付き接続 identity(`BrokerConnection`)
+## 型付き接続 identity(`BrokerConnection` — Broker 実体から導出)
 
-execution mode / 接続先は**呼び出しごとの自己申告文字列ではない**。`BrokerConnection` が Broker **インスタンス**を mode・接続先と共に組み立て時に束縛し、mode を Broker の具象型と相互検証する(`BROKER_TYPE_BY_MODE` レジストリ):
+execution mode / 接続先は**呼び出し側が申告する文字列ではない**。すべての Broker 実装は、自身の**構築時接続 config に由来する不変の identity**(`broker_models.BrokerConnectionIdentity`)を `connection_identity()` で自己申告する義務を負い、`BrokerConnection` は mode・接続先を **Broker インスタンスから導出**する(申告用の引数は存在せず、渡そうとすると `TypeError`):
 
-- `fake` は `FakeBroker`(サブクラス含む)だけが名乗れる。`FakeBroker` は `fake` 以外を名乗れない。
-- `demo` / `live` は**実 Adapter 型が登録されるまで接続オブジェクト自体を構築できない**(表現不能による fail-closed)。「live mode なのに fake 接続先」は拒否される以前に存在できない。
-- 接続先文字列は非空・前後空白なしを構築時に強制。mode ごとの許可接続先(`SafetyPolicy.allowed_connection_targets`。exact・大文字小文字区別・1 接続先 1 mode)は Gate が判定し、未知の接続先・大文字小文字違い(`FAKE`)は `execution_mode_mismatch` で拒否する。
-- Gate は評価時にも identity を再検証する(防御的多重化)。
+- FakeBroker の identity は mode `"fake"` 固定 + 構築時 `connection_target`(実 Adapter の endpoint URL に相当する構築時 config)。将来の Adapter は自身の実接続設定から identity を返す(mode / target を接続 config と別に申告する経路は存在しない)。
+- 導出された mode は Broker の具象型と相互検証される(`BROKER_TYPE_BY_MODE` レジストリ): `fake` は `FakeBroker`(サブクラス含む)のみ、`FakeBroker` は `fake` 以外を名乗れない。`demo` / `live` は**実 Adapter 型が登録されるまで接続オブジェクト自体を構築できない**(表現不能による fail-closed)。
+- mode ごとの許可接続先(`SafetyPolicy.allowed_connection_targets`。exact・大文字小文字区別・1 接続先 1 mode)は Gate が判定し、未知の接続先・大文字小文字違い(`FAKE`)は `execution_mode_mismatch` で拒否する。
+- Gate は**評価のたびに identity を Broker 実体から再導出**し、組み立て後に identity がドリフトした場合・identity メソッドが欠損 / 破損した場合も `execution_mode_mismatch` で fail-closed に拒否する。
 
 ## 入力
 
@@ -54,7 +64,7 @@ execution mode / 接続先は**呼び出しごとの自己申告文字列では�
 | Broker 照会 | `Broker.get_positions()` / `get_account_state()` | evaluate 内で同期照会 |
 | BELIAL 側状態 | `SafetyStateProvider`(kill switch) | Gate 構築時に注入 |
 | 現在時刻 | 注入 clock(UTC 必須) | Gate / サービス各々に注入 |
-| 接続 identity | `BrokerConnection` | サービス構築時に注入 |
+| 接続 identity | `BrokerConnection` | サービス構築時に注入(mode / target は Broker 自身の `connection_identity()` から導出。評価時にも再導出) |
 
 ## SafetyPolicy(構築時検証つき)
 
@@ -69,6 +79,8 @@ execution mode / 接続先は**呼び出しごとの自己申告文字列では�
 | `max_spread_by_symbol` | 銘柄別 spread 上限。**全許可銘柄をちょうど網羅**しなければ構築エラー(上限のない許可銘柄という設定ミスを排除) |
 | `allowed_connection_targets` | mode → 接続先集合。**1 つの接続先は 1 つの mode にのみ**属せる |
 | `require_stop_loss` | SL 必須(既定 True) |
+
+`SafetyPolicy` は **deep immutable** である: mapping フィールドは構築時検証の後に**防御的コピーされ read-only view(`MappingProxyType`)として保持**されるため、呼び出し元が構築に使った辞書を後から変更しても、また policy 属性を直接変更しようとしても、検証済みのポリシー内容が同一 `policy_id` のまま変化することはない。
 
 ## 判定基準の明確化
 
@@ -132,7 +144,7 @@ execution mode / 接続先は**呼び出しごとの自己申告文字列では�
 - `initialize()` は **pristine な DB のみ**へ schema を新規作成(オブジェクト 0 件 + `user_version` 0)。それ以外は完全検証し、不一致なら **DB 無変更で** `SafetySchemaError`。
 - 全 read / write が「open → **closed-world schema 検証**(sqlite_master 全 object 集合 + token 正規化 DDL + PRAGMA 構造 signature + version)→ トランザクション」で動作。trigger / view / 制約欠損 lookalike / 他コンポーネント DB は黙って受け入れない。
 - `record()` は**あらゆる失敗で例外**を送出する(DB ファイル欠損 = 未初期化も失敗であり、暗黙にファイルを作らない)。
-- **送信サービスは耐久 store のみを受け入れる**: `LiveOrderSubmissionService` は `SQLiteSafetyDecisionStore` 以外(InMemory / NoOp recorder)を構築時に拒否し、さらに record 後に **read-back で保存内容を検証**する。保存が黙って失われた場合も送信は行われない(`decision_persist_failed`)。
+- **監査 store は送信サービス内部に封印される**: `LiveOrderSubmissionService` のコンストラクタは **filesystem パス(`decision_db_path`)しか受け取らず**、具体実装 `SQLiteSafetyDecisionStore` をサービス内部で生成する。recorder オブジェクトの注入点自体が存在しないため、`record()` / read-back を override して永続化を偽装できる注入経路はない(InMemory / NoOp recorder は構造的に排除)。さらに record 後に **read-back で保存内容を検証**し、保存が黙って失われた場合も送信は行われない(`decision_persist_failed`)。
 - 読み取りは missing DB を**作成しない**(空タプル)。保存行は厳格に再検証(拒否 JSON のキー集合完全一致・既知コードのみ・UTC・allow/拒否整合)し、帯域外編集は `SafetyIntegrityError` で拒否する。DB CHECK 制約(allow ⇔ `rejections_json = '[]'`、UTC サフィックス等)を二重の防御とする。
 - 接続は常に明示 close(Windows のファイルハンドル衛生。Issue #83 r2)。
 
@@ -142,7 +154,7 @@ execution mode / 接続先は**呼び出しごとの自己申告文字列では�
 
 `python -m pytest execution/tests -q`(`tmp_path` の SQLite と FakeBroker のみ。外部通信・Discord・S3・実注文なし)。
 
-- `test_safety_gate.py` — 正常許可(FakeBroker へ 1 件送信・監査記録・execution store の phase/state 記録)、固定 client_order_id の使用、LIMIT の SL / TP が現在価格でなく `requested_price` 基準であること、**二重送信防止**(2 回目は `duplicate_submission`・Broker 送信 1 件のまま)、**UNKNOWN 再送禁止**(timeout / 通信失敗後の再 submit 拒否・UNKNOWN 記録)、**created→submitting 勝者のみ送信**(先行遷移・遷移インフラ失敗の fail-closed)、Broker 拒否は結果として記録、送信後の記録失敗は例外として伝播、未登録意図の拒否、破損 order store の fail-closed、**耐久保存 + read-back**(record 消失・no-op recorder・未初期化 store がすべて送信を阻止、元コード保持)、非耐久 recorder の構築時排除、各条件の独立拒否(銘柄 / 方向 / 数量 / SL 無し / SL・TP 不正(BUY / SELL)/ snapshot 銘柄不一致 / 参照価格欠損・stale・未来 / spread 欠損・超過 / market closed / not tradable / 接続先不一致・未知・大文字小文字)、**型付き接続 identity**(FakeBroker は live / demo を名乗れない・非 FakeBroker は fake を名乗れない・未知 mode・空白 / 空 target の構築時拒否・evaluate の再検証)、kill switch(全条件正常でも拒否・照会例外・bool 以外)、ポジション上限(long + short 合算・口座全体・上限未満の許可・stale / 未来 snapshot の fail-closed)、Broker 照会失敗(positions / account / 型不正)、**AccountState の stale / 未来 / 型不正の fail-closed**、想定外例外・clock 破損の `gate_internal_error`、複数違反の同時収集と**順序保持 dedup**(dedup 関数・`SafetyDecision` の一意性不変条件・evaluate 経由の重複排除)、**全拒否経路で `submitted_requests` が 0 件(または増加 0)**、ログへの機械可読コード出力、`SafetyPolicy` / `MarketSafetySnapshot` / `SafetyDecision` の構築時検証。
+- `test_safety_gate.py` — 正常許可(FakeBroker へ 1 件送信・監査記録・execution store の phase/state 記録)、固定 client_order_id の使用、LIMIT の SL / TP が現在価格でなく `requested_price` 基準であること、**二重送信防止**(2 回目は `duplicate_submission`・Broker 送信 1 件のまま)、**UNKNOWN 再送禁止**(timeout / 通信失敗後の再 submit 拒否・UNKNOWN 記録)、**created→submitting 勝者のみ送信**(先行遷移・遷移インフラ失敗の fail-closed)、Broker 拒否は結果として記録、**受領済み結果の保存失敗 → UNKNOWN フォールバック + `list_unresolved_submissions()` での可視性**(二重失敗時の submitting/pending 取得・送信前クラッシュ相当の stuck pending 取得を含む)、未登録意図の拒否、破損 order store の fail-closed、**封印された監査 store**(オブジェクト注入の構築時拒否・record 消失の read-back 検知・未初期化 store の送信阻止・元コード保持)、各条件の独立拒否(銘柄 / 方向 / 数量 / SL 無し / SL・TP 不正(BUY / SELL)/ snapshot 銘柄不一致 / 参照価格欠損・stale・未来 / spread 欠損・超過 / market closed / not tradable / 接続先不一致・未知・大文字小文字)、**Broker 実体から導出する型付き接続 identity**(caller 申告の構造的不能(`TypeError`)・FakeBroker は live / demo を名乗れない・非 FakeBroker は fake を名乗れない・未知 mode・identity 欠損 / 型不正の構築時拒否・**組み立て後の identity ドリフトを evaluate の再導出が拒否**)、kill switch(全条件正常でも拒否・照会例外・bool 以外)、ポジション上限(long + short 合算・口座全体・上限未満の許可・stale / 未来 snapshot の fail-closed)、Broker 照会失敗(positions / account / 型不正)、**AccountState の stale / 未来 / 型不正の fail-closed**、想定外例外・clock 破損の `gate_internal_error`、複数違反の同時収集と**順序保持 dedup**(dedup 関数・`SafetyDecision` の一意性不変条件・evaluate 経由の重複排除)、**全拒否経路で `submitted_requests` が 0 件(または増加 0)**、ログへの機械可読コード出力、`SafetyPolicy` / `MarketSafetySnapshot` / `SafetyDecision` の構築時検証と **policy の deep immutability**(呼び出し元 dict の事後変更が判定に影響しない・read-only view への書き込み拒否)。
 - `test_safety_store.py` — 再オープン(プロセス再起動相当)後の round-trip、記録順の復元、missing DB への書き込み拒否(ファイル非作成)・読み取り空(ファイル非作成)、pristine 判定、foreign schema / 制約欠損 lookalike / trigger / version 不一致の拒否(DB 無変更)、帯域外改竄(未知コード・未知キー・壊れた時刻)の復元時拒否、DB CHECK 制約の発火、公認送信サービスとの結合(拒否・許可の監査が再起動後も取得可能、未初期化 store の fail-closed)。
 - `test_submission_boundary.py` — `submit_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信呼び出しが 1 箇所であること)。
 
@@ -152,5 +164,7 @@ execution mode / 接続先は**呼び出しごとの自己申告文字列では�
 - Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ)
 - 動的ロット計算・証拠金最適化・リスク量からの数量計算
 - Strategy / Paper Signal の売買ロジック変更、Paper Execution への Broker 接続
-- reconciliation の定期実行(UNKNOWN の解決は後続照会記録のみ)
+- reconciliation の定期実行(UNKNOWN / 未解決 submission の解決は後続照会記録のみ。照会**対象の取得**は `list_unresolved_submissions()` で可能)
 - 数量ベース・証拠金ベースのポジション上限、部分約定中注文のカウント
+- in-process での故意回避(reflection / monkeypatch)の完全防止(言語的に不可能。上記「迂回防止境界の意味」参照。実 Adapter 導入時の認証情報分離等の運用境界として後続 Issue で設計)
+- order DB 全体が利用不能な場合の耐久フォールバック(サイドカーファイル等。現状は critical ログ + `list_unresolved_submissions()` による検知。後続 Issue)

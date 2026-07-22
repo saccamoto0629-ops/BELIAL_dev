@@ -41,6 +41,7 @@ from .broker_models import (
     AccountState,
     BrokerCancellationError,
     BrokerCommunicationError,
+    BrokerConnectionIdentity,
     BrokerInvalidRequestError,
     BrokerOrderNotFoundError,
     BrokerTimeoutError,
@@ -195,6 +196,7 @@ class FakeBroker:
         default_fill_price: Decimal | None = None,
         account_state: AccountState | None = None,
         clock: Callable[[], datetime] | None = None,
+        connection_target: str = "fake",
     ):
         if default_script is not None and not isinstance(default_script, _SUBMIT_SCRIPT_TYPES):
             raise BrokerInvalidRequestError(f"invalid default_script {default_script!r}")
@@ -206,6 +208,13 @@ class FakeBroker:
             raise BrokerInvalidRequestError(
                 f"clock must be a callable returning a datetime, got {clock!r}"
             )
+        # Connection identity (Issue #75): fixed at construction, constant for
+        # the instance lifetime. FakeBroker's mode is ALWAYS "fake"; the
+        # target names the fake endpoint this instance pretends to be
+        # (construction-time config, mirroring a real adapter's endpoint URL).
+        self._connection_identity = BrokerConnectionIdentity(
+            mode="fake", target=connection_target
+        )
         self._default_script: SubmitScript = default_script or FillImmediately()
         self._default_fill_price = default_fill_price
         self._account_state = account_state or _DEFAULT_ACCOUNT_STATE
@@ -415,6 +424,15 @@ class FakeBroker:
 
     def get_account_state(self) -> AccountState:
         return self._account_state
+
+    def connection_identity(self) -> BrokerConnectionIdentity:
+        """The identity this instance was CONSTRUCTED with (Issue #75).
+
+        Not part of the five Issue #73 order operations: it is the
+        connection-identity contract the execution layer's typed
+        ``BrokerConnection`` requires from every broker implementation.
+        """
+        return self._connection_identity
 
     # --- helpers -------------------------------------------------------------
 

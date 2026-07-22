@@ -16,6 +16,7 @@ import pytest
 from broker.broker_models import (
     AccountState,
     BrokerCommunicationError,
+    BrokerConnectionIdentity,
     BrokerTimeoutError,
     OrderSide,
     OrderState,
@@ -107,18 +108,14 @@ def account_state(retrieved_at=NOW):
     )
 
 
-def make_broker(cls=FakeBroker, *, account_retrieved_at=NOW):
-    broker = cls(default_fill_price=Decimal("150"), clock=lambda: NOW)
+def make_broker(cls=FakeBroker, *, account_retrieved_at=NOW, target="fake"):
+    broker = cls(default_fill_price=Decimal("150"), clock=lambda: NOW, connection_target=target)
     broker.set_account_state(account_state(account_retrieved_at))
     return broker
 
 
-def connection(broker=None, *, target="fake"):
-    return BrokerConnection(
-        broker=broker if broker is not None else make_broker(),
-        execution_mode=ExecutionMode.FAKE,
-        connection_target=target,
-    )
+def connection(broker=None):
+    return BrokerConnection(broker=broker if broker is not None else make_broker())
 
 
 def gate(*, state=None, selected_policy=None, clock=None):
@@ -129,34 +126,34 @@ def gate(*, state=None, selected_policy=None, clock=None):
     )
 
 
-def make_service(tmp_path, *, conn=None, the_gate=None, decision_store=None):
-    store = decision_store
-    if store is None:
-        store = SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3")
-        store.initialize()
+def make_service(tmp_path, *, conn=None, the_gate=None, initialize_decisions=True):
+    decision_db_path = tmp_path / "safety.sqlite3"
+    if initialize_decisions:
+        SQLiteSafetyDecisionStore(decision_db_path).initialize()
     conn = conn if conn is not None else connection()
     service = LiveOrderSubmissionService(
         connection=conn,
         gate=the_gate or gate(),
-        decision_store=store,
+        decision_db_path=decision_db_path,
         order_db_path=tmp_path / "orders.sqlite3",
         clock=lambda: NOW,
     )
-    return service, conn.broker, store
+    # Reader handle for assertions only (the service's own store is sealed).
+    return service, conn.broker, SQLiteSafetyDecisionStore(decision_db_path)
 
 
 def run(tmp_path, req=None, *, snapshot=None, register=True, **service_kwargs):
     """Register (unless told not to) and submit through the single service
-    boundary; returns (decision, result, broker, decision_store, service)."""
+    boundary; returns (decision, result, broker, decision_reader, service)."""
     req = req if req is not None else request()
-    service, broker, store = make_service(tmp_path, **service_kwargs)
+    service, broker, reader = make_service(tmp_path, **service_kwargs)
     if register:
         service.register(req, client_order_id="client-1")
     decision, result = service.submit(
         req.execution_request_id,
         market=snapshot if snapshot is not None else market(),
     )
-    return decision, result, broker, store, service
+    return decision, result, broker, reader, service
 
 
 def codes(decision):
@@ -167,14 +164,14 @@ def codes(decision):
 
 
 def test_normal_conditions_submit_to_fake_broker_without_external_io(tmp_path):
-    decision, result, broker, store, _ = run(tmp_path)
+    decision, result, broker, reader, _ = run(tmp_path)
 
     assert decision.allowed is True
     assert decision.rejections == ()
     assert result is not None
     assert result.state is OrderState.FILLED
     assert len(broker.submitted_requests) == 1
-    assert store.list_for_request("exec-1") == (decision,)
+    assert reader.list_for_request("exec-1") == (decision,)
 
 
 def test_submit_uses_the_registered_fixed_client_order_id(tmp_path):
@@ -236,7 +233,7 @@ def test_limit_order_sl_tp_are_judged_against_requested_price_not_live_price(tmp
 
 def test_second_submit_of_the_same_intent_is_rejected_before_the_broker(tmp_path):
     req = request()
-    service, broker, store = make_service(tmp_path)
+    service, broker, reader = make_service(tmp_path)
     service.register(req, client_order_id="client-1")
 
     first, first_result = service.submit(req.execution_request_id, market=market())
@@ -246,7 +243,7 @@ def test_second_submit_of_the_same_intent_is_rejected_before_the_broker(tmp_path
     assert SafetyRejectionCode.DUPLICATE_SUBMISSION in codes(second)
     assert second_result is None
     assert len(broker.submitted_requests) == 1
-    assert store.list_for_request(req.execution_request_id) == (first, second)
+    assert reader.list_for_request(req.execution_request_id) == (first, second)
 
 
 def test_unknown_outcome_bans_resubmission(tmp_path):
@@ -340,30 +337,88 @@ def test_broker_rejection_is_a_result_not_an_exception(tmp_path):
     assert row["order_state"] == OrderState.REJECTED.value
 
 
-def test_post_submit_persistence_failure_surfaces_loudly(tmp_path, monkeypatch):
+# --- broker answered but the result could not be persisted -------------------
+
+
+def test_result_persistence_failure_falls_back_to_unknown(tmp_path, monkeypatch):
     req = request()
     service, broker, _ = make_service(tmp_path)
     service.register(req, client_order_id="client-1")
 
     def broken_record_order_result(*args, **kwargs):
-        raise RuntimeError("order DB gone after submit")
+        raise RuntimeError("order DB failed while persisting the result")
 
     monkeypatch.setattr(execution_store, "record_order_result", broken_record_order_result)
-    with pytest.raises(RuntimeError, match="order DB gone"):
+    with pytest.raises(RuntimeError, match="persisting the result"):
         service.submit(req.execution_request_id, market=market())
-    # The order WAS submitted -- the failure must never be masked as a rejection.
+
+    # The order EXISTS at the broker; it must remain a query target.
     assert len(broker.submitted_requests) == 1
+    order_db = tmp_path / "orders.sqlite3"
+    row = execution_store.get_execution_order(req.execution_request_id, db_path=order_db)
+    assert row["order_state"] == OrderState.UNKNOWN.value
+    unresolved = execution_store.list_unresolved_submissions(db_path=order_db)
+    assert [r["execution_request_id"] for r in unresolved] == [req.execution_request_id]
+    assert [
+        r["execution_request_id"]
+        for r in execution_store.list_unknown_orders(db_path=order_db)
+    ] == [req.execution_request_id]
+
+
+def test_double_persistence_failure_keeps_the_order_visible_to_reconciliation(
+    tmp_path, monkeypatch
+):
+    req = request()
+    service, broker, _ = make_service(tmp_path)
+    service.register(req, client_order_id="client-1")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("order DB completely down")
+
+    monkeypatch.setattr(execution_store, "record_order_result", broken)
+    monkeypatch.setattr(execution_store, "record_order_state", broken)
+    with pytest.raises(RuntimeError, match="completely down"):
+        service.submit(req.execution_request_id, market=market())
+
+    assert len(broker.submitted_requests) == 1
+    order_db = tmp_path / "orders.sqlite3"
+    # Even with BOTH recordings failed, the submitting/pending order is
+    # retrievable as an unresolved submission -- it never disappears from
+    # the reconciliation view (Issue #75 review r3).
+    row = execution_store.get_execution_order(req.execution_request_id, db_path=order_db)
+    assert row["submission_phase"] == execution_store.PHASE_SUBMITTING
+    assert row["order_state"] == OrderState.PENDING.value
+    assert execution_store.list_unknown_orders(db_path=order_db) == []
+    unresolved = execution_store.list_unresolved_submissions(db_path=order_db)
+    assert [r["execution_request_id"] for r in unresolved] == [req.execution_request_id]
+
+
+def test_stuck_pending_submission_is_listed_as_unresolved(tmp_path):
+    # Simulated crash: the transition was won but the process died before the
+    # broker call. The order must be visible to reconciliation.
+    req = request()
+    service, _, _ = make_service(tmp_path)
+    service.register(req, client_order_id="client-1")
+    order_db = tmp_path / "orders.sqlite3"
+    execution_store.mark_submitting(
+        req.execution_request_id, reason="crashed before submit", changed_at_utc=NOW,
+        db_path=order_db,
+    )
+
+    unresolved = execution_store.list_unresolved_submissions(db_path=order_db)
+    assert [r["execution_request_id"] for r in unresolved] == [req.execution_request_id]
+    assert execution_store.list_unknown_orders(db_path=order_db) == []
 
 
 # --- intent registration / execution store integration -----------------------
 
 
 def test_unregistered_intent_is_rejected_before_the_broker(tmp_path):
-    decision, result, broker, store, _ = run(tmp_path, register=False)
+    decision, result, broker, reader, _ = run(tmp_path, register=False)
     assert SafetyRejectionCode.INTENT_NOT_REGISTERED in codes(decision)
     assert result is None
     assert broker.submitted_requests == []
-    assert store.list_for_request("exec-1") == (decision,)
+    assert reader.list_for_request("exec-1") == (decision,)
 
 
 def test_corrupted_order_store_is_fail_closed(tmp_path):
@@ -385,28 +440,34 @@ def test_corrupted_order_store_is_fail_closed(tmp_path):
     assert broker.submitted_requests == []
 
 
-# --- durable decision recording with read-back -------------------------------
+# --- durable decision recording: sealed store + read-back --------------------
 
 
-class LostCommitStore(SQLiteSafetyDecisionStore):
-    """record() appears to work but nothing can be read back."""
+def test_decision_store_cannot_be_injected_as_an_object(tmp_path):
+    class InMemoryRecorder:
+        def record(self, decision): ...
+        def list_for_request(self, execution_request_id): return ()
 
-    def list_for_request(self, execution_request_id):
-        return ()
+    for not_a_path in (
+        InMemoryRecorder(),
+        SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3"),
+    ):
+        with pytest.raises(ValueError, match="filesystem path"):
+            LiveOrderSubmissionService(
+                connection=connection(),
+                gate=gate(),
+                decision_db_path=not_a_path,
+                order_db_path=tmp_path / "orders.sqlite3",
+                clock=lambda: NOW,
+            )
 
 
-class NoOpRecordStore(SQLiteSafetyDecisionStore):
-    """A silently swallowing recorder -- must never enable a submit."""
-
-    def record(self, decision):
-        return None
-
-
-@pytest.mark.parametrize("store_cls", [LostCommitStore, NoOpRecordStore])
-def test_decision_readback_failure_prevents_submit(tmp_path, store_cls):
-    store = store_cls(tmp_path / "safety.sqlite3")
-    store.initialize()
-    decision, result, broker, _, _ = run(tmp_path, decision_store=store)
+def test_silently_lost_decision_write_is_caught_by_readback(tmp_path, monkeypatch):
+    # Simulate an infrastructure write loss on the SEALED store: record()
+    # appears to succeed but nothing lands in the DB. The read-back must
+    # catch it and block the submit.
+    monkeypatch.setattr(SQLiteSafetyDecisionStore, "record", lambda self, decision: None)
+    decision, result, broker, _, _ = run(tmp_path)
 
     assert SafetyRejectionCode.DECISION_PERSIST_FAILED in codes(decision)
     assert decision.allowed is False
@@ -415,37 +476,20 @@ def test_decision_readback_failure_prevents_submit(tmp_path, store_cls):
 
 
 def test_uninitialized_decision_store_prevents_submit(tmp_path):
-    store = SQLiteSafetyDecisionStore(tmp_path / "never-initialized.sqlite3")
-    decision, result, broker, _, _ = run(tmp_path, decision_store=store)
+    decision, result, broker, _, _ = run(tmp_path, initialize_decisions=False)
     assert decision.rejection_codes == (SafetyRejectionCode.DECISION_PERSIST_FAILED.value,)
     assert result is None
     assert broker.submitted_requests == []
 
 
 def test_persistence_failure_keeps_the_original_rejection_codes(tmp_path):
-    store = SQLiteSafetyDecisionStore(tmp_path / "never-initialized.sqlite3")
     decision, result, broker, _, _ = run(
-        tmp_path, request(quantity=Decimal("11")), decision_store=store
+        tmp_path, request(quantity=Decimal("11")), initialize_decisions=False
     )
     assert SafetyRejectionCode.QUANTITY_LIMIT_EXCEEDED in codes(decision)
     assert SafetyRejectionCode.DECISION_PERSIST_FAILED in codes(decision)
     assert result is None
     assert broker.submitted_requests == []
-
-
-def test_service_rejects_non_durable_recorders(tmp_path):
-    class InMemoryRecorder:
-        def record(self, decision): ...
-        def list_for_request(self, execution_request_id): return ()
-
-    with pytest.raises(ValueError, match="SQLiteSafetyDecisionStore"):
-        LiveOrderSubmissionService(
-            connection=connection(),
-            gate=gate(),
-            decision_store=InMemoryRecorder(),
-            order_db_path=tmp_path / "orders.sqlite3",
-            clock=lambda: NOW,
-        )
 
 
 # --- each safety condition rejects independently, before any submit ----------
@@ -511,10 +555,10 @@ def test_service_rejects_non_durable_recorders(tmp_path):
             SafetyRejectionCode.SYMBOL_NOT_TRADABLE, id="not-tradable"),
         pytest.param(
             request, market, policy, "oanda-live",
-            SafetyRejectionCode.EXECUTION_MODE_MISMATCH, id="fake-mode-live-target"),
+            SafetyRejectionCode.EXECUTION_MODE_MISMATCH, id="fake-broker-live-target"),
         pytest.param(
             request, market, policy, "oanda-demo",
-            SafetyRejectionCode.EXECUTION_MODE_MISMATCH, id="fake-mode-demo-target"),
+            SafetyRejectionCode.EXECUTION_MODE_MISMATCH, id="fake-broker-demo-target"),
         pytest.param(
             request, market, policy, "unknown-endpoint",
             SafetyRejectionCode.EXECUTION_MODE_MISMATCH, id="unknown-target"),
@@ -526,21 +570,21 @@ def test_service_rejects_non_durable_recorders(tmp_path):
 def test_each_condition_rejects_before_submit(
     tmp_path, req_factory, snapshot_factory, policy_factory, target, expected
 ):
-    decision, result, broker, store, _ = run(
+    decision, result, broker, reader, _ = run(
         tmp_path,
         req_factory(),
         snapshot=snapshot_factory(),
-        conn=connection(target=target),
+        conn=connection(make_broker(target=target)),
         the_gate=gate(selected_policy=policy_factory()),
     )
     assert expected in codes(decision)
     assert decision.allowed is False
     assert result is None
     assert broker.submitted_requests == []
-    assert store.list_for_request("exec-1") == (decision,)
+    assert reader.list_for_request("exec-1") == (decision,)
 
 
-# --- typed connection identity ----------------------------------------------
+# --- typed connection identity (derived from the broker instance) ------------
 
 
 class StubBroker:
@@ -553,43 +597,101 @@ class StubBroker:
     def get_account_state(self): ...
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "match"),
-    [
-        pytest.param(dict(execution_mode=ExecutionMode.LIVE, connection_target="oanda-live"),
-                     "no broker implementation is registered", id="fakebroker-cannot-claim-live"),
-        pytest.param(dict(execution_mode=ExecutionMode.DEMO, connection_target="oanda-demo"),
-                     "no broker implementation is registered", id="fakebroker-cannot-claim-demo"),
-        pytest.param(dict(execution_mode="live", connection_target="oanda-live"),
-                     "ExecutionMode", id="unknown-mode-string"),
-        pytest.param(dict(execution_mode=ExecutionMode.FAKE, connection_target=" fake "),
-                     "whitespace", id="whitespace-target"),
-        pytest.param(dict(execution_mode=ExecutionMode.FAKE, connection_target=""),
-                     "non-empty", id="empty-target"),
-    ],
-)
-def test_broker_connection_rejects_invalid_identity(kwargs, match):
-    with pytest.raises(ValueError, match=match):
-        BrokerConnection(broker=make_broker(), **kwargs)
+class StubBrokerWithIdentity(StubBroker):
+    def connection_identity(self):
+        return BrokerConnectionIdentity(mode="fake", target="fake")
 
 
-def test_broker_connection_rejects_non_fakebroker_claiming_fake_mode():
-    with pytest.raises(ValueError, match="requires a FakeBroker instance"):
+def identity_broker(mode, target):
+    class LyingIdentityBroker(FakeBroker):
+        def connection_identity(self):
+            return BrokerConnectionIdentity(mode=mode, target=target)
+
+    return LyingIdentityBroker(default_fill_price=Decimal("150"), clock=lambda: NOW)
+
+
+def test_connection_identity_is_derived_from_the_broker_instance():
+    conn = BrokerConnection(broker=make_broker(target="fake-endpoint-2"))
+    assert conn.execution_mode is ExecutionMode.FAKE
+    assert conn.connection_target == "fake-endpoint-2"
+
+
+def test_connection_mode_and_target_cannot_be_declared_by_the_caller():
+    with pytest.raises(TypeError):
         BrokerConnection(
-            broker=StubBroker(), execution_mode=ExecutionMode.FAKE, connection_target="fake"
+            broker=make_broker(),
+            execution_mode=ExecutionMode.LIVE,
+            connection_target="oanda-live",
         )
 
 
-def test_evaluate_rechecks_the_typed_identity_fail_closed():
-    # Bypass the frozen constructor on purpose to prove the gate re-checks.
+@pytest.mark.parametrize(
+    ("mode", "target", "match"),
+    [
+        pytest.param("live", "oanda-live", "no broker implementation is registered",
+                     id="fakebroker-cannot-claim-live"),
+        pytest.param("demo", "oanda-demo", "no broker implementation is registered",
+                     id="fakebroker-cannot-claim-demo"),
+        pytest.param("mystery", "somewhere", "unknown execution mode",
+                     id="unknown-mode"),
+    ],
+)
+def test_broker_connection_rejects_invalid_self_reported_identity(mode, target, match):
+    with pytest.raises(ValueError, match=match):
+        BrokerConnection(broker=identity_broker(mode, target))
+
+
+def test_broker_without_connection_identity_is_rejected():
+    with pytest.raises(ValueError, match="connection_identity"):
+        BrokerConnection(broker=StubBroker())
+
+
+def test_non_fakebroker_reporting_fake_mode_is_rejected():
+    with pytest.raises(ValueError, match="requires a FakeBroker instance"):
+        BrokerConnection(broker=StubBrokerWithIdentity())
+
+
+def test_malformed_identity_object_is_rejected():
+    class BadIdentityBroker(FakeBroker):
+        def connection_identity(self):
+            return ("fake", "fake")
+
+    with pytest.raises(ValueError, match="BrokerConnectionIdentity"):
+        BrokerConnection(
+            broker=BadIdentityBroker(default_fill_price=Decimal("150"), clock=lambda: NOW)
+        )
+
+
+def test_evaluate_rederives_the_identity_fail_closed():
+    # Bypass the frozen constructor on purpose to prove the gate re-derives.
     conn = connection()
     object.__setattr__(conn, "execution_mode", ExecutionMode.LIVE)
     decision = gate().evaluate(request(), connection=conn, market=market())
     assert SafetyRejectionCode.EXECUTION_MODE_MISMATCH in codes(decision)
-    # Both the identity re-check and the policy target check fire; dedup keeps one.
+    # Several identity checks fire; dedup keeps exactly one code.
     assert decision.rejection_codes.count(
         SafetyRejectionCode.EXECUTION_MODE_MISMATCH.value
     ) == 1
+
+
+def test_identity_drift_after_composition_is_fail_closed(tmp_path):
+    class ShiftyIdentityBroker(FakeBroker):
+        current_target = "fake"
+
+        def connection_identity(self):
+            return BrokerConnectionIdentity(mode="fake", target=self.current_target)
+
+    broker = ShiftyIdentityBroker(default_fill_price=Decimal("150"), clock=lambda: NOW)
+    broker.set_account_state(account_state())
+    conn = BrokerConnection(broker=broker)
+    assert conn.connection_target == "fake"
+
+    broker.current_target = "oanda-demo"  # identity drifts after composition
+    decision, result, broker, _, _ = run(tmp_path, conn=conn)
+
+    assert SafetyRejectionCode.EXECUTION_MODE_MISMATCH in codes(decision)
+    assert result is None
+    assert broker.submitted_requests == []
 
 
 # --- kill switch -------------------------------------------------------------
@@ -737,11 +839,11 @@ def test_unreliable_account_snapshots_are_fail_closed(tmp_path, retrieved_at):
 
 
 def test_unexpected_evaluation_failure_is_fail_closed_and_recorded(tmp_path):
-    decision, result, broker, store, _ = run(tmp_path, snapshot="not-a-snapshot")
+    decision, result, broker, reader, _ = run(tmp_path, snapshot="not-a-snapshot")
     assert SafetyRejectionCode.GATE_INTERNAL_ERROR in codes(decision)
     assert result is None
     assert broker.submitted_requests == []
-    assert store.list_for_request("exec-1") == (decision,)
+    assert reader.list_for_request("exec-1") == (decision,)
 
 
 def test_broken_gate_clock_is_fail_closed(tmp_path):
@@ -758,7 +860,7 @@ def test_broken_gate_clock_is_fail_closed(tmp_path):
 def test_multiple_violations_are_machine_readable_and_collected_together():
     decision = gate(state=StaticSafetyState(kill_switch_enabled=True)).evaluate(
         request(quantity=Decimal("11"), stop_loss_price=None, take_profit_price=None),
-        connection=connection(target="unknown-endpoint"),
+        connection=connection(make_broker(target="unknown-endpoint")),
         market=market(market_open=False),
     )
     assert decision.allowed is False
@@ -806,6 +908,36 @@ def test_allow_and_submit_are_logged(tmp_path, caplog):
 
 
 # --- model validation --------------------------------------------------------
+
+
+def test_policy_content_is_immune_to_caller_side_dict_mutation():
+    spreads = {"USD_JPY": Decimal("0.05")}
+    targets = {
+        ExecutionMode.FAKE: frozenset({"fake"}),
+        ExecutionMode.DEMO: frozenset({"oanda-demo"}),
+        ExecutionMode.LIVE: frozenset({"oanda-live"}),
+    }
+    frozen_policy = policy(max_spread_by_symbol=spreads, allowed_connection_targets=targets)
+
+    # Mutate the caller-held originals AFTER construction (Issue #75 review r3
+    # Major): the validated policy content must not move under its policy_id.
+    spreads["USD_JPY"] = Decimal("2")
+    targets[ExecutionMode.FAKE] = frozenset({"unknown-endpoint"})
+
+    assert frozen_policy.max_spread_by_symbol["USD_JPY"] == Decimal("0.05")
+    assert frozen_policy.allowed_connection_targets[ExecutionMode.FAKE] == frozenset({"fake"})
+    decision = gate(selected_policy=frozen_policy).evaluate(
+        request(), connection=connection(), market=market(ask=Decimal("150.10"))
+    )
+    assert SafetyRejectionCode.SPREAD_LIMIT_EXCEEDED in codes(decision)
+
+
+def test_policy_mappings_are_read_only():
+    frozen_policy = policy()
+    with pytest.raises(TypeError):
+        frozen_policy.max_spread_by_symbol["USD_JPY"] = Decimal("2")
+    with pytest.raises(TypeError):
+        frozen_policy.allowed_connection_targets[ExecutionMode.FAKE] = frozenset({"x"})
 
 
 def test_policy_requires_spread_limit_coverage_for_every_allowed_symbol():

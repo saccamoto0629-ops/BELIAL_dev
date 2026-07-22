@@ -585,6 +585,42 @@ def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
                 )
 
 
+# --- connection identity -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BrokerConnectionIdentity:
+    """The immutable connection identity a broker implementation reports
+    about ITSELF (Issue #75): which execution mode its connection belongs to
+    and the exact endpoint/config target it talks to.
+
+    The identity must be derived from the implementation's own
+    construction-time configuration -- never from caller-side declarations --
+    so a mode/target claim can never drift from what the instance actually
+    connects to. It must stay CONSTANT for the lifetime of the instance.
+
+    ``mode`` / ``target`` are deliberately plain strings: the broker layer
+    owns no execution-layer vocabulary (dependency direction, Issue #73).
+    The execution layer maps ``mode`` onto its own enum and cross-checks the
+    implementation's concrete type; unknown modes fail there, closed.
+    """
+
+    mode: str
+    target: str
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.mode, "mode")
+        _require_non_empty_str(self.target, "target")
+        if self.mode != self.mode.strip():
+            raise BrokerInvalidRequestError(
+                f"mode {self.mode!r} carries surrounding whitespace"
+            )
+        if self.target != self.target.strip():
+            raise BrokerInvalidRequestError(
+                f"target {self.target!r} carries surrounding whitespace"
+            )
+
+
 # --- position / account models ---------------------------------------------
 
 

@@ -270,7 +270,10 @@ def test_db_check_constraints_reject_inconsistent_rows_at_write_time(tmp_path):
 # --- integration with the sanctioned submission path -------------------------
 
 
-def _submit_with_store(store, tmp_path, *, kill_switch=False):
+def _submit_with_path(tmp_path, *, initialized=True, kill_switch=False):
+    decision_db_path = tmp_path / "safety.sqlite3"
+    if initialized:
+        SQLiteSafetyDecisionStore(decision_db_path).initialize()
     broker = FakeBroker(default_fill_price=Decimal("150"), clock=lambda: NOW)
     broker.set_account_state(
         AccountState(
@@ -319,11 +322,9 @@ def _submit_with_store(store, tmp_path, *, kill_switch=False):
         tradable=True,
     )
     service = LiveOrderSubmissionService(
-        connection=BrokerConnection(
-            broker=broker, execution_mode=ExecutionMode.FAKE, connection_target="fake"
-        ),
+        connection=BrokerConnection(broker=broker),
         gate=gate,
-        decision_store=store,
+        decision_db_path=decision_db_path,
         order_db_path=tmp_path / "orders.sqlite3",
         clock=lambda: NOW,
     )
@@ -334,7 +335,7 @@ def _submit_with_store(store, tmp_path, *, kill_switch=False):
 
 def test_rejection_audit_survives_a_store_reopen(tmp_path):
     path = tmp_path / "safety.sqlite3"
-    decision, result, broker = _submit_with_store(store_at(tmp_path), tmp_path, kill_switch=True)
+    decision, result, broker = _submit_with_path(tmp_path, kill_switch=True)
     assert result is None
     assert broker.submitted_requests == []
 
@@ -345,7 +346,7 @@ def test_rejection_audit_survives_a_store_reopen(tmp_path):
 
 def test_allow_audit_survives_a_store_reopen(tmp_path):
     path = tmp_path / "safety.sqlite3"
-    decision, result, broker = _submit_with_store(store_at(tmp_path), tmp_path)
+    decision, result, broker = _submit_with_path(tmp_path)
     assert decision.allowed is True
     assert result is not None
     assert len(broker.submitted_requests) == 1
@@ -353,8 +354,7 @@ def test_allow_audit_survives_a_store_reopen(tmp_path):
 
 
 def test_uninitialized_store_fails_closed_through_the_submission_path(tmp_path):
-    store = SQLiteSafetyDecisionStore(tmp_path / "never-initialized.sqlite3")
-    decision, result, broker = _submit_with_store(store, tmp_path)
+    decision, result, broker = _submit_with_path(tmp_path, initialized=False)
     assert decision.allowed is False
     assert decision.rejection_codes == (SafetyRejectionCode.DECISION_PERSIST_FAILED.value,)
     assert result is None

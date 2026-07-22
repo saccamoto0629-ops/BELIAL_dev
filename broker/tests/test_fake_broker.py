@@ -513,3 +513,26 @@ def test_fake_broker_records_submitted_requests_for_assertions():
     request = make_request()
     broker.submit_order(request)
     assert broker.submitted_requests == [request]
+
+
+# --- connection identity (Issue #75) -----------------------------------------
+
+def test_connection_identity_is_fixed_at_construction():
+    broker = fb.FakeBroker()
+    identity = broker.connection_identity()
+    assert identity == m.BrokerConnectionIdentity(mode="fake", target="fake")
+    # constant for the instance lifetime
+    assert broker.connection_identity() == identity
+
+
+def test_connection_identity_target_comes_from_constructor_config():
+    broker = fb.FakeBroker(connection_target="fake-endpoint-2")
+    assert broker.connection_identity() == m.BrokerConnectionIdentity(
+        mode="fake", target="fake-endpoint-2"
+    )
+
+
+@pytest.mark.parametrize("bad_target", ["", "   ", " fake ", None, 42])
+def test_invalid_connection_target_is_rejected_at_construction(bad_target):
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FakeBroker(connection_target=bad_target)
