@@ -51,7 +51,7 @@ execution_store                 ← execution/execution_store.py(SQLite 永続�
 - `execution_request_id` — BELIAL 内部の発注**意図**の ID。execution store の主キーで、状態履歴のキー。
 - `client_order_id` — Broker 境界(submit / cancel / query, Issue #73)の呼び出し側キー。この意図に対する Broker 側注文 1 件を指す。
 
-store は両者を **1:1 で固定**する(`client_order_id` は NOT NULL + UNIQUE、保存後は不変)。UNKNOWN(結果不明)後の照会は**保存済みの `client_order_id`** で行う。同じ意図を**新しい `client_order_id` で再送することが二重発注の正体**であるため、モデル・store は client order ID を暗黙に生成・更新・ローテーションしない。再送(意図の再発行)が必要なら、それは新しい `execution_request_id` + 新しい `client_order_id` を持つ別レコードであり、UNKNOWN の解決とは区別される(再送フロー自体は非スコープ)。
+store は両者を **1:1 で固定**する(`client_order_id` は NOT NULL + UNIQUE、保存後は不変)。UNKNOWN(結果不明)後の照会は**保存済みの `client_order_id`** で行う。同じ意図を**新しい `client_order_id` で再送することが二重発注の正体**であるため、モデル・store は client order ID を暗黙に生成・更新・ローテーションしない。再送(意図の再発行)は新しい `execution_request_id` + 新しい `client_order_id` を持つ別レコードとして UNKNOWN の解決と区別されるが、**Issue #76 以降は同一 source signal からの新レコード作成自体が `signal_id` の UNIQUE 制約で拒否される**: 暗黙の再発行経路は存在せず、将来再発行フローを作る場合(非スコープ)は明示的な運用判断・migration を伴う設計にしなければならない。
 
 ## ExecutionRequest(`execution_models.py`)
 
@@ -98,6 +98,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - `execution_request_id` TEXT PRIMARY KEY
 - request 本体: `signal_id` / `strategy_id` / `symbol` / `side` / `order_type` / `quantity` / `requested_price` / `stop_loss_price` / `take_profit_price` / `requested_at_utc`(Decimal は正準 TEXT で保存し float 誤差を持ち込まない)
+- `signal_id` は**専用 UNIQUE index(`idx_execution_orders_signal`)でテーブル全体一意**(Issue #76): 1 つの source signal からは高々 1 件の Execution Request しか作成できない。inline 列制約でなく独立 index にしたのは **v2 → v3 migration を purely additive にするため**(テーブル DDL は v2 / v3 で同一)
 - `client_order_id` TEXT NOT NULL UNIQUE(1:1・不変)
 - `submission_phase` TEXT NOT NULL(CHECK: 上記 3 値)
 - `order_state` TEXT NULL(CHECK: `OrderState` の値集合。`created` ⇔ NULL を CHECK で強制)
@@ -168,15 +169,27 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - store / API は UNKNOWN を「未発注」「拒否」「再送可」へ**自動変換しない**。即時再送可能状態として扱わない。
 - 自動照会 runner・定期 reconciliation は**非スコープ**(未実装)。
 
+### 二重発注防止と idempotency(Issue #76)
+
+同一 Execution Request の再処理・同一 Signal からの重複生成・多重起動時の競合が Broker への重複送信を生まないことは、**永続化層の契約**として保証する(インメモリ集合・プロセス内ロック・FakeBroker 内部の判定に依存しない)。
+
+- **一意性の最終防衛線は DB 制約 + トランザクション**: `execution_request_id`(PRIMARY KEY)・`signal_id`(UNIQUE index)・`client_order_id`(UNIQUE)。事前 SELECT はログ用の分類にのみ使い、重複判定そのものは `BEGIN IMMEDIATE` トランザクション内の INSERT / UPDATE が制約に衝突するかどうかで確定する。並行 creator の敗者は `ExecutionOrderConflictError`(正常系の抑止であり異常終了ではない)。
+- **送信権の獲得は短いトランザクションで完了してから Broker を呼ぶ**: `mark_submitting()`(created → submitting、`order_state = pending` の永続化)が `BEGIN IMMEDIATE` で直列化され一度しか成功しないため、Broker を呼べる実行主体は最大 1 つ。外部 Broker 呼び出し中に SQLite の書き込みトランザクションを保持しない。
+- **再処理の抑止**: phase が `created` 以外(submitting / submitted。order_state が pending / accepted / partially_filled / filled / unknown / terminal のいずれでも)の Request は再送信されない([Safety Gate](safety_gate.md) の `duplicate_submission`)。**REJECTED も同一意図での再送は不可**(判断根拠: `client_order_id` は 1:1 不変で `mark_submitting` は一度きり、かつ再発行レコードは `signal_id` UNIQUE が拒否する。暗黙の再送可能状態は存在しない)。
+- **タイムアウト・結果不明は UNKNOWN として保存**され、即時再送しない(上記「UNKNOWN の扱い」)。
+- **重複抑止ログ**: 抑止時は WARN で `execution_request_id`・`signal_id`・現在の `submission_phase` / `order_state`・抑止理由を必ず出力する(store の作成時 conflict と送信サービスの `duplicate_submission` の両方)。
+- `get_execution_order_by_signal_id()`: signal からの逆引き read helper(高々 1 件)。missing DB はファイルを作らず None。
+
 ### schema 管理・読み取り経路
 
-- schema version は **v2**(v1 = PR #91 初版。r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加。未リリースのため migration は提供せず、v1 DB は検証で明示的に失敗する)。
+- schema version は **v3**(v1 = PR #91 初版、v2 = r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加、v3 = Issue #76 で `signal_id` の UNIQUE index を追加)。
+- **v2 → v3 migration**(Issue #76): `init_db()` が「**完全な構造検証で v2 と一致した DB のみ**」を additive に migration する — 重複 `signal_id` の事前 scan → `CREATE UNIQUE INDEX` → version bump → **v3 の完全再検証** → COMMIT を**単一の `BEGIN IMMEDIATE` トランザクション**で行う。途中失敗は全体 rollback となり中途半端な schema は残らない。既存行は削除・書き換えされない。**既存データに重複 signal がある場合は明示的に失敗**し(重複の解消は人間の判断)、DB は無変更。v1 および v2 / v3 のどちらとも一致しない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
 - `init_db()` が schema を**新規作成するのは pristine な DB のみ**(PR #91 レビュー r2 Major 2): `sqlite_master` のオブジェクトが **0 件**かつ `user_version = 0`。**version だけが設定された DB・metadata だけが残った DB(`sqlite_sequence` 等)は新規 DB として扱わず**、DB を変更せずに失敗する。
 - 既存 schema の判定は**列名ではなく完全な構造検証**で行う(PR #91 レビュー r2 Minor 2 / r3 Major 1 / r3 Minor 1)。
   - **sqlite_master 全 object 集合の closed-world 検証(r3 Major 1)**: `type IN ('table','index')` の抽出ではなく、**全 type の object 集合**を pristine な参照 schema(in-memory)の集合と完全一致で比較する。許可される SQLite 内部 object は本 schema 自身が作るもの(AUTOINCREMENT の `sqlite_sequence`、UNIQUE 制約の `sqlite_autoindex_*`)だけを**明示的に**参照集合へ含める。**trigger・view・予期しないテーブル・予期しない index は type を問わずすべて失敗**である(trigger / view は store の背後で行を書き換え・削除できるため、存在自体を拒否する)。
   - **構造(列・NOT NULL / PK / UNIQUE / FK / index)は PRAGMA signature が正**: `PRAGMA user_version` に加え、`PRAGMA table_info` / `index_list` / `index_info` / `foreign_key_list` から構築した構造 signature を参照 schema と比較する。
   - **DDL は token 正規化比較(r3 Minor 1)**: `sqlite_master.sql` のバイト一致は要求しない。quoted identifier(`"execution_orders"` 等)・空白 / 改行・keyword の大文字小文字・コメント・冗長な括弧(単一 atom を包む括弧と二重括弧のみ、意味を保存できる collapse に限定)は SQLite 上同値なため吸収する。**設計判断**: CHECK 式のみの抽出比較ではなく DDL 全体の token 比較を選んだ。PRAGMA から見えない意味論は CHECK 式だけでなく `WITHOUT ROWID` / `AUTOINCREMENT` / `COLLATE` 等にも存在し、token 比較はそれらを一括で防御できる。CHECK 式内の**文字列 literal は大文字小文字を保存**して比較し(`'created'` → `'CREATED'` は拒否)、正規化で同値と証明できない差分はすべて不一致として扱う(fail closed。同値だが表記が大きく異なる式の誤拒否は残るが、安全側)。
-- **新規コンポーネント・新規 DB のため legacy migration 経路は存在しない**: partial schema(片側テーブル欠損)・制約欠損の同名テーブル・version 不一致・他コンポーネントの DB は、いずれも **DB を一切変更せず** `ExecutionSchemaError` で明示的に失敗する(自動補完・黙った rebuild をしない)。
+- **migration 経路はリリース済み v2 からの additive 移行(上記)のみ**: partial schema(片側テーブル欠損)・制約欠損の同名テーブル・未知 version・他コンポーネントの DB は、いずれも **DB を一切変更せず** `ExecutionSchemaError` で明示的に失敗する(自動補完・黙った rebuild をしない)。v1 は未リリース schema のため migration を提供しない。
 - **復元時の整合検証**(PR #91 レビュー Major 2 / r2 Major 1): 注文を返すすべての読み取りは schema 検証の後、enum 値・UTC・非空 ID / reason・**current / history chain**(先頭は created → pending、リンク欠落なし、各ペアが許可遷移、末尾が current 行と一致)・phase 整合・broker_order_id の chain・**snapshot の history anchor**(上記)を再検証し、帯域外編集で不整合になった DB は `ExecutionIntegrityError` で拒否する。**DB 全体の `broker_order_id` 重複 scan** も読み取り・書き込みの両方で実施し、重複を保持する DB からは一切復元しない(PR #91 レビュー r2 Major 3)。
 - snapshot JSON は**厳格に**解析する(PR #91 レビュー r2 Minor 1): top-level と fills の**キー集合が期待集合と完全一致**しなければならず、未知 field・欠落 field は拒否する。
 - 読み取り API は存在しない DB ファイルを**作成しない**(missing → None / 空)。存在するファイルの読み取りエラーは握り潰さず伝播する。更新 API も存在しないファイルを作成せず `ExecutionOrderNotFoundError` にする。
@@ -196,4 +209,5 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - `test_execution_models.py` — 正常生成、必須 ID 空文字拒否、quantity / price 不正拒否、naive datetime 拒否、MARKET / LIMIT 価格整合、SL / TP 方向整合(一意に保証できる関係のみ)、`to_order_request` 変換(SL / TP が境界を越えないこと)。
 - `test_execution_store.py` — 初期レコード保存・復元、created → submitting(2 接続競合で 1 更新のみ成功を含む)、ACCEPTED 保存、ACCEPTED → PARTIALLY_FILLED → FILLED / REJECTED / CANCELLED、state-only API の UNKNOWN 限定と broker_order_id 新規導入拒否、stale snapshot による fill 消失拒否・`previous_result` と anchored snapshot の一致要求・再起動後も更新検証が機能すること、UNKNOWN 保存・抽出・許可解決・fill を失う解決の拒否、**UNKNOWN 中の current 行 snapshot 差し替え検出(history anchor)**・current 行 broker_order_id 改竄検出・history snapshot 改竄 / 剥離検出、terminal からの不正遷移拒否と terminal same-state 再観測、broker_order_id 差し替え / 欠落拒否と **DB 全体一意性(競合時の全 rollback・復元時重複 scan)**、updated_at 逆行拒否、current + snapshot + history の原子性、**pristine 判定**(version-only DB / metadata-only DB の拒否・無変更)、制約欠損 / partial / 他コンポーネント DB / version 不一致 / index 差し替え / index 欠落 schema の拒否(DB 無変更)、**trigger / view の検出**(AFTER UPDATE で history 削除・BEFORE UPDATE で値書き換え・AFTER INSERT で history 追加・view。全公開 API が DB 無変更 = バイト一致で `ExecutionSchemaError`、r3 Major 再現経路の回帰、trigger 削除後は同じ更新が成功)、**schema 検証後にトランザクション内で発火する副作用の commit 前検出と rollback**(history 削除 / 既存 history 改竄 / current 行書き換えの 3 系統、失敗後の current / history / snapshot 完全一致、副作用が無ければ同じ更新が成功)、**同値 DDL の受理**(quoted identifier・空白 / 改行・keyword case・冗長括弧・コメント)と **CHECK 欠損 / CHECK 式変更 / literal 変更・NOT NULL / UNIQUE / FK / WITHOUT ROWID 欠損の拒否**、**read API の schema 検証**、DB CHECK 制約の発火(NULL PK 含む)、snapshot JSON の未知 field 拒否、DB を開き直した後の完全復元(fills / Decimal / UTC 含む)、init 冪等性、missing DB を作成しないこと。
+- `test_execution_store.py`(Issue #76 追加分)— 同一 `signal_id` の 2 件目作成が conflict になり行が増えないこと、重複抑止の WARN ログ(execution_request_id / signal_id / 既存行の phase・state / 理由)、**独立 DB 接続 2 本の同時作成で 1 行のみ**(敗者は正常な conflict でプロセス継続)、schema レベルの UNIQUE 発火(帯域外 INSERT も拒否)、`get_execution_order_by_signal_id` の round-trip と missing DB 非作成、**v2 → v3 migration**(既存行の完全保持・migration 後の通常読み取り・制約の有効化・冪等性)、**重複 signal を含む v2 の migration 明示失敗(DB 無変更)**、読み取り・更新経路が v2 DB を migration しないこと。
 - `test_package_imports.py` — リポジトリルートからの package import(subprocess)、Paper / Observation レイヤーが execution を import しないこと(AST 走査)、execution が stdlib + broker 以外へ依存しないこと。

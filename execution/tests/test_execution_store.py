@@ -5,6 +5,7 @@ sleep, no real orders anywhere in this suite.
 """
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import closing
@@ -25,9 +26,11 @@ def at(seconds: int) -> datetime:
 
 
 def make_request(request_id="exec-1", **overrides):
+    # signal_id derives from the request id: signal_id is UNIQUE DB-wide
+    # (Issue #76), so distinct default requests must carry distinct signals.
     kwargs = dict(
         execution_request_id=request_id,
-        signal_id="sig-1",
+        signal_id=f"sig-{request_id}",
         strategy_id="strat-1",
         symbol="XAUUSD",
         side=OrderSide.BUY,
@@ -1364,6 +1367,7 @@ def test_equivalent_ddl_with_quoted_identifiers_and_cosmetic_differences_is_acce
         f'create index "{store._ORDERS_STATE_INDEX}" on "{store.ORDERS_TABLE}" '
         "(order_state, updated_at_utc)",
         store._create_index_sql()[store._HISTORY_REQUEST_INDEX],
+        f'create UNIQUE index "{store._SIGNAL_UNIQUE_INDEX}" on {store.ORDERS_TABLE} (signal_id)',
     ]
     _write_schema(db_path, orders_sql, history_sql, index_sqls)
     store.init_db(db_path)  # verification accepts the equivalent schema
@@ -1428,3 +1432,196 @@ def test_dropped_index_is_rejected(db_path):
         connection.commit()
     with pytest.raises(store.ExecutionSchemaError):
         store.get_execution_order("exec-1", db_path=db_path)
+
+
+# --- Issue #76: source-signal uniqueness / duplicate suppression / migration --
+
+
+def _raw_created_row(connection, request_id, signal_id):
+    """Insert a well-formed `created` row out-of-band (bypassing the store's
+    constraints only where the schema itself allows it -- used to seed a v2
+    DB with data the v3 constraint would refuse)."""
+    values = {
+        "execution_request_id": request_id,
+        "signal_id": signal_id,
+        "strategy_id": "strat-1",
+        "symbol": "XAUUSD",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "10",
+        "requested_price": "2400.00",
+        "stop_loss_price": None,
+        "take_profit_price": None,
+        "requested_at_utc": T0.isoformat(),
+        "client_order_id": f"client-{request_id}",
+        "submission_phase": "created",
+        "order_state": None,
+        "broker_order_id": None,
+        "last_state_reason": None,
+        "last_order_result_json": None,
+        "created_at_utc": T0.isoformat(),
+        "updated_at_utc": T0.isoformat(),
+    }
+    connection.execute(
+        f"INSERT INTO {store.ORDERS_TABLE} ({', '.join(store._ORDER_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in store._ORDER_COLUMNS)})",
+        tuple(values[c] for c in store._ORDER_COLUMNS),
+    )
+
+
+def _downgrade_to_v2(db_path):
+    """Turn a freshly created v3 DB into a genuine released v2 DB: drop the
+    Issue #76 unique signal index and stamp the v2 version. Rows persist."""
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(f"DROP INDEX {store._SIGNAL_UNIQUE_INDEX}")
+        connection.execute(f"PRAGMA user_version = {store._MIGRATABLE_VERSION}")
+        connection.commit()
+
+
+def test_duplicate_signal_id_is_a_conflict_and_creates_no_second_row(db_path):
+    create_order(db_path)
+    with pytest.raises(store.ExecutionOrderConflictError):
+        create_order(db_path, request_id="exec-2", signal_id="sig-exec-1")
+    assert store.get_execution_order("exec-2", db_path=db_path) is None
+    row = store.get_execution_order_by_signal_id("sig-exec-1", db_path=db_path)
+    assert row["execution_request_id"] == "exec-1"
+
+
+def test_duplicate_signal_suppression_is_logged_with_ids_state_and_reason(db_path, caplog):
+    create_order(db_path)
+    store.mark_submitting("exec-1", reason="submit", changed_at_utc=at(1), db_path=db_path)
+    with caplog.at_level(logging.WARNING, logger="execution.execution_store"):
+        with pytest.raises(store.ExecutionOrderConflictError):
+            create_order(db_path, request_id="exec-2", signal_id="sig-exec-1")
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "execution_request_id=exec-2" in message
+    assert "signal_id=sig-exec-1" in message
+    assert "existing_execution_request_id=exec-1" in message
+    assert "existing_submission_phase=submitting" in message
+    assert "existing_order_state=pending" in message
+    assert "reason=source signal already produced an execution request" in message
+
+
+def test_duplicate_request_id_suppression_is_logged(db_path, caplog):
+    create_order(db_path)
+    with caplog.at_level(logging.WARNING, logger="execution.execution_store"):
+        with pytest.raises(store.ExecutionOrderConflictError):
+            create_order(db_path, client_order_id="client-other", signal_id="sig-other")
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "execution_request_id=exec-1" in message
+    assert "existing_submission_phase=created" in message
+    assert "reason=execution_request_id is already persisted" in message
+
+
+def test_concurrent_creates_from_the_same_signal_yield_exactly_one_row(db_path):
+    # Two independent DB connections (each store call opens its own --
+    # equivalent to two processes) race to create an intent from the SAME
+    # source signal. The UNIQUE constraint inside BEGIN IMMEDIATE -- not any
+    # pre-SELECT -- guarantees exactly one row and a clean conflict error
+    # for the loser (no crash, DB stays usable).
+    store.init_db(db_path)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def attempt(request_id):
+        barrier.wait()
+        try:
+            create_order(db_path, request_id=request_id, signal_id="sig-shared")
+            outcomes.append(("ok", request_id))
+        except store.ExecutionOrderConflictError:
+            outcomes.append(("suppressed", request_id))
+
+    threads = [threading.Thread(target=attempt, args=(rid,)) for rid in ("exec-a", "exec-b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(o[0] for o in outcomes) == ["ok", "suppressed"]
+    winner = store.get_execution_order_by_signal_id("sig-shared", db_path=db_path)
+    assert winner is not None
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute(
+            f"SELECT COUNT(*) FROM {store.ORDERS_TABLE}"
+        ).fetchone()[0] == 1
+    # the DB remains fully usable after the suppressed conflict
+    store.mark_submitting(
+        winner["execution_request_id"], reason="submit", changed_at_utc=at(1), db_path=db_path
+    )
+
+
+def test_signal_uniqueness_is_enforced_by_the_db_itself(db_path):
+    # second guard: even an out-of-band INSERT cannot create a second row
+    # for the same signal on a v3 schema.
+    create_order(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_created_row(connection, "exec-oob", "sig-exec-1")
+
+
+def test_get_execution_order_by_signal_id_round_trips(db_path):
+    create_order(db_path)
+    row = store.get_execution_order_by_signal_id("sig-exec-1", db_path=db_path)
+    assert row["execution_request_id"] == "exec-1"
+    assert store.get_execution_order_by_signal_id("sig-none", db_path=db_path) is None
+
+
+def test_get_execution_order_by_signal_id_never_creates_a_missing_db(db_path):
+    assert store.get_execution_order_by_signal_id("sig-1", db_path=db_path) is None
+    assert not db_path.exists()
+
+
+def test_init_db_migrates_a_v2_db_in_place_and_keeps_rows_readable(db_path):
+    # a released v2 DB (rows included, one already accepted) migrates
+    # additively: unique signal index + version bump, rows byte-identical.
+    submit_and_accept(db_path)
+    create_order(db_path, request_id="exec-2")
+    _downgrade_to_v2(db_path)
+    rows_before = full_db_state(db_path)[store.ORDERS_TABLE]
+
+    store.init_db(db_path)
+
+    after = full_db_state(db_path)
+    assert after["user_version"] == store.SCHEMA_VERSION
+    assert any(name == store._SIGNAL_UNIQUE_INDEX for _, name, _, _ in after["schema"])
+    assert after[store.ORDERS_TABLE] == rows_before  # nothing deleted or rewritten
+    # existing records restore through the normal validated read path
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
+    assert store.load_execution_request("exec-2", db_path=db_path) == make_request("exec-2")
+    # the migrated constraint is live
+    with pytest.raises(store.ExecutionOrderConflictError):
+        create_order(db_path, request_id="exec-3", signal_id="sig-exec-1")
+    store.init_db(db_path)  # and migration is idempotent
+
+
+def test_migration_with_duplicate_signals_fails_explicitly_and_changes_nothing(db_path):
+    create_order(db_path)
+    _downgrade_to_v2(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        _raw_created_row(connection, "exec-dup", "sig-exec-1")  # legal on v2
+        connection.commit()
+    before = full_db_state(db_path)
+
+    with pytest.raises(store.ExecutionSchemaError, match="sig-exec-1"):
+        store.init_db(db_path)
+
+    assert full_db_state(db_path) == before  # no rows deleted, no index, still v2
+
+
+def test_reads_never_migrate_a_v2_db(db_path):
+    create_order(db_path)
+    _downgrade_to_v2(db_path)
+    before = full_db_state(db_path)
+    with pytest.raises(store.ExecutionSchemaError, match="init_db"):
+        store.get_execution_order("exec-1", db_path=db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.get_execution_order_by_signal_id("sig-exec-1", db_path=db_path)
+    assert full_db_state(db_path) == before
+
+
+def test_updates_refuse_a_v2_db_without_migrating_it(db_path):
+    create_order(db_path)
+    _downgrade_to_v2(db_path)
+    before = full_db_state(db_path)
+    with pytest.raises(store.ExecutionSchemaError):
+        store.mark_submitting("exec-1", reason="submit", changed_at_utc=at(1), db_path=db_path)
+    assert full_db_state(db_path) == before

@@ -125,6 +125,36 @@ ROWID. Key invariants (non-empty IDs / reasons, UTC suffix, MARKET/LIMIT x
 by DB CHECK constraints as a second guard under the application-level
 validation.
 
+Source-signal idempotency (Issue #76): ``signal_id`` is UNIQUE across the
+orders table via a dedicated UNIQUE index (schema v3) -- one source signal
+produces AT MOST ONE execution request, ever. The index (not an inline
+column constraint) was chosen deliberately so the v2 -> v3 migration is
+purely ADDITIVE: the table DDL is identical between v2 and v3. The
+constraint -- not any pre-SELECT -- is the last line of defence: concurrent
+creators race INSERTs inside ``BEGIN IMMEDIATE`` transactions and the loser
+gets :class:`ExecutionOrderConflictError`, never a second row. Every
+suppressed duplicate (same ``execution_request_id``, same ``signal_id`` or
+same ``client_order_id``) is WARN-logged with the execution_request_id, the
+signal_id, the existing row's submission_phase / order_state and the
+suppression reason before the conflict error is raised. Together with the
+1:1 immutable ``client_order_id`` binding and the enter-once
+``mark_submitting`` transition this makes re-processing idempotent across
+process restarts and concurrent runners. Note the consequence for re-issue:
+a NEW intent for an already-registered signal is refused by the DB itself,
+so any future re-issue flow (out of scope) must be an explicit
+administrative decision, never an implicit retry.
+
+Migration (Issue #76): ``init_db`` migrates a COMPLETE, verified v2 schema
+to v3 in ONE ``BEGIN IMMEDIATE`` transaction: duplicate-``signal_id`` scan
+-> ``CREATE UNIQUE INDEX`` -> version bump -> full v3 re-verification ->
+COMMIT. Existing rows are read back unchanged; nothing is deleted. If the
+v2 data already violates the uniqueness (two rows sharing a signal_id) the
+migration FAILS EXPLICITLY without modifying the file -- deduplication is a
+human decision, not something a store invents. Anything that is neither a
+valid v3 nor a valid v2 schema fails exactly as before. Read paths NEVER
+migrate (they refuse a v2 DB with a schema error pointing at ``init_db``),
+so dry-run / read-only contracts keep their no-side-effect guarantee.
+
 Pre-commit write-back validation (PR #91 review r3 Major 1): schema
 verification runs BEFORE the writes, so every write path additionally
 re-reads the target execution bundle INSIDE the same transaction after
@@ -155,6 +185,7 @@ existing file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from contextlib import closing, contextmanager
@@ -172,6 +203,8 @@ from broker.broker_models import (
     validate_order_state_transition,
 )
 from execution.execution_models import ExecutionRequest, _require_non_empty_str, _require_utc
+
+_LOGGER = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "execution_orders.sqlite3"
@@ -243,9 +276,13 @@ REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
 # v1: initial PR #91 schema (snapshot on the current row only).
 # v2 (PR #91 review r2): snapshot anchored on history rows
 #     (history.order_result_json), NOT NULL + WITHOUT ROWID on the orders
-#     primary key. No migration path -- pre-release component; a v1 DB fails
-#     verification loudly.
-SCHEMA_VERSION = 2
+#     primary key. No migration path from v1 -- pre-release schema; a v1 DB
+#     fails verification loudly.
+# v3 (Issue #76): UNIQUE index on orders.signal_id (one source signal ->
+#     at most one execution request). Purely additive over v2; init_db
+#     migrates a verified v2 DB in place (see the module docstring).
+SCHEMA_VERSION = 3
+_MIGRATABLE_VERSION = 2
 
 # Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
 # match EXACTLY -- unknown fields are rejected, missing fields are rejected.
@@ -374,10 +411,17 @@ def _create_history_table_sql() -> str:
 
 _ORDERS_STATE_INDEX = f"idx_{ORDERS_TABLE}_state"
 _HISTORY_REQUEST_INDEX = f"idx_{HISTORY_TABLE}_request"
+# Issue #76: source-signal uniqueness lives in a dedicated UNIQUE index (not
+# an inline column constraint) so the v2 -> v3 migration is purely additive:
+# the table DDL is byte-identical between the two versions.
+_SIGNAL_UNIQUE_INDEX = f"idx_{ORDERS_TABLE}_signal"
+_SIGNAL_UNIQUE_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX {_SIGNAL_UNIQUE_INDEX} ON {ORDERS_TABLE} (signal_id)"
+)
 
 
-def _create_index_sql() -> dict[str, str]:
-    return {
+def _create_index_sql(*, version: int = SCHEMA_VERSION) -> dict[str, str]:
+    index_sql = {
         _ORDERS_STATE_INDEX: (
             f"CREATE INDEX {_ORDERS_STATE_INDEX} ON {ORDERS_TABLE} (order_state, updated_at_utc)"
         ),
@@ -386,6 +430,9 @@ def _create_index_sql() -> dict[str, str]:
             "(execution_request_id, history_id)"
         ),
     }
+    if version >= SCHEMA_VERSION:
+        index_sql[_SIGNAL_UNIQUE_INDEX] = _SIGNAL_UNIQUE_INDEX_SQL
+    return index_sql
 
 
 # --- DDL token normalization (PR #91 r3 Minor 1) ------------------------------
@@ -511,12 +558,15 @@ def _ddl_tokens(sql: str) -> tuple[str, ...]:
     return tuple(flat)
 
 
-def _create_schema(connection: sqlite3.Connection) -> None:
+def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
+    """Create the schema for ``version`` (v2 is used only as the in-memory
+    migration reference and by migration tests; real DBs are created at the
+    current version)."""
     connection.execute(_create_orders_table_sql())
     connection.execute(_create_history_table_sql())
-    for create_sql in _create_index_sql().values():
+    for create_sql in _create_index_sql(version=version).values():
         connection.execute(create_sql)
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    connection.execute(f"PRAGMA user_version = {version}")
 
 
 def _structure_signature(connection: sqlite3.Connection) -> dict:
@@ -545,48 +595,38 @@ def _structure_signature(connection: sqlite3.Connection) -> dict:
     return signature
 
 
-_REFERENCE_SCHEMA_CACHE: tuple[dict, dict] | None = None
+_REFERENCE_SCHEMA_CACHE: dict[int, tuple[dict, dict]] = {}
 
 
-def _reference_schema() -> tuple[dict, dict]:
-    """Pristine reference schema, built once in memory.
+def _reference_schema(version: int = SCHEMA_VERSION) -> tuple[dict, dict]:
+    """Pristine reference schema for ``version``, built once in memory.
 
     Returns ``(objects, signature)``: ``objects`` maps every ``sqlite_master``
     entry -- SQLite-internal ones included (``sqlite_sequence`` from
     AUTOINCREMENT, ``sqlite_autoindex_*`` from the UNIQUE constraints) -- as
     ``(type, name) -> (tbl_name, ddl_tokens | None)``; ``signature`` is the
-    PRAGMA structural signature."""
-    global _REFERENCE_SCHEMA_CACHE
-    if _REFERENCE_SCHEMA_CACHE is None:
+    PRAGMA structural signature. The v2 reference exists solely so migration
+    can prove a DB is EXACTLY a valid v2 schema before touching it."""
+    if version not in _REFERENCE_SCHEMA_CACHE:
         with closing(sqlite3.connect(":memory:")) as connection:
-            _create_schema(connection)
+            _create_schema(connection, version=version)
             objects = {
                 (row[0], row[1]): (row[2], None if row[3] is None else _ddl_tokens(row[3]))
                 for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
             }
-            _REFERENCE_SCHEMA_CACHE = (objects, _structure_signature(connection))
-    return _REFERENCE_SCHEMA_CACHE
+            _REFERENCE_SCHEMA_CACHE[version] = (objects, _structure_signature(connection))
+    return _REFERENCE_SCHEMA_CACHE[version]
 
 
-def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
-    """Full structural verification; raises :class:`ExecutionSchemaError`.
-
-    Closed-world check (PR #91 r3 Major 1): the COMPLETE ``sqlite_master``
-    object set -- all types, so triggers and views too -- must exactly equal
-    the pristine reference set; there is no allow-by-type extraction, only an
-    explicit allow-list of the objects this schema itself creates. On top of
-    that: the schema version, the token-normalized DDL of every SQL-bearing
-    object (PR #91 r3 Minor 1 -- cosmetic differences absorbed, CHECK /
-    WITHOUT ROWID / AUTOINCREMENT semantics enforced), and the PRAGMA-derived
-    structural signature (authoritative for columns, NOT NULL, PK, UNIQUE,
-    FK, indexes). Read-only -- makes no change to the DB.
-    """
+def _schema_problems(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> list[str]:
+    """Closed-world structural diff against the ``version`` reference schema;
+    returns the list of problems (empty = exact match). Read-only."""
     problems: list[str] = []
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version != SCHEMA_VERSION:
-        problems.append(f"user_version is {version}, expected {SCHEMA_VERSION}")
+    actual_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if actual_version != version:
+        problems.append(f"user_version is {actual_version}, expected {version}")
 
-    expected_objects, expected_signature = _reference_schema()
+    expected_objects, expected_signature = _reference_schema(version)
     actual_objects = {
         (row[0], row[1]): (row[2], row[3])
         for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
@@ -610,8 +650,31 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
             "live PRAGMA structure (table_info/index_list/index_info/foreign_key_list) "
             "differs from the reference schema"
         )
+    return problems
 
+
+def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
+    """Full structural verification; raises :class:`ExecutionSchemaError`.
+
+    Closed-world check (PR #91 r3 Major 1): the COMPLETE ``sqlite_master``
+    object set -- all types, so triggers and views too -- must exactly equal
+    the pristine reference set; there is no allow-by-type extraction, only an
+    explicit allow-list of the objects this schema itself creates. On top of
+    that: the schema version, the token-normalized DDL of every SQL-bearing
+    object (PR #91 r3 Minor 1 -- cosmetic differences absorbed, CHECK /
+    WITHOUT ROWID / AUTOINCREMENT semantics enforced), and the PRAGMA-derived
+    structural signature (authoritative for columns, NOT NULL, PK, UNIQUE,
+    FK, indexes). Read-only -- makes no change to the DB. A DB that is a
+    valid v2 schema is still refused here (only :func:`init_db` migrates);
+    the error says so explicitly.
+    """
+    problems = _schema_problems(connection)
     if problems:
+        if not _schema_problems(connection, version=_MIGRATABLE_VERSION):
+            problems.append(
+                f"the DB is a valid v{_MIGRATABLE_VERSION} schema; run init_db() to "
+                f"migrate it to v{SCHEMA_VERSION} (reads never migrate)"
+            )
         raise ExecutionSchemaError(
             f"execution DB at {db_path} failed schema verification; refusing to touch it: "
             + "; ".join(problems)
@@ -679,18 +742,62 @@ def _verified_read(db_path: Path):
             connection.execute("ROLLBACK")
 
 
+def _migrate_v2_to_v3(connection: sqlite3.Connection, db_path: Path) -> None:
+    """Migrate a fully verified v2 schema to v3 inside the caller's
+    transaction (Issue #76): duplicate-``signal_id`` scan -> additive
+    ``CREATE UNIQUE INDEX`` -> version bump. Existing rows are untouched;
+    nothing is deleted. Pre-existing duplicates make the migration FAIL
+    EXPLICITLY (deduplicating released data is a human decision, not
+    something a store invents); the caller's rollback then leaves the DB
+    byte-for-byte as it was."""
+    duplicates = [
+        f"{row[0]!r} ({row[1]} rows)"
+        for row in connection.execute(
+            f"SELECT signal_id, COUNT(*) FROM {ORDERS_TABLE} "
+            "GROUP BY signal_id HAVING COUNT(*) > 1 ORDER BY signal_id"
+        )
+    ]
+    if duplicates:
+        raise ExecutionSchemaError(
+            f"cannot migrate execution DB at {db_path} to schema v{SCHEMA_VERSION}: "
+            f"signal_id values held by more than one execution request: "
+            f"{', '.join(duplicates)}; the unique-signal constraint cannot be added "
+            "safely -- resolve the duplicates explicitly first (nothing was changed)"
+        )
+    try:
+        connection.execute(_SIGNAL_UNIQUE_INDEX_SQL)
+    except sqlite3.IntegrityError as exc:  # defence in depth under the scan
+        raise ExecutionSchemaError(
+            f"cannot migrate execution DB at {db_path} to schema v{SCHEMA_VERSION}: "
+            f"unique signal_id index creation failed: {exc} (nothing was changed)"
+        ) from exc
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    _LOGGER.info(
+        "migrated execution DB %s from schema v%d to v%d (added unique signal_id index %s)",
+        db_path,
+        _MIGRATABLE_VERSION,
+        SCHEMA_VERSION,
+        _SIGNAL_UNIQUE_INDEX,
+    )
+
+
 def init_db(db_path: Path | None = None) -> None:
-    """Create the Issue #74 schema, or verify an existing one; idempotent.
+    """Create the Issue #74 schema, verify an existing one, or migrate a
+    valid v2 schema to v3 (Issue #76); idempotent.
 
     - PRISTINE DB only (PR #91 review r2 Major 2): the schema is created only
       when ``sqlite_master`` holds ZERO objects AND ``user_version`` is 0. A
       version-only DB, a metadata-only DB (e.g. a stray ``sqlite_sequence``),
       or any other object present means this is NOT a fresh DB.
-    - Anything else: FULL structural verification (:func:`_verify_schema`).
-      A partial schema, a constraint-less lookalike, a wrong version, or a
-      foreign table raises :class:`ExecutionSchemaError` WITHOUT modifying
-      the DB -- brand-new component, brand-new DB, so there is no
-      legacy-migration or auto-completion path.
+    - A DB that fully matches the CURRENT schema passes verification.
+    - A DB that fully matches the released v2 schema -- and ONLY such a DB --
+      is migrated in place (:func:`_migrate_v2_to_v3`): the migration, the
+      version bump and a full v3 re-verification commit in ONE transaction,
+      so a failed migration leaves no half-migrated schema behind.
+    - Anything else: a partial schema, a constraint-less lookalike, an
+      unknown version, or a foreign table raises
+      :class:`ExecutionSchemaError` WITHOUT modifying the DB (no
+      auto-completion, no silent rebuild).
     """
     db_path = Path(db_path) if db_path is not None else execution_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -709,7 +816,13 @@ def init_db(db_path: Path | None = None) -> None:
                 # pre-commit self-check: the freshly created schema must pass
                 # the same closed-world verification before it is committed
                 _verify_schema(connection, db_path)
-            else:
+            elif _schema_problems(connection):
+                if _schema_problems(connection, version=_MIGRATABLE_VERSION):
+                    # neither a valid current nor a valid v2 schema: fail
+                    # with the full diagnosis, DB untouched
+                    _verify_schema(connection, db_path)
+                _migrate_v2_to_v3(connection, db_path)
+                # the migrated schema must pass full verification pre-COMMIT
                 _verify_schema(connection, db_path)
             connection.execute("COMMIT")
         except Exception:
@@ -1131,6 +1244,28 @@ def _validate_writeback(
 # --- write paths -------------------------------------------------------------
 
 
+def _classify_create_conflict(
+    connection: sqlite3.Connection, record: dict
+) -> tuple[str, dict | None]:
+    """Best-effort classification of an insert conflict for the duplicate
+    suppression log (Issue #76): which UNIQUE key collided and with which
+    existing row. Raw column reads only -- this runs on the failure path and
+    must work even when the existing bundle would fail full validation."""
+    for column, reason in (
+        ("execution_request_id", "execution_request_id is already persisted"),
+        ("signal_id", "source signal already produced an execution request"),
+        ("client_order_id", "client_order_id is already bound to an execution request"),
+    ):
+        row = connection.execute(
+            f"SELECT execution_request_id, signal_id, submission_phase, order_state "
+            f"FROM {ORDERS_TABLE} WHERE {column} = ?",
+            (record[column],),
+        ).fetchone()
+        if row is not None:
+            return reason, dict(row)
+    return "uniqueness constraint violated", None
+
+
 def create_execution_order(
     request: ExecutionRequest,
     *,
@@ -1141,11 +1276,18 @@ def create_execution_order(
     """Persist a new intent in phase ``created`` (no broker state yet).
 
     ``client_order_id`` is bound here, once, 1:1 (UNIQUE) -- see the ID design
-    in ``execution_models``. A duplicate ``execution_request_id`` or
-    ``client_order_id`` raises :class:`ExecutionOrderConflictError` (an intent
-    is inserted exactly once; there is no idempotent re-insert semantics at
-    this layer). No history row is written: history records STATE changes and
-    a created intent has no order state.
+    in ``execution_models``. A duplicate ``execution_request_id``,
+    ``signal_id`` (Issue #76: one source signal -> at most one execution
+    request) or ``client_order_id`` raises
+    :class:`ExecutionOrderConflictError` (an intent is inserted exactly once;
+    there is no idempotent re-insert semantics at this layer). The UNIQUE
+    constraints inside the ``BEGIN IMMEDIATE`` transaction -- not any
+    pre-SELECT -- are what make this safe under concurrent creators: the
+    loser's INSERT fails and is rolled back, never committed as a second
+    row. Every suppressed duplicate is WARN-logged with the ids, the
+    existing row's phase/state and the suppression reason. No history row is
+    written: history records STATE changes and a created intent has no order
+    state.
     """
     if not isinstance(request, ExecutionRequest):
         raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
@@ -1184,9 +1326,22 @@ def create_execution_order(
         try:
             connection.execute(insert_sql, tuple(record[col] for col in _ORDER_COLUMNS))
         except sqlite3.IntegrityError as exc:
+            reason, existing = _classify_create_conflict(connection, record)
+            _LOGGER.warning(
+                "duplicate execution order suppressed: execution_request_id=%s "
+                "signal_id=%s existing_execution_request_id=%s "
+                "existing_submission_phase=%s existing_order_state=%s reason=%s",
+                request.execution_request_id,
+                request.signal_id,
+                None if existing is None else existing["execution_request_id"],
+                None if existing is None else existing["submission_phase"],
+                None if existing is None else existing["order_state"],
+                reason,
+            )
             raise ExecutionOrderConflictError(
-                f"execution order {request.execution_request_id!r} / client_order_id "
-                f"{client_order_id!r} collides with an existing row: {exc}"
+                f"execution order {request.execution_request_id!r} (signal_id "
+                f"{request.signal_id!r} / client_order_id {client_order_id!r}) collides "
+                f"with an existing row ({reason}): {exc}"
             ) from exc
         created = _validate_writeback(
             connection,
@@ -1598,6 +1753,30 @@ def get_execution_order(execution_request_id: str, *, db_path: Path | None = Non
         return None
     with _verified_read(db_path) as connection:
         bundle = _fetch_and_validate(connection, execution_request_id)
+    return None if bundle is None else bundle[0]
+
+
+def get_execution_order_by_signal_id(
+    signal_id: str, *, db_path: Path | None = None
+) -> dict | None:
+    """The execution order created from this source signal, or None.
+
+    At most one can exist (Issue #76: ``signal_id`` is UNIQUE), so callers
+    can look up what a signal already produced -- e.g. to report why a new
+    intent was suppressed. Same read contract as every other read helper:
+    schema verification first, full bundle validation, missing DB -> None
+    without creating the file.
+    """
+    _require_non_empty_str(signal_id, "signal_id")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return None
+    with _verified_read(db_path) as connection:
+        row = connection.execute(
+            f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        bundle = None if row is None else _fetch_and_validate(connection, row[0])
     return None if bundle is None else bundle[0]
 
 

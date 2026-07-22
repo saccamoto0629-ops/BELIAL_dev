@@ -27,6 +27,12 @@ Submission contract (docs/architecture/safety_gate.md):
    submit: a second call -- including any call after an UNKNOWN outcome -- is
    rejected with ``DUPLICATE_SUBMISSION`` and never reaches the broker.
    UNKNOWN is resolved by later queries (Issue #74), never by re-sending.
+   Every duplicate suppression is WARN-logged with the
+   ``execution_request_id``, the source ``signal_id``, the current
+   ``submission_phase`` / ``order_state`` and the suppression reason
+   (Issue #76); ``register()`` duplicates (same intent id or same source
+   signal) are suppressed and logged by the execution store's UNIQUE
+   constraints (``signal_id`` is unique DB-wide, Issue #76).
 3. The broker outcome is recorded back into the execution store: an
    ``OrderResult`` via ``record_order_result``; ANY exception from
    ``submit_order`` records state UNKNOWN (conservative: even a
@@ -124,7 +130,11 @@ class LiveOrderSubmissionService:
 
         Registration is separate from submission on purpose: the broker key
         exists before any submit attempt, and ``submit()`` can only ever use
-        this stored key.
+        this stored key. Duplicate registrations -- same
+        ``execution_request_id`` OR same source ``signal_id`` (Issue #76:
+        one signal produces at most one execution request) -- raise
+        ``ExecutionOrderConflictError`` from the store, which also logs the
+        suppression.
         """
         execution_store.create_execution_order(
             request,
@@ -255,7 +265,11 @@ class LiveOrderSubmissionService:
         if row["submission_phase"] != execution_store.PHASE_CREATED:
             return self._recorded(
                 self._duplicate_submission_decision(
-                    execution_request_id, row["submission_phase"], row["order_state"], now
+                    execution_request_id,
+                    row["submission_phase"],
+                    row["order_state"],
+                    now,
+                    signal_id=row["signal_id"],
                 )
             )
 
@@ -292,17 +306,24 @@ class LiveOrderSubmissionService:
         everything else is a store/state failure (fail closed)."""
         phase = None
         state = None
+        signal_id = None
         try:
             row = execution_store.get_execution_order(
                 execution_request_id, db_path=self._order_db_path
             )
             if row is not None:
-                phase, state = row["submission_phase"], row["order_state"]
+                phase, state, signal_id = (
+                    row["submission_phase"],
+                    row["order_state"],
+                    row["signal_id"],
+                )
         except execution_store.ExecutionStoreError:
             pass
         now = self._now()
         if phase is not None and phase != execution_store.PHASE_CREATED:
-            return self._duplicate_submission_decision(execution_request_id, phase, state, now)
+            return self._duplicate_submission_decision(
+                execution_request_id, phase, state, now, signal_id=signal_id
+            )
         return self._decision(
             execution_request_id,
             (
@@ -315,8 +336,27 @@ class LiveOrderSubmissionService:
         )
 
     def _duplicate_submission_decision(
-        self, execution_request_id: str, phase: str, state: str | None, now: datetime
+        self,
+        execution_request_id: str,
+        phase: str,
+        state: str | None,
+        now: datetime,
+        *,
+        signal_id: str | None,
     ) -> SafetyDecision:
+        # Issue #76 suppression log contract: the ids, the current state and
+        # the suppression reason must be visible in the log, not only the
+        # machine-readable rejection code.
+        _LOGGER.warning(
+            "duplicate submission suppressed: execution_request_id=%s signal_id=%s "
+            "submission_phase=%s order_state=%s reason=%s",
+            execution_request_id,
+            signal_id,
+            phase,
+            state,
+            "a submit attempt already exists; re-sending is banned while the outcome "
+            "is submitted or uncertain (UNKNOWN is resolved by later queries)",
+        )
         return self._decision(
             execution_request_id,
             (
