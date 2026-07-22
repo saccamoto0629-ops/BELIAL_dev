@@ -20,4 +20,8 @@ BELIAL の設計資料を置く。
 - [Execution Request / Order Persistence](execution_request.md)(Issue #74): Strategy / Signal から
   将来の Live Execution ユースケースへ渡す ExecutionRequest モデルと、注文状態・状態履歴の SQLite
   永続化基盤。注文状態は既存 `broker.OrderState` を唯一の正として再利用する。実装は `execution/`。
-  Live Execution 本体・Broker API Adapter・実注文・Safety Gate・reconciliation runner は未実装のまま。
+  Live Execution 本体・Broker API Adapter・実注文・reconciliation runner は未実装のまま。
+- [Safety Gate](safety_gate.md)(Issue #75): Broker 送信直前の fail-closed 検証層と判定の SQLite
+  監査保存。Strategy / Broker Adapter から独立し、`submit_after_safety_gate()` を唯一の公認送信
+  経路として Gate 通過前に `Broker.submit_order()` へ到達できない構成にする。実装は
+  `execution/safety_gate.py` / `execution/safety_store.py`。実発注・Live 接続は引き続き未実装。

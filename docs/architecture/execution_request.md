@@ -10,7 +10,7 @@ from execution import execution_store
 > **重要な位置づけ**
 >
 > - 本コンポーネントは **将来の Live Execution 用のモデル・状態永続化基盤のみ** を実装する。
-> - **Live Execution 本体・Broker API Adapter・実発注・Safety Gate・reconciliation runner は未実装**である。このコンポーネントが存在しても Live Execution が実装済みになったわけではない。
+> - **Live Execution 本体・Broker API Adapter・実発注・reconciliation runner は未実装**である。このコンポーネントが存在しても Live Execution が実装済みになったわけではない。発注前の Safety Gate は Issue #75 で `execution/safety_gate.py` に実装済み([Safety Gate](safety_gate.md))だが、これも検証部品のみで実発注経路は存在しない。
 > - 外部通信・Discord・S3・実注文はこのパッケージのどこにも存在しない。
 > - **Paper Signal / Paper Execution は従来どおり Broker 非依存**であり、本パッケージを import しない・させない(`execution/tests/test_package_imports.py` が回帰として固定)。
 > - 注文状態の唯一の正は既存の `broker.broker_models.OrderState` / `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)である。**本パッケージは注文状態 Enum・遷移表を一切新設しない。**
@@ -184,7 +184,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - Live Execution runner / ユースケース本体
 - Broker API 実装(OANDA 等の Adapter)・実注文送信・外部通信
-- Safety Gate
+- Safety Gate(その後 Issue #75 で実装済み。[Safety Gate](safety_gate.md) を参照)
 - 自動照会・定期 reconciliation
 - 再送フロー(UNKNOWN の解決は照会結果の記録のみ)
 - Paper Signal / Paper Execution からの接続(両レイヤーは本パッケージを使わない)
