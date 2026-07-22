@@ -41,7 +41,7 @@ Paper Signal (保存済みレコード)
 
 ## Alert / Strategy / Signal / Execution の責務分離
 
-Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定の**未実装**レイヤー)に分かれる。Paper Execution は仮想レコードのみを生成し、Broker API 連携・実注文・自動売買は含まない(それらは Live Execution の責務で未実装・非スコープ)。将来の Live Execution が使う **Broker 境界**(共通インターフェース・共通モデル・外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に定義済みだが、境界の定義のみであり Live Execution 本体・実発注・OANDA Adapter は未実装である([Broker Interface](broker_interface.md))。Paper Execution はこの境界を使わない。
+Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定の**未実装**レイヤー)に分かれる。Paper Execution は仮想レコードのみを生成し、Broker API 連携・実注文・自動売買は含まない(それらは Live Execution の責務で未実装・非スコープ)。将来の Live Execution が使う **Broker 境界**(共通インターフェース・共通モデル・外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に定義済みだが、境界の定義のみであり Live Execution 本体・実発注・OANDA Adapter は未実装である([Broker Interface](broker_interface.md))。Paper Execution はこの境界を使わない。加えて Issue #74 で、Strategy / Signal から将来の Live Execution ユースケースへ渡す **ExecutionRequest** と注文状態・状態履歴の SQLite 永続化基盤を `execution/` に実装した([Execution Request / Order Persistence](execution_request.md))。これも**モデル・永続化基盤のみ**であり、Live Execution runner・Broker API Adapter・実注文・Safety Gate・reconciliation runner は引き続き未実装である。
 
 | Layer | Responsibility | Status |
 |---|---|---|
@@ -49,7 +49,7 @@ Execution は **Paper Execution**(仮想約定・仮想ポジション管理・E
 | Strategy / Method | 観測・分類情報をどう解釈し、どの条件でエントリー候補とするかのルール | 実装済み(Paper Signal のルールベース候補生成、Backtest の外部 Strategy 定義(YAML)) |
 | Signal (Paper Signal) | Strategy 評価の結果を paper_only 仮説として記録・通知する。entry / exit は決めない | 実装済み(`paper-signal/`) |
 | Paper Execution | Paper Signal を入力に、仮想Entry・仮想ポジション管理・SL / TP / Exit 判定・仮想損益計算を行う | **実装済み**(`paper-execution/`)。設計 [Paper Execution](paper_execution.md)(Issue #49)、実装 Issue #50 / #51。Broker API・実注文は含まない |
-| Live Execution | Broker API による実際の注文・約定・ポジション管理 | 未実装(将来・非スコープ)。Broker 境界(interface / 共通モデル / FakeBroker)のみ `broker/` に定義済み([Broker Interface](broker_interface.md)、Issue #73) |
+| Live Execution | Broker API による実際の注文・約定・ポジション管理 | 未実装(将来・非スコープ)。Broker 境界(interface / 共通モデル / FakeBroker)は `broker/`([Broker Interface](broker_interface.md)、Issue #73)、ExecutionRequest モデルと注文状態の永続化基盤は `execution/`([Execution Request / Order Persistence](execution_request.md)、Issue #74)に定義済み。いずれも基盤のみで実発注は行わない |
 
 この分離は、[Concept](../product/concept.md) のレイヤー分離(Observation / Classification / Alert / Strategy / Execution / Persistence)のうち、Alert 以降を実装観点で細分化したものである。層の対応は以下の通り。
 
@@ -130,6 +130,7 @@ BELIAL はコンポーネントごとに独立したSQLiteファイルを持つ�
 | Market Bias DB | `news-feed-bot/data/market_bias.sqlite3` | `news-feed-bot/` | `market_bias` |
 | Paper Position DB | `paper-execution/data/paper_positions.sqlite3` | `paper-execution/` | `virtual_positions`, `paper_execution_notifications` |
 | Backtest DB | `backtest/data/backtest_results.sqlite3` | `backtest/` | `backtest_runs`, `backtest_signals` |
+| Execution Order DB | `execution/data/execution_orders.sqlite3` | `execution/` | `execution_orders`, `execution_order_state_history`(Issue #74。将来の Live Execution 用の永続化基盤のみ。実注文なし) |
 
 いずれも `data/` はGit管理しない。関連付けは時刻のみに依存せず、可能な限りIDで行う(例: `alerts.snapshot_id` → `chart_snapshots.id`、`virtual_positions.signal_id` → `paper_signals.signal_id`)。時刻は補助情報として扱う。詳細スキーマは [Market Watch](market_watch.md)、[Market Bias](market_bias.md)、[Paper Signal](paper_signal.md)、[Paper Execution](paper_execution.md)、[Backtest](../backtest.md) を参照。
 
@@ -142,6 +143,7 @@ Persistence の責務は各コンポーネントの store 層が持つ。他コ�
 - `paper-signal/paper_signal_store.py`: classification / `target_candle_utc` / `market_state` など既知の不足列を冪等に追加し、既知値をbackfillする。基本列の型・NOT NULL・PRIMARY KEYを含む既存schema全体の完全性検証ではない。
 - `market-watch/chart_collector.py`: テーブルを `CREATE TABLE IF NOT EXISTS` で初期化し、`chart_snapshots` などの一部既知列を追加する。全テーブル・全制約の完全性検証ではない。
 - `news-feed-bot/market_bias_store.py`: `CREATE TABLE/INDEX IF NOT EXISTS` による初期化が中心であり、既存schemaの型・制約を完全検証またはmigrationする仕組みではない。
+- `execution/execution_store.py`(Issue #74 / PR #91): schema の新規作成は **pristine な DB のみ**(`sqlite_master` 0 件かつ `user_version` 0。version だけ・metadata だけの DB は拒否)。既存 schema の判定は列名ではなく**完全な構造検証**(`PRAGMA user_version` + 両テーブル・両 index の正規化 CREATE SQL 全体 = NOT NULL / UNIQUE / CHECK / FK + `PRAGMA table_info`/`index_list`/`index_info`/`foreign_key_list` による構造 signature + 予期しないテーブル・index の不在)で行い、**読み取り経路も同じ検証を通ってから復元する**。新規コンポーネント・新規DBのため legacy migration 経路は持たず、partial schema・制約欠損テーブル・他コンポーネントのDBは **DB を変更せず**明示的に失敗する(自動補完・黙った rebuild をしない)。存在しないDBファイルは作成せず、復元時に current / history chain・enum・UTC・reason・history に anchor した OrderResult snapshot・broker_order_id の DB 全体一意性を再検証する。
 - **dry-run では DB作成・migration を行わない**(Paper Execution は読み取り専用のスキーマ確認のみ行う)。
 
 ## dry-run 方針
@@ -163,6 +165,8 @@ Paper Execution の dry-run は完全無副作用であり、読み取りエラ�
 - [Paper Signal](paper_signal.md)
 - [Paper Execution](paper_execution.md)
 - [Strategy 定義仕様](strategy_definition.md)
+- [Broker Interface](broker_interface.md)
+- [Execution Request / Order Persistence](execution_request.md)
 - [Backtest](../backtest.md)
 - [Operations](../operations/operations.md)
 - [Roadmap](../product/roadmap.md)

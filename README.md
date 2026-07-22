@@ -34,6 +34,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | `paper-signal/` | Market Bias + Chart Snapshot から `paper_only` 仮説を生成 | [paper-signal/README.md](paper-signal/README.md) |
 | `paper-execution/` | Paper Signal を入力に仮想ポジションを Open / Close し仮想損益を記録(仮想約定のみ。Broker API・実注文なし) | [Paper Execution 設計](docs/architecture/paper_execution.md) |
 | `broker/` | 将来の Live Execution 用の Broker 境界(共通インターフェース・共通モデル)と、外部通信しないテストダブル FakeBroker(Issue #73)。実発注・OANDA Adapter・Live Execution は未実装のまま | [broker/README.md](broker/README.md) / [設計](docs/architecture/broker_interface.md) |
+| `execution/` | 将来の Live Execution 用の ExecutionRequest モデルと注文状態・状態履歴の SQLite 永続化基盤(Issue #74)。注文状態は既存 `broker.OrderState` を再利用。Live Execution 本体・Broker API Adapter・実注文・Safety Gate・reconciliation runner は未実装のまま | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) |
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 
@@ -60,6 +61,7 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 | Paper Signal DB | `paper-signal/data/paper_signals.sqlite3` | `paper-signal/` | `paper_only` シグナル記録 |
 | Market Bias DB | `news-feed-bot/data/market_bias.sqlite3` | `news-feed-bot/` | Market Bias(trend/risk/volatility)の評価履歴。Backtest からの時点参照用 |
 | Paper Position DB | `paper-execution/data/paper_positions.sqlite3` | `paper-execution/` | Paper Execution の仮想ポジション(状態・仮想損益)。上書きは `PAPER_POSITION_DB_PATH` |
+| Execution Order DB | `execution/data/execution_orders.sqlite3` | `execution/` | 将来の Live Execution 用の execution request・注文状態・状態履歴(Issue #74。永続化基盤のみ・実注文なし)。上書きは `EXECUTION_ORDER_DB_PATH` |
 
 いずれも `data/` はGit管理しません。詳細スキーマは [Architecture](docs/architecture/architecture.md)、[Market Watch](docs/architecture/market_watch.md)、[Market Bias](docs/architecture/market_bias.md)、[Paper Signal](docs/architecture/paper_signal.md) を参照してください。
 

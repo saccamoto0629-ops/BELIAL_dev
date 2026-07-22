@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      # The six component suites are run as separate pytest processes -- the
+      # The seven component suites are run as separate pytest processes -- the
       # project has no root pytest config / conftest.py, and each test file
       # sets up its own sys.path. Separate steps keep component namespaces
       # isolated and make a failing component obvious from the step name.
@@ -66,13 +66,21 @@ jobs:
       - name: Run broker tests
         run: python -m pytest broker/tests -q
 
+      # Issue #74: ExecutionRequest model + order-state persistence for the
+      # future Live Execution layer. tmp_path SQLite only -- no network.
+      - name: Run execution tests
+        run: python -m pytest execution/tests -q
+
       # PR #87: broker/ must import as a normal package from the repo root,
-      # without any sys.path manipulation.
+      # without any sys.path manipulation. Issue #74 adds execution/ under
+      # the same rule.
       - name: Verify root-level broker package imports
         run: |
           python -c "from broker.broker_interface import Broker"
           python -c "from broker.broker_models import OrderRequest, OrderResult"
           python -c "from broker.fake_broker import FakeBroker"
+          python -c "from execution.execution_models import ExecutionRequest"
+          python -c "from execution import execution_store"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot

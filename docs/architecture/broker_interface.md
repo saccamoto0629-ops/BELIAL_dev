@@ -31,6 +31,7 @@ FakeBroker                      ← broker/fake_broker.py(テストダブル)
 
 - Strategy / Paper Signal / Paper Execution から FakeBroker・将来の OANDA 実装を**直接 import しない**(`broker/tests/test_broker_interface.py` が回帰として固定)。
 - FakeBroker と将来の Adapter は Broker interface に依存する。逆方向の依存はない。
+- 「(将来の) Execution use case」のうち、ExecutionRequest(BELIAL 内部の発注意図)と注文状態の永続化基盤は Issue #74 で `execution/` に実装済み([Execution Request / Order Persistence](execution_request.md))。依存は `execution → broker` の一方向のみで、本パッケージは `execution/` を知らない。
 
 ## Broker interface(`broker_interface.py`)
 
