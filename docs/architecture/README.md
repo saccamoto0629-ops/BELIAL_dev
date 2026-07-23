@@ -26,3 +26,7 @@ BELIAL の設計資料を置く。
   Strategy / Broker Adapter から独立し、判定の耐久保存 + read-back と execution store の
   created→submitting 遷移(一度きり)に成功した呼び出しだけが `Broker.submit_order()` へ到達する。
   実装は `execution/{safety_gate,safety_store,live_submission}.py`。実発注・Live 接続は引き続き未実装。
+- [Shadow Mode](shadow_execution.md)(Issue #78): 実際の ExecutionRequest・設定・Safety Gate という
+  本番相当の判定経路を Broker へ一切送信せずに実行し、判定結果・拒否理由・想定注文内容を検証記録として
+  SQLite へ保存する観察モードと、読み取り専用の確認 CLI。仮想約定・仮想 PnL は行わない。
+  実装は `execution/{shadow_execution,shadow_store,shadow_report}.py`。実発注・Demo / Live 接続は未実装のまま。

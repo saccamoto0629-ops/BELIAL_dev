@@ -73,7 +73,8 @@ jobs:
 
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
-      # the same rule; Issue #75 adds the Safety Gate modules.
+      # the same rule; Issue #75 adds the Safety Gate modules; Issue #78
+      # adds the Shadow Mode modules.
       - name: Verify root-level broker package imports
         run: |
           python -c "from broker.broker_interface import Broker"
@@ -84,6 +85,8 @@ jobs:
           python -c "from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy"
           python -c "from execution.safety_store import SQLiteSafetyDecisionStore"
           python -c "from execution.live_submission import LiveOrderSubmissionService"
+          python -c "from execution.shadow_store import SQLiteShadowExecutionStore"
+          python -c "from execution.shadow_execution import ShadowExecutionService"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot

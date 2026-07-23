@@ -1,6 +1,6 @@
 # execution/
 
-将来の **Live Execution** に向けた ExecutionRequest モデル、注文状態・状態履歴の SQLite 永続化基盤(Issue #74)、および Broker 送信直前の fail-closed **Safety Gate**(Issue #75)。**実発注は行わない。外部通信も行わない。OANDA Adapter・Live 接続・Live Execution runner は未実装。**
+将来の **Live Execution** に向けた ExecutionRequest モデル、注文状態・状態履歴の SQLite 永続化基盤(Issue #74)、Broker 送信直前の fail-closed **Safety Gate**(Issue #75)、および判定経路を Broker へ送信せずに観察・記録する **Shadow Mode**(Issue #78)。**実発注は行わない。外部通信も行わない。OANDA Adapter・Live 接続・Live Execution runner は未実装。**
 
 明示的な Python package。リポジトリルートから import する:
 
@@ -10,6 +10,8 @@ from execution import execution_store
 from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy
 from execution.safety_store import SQLiteSafetyDecisionStore
 from execution.live_submission import LiveOrderSubmissionService
+from execution.shadow_execution import ShadowExecutionService
+from execution.shadow_store import SQLiteShadowExecutionStore
 ```
 
 | ファイル | 内容 |
@@ -19,6 +21,9 @@ from execution.live_submission import LiveOrderSubmissionService
 | `safety_gate.py` | 発注前 Safety Gate(Issue #75): 許可銘柄・方向・数量上限・銘柄別 / 口座全体ポジション上限(件数ベース)・SL 必須 / SL・TP 妥当性・参照価格の鮮度(未来時刻含む)・spread 上限・market open / tradable・kill switch・**Broker 実体から導出する型付き接続 identity**(`BrokerConnection` — mode / target は `connection_identity()` から導出され caller は申告不能。評価のたびに再導出しドリフトを拒否)× 許可接続先の整合を独立検査し、**全違反を機械可読コードで収集・順序保持 dedup** する。Broker 照会(positions / account)の失敗・型不正・stale / 未来 snapshot、bool 以外の kill switch 応答はすべて fail-closed で拒否。`SafetyPolicy` は deep immutable(防御的コピー + read-only view) |
 | `safety_store.py` | Safety Gate 判定の SQLite 監査保存(`safety_gate_decisions.sqlite3`。`execution_orders.sqlite3` とは別ファイル): allow / reject・機械可読な拒否コード・詳細・判定時刻・`policy_id`・mode / 接続先・account / position 情報。execution_store と同方針の closed-world schema 検証・pristine 判定・厳格復元。**保存失敗は例外 = 送信されない** |
 | `live_submission.py` | **唯一の公認送信経路** `LiveOrderSubmissionService`(Issue #75): `register()` が意図と固定 `client_order_id` を execution store へ 1:1 で永続化し、`submit()` が「意図復元 → Gate 評価 → 判定の耐久保存 + read-back 検証 → created→submitting 遷移の獲得(一度きり)→ 送信 → 結果記録」を実施。二重送信・UNKNOWN 後の再送は `duplicate_submission` で拒否(抑止時は execution_request_id / signal_id / 現在の phase・state / 理由を WARN ログへ出力。Issue #76)。**監査 store はサービス内部に封印**(コンストラクタは `decision_db_path` パスのみ受理。recorder オブジェクトの注入点なし)。受領済み結果の保存失敗は UNKNOWN へフォールバック記録し、停止・二重失敗で残る submitting/pending も `execution_store.list_unresolved_submissions()` で照会可能 |
+| `shadow_execution.py` | **Shadow Mode**(Issue #78): `ShadowExecutionService.observe()` が通常の `SafetyGate.evaluate()` をそのまま実行し(専用判定ロジックなし)、結果を shadow store へ保存する。**`submit_order` / `to_order_request` の呼び出し箇所自体が存在せず**、AST 走査テストで固定(送信境界へ構造的に到達不能)。shadow store はサービス内部に封印(パスのみ受理)。`initialize_store()` だけが DB を明示作成する |
+| `shadow_store.py` | Shadow 検証記録のモデル + SQLite 永続化(`shadow_executions.sqlite3`。他 store とは別ファイル): ExecutionRequest 全項目・Safety Gate 判定(allow / reject・拒否コード + 詳細・policy_id・接続 identity)・想定注文内容(client_order_id なし)・観察時刻。**Broker 注文状態列は存在しない**(未送信の記録に ACCEPTED / FILLED 等を付けない)。`execution_request_id` / `signal_id` は **shadow store 内で UNIQUE**(shadow 再実行・多重起動の抑止。実登録の idempotency とは独立で、mode 跨ぎの干渉なし)。schema 方針は safety_store と同一(pristine のみ作成・closed-world 検証・厳格復元・missing DB 非作成) |
+| `shadow_report.py` | **読み取り専用 CLI**: `python -m execution.shadow_report list [--limit N] [--db PATH]` / `show <execution_request_id> [--db PATH]`。決定的順序で一覧・詳細(拒否理由全文・想定注文内容)を表示。DB 作成・migration・書き込みを行わず、missing DB は「no records」(exit 0)、未知 ID・壊れた記録は exit 1 |
 | `tests/` | `python -m pytest execution/tests -q`(`tmp_path` 配下の SQLite と FakeBroker のみ。外部通信・Discord・S3・sleep・実注文なし) |
 
 ## Safety Gate / 送信サービスの境界
@@ -35,6 +40,7 @@ from execution.live_submission import LiveOrderSubmissionService
 - 注文状態の唯一の正は既存の `broker.OrderState` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)。**本パッケージは注文状態 Enum・遷移表を新設しない。** CREATED / SUBMITTING は注文状態ではなく Execution Request 側の**送信フェーズ**(別フィールド)である。
 - Safety Gate は将来の Live Execution 送信経路を安全にする**部品のみ**であり、OANDA Adapter・Live 接続・実注文 runner・reconciliation runner は**未実装**。`ExecutionMode` に `paper` は存在しない(Paper Execution は Broker 境界を使わず、Safety Gate を通らない)。
 - **Paper Signal / Paper Execution は本パッケージを使わない**(`tests/test_package_imports.py` が回帰として固定)。
+- **Shadow Mode は Paper Execution / Backtest ではない**: 仮想約定・仮想ポジション・仮想 PnL を一切行わず、判定経路(ExecutionRequest + Safety Gate)の観察と記録のみを行う。`ExecutionMode.SHADOW` は接続種別ではなく(`BROKER_TYPE_BY_MODE` に entry なし=`shadow` を名乗る Broker 接続は構築不能、policy の `allowed_connection_targets` にも設定不能)、dry-run(記録を残さない副作用ゼロ契約)とも別概念である。詳細は [docs/architecture/shadow_execution.md](../docs/architecture/shadow_execution.md)。
 - UNKNOWN は即時再送可能状態ではない。照会対象として抽出し、後続照会結果の記録によってのみ確定状態へ解決する。state-only で記録できるのは UNKNOWN のみで、他のすべての観測は完全な `OrderResult` を `record_order_result` で記録する(stale snapshot による fill 消失・巻き戻しを DB 側 snapshot 検証で拒否)。
 
-設計の詳細は [docs/architecture/execution_request.md](../docs/architecture/execution_request.md)(ExecutionRequest / 永続化)と [docs/architecture/safety_gate.md](../docs/architecture/safety_gate.md)(Safety Gate)を参照。
+設計の詳細は [docs/architecture/execution_request.md](../docs/architecture/execution_request.md)(ExecutionRequest / 永続化)、[docs/architecture/safety_gate.md](../docs/architecture/safety_gate.md)(Safety Gate)、[docs/architecture/shadow_execution.md](../docs/architecture/shadow_execution.md)(Shadow Mode)を参照。

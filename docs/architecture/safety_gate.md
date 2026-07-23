@@ -53,6 +53,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - 導出された mode は Broker の具象型と相互検証される(`BROKER_TYPE_BY_MODE` レジストリ): `fake` は `FakeBroker`(サブクラス含む)のみ、`FakeBroker` は `fake` 以外を名乗れない。`demo` / `live` は**実 Adapter 型が登録されるまで接続オブジェクト自体を構築できない**(表現不能による fail-closed)。
 - mode ごとの許可接続先(`SafetyPolicy.allowed_connection_targets`。exact・大文字小文字区別・1 接続先 1 mode)は Gate が判定し、未知の接続先・大文字小文字違い(`FAKE`)は `execution_mode_mismatch` で拒否する。
 - Gate は**評価のたびに identity を Broker 実体から再導出**し、組み立て後に identity がドリフトした場合・identity メソッドが欠損 / 破損した場合も `execution_mode_mismatch` で fail-closed に拒否する。
+- `ExecutionMode` には Issue #78 で `shadow`(観察専用 mode)が追加されたが、**`shadow` は接続種別ではない**: `BROKER_TYPE_BY_MODE` に entry を持たないため `shadow` を名乗る Broker から接続は構築できず、`allowed_connection_targets` に `shadow` の接続先を設定することも `SafetyPolicy` 構築時に拒否される。Shadow Mode は本 Gate を**同一クラス・同一契約のまま**利用し、送信境界には到達しない([Shadow Mode](shadow_execution.md))。
 
 ## 入力
 

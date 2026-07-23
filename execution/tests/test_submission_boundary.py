@@ -76,3 +76,24 @@ def test_submission_service_holds_exactly_one_submit_order_call():
         "execution/live_submission.py must hold exactly one Broker.submit_order call "
         f"(the gated one in LiveOrderSubmissionService.submit), found lines {sites}"
     )
+
+
+# Shadow Mode (Issue #78) must never grow a path to the submission boundary:
+# the shadow modules are deliberately NOT in the allow-lists above (so the
+# repository-wide scans already cover them); this test pins the intent
+# explicitly and fails with a direct message if a call ever appears.
+SHADOW_MODULES = (
+    "execution/shadow_execution.py",
+    "execution/shadow_store.py",
+    "execution/shadow_report.py",
+)
+
+
+def test_shadow_modules_hold_zero_submission_boundary_calls():
+    for relative in SHADOW_MODULES:
+        for method in ("submit_order", "to_order_request"):
+            sites = _method_call_sites(REPO_ROOT / relative, method)
+            assert sites == [], (
+                f"{relative} must never call {method} (Shadow Mode never crosses the "
+                f"broker submission boundary, Issue #78), found lines {sites}"
+            )

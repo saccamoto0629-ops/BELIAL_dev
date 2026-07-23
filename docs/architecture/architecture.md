@@ -41,7 +41,7 @@ Paper Signal (保存済みレコード)
 
 ## Alert / Strategy / Signal / Execution の責務分離
 
-Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定の**未実装**レイヤー)に分かれる。Paper Execution は仮想レコードのみを生成し、Broker API 連携・実注文・自動売買は含まない(それらは Live Execution の責務で未実装・非スコープ)。将来の Live Execution が使う **Broker 境界**(共通インターフェース・共通モデル・外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に定義済みだが、境界の定義のみであり Live Execution 本体・実発注・OANDA Adapter は未実装である([Broker Interface](broker_interface.md))。Paper Execution はこの境界を使わない。加えて Issue #74 で、Strategy / Signal から将来の Live Execution ユースケースへ渡す **ExecutionRequest** と注文状態・状態履歴の SQLite 永続化基盤を、Issue #75 で Broker 送信直前の fail-closed **Safety Gate**(検証・判定監査部品。Strategy / Broker Adapter から独立)を `execution/` に実装した([Execution Request / Order Persistence](execution_request.md) / [Safety Gate](safety_gate.md))。これらも**モデル・永続化・検証基盤のみ**であり、Live Execution runner・Broker API Adapter・実注文・reconciliation runner は引き続き未実装である。
+Execution は **Paper Execution**(仮想約定・仮想ポジション管理・Exit・損益計算を時間進行に沿って行う。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定の**未実装**レイヤー)に分かれる。Paper Execution は仮想レコードのみを生成し、Broker API 連携・実注文・自動売買は含まない(それらは Live Execution の責務で未実装・非スコープ)。将来の Live Execution が使う **Broker 境界**(共通インターフェース・共通モデル・外部通信しないテストダブル FakeBroker)は Issue #73 で `broker/` に定義済みだが、境界の定義のみであり Live Execution 本体・実発注・OANDA Adapter は未実装である([Broker Interface](broker_interface.md))。Paper Execution はこの境界を使わない。加えて Issue #74 で、Strategy / Signal から将来の Live Execution ユースケースへ渡す **ExecutionRequest** と注文状態・状態履歴の SQLite 永続化基盤を、Issue #75 で Broker 送信直前の fail-closed **Safety Gate**(検証・判定監査部品。Strategy / Broker Adapter から独立)を `execution/` に実装した([Execution Request / Order Persistence](execution_request.md) / [Safety Gate](safety_gate.md))。これらも**モデル・永続化・検証基盤のみ**であり、Live Execution runner・Broker API Adapter・実注文・reconciliation runner は引き続き未実装である。加えて Issue #78 で、この判定経路(ExecutionRequest + Safety Gate)を **Broker へ一切送信せず**に実行し結果を検証記録として保存する **Shadow Mode** を `execution/` に実装した([Shadow Mode](shadow_execution.md)。仮想約定・仮想 PnL は行わない観察機能であり、実発注が実装されたわけではない)。
 
 | Layer | Responsibility | Status |
 |---|---|---|
@@ -132,6 +132,7 @@ BELIAL はコンポーネントごとに独立したSQLiteファイルを持つ�
 | Backtest DB | `backtest/data/backtest_results.sqlite3` | `backtest/` | `backtest_runs`, `backtest_signals` |
 | Execution Order DB | `execution/data/execution_orders.sqlite3` | `execution/` | `execution_orders`, `execution_order_state_history`(Issue #74。将来の Live Execution 用の永続化基盤のみ。実注文なし) |
 | Safety Gate Decision DB | `execution/data/safety_gate_decisions.sqlite3` | `execution/` | `safety_gate_decisions`(Issue #75。Safety Gate の allow / reject 判定・拒否コード・policy_id の監査保存。execution store の closed-world schema 検証と同居できないため別ファイル。実注文なし) |
+| Shadow Execution DB | `execution/data/shadow_executions.sqlite3` | `execution/` | `shadow_executions`(Issue #78。Shadow Mode の検証記録: ExecutionRequest 全項目・Safety Gate 判定・拒否理由・想定注文内容・実行時刻。Broker へ未送信の観察記録のみで、Broker 注文状態は持たない。実登録用 `execution_orders.sqlite3` とは別ファイルで、mode 間の idempotency 干渉を持たない。[Shadow Mode](shadow_execution.md)) |
 
 いずれも `data/` はGit管理しない。関連付けは時刻のみに依存せず、可能な限りIDで行う(例: `alerts.snapshot_id` → `chart_snapshots.id`、`virtual_positions.signal_id` → `paper_signals.signal_id`)。時刻は補助情報として扱う。詳細スキーマは [Market Watch](market_watch.md)、[Market Bias](market_bias.md)、[Paper Signal](paper_signal.md)、[Paper Execution](paper_execution.md)、[Backtest](../backtest.md) を参照。
 
@@ -146,6 +147,7 @@ Persistence の責務は各コンポーネントの store 層が持つ。他コ�
 - `news-feed-bot/market_bias_store.py`: `CREATE TABLE/INDEX IF NOT EXISTS` による初期化が中心であり、既存schemaの型・制約を完全検証またはmigrationする仕組みではない。
 - `execution/execution_store.py`(Issue #74 / PR #91): schema の新規作成は **pristine な DB のみ**(`sqlite_master` 0 件かつ `user_version` 0。version だけ・metadata だけの DB は拒否)。既存 schema の判定は列名ではなく**完全な構造検証**(`PRAGMA user_version` + 両テーブル・両 index の正規化 CREATE SQL 全体 = NOT NULL / UNIQUE / CHECK / FK + `PRAGMA table_info`/`index_list`/`index_info`/`foreign_key_list` による構造 signature + 予期しないテーブル・index の不在)で行い、**読み取り経路も同じ検証を通ってから復元する**。schema v3(Issue #76)は `signal_id` の UNIQUE index を追加する(source signal 1 件につき Execution Request 高々 1 件): **リリース済み v2 と完全一致した DB のみ** `init_db()` が additive に migration する(重複 signal の事前 scan → `CREATE UNIQUE INDEX` → version bump → v3 完全再検証を単一トランザクションで実施。途中失敗は全体 rollback、既存行は削除・書き換えなし、重複 signal を含む DB は明示的に失敗、読み取り経路は migration しない)。それ以外(v1・partial schema・制約欠損テーブル・他コンポーネントのDB)は **DB を変更せず**明示的に失敗する(自動補完・黙った rebuild をしない)。存在しないDBファイルは作成せず、復元時に current / history chain・enum・UTC・reason・history に anchor した OrderResult snapshot・broker_order_id の DB 全体一意性を再検証する。
 - `execution/safety_store.py`(Issue #75): execution_store と同方針。新規作成は pristine な DB のみ、全 read / write が closed-world schema 検証(sqlite_master 全 object 集合 + token 正規化 DDL + PRAGMA 構造 signature + `user_version`)を通り、trigger / view / 制約欠損 lookalike / 他コンポーネント DB は **DB 無変更で**拒否する。読み取りは missing DB を作成せず、保存行(拒否コード JSON・UTC・allow/拒否整合)を厳格に再検証する。**書き込み失敗は例外 = Safety Gate が注文を送信しない**(fail-closed)。
+- `execution/shadow_store.py`(Issue #78): safety_store と同方針(pristine のみ新規作成、closed-world schema 検証、missing DB を作成しない読み取り、厳格復元、書き込み失敗の全 rollback)。Shadow Mode の検証記録専用で、`initialize()` の明示呼び出しだけが schema を作成し、読み取り経路(`shadow_report` CLI 含む)は DB を作成・migration しない([Shadow Mode](shadow_execution.md))。
 - **dry-run では DB作成・migration を行わない**(Paper Execution は読み取り専用のスキーマ確認のみ行う)。
 
 ## dry-run 方針
@@ -169,6 +171,8 @@ Paper Execution の dry-run は完全無副作用であり、読み取りエラ�
 - [Strategy 定義仕様](strategy_definition.md)
 - [Broker Interface](broker_interface.md)
 - [Execution Request / Order Persistence](execution_request.md)
+- [Safety Gate](safety_gate.md)
+- [Shadow Mode](shadow_execution.md)
 - [Backtest](../backtest.md)
 - [Operations](../operations/operations.md)
 - [Roadmap](../product/roadmap.md)

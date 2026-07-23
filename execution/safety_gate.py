@@ -78,8 +78,17 @@ class ExecutionMode(enum.Enum):
     deliberately NOT named "paper": Paper Execution (``paper-execution/``) is
     an independent virtual-execution layer that never touches the broker
     boundary and never passes through this gate.
+
+    ``SHADOW`` (Issue #78) is the observation-only mode: the normal
+    ExecutionRequest + Safety Gate decision path runs, the outcome is
+    persisted as a verification record (``execution/shadow_store.py``), and
+    the broker submission boundary is NEVER crossed. It is a MODE of running
+    the decision path, not a connection kind: no broker implementation may
+    claim it (see :data:`BROKER_TYPE_BY_MODE`) and no policy may allow-list
+    connection targets for it -- a "shadow connection" is unrepresentable.
     """
 
+    SHADOW = "shadow"
     FAKE = "fake"
     DEMO = "demo"
     LIVE = "live"
@@ -88,7 +97,10 @@ class ExecutionMode(enum.Enum):
 # Typed connection identity registry (Issue #75 review r1): which concrete
 # broker type may claim which execution mode. DEMO / LIVE deliberately have
 # NO entry -- no such adapter exists, so no such connection can be built.
-# A future adapter is added HERE, never by loosening BrokerConnection.
+# SHADOW deliberately has NO entry either (Issue #78): shadow is not a
+# connection kind -- shadow runs never submit, so a broker claiming "shadow"
+# is a misconfiguration and fails closed here. A future adapter is added
+# HERE, never by loosening BrokerConnection.
 BROKER_TYPE_BY_MODE: dict[ExecutionMode, type] = {
     ExecutionMode.FAKE: FakeBroker,
 }
@@ -333,6 +345,14 @@ class SafetyPolicy:
         for mode, targets in self.allowed_connection_targets.items():
             if not isinstance(mode, ExecutionMode):
                 raise ValueError(f"allowed_connection_targets keys must be ExecutionMode, got {mode!r}")
+            if mode is ExecutionMode.SHADOW:
+                # Shadow is not a connection kind (Issue #78): no broker
+                # connection can claim it, so a target list for it can only
+                # mask a misconfiguration.
+                raise ValueError(
+                    "allowed_connection_targets must not contain ExecutionMode.SHADOW; "
+                    "shadow runs never hold a broker connection of their own"
+                )
             if not isinstance(targets, frozenset):
                 raise ValueError(f"targets for {mode.value!r} must be a frozenset")
             for target in targets:

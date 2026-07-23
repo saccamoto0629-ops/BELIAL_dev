@@ -15,6 +15,9 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy",
     "from execution.safety_store import SQLiteSafetyDecisionStore",
     "from execution.live_submission import LiveOrderSubmissionService",
+    "from execution.shadow_store import ShadowExecutionRecord, SQLiteShadowExecutionStore",
+    "from execution.shadow_execution import ShadowExecutionService",
+    "from execution.shadow_report import main",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /
@@ -63,9 +66,9 @@ def test_paper_and_observation_layers_never_import_the_execution_package():
 
 def test_execution_package_only_depends_on_stdlib_and_broker():
     allowed = {
-        "annotations", "ast", "collections", "contextlib", "dataclasses", "datetime",
-        "decimal", "enum", "json", "logging", "os", "pathlib", "sqlite3", "types",
-        "typing", "broker", "execution", "__future__",
+        "annotations", "argparse", "ast", "collections", "contextlib", "dataclasses",
+        "datetime", "decimal", "enum", "json", "logging", "os", "pathlib", "sqlite3",
+        "sys", "types", "typing", "broker", "execution", "__future__",
     }
     for path in (REPO_ROOT / "execution").glob("*.py"):
         names = _imported_top_level_names(path)
