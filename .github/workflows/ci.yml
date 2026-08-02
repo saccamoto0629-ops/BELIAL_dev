@@ -123,3 +123,15 @@ jobs:
 
       - name: Run paper-execution tests (Windows)
         run: python -m pytest paper-execution/tests -q
+
+      # PR #96 review r1 (Issue #77): the scenario CLI must not depend on the
+      # console encoding. Windows pipes stdout through the ANSI codepage (not
+      # UTF-8), so an encoding regression that would crash the default
+      # Japanese cp932 console fails here too. PYTHONUTF8 is deliberately NOT
+      # set. Same isolation as the Ubuntu step: FakeBroker + per-scenario
+      # tmp-dir SQLite, no secrets, no network.
+      - name: Run fixed execution scenarios CLI (Windows)
+        run: |
+          python -m execution.scenario_runner
+          python -m execution.scenario_runner --list
+          python -m execution.scenario_runner --json

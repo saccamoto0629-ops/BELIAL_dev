@@ -51,14 +51,17 @@
     "final_phase": "submitting",
     "final_state": "unknown",
     "state_history": [
-      [
-        null,
-        "pending"
-      ],
-      [
-        "pending",
-        "unknown"
-      ]
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "unknown",
+        "broker_order_id": null
+      }
     ],
     "broker_submit_calls": 1,
     "order_rows": 1,

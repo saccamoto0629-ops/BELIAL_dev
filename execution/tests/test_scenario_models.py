@@ -110,8 +110,33 @@ def test_primary_id_can_be_declared_explicitly():
         (lambda s: s["steps"][1]["expect"].update(rejection_codes=["not_a_code"]), "rejection codes"),
         (lambda s: s["expected"].update(final_state="teleported"), "final_state"),
         (lambda s: s["expected"].update(final_phase="warp"), "final_phase"),
-        (lambda s: s["expected"].update(state_history=[["pending"]]), "state_history"),
-        (lambda s: s["expected"].update(state_history=[["pending", "warp"]]), "state_history"),
+        # legacy [previous, new] pair form is no longer a valid entry
+        (lambda s: s["expected"].update(state_history=[["pending", "filled"]]), "state_history"),
+        (lambda s: s["expected"].update(state_history=[{"new_state": "pending"}]), "missing required keys"),
+        (
+            lambda s: s["expected"].update(
+                state_history=[{"previous_state": "pending", "new_state": "warp"}]
+            ),
+            "new_state",
+        ),
+        (
+            lambda s: s["expected"].update(
+                state_history=[{"previous_state": "warp", "new_state": "filled"}]
+            ),
+            "previous_state",
+        ),
+        (
+            lambda s: s["expected"].update(
+                state_history=[{"previous_state": None, "new_state": "pending", "surprise": 1}]
+            ),
+            "unknown keys",
+        ),
+        (
+            lambda s: s["expected"].update(
+                state_history=[{"previous_state": None, "new_state": "pending", "reason": ""}]
+            ),
+            "reason",
+        ),
         (lambda s: s["expected"].update(broker_submit_calls="1"), "broker_submit_calls"),
         (lambda s: s["expected"].update(last_decision_codes=[]), "last_decision_codes"),
         (lambda s: s["expected"].update(nonsense=True), "unknown keys"),
@@ -119,9 +144,16 @@ def test_primary_id_can_be_declared_explicitly():
         (lambda s: s.update(faults=[{"boundary": "everywhere"}]), "boundary"),
         (lambda s: s.update(faults=[{"boundary": "initial_save", "after_calls": -1}]), "after_calls"),
         (lambda s: s.update(broker={"scripts": {"client-1": {"behavior": "explode"}}}), "behavior"),
+        # cancel scripting left the schema with the cancel step (PR #96 r1)
         (
-            lambda s: s.update(broker={"cancel_scripts": {"client-1": {"behavior": "explode"}}}),
-            "behavior",
+            lambda s: s.update(broker={"cancel_scripts": {"client-1": {"behavior": "fail_cancellation"}}}),
+            "unknown keys",
+        ),
+        (
+            lambda s: s["steps"].append(
+                {"action": "cancel", "execution_request_id": "exec-1", "expect": {"outcome": "cancelled"}}
+            ),
+            "action",
         ),
         (
             lambda s: s.update(broker={"scripts": {"client-1": {"behavior": "reject", "price": "1"}}}),

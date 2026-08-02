@@ -50,14 +50,18 @@
     "final_phase": "submitted",
     "final_state": "filled",
     "state_history": [
-      [
-        null,
-        "pending"
-      ],
-      [
-        "pending",
-        "filled"
-      ]
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "filled",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-22"
+      }
     ],
     "history_rows": 2,
     "broker_submit_calls": 1

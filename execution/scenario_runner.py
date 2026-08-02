@@ -60,7 +60,6 @@ from tempfile import TemporaryDirectory
 
 from broker.broker_models import BrokerError, OrderSide, OrderState, OrderType
 from broker.fake_broker import (
-    FailCancellation,
     FailCommunication,
     FakeBroker,
     FillImmediately,
@@ -101,7 +100,6 @@ EXIT_USAGE_ERROR = 2
 # ``updated_at_utc`` the store's monotonicity checks compare against.
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-_CANCEL_REASON = "scenario cancel step"
 _UNKNOWN_REASON = "scenario reconciliation observation"
 _MARK_SUBMITTING_REASON = "scenario: another worker won the transition"
 
@@ -233,11 +231,6 @@ def _build_broker(definition: ScenarioDefinition) -> FakeBroker:
     )
     for client_order_id, script in spec.get("scripts", {}).items():
         broker.script_order(client_order_id, _build_submit_script(script))
-    for client_order_id, script in spec.get("cancel_scripts", {}).items():
-        broker.script_cancel(
-            client_order_id,
-            FailCancellation(**({"reason": script["reason"]} if "reason" in script else {})),
-        )
     return broker
 
 
@@ -399,28 +392,6 @@ def _execute_submit(context: _ScenarioContext, step: ScenarioStep) -> dict:
     return {"outcome": "rejected", "rejection_codes": sorted(decision.rejection_codes)}
 
 
-def _execute_cancel(context: _ScenarioContext, step: ScenarioStep) -> dict:
-    """Cancel via the broker boundary, persisting the observation through the
-    production store path (``record_order_result`` re-runs the full state
-    machine + snapshot validation). No production cancel orchestration exists
-    yet (Issue #74/#75 scope), so this step IS just broker call + recording."""
-    execution_request_id = step.params["execution_request_id"]
-    row = execution_store.get_execution_order(execution_request_id, db_path=context.orders_db)
-    if row is None:
-        return {"outcome": "error", "error_type": "ExecutionOrderNotFoundError"}
-    try:
-        cancelled = context.broker.cancel_order(row["client_order_id"])
-    except Exception as exc:
-        return {"outcome": "error", **_classify_error(exc)}
-    try:
-        execution_store.record_order_result(
-            execution_request_id, cancelled, reason=_CANCEL_REASON, db_path=context.orders_db
-        )
-    except Exception as exc:
-        return {"outcome": "error", **_classify_error(exc)}
-    return {"outcome": "cancelled", "state": cancelled.state.value}
-
-
 def _execute_record_unknown(context: _ScenarioContext, step: ScenarioStep) -> dict:
     try:
         execution_store.record_order_state(
@@ -526,10 +497,14 @@ def _execute_register_concurrent(context: _ScenarioContext, step: ScenarioStep) 
     }
 
 
+# Cancel is deliberately NOT a step action (PR #96 review r1): no production
+# cancel Execution use case exists yet, and the runner must not synthesize
+# one. FakeBroker cancel behaviour and the store's cancel transitions are
+# covered by ordinary pytest (broker/tests/test_fake_broker.py,
+# execution/tests/test_execution_store.py).
 _STEP_EXECUTORS = {
     "register": _execute_register,
     "submit": _execute_submit,
-    "cancel": _execute_cancel,
     "record_unknown": _execute_record_unknown,
     "mark_submitting": _execute_mark_submitting,
     "submit_concurrent": _execute_submit_concurrent,
@@ -594,7 +569,16 @@ def _collect_actual(context: _ScenarioContext) -> dict:
     actual = {
         "final_phase": None if row is None else row["submission_phase"],
         "final_state": None if row is None else row["order_state"],
-        "state_history": [[entry["previous_state"], entry["new_state"]] for entry in history],
+        "state_history": [
+            {
+                "previous_state": entry["previous_state"],
+                "new_state": entry["new_state"],
+                "reason": entry["reason"],
+                "broker_order_id": entry["broker_order_id"],
+                "changed_at_utc": entry["changed_at_utc"],
+            }
+            for entry in history
+        ],
         "broker_submit_calls": len(submitted),
         "broker_cancel_calls": len(context.broker.cancel_requests),
         "submitted_request": None
@@ -656,10 +640,64 @@ def _values_match(key: str, expected, actual) -> bool:
     return expected == actual
 
 
+def _history_mismatches(expected_entries: list, actual_entries: list) -> list[Mismatch]:
+    """Full-history comparison: entry COUNT and ORDER always match exactly.
+
+    Each expected entry is a subset comparison over ``previous_state`` /
+    ``new_state`` / ``reason`` / ``broker_order_id``: an ABSENT key is not
+    compared, while an explicit null requires the stored value to be NULL --
+    the two declarations stay distinct. Independent of what a scenario
+    declares, every actual entry must carry a ``changed_at_utc`` and the
+    timestamps must be monotonically non-decreasing; the exact timestamp
+    strings are dynamic and are never compared.
+    """
+    mismatches = []
+    if len(expected_entries) != len(actual_entries):
+        mismatches.append(
+            Mismatch(
+                "expected.state_history length",
+                len(expected_entries),
+                [f"{e['previous_state']}->{e['new_state']}" for e in actual_entries],
+            )
+        )
+    previous_changed_at = None
+    for index, actual_entry in enumerate(actual_entries):
+        if index < len(expected_entries):
+            for key in ("previous_state", "new_state", "reason", "broker_order_id"):
+                expected_entry = expected_entries[index]
+                if key in expected_entry and expected_entry[key] != actual_entry[key]:
+                    mismatches.append(
+                        Mismatch(
+                            f"expected.state_history[{index}].{key}",
+                            expected_entry[key],
+                            actual_entry[key],
+                        )
+                    )
+        changed_at = actual_entry["changed_at_utc"]
+        if not isinstance(changed_at, str) or not changed_at.strip():
+            mismatches.append(
+                Mismatch(f"state_history[{index}].changed_at_utc", "<present>", changed_at)
+            )
+            continue
+        parsed = datetime.fromisoformat(changed_at)
+        if previous_changed_at is not None and parsed < previous_changed_at:
+            mismatches.append(
+                Mismatch(
+                    f"state_history[{index}].changed_at_utc monotonicity",
+                    f">= {previous_changed_at.isoformat()}",
+                    changed_at,
+                )
+            )
+        previous_changed_at = parsed
+    return mismatches
+
+
 def _compare_expected(definition: ScenarioDefinition, actual: dict) -> list[Mismatch]:
     mismatches = []
     for key, expected_value in definition.expected.items():
-        if not _values_match(key, expected_value, actual[key]):
+        if key == "state_history":
+            mismatches.extend(_history_mismatches(expected_value, actual[key]))
+        elif not _values_match(key, expected_value, actual[key]):
             mismatches.append(Mismatch(f"expected.{key}", expected_value, actual[key]))
     return mismatches
 
@@ -732,8 +770,11 @@ def run_scenarios(
 
 
 def _render_report(report: RunReport, *, verbose: bool, out) -> None:
+    # ASCII separators only (PR #96 review r1): the default Windows console
+    # (cp932) cannot encode characters like an em dash, and the report
+    # structure must survive any console encoding.
     for outcome in report.outcomes:
-        print(f"{outcome.status} {outcome.scenario_id} — {outcome.description}", file=out)
+        print(f"{outcome.status} {outcome.scenario_id} - {outcome.description}", file=out)
         if verbose or outcome.status == STATUS_FAIL:
             if verbose:
                 print(f"  expected: {_jsonable(outcome.expected_summary)}", file=out)
@@ -803,7 +844,28 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _make_streams_encoding_safe() -> None:
+    """Never let the console encoding turn an all-PASS run into exit 1.
+
+    The Windows-ja default console is cp932 and GitHub's Windows runners pipe
+    stdout through the ANSI codepage; scenario descriptions are free text, so
+    a strict-encoding stream would raise ``UnicodeEncodeError`` mid-report.
+    Separators are ASCII and ``--json`` is pure ASCII already; here the
+    remaining free text degrades to escape sequences instead of crashing.
+    Streams that cannot be reconfigured (already-detached wrappers) are left
+    alone -- worst case those environments keep their own behaviour.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="backslashreplace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_streams_encoding_safe()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -831,7 +893,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         for definition in definitions:
-            print(f"{definition.scenario_id} — {definition.description}")
+            print(f"{definition.scenario_id} - {definition.description}")
         return EXIT_OK
 
     # CLI readability only: production WARN/CRITICAL logs (duplicate
@@ -848,7 +910,10 @@ def main(argv: list[str] | None = None) -> int:
         logging.disable(previous_disable)
 
     if args.json:
-        print(json.dumps(_report_as_json(report), ensure_ascii=False, indent=2))
+        # Pure-ASCII JSON: the machine-readable output must never depend on
+        # the console encoding (PR #96 review r1) -- non-ASCII scenario text
+        # is escaped, so parsing round-trips losslessly on any console.
+        print(json.dumps(_report_as_json(report), ensure_ascii=True, indent=2))
     else:
         _render_report(report, verbose=args.verbose, out=sys.stdout)
     return EXIT_OK if report.all_passed else EXIT_FAILURE

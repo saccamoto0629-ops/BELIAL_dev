@@ -24,8 +24,6 @@ REQUIRED_SCENARIO_IDS = {
     "timeout_unknown_no_resend",
     "broker_reject",
     "partial_fill",
-    "cancel_success",
-    "cancel_failure",
     "fill_price_deviation",
     "db_failure_initial_save",
     "db_failure_result_save_after_acceptance",
@@ -40,8 +38,14 @@ REQUIRED_SCENARIO_IDS = {
     "multiple_gate_violations",
     "invalid_state_transition_rejected_by_store",
     "same_request_id_different_payload_suppressed",
-    "cancel_after_filled_fails",
 }
+
+# Cancel scenarios are deliberately NOT part of the fixed suite (PR #96
+# review r1): no production cancel Execution use case exists yet, so a fixed
+# scenario could only exercise a runner-synthesized path. FakeBroker cancel
+# behaviour is covered by broker/tests/test_fake_broker.py and the store's
+# cancel transitions by execution/tests/test_execution_store.py
+# (test_accepted_to_cancelled and the terminal-state invariants).
 
 
 def test_all_required_scenarios_are_bundled():

@@ -42,10 +42,12 @@
     "final_phase": "submitting",
     "final_state": "pending",
     "state_history": [
-      [
-        null,
-        "pending"
-      ]
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "scenario: another worker won the transition",
+        "broker_order_id": null
+      }
     ],
     "broker_submit_calls": 0,
     "listed_unknown": false,

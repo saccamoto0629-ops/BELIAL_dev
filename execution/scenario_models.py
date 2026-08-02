@@ -47,7 +47,10 @@ _ORDER_TYPE_VALUES = frozenset(order_type.value for order_type in OrderType)
 # Submit-script behaviours the runner can configure on FakeBroker, with the
 # extra keys each behaviour accepts. Kept in lockstep with
 # ``broker.fake_broker``; an unknown behaviour is a schema error, never a
-# silent default.
+# silent default. Cancel behaviours are deliberately NOT part of the scenario
+# schema (PR #96 review r1): no production cancel Execution use case exists
+# yet, so fixed scenarios cannot exercise one -- FakeBroker cancel behaviour
+# and the store's cancel transitions are covered by ordinary pytest instead.
 _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
     "fill_immediately": frozenset({"price", "broker_order_id"}),
     "stay_pending": frozenset({"broker_order_id"}),
@@ -55,9 +58,6 @@ _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
     "reject": frozenset({"reason"}),
     "timeout": frozenset(),
     "fail_communication": frozenset(),
-}
-_CANCEL_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
-    "fail_cancellation": frozenset({"reason"}),
 }
 
 # DB boundaries where a fault can be injected (Issue #77): each maps to one
@@ -74,7 +74,6 @@ _STEP_ACTIONS = frozenset(
     {
         "register",
         "submit",
-        "cancel",
         "record_unknown",
         "mark_submitting",
         "submit_concurrent",
@@ -86,7 +85,6 @@ _STEP_ACTIONS = frozenset(
 _STEP_OUTCOMES: dict[str, frozenset[str]] = {
     "register": frozenset({"registered", "conflict", "error"}),
     "submit": frozenset({"submitted", "rejected", "error"}),
-    "cancel": frozenset({"cancelled", "error"}),
     "record_unknown": frozenset({"recorded", "error"}),
     "mark_submitting": frozenset({"ok", "error"}),
 }
@@ -115,7 +113,7 @@ _GATE_KEYS = frozenset(
     }
 )
 
-_BROKER_KEYS = frozenset({"default_fill_price", "connection_target", "scripts", "cancel_scripts"})
+_BROKER_KEYS = frozenset({"default_fill_price", "connection_target", "scripts"})
 
 _FAULT_KEYS = frozenset({"boundary", "after_calls"})
 
@@ -137,12 +135,18 @@ _STEP_COMMON_KEYS = frozenset({"action", "expect"})
 _STEP_EXTRA_KEYS: dict[str, frozenset[str]] = {
     "register": frozenset({"request", "client_order_id"}),
     "submit": frozenset({"execution_request_id"}),
-    "cancel": frozenset({"execution_request_id"}),
     "record_unknown": frozenset({"execution_request_id", "reason"}),
     "mark_submitting": frozenset({"execution_request_id", "reason"}),
     "submit_concurrent": frozenset({"execution_request_id", "workers"}),
     "register_concurrent": frozenset({"registrations"}),
 }
+
+# History-entry expectation keys (PR #96 review Minor 1): entries are objects
+# so reason / broker reference can be declared; ``changed_at_utc`` presence
+# and timestamp monotonicity are always verified by the runner and are not
+# part of the declared keys (dynamic values are never string-compared).
+_HISTORY_ENTRY_REQUIRED_KEYS = frozenset({"previous_state", "new_state"})
+_HISTORY_ENTRY_KEYS = _HISTORY_ENTRY_REQUIRED_KEYS | frozenset({"reason", "broker_order_id"})
 
 # Scenario-level expected keys (closed world). ``decimal`` entries are
 # compared as Decimal so "150.0" == "150.00"; DB-assigned values such as
@@ -313,13 +317,12 @@ def _validate_broker(spec, scenario: str) -> dict:
     _require_optional_decimal_str(broker.get("default_fill_price"), "broker.default_fill_price", scenario)
     if "connection_target" in broker:
         _require_non_empty_str(broker["connection_target"], "broker.connection_target", scenario)
-    for table_name, table in (("scripts", _SUBMIT_BEHAVIOUR_KEYS), ("cancel_scripts", _CANCEL_BEHAVIOUR_KEYS)):
-        scripts = _require_mapping(broker.get(table_name, {}), f"broker.{table_name}", scenario)
-        for client_order_id, script in scripts.items():
-            _require_non_empty_str(client_order_id, f"broker.{table_name} key", scenario)
-            _validate_script(
-                script, f"broker.{table_name}[{client_order_id}]", scenario, table=table
-            )
+    scripts = _require_mapping(broker.get("scripts", {}), "broker.scripts", scenario)
+    for client_order_id, script in scripts.items():
+        _require_non_empty_str(client_order_id, "broker.scripts key", scenario)
+        _validate_script(
+            script, f"broker.scripts[{client_order_id}]", scenario, table=_SUBMIT_BEHAVIOUR_KEYS
+        )
     return broker
 
 
@@ -489,15 +492,25 @@ def _validate_expected(spec, scenario: str) -> dict:
     if "state_history" in expected:
         history = expected["state_history"]
         if not isinstance(history, list):
-            raise _fail(scenario, "expected.state_history must be a list of [previous, new] pairs")
+            raise _fail(scenario, "expected.state_history must be a list of history-entry objects")
         for index, entry in enumerate(history):
-            if not isinstance(entry, list) or len(entry) != 2:
-                raise _fail(scenario, f"expected.state_history[{index}] must be a [previous, new] pair")
-            previous, new = entry
-            if previous is not None and previous not in _ORDER_STATE_VALUES:
-                raise _fail(scenario, f"expected.state_history[{index}] has unknown previous state {previous!r}")
-            if new not in _ORDER_STATE_VALUES:
-                raise _fail(scenario, f"expected.state_history[{index}] has unknown new state {new!r}")
+            name = f"expected.state_history[{index}]"
+            entry = _require_mapping(entry, name, scenario)
+            _require_known_keys(entry, _HISTORY_ENTRY_KEYS, name, scenario)
+            missing = _HISTORY_ENTRY_REQUIRED_KEYS - set(entry)
+            if missing:
+                raise _fail(scenario, f"{name} is missing required keys {sorted(missing)}")
+            if entry["previous_state"] is not None and entry["previous_state"] not in _ORDER_STATE_VALUES:
+                raise _fail(scenario, f"{name} has unknown previous_state {entry['previous_state']!r}")
+            if entry["new_state"] not in _ORDER_STATE_VALUES:
+                raise _fail(scenario, f"{name} has unknown new_state {entry['new_state']!r}")
+            # reason / broker_order_id: ABSENT means "not compared"; an
+            # explicit null means "must be NULL in the DB" -- the two are
+            # deliberately different declarations.
+            if "reason" in entry and entry["reason"] is not None:
+                _require_non_empty_str(entry["reason"], f"{name}.reason", scenario)
+            if "broker_order_id" in entry and entry["broker_order_id"] is not None:
+                _require_non_empty_str(entry["broker_order_id"], f"{name}.broker_order_id", scenario)
     for key in ("broker_submit_calls", "broker_cancel_calls", "order_rows", "history_rows", "safety_decisions"):
         if key in expected:
             _require_int(expected[key], f"expected.{key}", scenario)

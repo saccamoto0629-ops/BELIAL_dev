@@ -5,6 +5,7 @@ integration-tested separately in ``test_fixed_scenarios.py``."""
 
 import json
 import socket
+import sys
 
 import pytest
 
@@ -236,3 +237,160 @@ def test_runner_defines_no_execution_decision_logic():
         "dedupe_rejections",
     }
     assert imported_names & forbidden == set()
+
+
+# --- Windows default-console encoding (PR #96 review r1) ---------------------
+# The Windows-ja default console is cp932 and cannot encode e.g. an em dash;
+# a strict cp932 stream reproduces that console on any platform. The CLI must
+# finish with the right exit code instead of dying in UnicodeEncodeError.
+
+
+def _cp932_stdout(monkeypatch):
+    import io
+
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp932", errors="strict", newline="")
+    monkeypatch.setattr(sys, "stdout", stream)
+    return buffer, stream
+
+
+def test_cli_report_survives_a_cp932_console(tmp_path, monkeypatch):
+    directory = cli_dir(tmp_path, minimal_scenario())
+    buffer, stream = _cp932_stdout(monkeypatch)
+    assert main(["--scenario-dir", str(directory)]) == EXIT_OK
+    stream.flush()
+    out = buffer.getvalue().decode("cp932")
+    assert "PASS minimal_ok" in out
+    assert "total 1  pass 1  fail 0  error 0" in out
+
+
+def test_cli_report_survives_cp932_with_the_bundled_japanese_scenarios(monkeypatch):
+    # The real fixed scenarios carry Japanese descriptions -- run one end to
+    # end against a strict cp932 console.
+    buffer, stream = _cp932_stdout(monkeypatch)
+    assert main(["--scenario-id", "normal_market_order"]) == EXIT_OK
+    stream.flush()
+    assert "PASS normal_market_order" in buffer.getvalue().decode("cp932")
+
+
+def test_cli_list_survives_a_cp932_console(monkeypatch):
+    buffer, stream = _cp932_stdout(monkeypatch)
+    assert main(["--list"]) == EXIT_OK
+    stream.flush()
+    assert "normal_market_order" in buffer.getvalue().decode("cp932")
+
+
+def test_cli_json_survives_a_cp932_console_and_stays_machine_readable(tmp_path, monkeypatch):
+    directory = cli_dir(tmp_path, minimal_scenario())
+    buffer, stream = _cp932_stdout(monkeypatch)
+    assert main(["--scenario-dir", str(directory), "--json"]) == EXIT_OK
+    stream.flush()
+    raw = buffer.getvalue()
+    # pure ASCII: parseable regardless of the console encoding
+    payload = raw.decode("ascii")
+    report = json.loads(payload)
+    assert report["passed"] == 1
+
+
+def test_cli_failure_exit_code_is_preserved_on_a_cp932_console(tmp_path, monkeypatch):
+    failing = minimal_scenario(scenario_id="failing_one")
+    failing["expected"]["final_state"] = "cancelled"
+    directory = cli_dir(tmp_path, failing)
+    buffer, stream = _cp932_stdout(monkeypatch)
+    assert main(["--scenario-dir", str(directory)]) == EXIT_FAILURE
+    stream.flush()
+    assert "FAIL failing_one" in buffer.getvalue().decode("cp932")
+
+
+# --- state-history object comparison (PR #96 review Minor 1) -----------------
+
+
+def history_scenario(entries):
+    scenario = minimal_scenario(scenario_id="history_check")
+    scenario["expected"] = {"state_history": entries}
+    return scenario
+
+
+def test_history_subset_comparison_checks_only_declared_fields(tmp_path):
+    outcome = run_one(
+        history_scenario(
+            [
+                {"previous_state": None, "new_state": "pending", "broker_order_id": None},
+                {
+                    "previous_state": "pending",
+                    "new_state": "filled",
+                    "reason": "live submission via safety gate",
+                },
+            ]
+        ),
+        tmp_path,
+    )
+    assert outcome.status == STATUS_PASS
+
+
+def test_history_wrong_reason_fails(tmp_path):
+    outcome = run_one(
+        history_scenario(
+            [
+                {"previous_state": None, "new_state": "pending", "reason": "some other reason"},
+                {"previous_state": "pending", "new_state": "filled"},
+            ]
+        ),
+        tmp_path,
+    )
+    assert outcome.status == STATUS_FAIL
+    assert any("state_history[0].reason" in m.render() for m in outcome.mismatches)
+
+
+def test_history_null_expectation_differs_from_unspecified(tmp_path):
+    # broker_order_id: null must FAIL against the stored "FAKE-1" of the
+    # filled entry, while leaving the key out passes (subset comparison).
+    outcome = run_one(
+        history_scenario(
+            [
+                {"previous_state": None, "new_state": "pending"},
+                {"previous_state": "pending", "new_state": "filled", "broker_order_id": None},
+            ]
+        ),
+        tmp_path,
+    )
+    assert outcome.status == STATUS_FAIL
+    assert any("state_history[1].broker_order_id" in m.render() for m in outcome.mismatches)
+
+
+def test_history_count_and_order_are_enforced(tmp_path):
+    outcome = run_one(
+        history_scenario([{"previous_state": None, "new_state": "pending"}]),
+        tmp_path,
+    )
+    assert outcome.status == STATUS_FAIL
+    assert any("state_history length" in m.render() for m in outcome.mismatches)
+
+
+def test_history_monotonicity_and_timestamp_presence_are_always_checked():
+    from execution.scenario_runner import _history_mismatches
+
+    entries = [
+        {
+            "previous_state": None,
+            "new_state": "pending",
+            "reason": "r",
+            "broker_order_id": None,
+            "changed_at_utc": "2026-01-01T00:00:02+00:00",
+        },
+        {
+            "previous_state": "pending",
+            "new_state": "filled",
+            "reason": "r",
+            "broker_order_id": "B-1",
+            "changed_at_utc": "2026-01-01T00:00:01+00:00",  # goes backwards
+        },
+    ]
+    mismatches = _history_mismatches([], entries)
+    rendered = [m.render() for m in mismatches]
+    assert any("length" in line for line in rendered)
+    assert any("monotonicity" in line for line in rendered)
+
+    missing_ts = [dict(entries[0], changed_at_utc="")]
+    rendered = [m.render() for m in _history_mismatches([], missing_ts)]
+    assert any("changed_at_utc" in line for line in rendered)
