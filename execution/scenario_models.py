@@ -157,7 +157,6 @@ EXPECTED_KEYS = frozenset(
         "final_state",
         "state_history",
         "broker_submit_calls",
-        "broker_cancel_calls",
         "submitted_request",
         "order_rows",
         "history_rows",
@@ -447,7 +446,7 @@ def _validate_step(spec, index: int, scenario: str) -> ScenarioStep:
     if action == "register":
         params["request"] = _validate_request(step.get("request"), f"{name}.request", scenario)
         _require_non_empty_str(step.get("client_order_id"), f"{name}.client_order_id", scenario)
-    elif action in ("submit", "cancel", "record_unknown", "mark_submitting", "submit_concurrent"):
+    elif action in ("submit", "record_unknown", "mark_submitting", "submit_concurrent"):
         _require_non_empty_str(step.get("execution_request_id"), f"{name}.execution_request_id", scenario)
         if action == "submit_concurrent":
             _require_int(step.get("workers"), f"{name}.workers", scenario, minimum=2)
@@ -511,7 +510,7 @@ def _validate_expected(spec, scenario: str) -> dict:
                 _require_non_empty_str(entry["reason"], f"{name}.reason", scenario)
             if "broker_order_id" in entry and entry["broker_order_id"] is not None:
                 _require_non_empty_str(entry["broker_order_id"], f"{name}.broker_order_id", scenario)
-    for key in ("broker_submit_calls", "broker_cancel_calls", "order_rows", "history_rows", "safety_decisions"):
+    for key in ("broker_submit_calls", "order_rows", "history_rows", "safety_decisions"):
         if key in expected:
             _require_int(expected[key], f"expected.{key}", scenario)
     if "submitted_request" in expected:
@@ -603,7 +602,6 @@ def _require_resolvable_primary(definition: ScenarioDefinition) -> None:
         return
     row_level = EXPECTED_KEYS - {
         "broker_submit_calls",
-        "broker_cancel_calls",
         "order_rows",
         "history_rows",
         "submitted_request",

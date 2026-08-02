@@ -580,7 +580,6 @@ def _collect_actual(context: _ScenarioContext) -> dict:
             for entry in history
         ],
         "broker_submit_calls": len(submitted),
-        "broker_cancel_calls": len(context.broker.cancel_requests),
         "submitted_request": None
         if first_submitted is None
         else {
@@ -844,28 +843,50 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _make_streams_encoding_safe() -> None:
-    """Never let the console encoding turn an all-PASS run into exit 1.
+@contextlib.contextmanager
+def _encoding_safe_streams():
+    """Never let the console encoding turn an all-PASS run into exit 1 --
+    and never LEAK the changed stream configuration past ``main()``.
 
     The Windows-ja default console is cp932 and GitHub's Windows runners pipe
     stdout through the ANSI codepage; scenario descriptions are free text, so
     a strict-encoding stream would raise ``UnicodeEncodeError`` mid-report.
-    Separators are ASCII and ``--json`` is pure ASCII already; here the
-    remaining free text degrades to escape sequences instead of crashing.
-    Streams that cannot be reconfigured (already-detached wrappers) are left
-    alone -- worst case those environments keep their own behaviour.
+    Separators are ASCII and ``--json`` is pure ASCII already; inside this
+    context the remaining free text degrades to escape sequences instead of
+    crashing. The previous ``errors`` policy of each stream is restored in
+    ``finally`` on EVERY exit path -- normal return, usage error
+    (``SystemExit`` from argparse), schema error and unexpected exceptions --
+    so embedding callers (pytest, other CLIs) never observe a leftover
+    configuration. Streams that cannot be reconfigured are left alone.
+    This runs only inside ``main()``; importing the module changes nothing.
     """
+    restores: list[tuple] = []
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
+        original_errors = getattr(stream, "errors", None)
+        if not callable(reconfigure) or original_errors is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (ValueError, OSError):
+            continue
+        restores.append((reconfigure, original_errors))
+    try:
+        yield
+    finally:
+        for reconfigure, original_errors in reversed(restores):
             try:
-                reconfigure(errors="backslashreplace")
+                reconfigure(errors=original_errors)
             except (ValueError, OSError):
                 pass
 
 
 def main(argv: list[str] | None = None) -> int:
-    _make_streams_encoding_safe()
+    with _encoding_safe_streams():
+        return _run_cli(argv)
+
+
+def _run_cli(argv: list[str] | None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 

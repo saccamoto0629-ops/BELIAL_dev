@@ -56,7 +56,6 @@
       }
     ],
     "broker_submit_calls": 1,
-    "broker_cancel_calls": 0,
     "submitted_request": {
       "client_order_id": "client-1",
       "symbol": "USD_JPY",

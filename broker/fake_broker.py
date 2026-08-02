@@ -365,6 +365,13 @@ class FakeBroker:
                 client_order_id=request.client_order_id,
             )
 
+        # Rejection atomicity (PR #96 review r2): every branch below runs in
+        # the same strict order -- (1) side-effect-free validation, (2)
+        # broker_order_id resolution incl. the duplicate check, (3) fill /
+        # timestamp generation, (4) result construction, (5) registration.
+        # A submit rejected at (1) or (2) therefore consumes NO fill IDs, NO
+        # clock ticks and NO sequence numbers -- the failed order is
+        # observable only in submitted_requests (the attempt record).
         if isinstance(script, RejectOrder):
             result = self._result(
                 request,
@@ -374,10 +381,11 @@ class FakeBroker:
                 reject_reason=script.reason,
             )
         elif isinstance(script, StayPending):
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
             result = self._result(
                 request,
                 state=OrderState.ACCEPTED,
-                broker_order_id=self._scripted_broker_order_id(script, request.client_order_id),
+                broker_order_id=broker_order_id,
                 fills=(),
             )
         elif isinstance(script, PartiallyFill):
@@ -388,11 +396,12 @@ class FakeBroker:
                     f"({request.quantity}), got {total}",
                     client_order_id=request.client_order_id,
                 )
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
             fills = self._build_fills(script.fills)
             result = self._result(
                 request,
                 state=OrderState.PARTIALLY_FILLED,
-                broker_order_id=self._scripted_broker_order_id(script, request.client_order_id),
+                broker_order_id=broker_order_id,
                 fills=fills,
             )
         elif isinstance(script, FillImmediately):
@@ -410,11 +419,12 @@ class FakeBroker:
                     "or configure FakeBroker(default_fill_price=...)",
                     client_order_id=request.client_order_id,
                 )
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
             fills = (Fill(self._next_fill_id(), price, request.quantity, self._now()),)
             result = self._result(
                 request,
                 state=OrderState.FILLED,
-                broker_order_id=self._scripted_broker_order_id(script, request.client_order_id),
+                broker_order_id=broker_order_id,
                 fills=fills,
             )
         else:  # unreachable while script_order()/__init__ validate script types
@@ -493,7 +503,12 @@ class FakeBroker:
 
     # --- helpers -------------------------------------------------------------
 
-    def _scripted_broker_order_id(self, script, client_order_id: str) -> str:
+    def _resolve_broker_order_id(self, script, client_order_id: str) -> str:
+        """Resolve the ID an accepting branch WILL use, duplicate check
+        included, BEFORE any fill / timestamp / sequence side effect: a
+        pinned duplicate raises here having consumed nothing (r2 atomicity);
+        an unpinned script advances the sequence only after every validation
+        that could still reject the order has passed."""
         if script.broker_order_id is not None:
             if script.broker_order_id in self._assigned_broker_order_ids:
                 raise BrokerInvalidRequestError(

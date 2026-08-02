@@ -35,7 +35,7 @@ from execution.live_submission import LiveOrderSubmissionService
 
 ## 固定シナリオ試験(Issue #77)
 
-実発注処理は実相場や Broker 障害を待って検証できないため、正常約定だけでなく拒否・部分約定・timeout(結果不明)・DB保存失敗・多重起動競合などを**固定データから決定的に再現**する試験基盤。通常の pytest がモジュール単位の観点を固定するのに対し、固定シナリオは「入力 → Safety Gate → Broker → 永続化」の分岐 1 本を 1 シナリオとしてデータで表現する。**試験対象の判定はすべて本番コード**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / broker の状態機械)であり、runner は wiring・actual 収集・比較のみを行う(`tests/test_scenario_runner.py` の AST 検査が遷移表・validator の import を禁止)。`mark_submitting` / `record_unknown` ステップは store の公開 API による前提状態・観測の注入であり、ユースケースの合成ではない。
+実発注処理は実相場や Broker 障害を待って検証できないため、正常約定だけでなく拒否・部分約定・timeout(結果不明)・DB保存失敗・多重起動競合などを**固定データから決定的に再現**する試験基盤(固定シナリオは現在 **21 件**)。通常の pytest がモジュール単位の観点を固定するのに対し、固定シナリオは「入力 → Safety Gate → Broker → 永続化」の分岐 1 本を 1 シナリオとしてデータで表現する。**試験対象の判定はすべて本番コード**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / broker の状態機械)であり、runner は wiring・actual 収集・比較のみを行う(`tests/test_scenario_runner.py` の AST 検査が遷移表・validator の import を禁止)。`mark_submitting` / `record_unknown` ステップは store の公開 API による前提状態・観測の注入であり、ユースケースの合成ではない。
 
 **キャンセルは固定シナリオの対象外**(PR #96 レビュー): Production のキャンセル Execution ユースケース(サービス境界経由のキャンセル)は未実装であり、runner がキャンセル処理を合成すると「本番経路の再現」にならないため。FakeBroker のキャンセル振る舞い(成功・失敗・terminal 拒否・呼び出し記録)は `broker/tests/test_fake_broker.py`、Execution Store の CANCELLED 遷移は `tests/test_execution_store.py` の通常 pytest が検証する。キャンセルユースケース実装(別 Issue 候補)後に、その公開 API を呼ぶ形で固定シナリオを追加する。
 
@@ -52,7 +52,7 @@ python -m execution.scenario_runner --json                # machine-readable JSO
 
 - 出力: シナリオごとに `PASS / FAIL / ERROR` + scenario id + description、FAIL 時は不一致フィールドの expected/actual 差分、末尾に総数・PASS/FAIL/ERROR 数・実行時間・失敗シナリオ一覧。
 - 終了コード: **0 = 全シナリオ PASS のみ**。FAIL(expected 不一致)または ERROR(未処理例外)が 1 件でもあれば 1、usage・シナリオ定義エラーは 2。
-- コンソール encoding 非依存(PR #96 レビュー): 区切り文字は ASCII、`--json` は pure ASCII(`ensure_ascii`)、自由テキストは encode 不能文字をエスケープへ退避する。Windows 既定の cp932 コンソールでも(`PYTHONUTF8` なしで)クラッシュせず、終了コード契約が保たれる(cp932 を再現する pytest と Windows CI ジョブで固定)。
+- コンソール encoding 非依存(PR #96 レビュー): 区切り文字は ASCII、`--json` は pure ASCII(`ensure_ascii`)、自由テキストは encode 不能文字をエスケープへ退避する。Windows 既定の cp932 コンソールでも(`PYTHONUTF8` なしで)クラッシュせず、終了コード契約が保たれる(cp932 を再現する pytest と Windows CI ジョブで固定)。この encoding 退避は `main()` 実行中のみで、stdout / stderr の設定は正常終了・usage error・schema error・未処理例外のすべての経路で元へ復元される(import 時には一切変更しない。pytest で固定)。
 - CI では pytest スイート(`tests/test_fixed_scenarios.py` がシナリオ id 単位で parametrize)と CLI ステップ(Ubuntu / Windows)の両方で実行される。
 
 ### シナリオ定義(schema)
@@ -67,7 +67,7 @@ python -m execution.scenario_runner --json                # machine-readable JSO
 | `broker` | FakeBroker 設定: `default_fill_price` / `connection_target` / `scripts`(client_order_id → behavior: `fill_immediately`(`price`・`broker_order_id` 指定可)/ `stay_pending` / `partially_fill` / `reject` / `timeout` / `fail_communication`) |
 | `faults` | fault injection: `boundary` = `initial_save` / `mark_submitting` / `record_order_result` / `record_order_state` / `state_history` + `after_calls`(最初の N 回は成功させる) |
 | `steps` | 宣言的ステップ列。`register` / `submit` / `record_unknown` / `mark_submitting`(別 worker が遷移を獲得済みの状態を作る)/ `submit_concurrent`(`workers` 本の thread を barrier 同期で同時 submit)/ `register_concurrent`。各ステップは `expect`(outcome・状態・拒否コード・エラー分類)を持つ |
-| `expected` | 最終結果の比較: `final_phase` / `final_state` / `state_history`(履歴エントリのオブジェクト列。件数・順序は常に厳密比較。各エントリは `previous_state` / `new_state` 必須 + `reason` / `broker_order_id` の部分比較 — **キー省略 = 比較しない、明示 `null` = NULL であること**の区別あり。`changed_at_utc` の存在と単調性は宣言に関係なく常に検証、動的 timestamp の完全一致比較はしない)/ `broker_submit_calls` / `broker_cancel_calls` / `submitted_request`(Broker へ渡った request の部分一致)/ `order_rows` / `history_rows` / `safety_decisions` / `last_decision_allowed` / `last_decision_codes` / `broker_order_id` / `filled_quantity` / `average_fill_price` / `fill_prices` / `requested_price` / `reject_reason` / `listed_unknown` / `listed_unresolved` |
+| `expected` | 最終結果の比較: `final_phase` / `final_state` / `state_history`(履歴エントリのオブジェクト列。件数・順序は常に厳密比較。各エントリは `previous_state` / `new_state` 必須 + `reason` / `broker_order_id` の部分比較 — **キー省略 = 比較しない、明示 `null` = NULL であること**の区別あり。`changed_at_utc` の存在と単調性は宣言に関係なく常に検証、動的 timestamp の完全一致比較はしない)/ `broker_submit_calls` / `submitted_request`(Broker へ渡った request の部分一致)/ `order_rows` / `history_rows` / `safety_decisions` / `last_decision_allowed` / `last_decision_codes` / `broker_order_id` / `filled_quantity` / `average_fill_price` / `fill_prices` / `requested_price` / `reject_reason` / `listed_unknown` / `listed_unresolved` |
 
 実行ごとに変動する値は比較しない設計: runner は固定 clock(`NOW` = FakeBroker の決定的 clock base)を注入し、`broker_order_id` は比較したいシナリオが script で固定値を指定する。DB 採番値(history_id)は比較対象外。
 

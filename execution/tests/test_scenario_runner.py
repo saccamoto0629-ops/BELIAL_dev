@@ -394,3 +394,94 @@ def test_history_monotonicity_and_timestamp_presence_are_always_checked():
     missing_ts = [dict(entries[0], changed_at_utc="")]
     rendered = [m.render() for m in _history_mismatches([], missing_ts)]
     assert any("changed_at_utc" in line for line in rendered)
+
+
+# --- stream configuration is never leaked past main() (PR #96 review r2) -----
+
+
+def _stream_settings():
+    return (
+        getattr(sys.stdout, "encoding", None),
+        getattr(sys.stdout, "errors", None),
+        getattr(sys.stderr, "encoding", None),
+        getattr(sys.stderr, "errors", None),
+    )
+
+
+def test_main_restores_streams_after_a_normal_run(tmp_path):
+    directory = cli_dir(tmp_path, minimal_scenario())
+    before = _stream_settings()
+    assert main(["--scenario-dir", str(directory)]) == EXIT_OK
+    assert _stream_settings() == before
+
+
+def test_main_restores_streams_after_list_and_json(tmp_path):
+    directory = cli_dir(tmp_path, minimal_scenario())
+    before = _stream_settings()
+    assert main(["--scenario-dir", str(directory), "--list"]) == EXIT_OK
+    assert _stream_settings() == before
+    assert main(["--scenario-dir", str(directory), "--json"]) == EXIT_OK
+    assert _stream_settings() == before
+
+
+def test_main_restores_streams_after_a_mismatch(tmp_path):
+    failing = minimal_scenario(scenario_id="failing_one")
+    failing["expected"]["final_state"] = "cancelled"
+    directory = cli_dir(tmp_path, failing)
+    before = _stream_settings()
+    assert main(["--scenario-dir", str(directory)]) == EXIT_FAILURE
+    assert _stream_settings() == before
+
+
+def test_main_restores_streams_after_a_schema_error(tmp_path):
+    directory = cli_dir(tmp_path, minimal_scenario(expected={"nonsense": 1}))
+    before = _stream_settings()
+    assert main(["--scenario-dir", str(directory)]) == EXIT_USAGE_ERROR
+    assert _stream_settings() == before
+
+
+def test_main_restores_streams_after_a_usage_error():
+    before = _stream_settings()
+    with pytest.raises(SystemExit):
+        main(["--no-such-flag"])
+    assert _stream_settings() == before
+
+
+def test_main_restores_streams_after_an_unexpected_exception(tmp_path, monkeypatch):
+    directory = cli_dir(tmp_path, minimal_scenario())
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(scenario_runner, "run_scenarios", explode)
+    before = _stream_settings()
+    with pytest.raises(RuntimeError, match="boom"):
+        main(["--scenario-dir", str(directory)])
+    assert _stream_settings() == before
+
+
+def test_cp932_strict_stream_is_restored_to_strict_after_main(tmp_path, monkeypatch):
+    directory = cli_dir(tmp_path, minimal_scenario())
+    buffer, stream = _cp932_stdout(monkeypatch)
+    assert main(["--scenario-dir", str(directory)]) == EXIT_OK
+    # the strict policy the caller configured is back in place
+    assert sys.stdout.errors == "strict"
+    stream.flush()
+    assert "PASS minimal_ok" in buffer.getvalue().decode("cp932")
+
+
+def test_importing_the_runner_never_touches_stream_configuration():
+    import subprocess
+    from pathlib import Path
+
+    repo_root = Path(scenario_runner.__file__).resolve().parents[1]
+    code = (
+        "import sys; before = (sys.stdout.errors, sys.stderr.errors); "
+        "import execution.scenario_runner; "
+        "assert (sys.stdout.errors, sys.stderr.errors) == before; print('ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=repo_root, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
