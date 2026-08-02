@@ -37,7 +37,7 @@ from execution.live_submission import LiveOrderSubmissionService
 
 実発注処理は実相場や Broker 障害を待って検証できないため、正常約定だけでなく拒否・部分約定・timeout(結果不明)・DB保存失敗・多重起動競合などを**固定データから決定的に再現**する試験基盤(固定シナリオは現在 **21 件**)。通常の pytest がモジュール単位の観点を固定するのに対し、固定シナリオは「入力 → Safety Gate → Broker → 永続化」の分岐 1 本を 1 シナリオとしてデータで表現する。**試験対象の判定はすべて本番コード**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / broker の状態機械)であり、runner は wiring・actual 収集・比較のみを行う(`tests/test_scenario_runner.py` の AST 検査が遷移表・validator の import を禁止)。`mark_submitting` / `record_unknown` ステップは store の公開 API による前提状態・観測の注入であり、ユースケースの合成ではない。
 
-**キャンセルは固定シナリオの対象外**(PR #96 レビュー): Production のキャンセル Execution ユースケース(サービス境界経由のキャンセル)は未実装であり、runner がキャンセル処理を合成すると「本番経路の再現」にならないため。FakeBroker のキャンセル振る舞い(成功・失敗・terminal 拒否・呼び出し記録)は `broker/tests/test_fake_broker.py`、Execution Store の CANCELLED 遷移は `tests/test_execution_store.py` の通常 pytest が検証する。キャンセルユースケース実装(別 Issue 候補)後に、その公開 API を呼ぶ形で固定シナリオを追加する。
+**キャンセルは固定シナリオの対象外**(Issue #77 / PR #96 レビュー): Production のキャンセル Execution ユースケース(サービス境界経由のキャンセル)は未実装であり、runner がキャンセル処理を合成すると「本番経路の再現」にならないため。FakeBroker のキャンセル振る舞い(成功・失敗・terminal 拒否・呼び出し記録)は `broker/tests/test_fake_broker.py`、Execution Store の CANCELLED 遷移は `tests/test_execution_store.py` の通常 pytest が検証する。Production キャンセル Execution ユースケースは [Issue #99](https://github.com/saccamoto0629-ops/BELIAL_dev/issues/99) で扱い、その実装後に公開 API を呼ぶ形でキャンセル固定シナリオを復帰させる。
 
 ### 実行方法
 
