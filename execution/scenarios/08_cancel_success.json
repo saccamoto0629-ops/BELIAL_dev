@@ -1,0 +1,72 @@
+{
+  "scenario_id": "cancel_success",
+  "description": "キャンセル成功: ACCEPTEDの注文をキャンセルし、CANCELLEDへの遷移が本番の状態機械検証を通って保存される",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-8"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "cancelled",
+        "state": "cancelled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "cancelled",
+    "state_history": [
+      [
+        null,
+        "pending"
+      ],
+      [
+        "pending",
+        "accepted"
+      ],
+      [
+        "accepted",
+        "cancelled"
+      ]
+    ],
+    "broker_submit_calls": 1,
+    "broker_cancel_calls": 1,
+    "broker_order_id": "BRK-8",
+    "filled_quantity": "0",
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

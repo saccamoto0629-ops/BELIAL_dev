@@ -1,0 +1,79 @@
+{
+  "scenario_id": "normal_market_order",
+  "description": "正常な成行注文: Safety Gate通過 → Broker送信 → 全量約定 → FILLEDで保存される",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "fill_immediately",
+        "price": "150.25",
+        "broker_order_id": "BRK-1"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "filled",
+    "state_history": [
+      [
+        null,
+        "pending"
+      ],
+      [
+        "pending",
+        "filled"
+      ]
+    ],
+    "broker_submit_calls": 1,
+    "broker_cancel_calls": 0,
+    "submitted_request": {
+      "client_order_id": "client-1",
+      "symbol": "USD_JPY",
+      "side": "buy",
+      "order_type": "market",
+      "quantity": "1",
+      "limit_price": null
+    },
+    "order_rows": 1,
+    "history_rows": 2,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "broker_order_id": "BRK-1",
+    "filled_quantity": "1",
+    "average_fill_price": "150.25",
+    "fill_prices": [
+      "150.25"
+    ],
+    "requested_price": null,
+    "reject_reason": null,
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "scenario_id": "concurrent_register_same_signal",
+  "description": "多重起動相当の競合(register): 同一source signalから3workerが同時に別Requestを登録してもUNIQUE制約により行は1件だけ残り、敗者はconflictとして明示される",
+  "steps": [
+    {
+      "action": "register_concurrent",
+      "registrations": [
+        {
+          "request": {
+            "execution_request_id": "exec-1",
+            "signal_id": "signal-1",
+            "strategy_id": "strategy-1",
+            "symbol": "USD_JPY",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": "1",
+            "stop_loss_price": "149.50",
+            "take_profit_price": "151.50"
+          },
+          "client_order_id": "client-1"
+        },
+        {
+          "request": {
+            "execution_request_id": "exec-2",
+            "signal_id": "signal-1",
+            "strategy_id": "strategy-1",
+            "symbol": "USD_JPY",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": "1",
+            "stop_loss_price": "149.50",
+            "take_profit_price": "151.50"
+          },
+          "client_order_id": "client-2"
+        },
+        {
+          "request": {
+            "execution_request_id": "exec-3",
+            "signal_id": "signal-1",
+            "strategy_id": "strategy-1",
+            "symbol": "USD_JPY",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": "1",
+            "stop_loss_price": "149.50",
+            "take_profit_price": "151.50"
+          },
+          "client_order_id": "client-3"
+        }
+      ],
+      "expect": {
+        "registered": 1,
+        "conflicts": 2,
+        "errors": 0
+      }
+    }
+  ],
+  "expected": {
+    "order_rows": 1,
+    "history_rows": 0,
+    "broker_submit_calls": 0
+  }
+}

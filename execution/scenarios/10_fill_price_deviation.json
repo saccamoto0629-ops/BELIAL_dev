@@ -1,0 +1,57 @@
+{
+  "scenario_id": "fill_price_deviation",
+  "description": "約定価格の乖離: requested price(指値)と異なるfill priceで約定してもrequested priceは上書きされず、両方が保存される",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "fill_immediately",
+        "price": "149.95",
+        "broker_order_id": "BRK-10"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50",
+        "requested_price": "150.00"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_state": "filled",
+    "broker_submit_calls": 1,
+    "submitted_request": {
+      "order_type": "limit",
+      "limit_price": "150.00"
+    },
+    "broker_order_id": "BRK-10",
+    "requested_price": "150.00",
+    "average_fill_price": "149.95",
+    "fill_prices": [
+      "149.95"
+    ],
+    "filled_quantity": "1"
+  }
+}
