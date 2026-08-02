@@ -536,3 +536,196 @@ def test_connection_identity_target_comes_from_constructor_config():
 def test_invalid_connection_target_is_rejected_at_construction(bad_target):
     with pytest.raises(m.BrokerInvalidRequestError):
         fb.FakeBroker(connection_target=bad_target)
+
+
+# --- Issue #77 minimal extensions: cancel-call recording / pinned broker id --
+
+def test_fake_broker_records_every_cancel_attempt():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    broker.script_cancel("c-1", fb.FailCancellation(reason="refused"))
+    broker.submit_order(make_request())
+    with pytest.raises(m.BrokerCancellationError):
+        broker.cancel_order("c-1")
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.cancel_order("no-such-order")
+    # failed and not-found cancels are attempts too — both are recorded
+    assert broker.cancel_requests == ["c-1", "no-such-order"]
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        fb.FillImmediately(price=Decimal("2400"), broker_order_id="BRK-PINNED"),
+        fb.StayPending(broker_order_id="BRK-PINNED"),
+        fb.PartiallyFill(
+            fills=((Decimal("2400"), Decimal("4")),), broker_order_id="BRK-PINNED"
+        ),
+    ],
+)
+def test_scripts_can_pin_the_broker_order_id(script):
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", script)
+    result = broker.submit_order(make_request())
+    assert result.broker_order_id == "BRK-PINNED"
+
+
+def test_unpinned_scripts_keep_the_sequential_broker_order_id():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    assert broker.submit_order(make_request()).broker_order_id == "FAKE-1"
+
+
+@pytest.mark.parametrize("bad_id", ["", "   ", 42])
+def test_invalid_pinned_broker_order_id_fails_at_construction(bad_id):
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.StayPending(broker_order_id=bad_id)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FillImmediately(broker_order_id=bad_id)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.PartiallyFill(fills=((Decimal("1"), Decimal("1")),), broker_order_id=bad_id)
+
+
+# --- Issue #77 review r1: broker_order_id uniqueness across orders -----------
+
+def test_same_pinned_broker_order_id_on_two_orders_rejects_the_second():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))
+    broker.script_order("c-2", fb.FillImmediately(price=Decimal("2400"), broker_order_id="DUP"))
+    broker.submit_order(make_request("c-1"))
+    with pytest.raises(m.BrokerInvalidRequestError, match="already assigned"):
+        broker.submit_order(make_request("c-2"))
+
+
+def test_rejected_duplicate_pinned_id_leaves_no_partial_order_behind():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))
+    broker.script_order("c-2", fb.StayPending(broker_order_id="DUP"))
+    broker.submit_order(make_request("c-1"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request("c-2"))
+    # no half-registered order: c-2 is unknown to the broker...
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.get_order("c-2")
+    # ...the attempt is still recorded, and c-2 can retry under a free ID
+    assert [r.client_order_id for r in broker.submitted_requests] == ["c-1", "c-2"]
+    broker.script_order("c-2", fb.StayPending(broker_order_id="FREE"))
+    assert broker.submit_order(make_request("c-2")).broker_order_id == "FREE"
+
+
+def test_sequential_ids_skip_over_a_pinned_collision():
+    broker = fb.FakeBroker()
+    # pin the value the sequence would produce next
+    broker.script_order("c-1", fb.StayPending(broker_order_id="FAKE-1"))
+    broker.submit_order(make_request("c-1"))
+    result = broker.submit_order(make_request("c-2"))
+    # auto-numbering shares the uniqueness set and safely advances past FAKE-1
+    assert result.broker_order_id == "FAKE-2"
+
+
+def test_pinning_an_already_auto_assigned_id_is_rejected():
+    broker = fb.FakeBroker()
+    first = broker.submit_order(make_request("c-1"))
+    assert first.broker_order_id == "FAKE-1"
+    broker.script_order("c-2", fb.StayPending(broker_order_id="FAKE-1"))
+    with pytest.raises(m.BrokerInvalidRequestError, match="already assigned"):
+        broker.submit_order(make_request("c-2"))
+
+
+def test_unpinned_ids_stay_a_unique_plain_sequence():
+    broker = fb.FakeBroker()
+    ids = [
+        broker.submit_order(make_request(f"c-{n}")).broker_order_id for n in range(1, 4)
+    ]
+    assert ids == ["FAKE-1", "FAKE-2", "FAKE-3"]
+
+
+def test_concurrent_submits_never_share_a_broker_order_id():
+    import threading
+
+    broker = fb.FakeBroker()
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+    results: list[m.OrderResult | None] = [None] * worker_count
+
+    def submit(index: int) -> None:
+        request = make_request(f"c-{index}")
+        barrier.wait(timeout=30)
+        results[index] = broker.submit_order(request)
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assigned = [result.broker_order_id for result in results]
+    assert None not in results
+    assert len(set(assigned)) == worker_count
+
+
+# --- Issue #77 review r2: rejection atomicity of broker_order_id duplicates --
+# Contract: ``submitted_requests`` records every submit ATTEMPT (rejected
+# ones included) -- it is a call log, not a book of accepted orders. All
+# OTHER internal state (fill sequence, deterministic clock, orders, assigned
+# broker IDs) must be completely untouched by a rejected submit.
+
+def test_fill_immediately_duplicate_id_rejection_consumes_nothing():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))
+    broker.script_order("c-2", fb.FillImmediately(price=Decimal("2400"), broker_order_id="DUP"))
+    broker.submit_order(make_request("c-1"))
+    fill_seq_before, tick_before = broker._fill_seq, broker._tick
+    assigned_before = set(broker._assigned_broker_order_ids)
+
+    with pytest.raises(m.BrokerInvalidRequestError, match="already assigned"):
+        broker.submit_order(make_request("c-2"))
+
+    # the failed order consumed no fill IDs, no clock ticks, no order slot
+    # and no broker-ID assignment; only the attempt log grew
+    assert broker._fill_seq == fill_seq_before
+    assert broker._tick == tick_before
+    assert set(broker._assigned_broker_order_ids) == assigned_before
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.get_order("c-2")
+    assert [r.client_order_id for r in broker.submitted_requests] == ["c-1", "c-2"]
+
+
+def test_partially_fill_duplicate_id_rejection_consumes_nothing():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))
+    broker.script_order(
+        "c-2",
+        fb.PartiallyFill(fills=((Decimal("2400"), Decimal("4")),), broker_order_id="DUP"),
+    )
+    broker.submit_order(make_request("c-1"))
+    fill_seq_before, tick_before = broker._fill_seq, broker._tick
+    assigned_before = set(broker._assigned_broker_order_ids)
+
+    with pytest.raises(m.BrokerInvalidRequestError, match="already assigned"):
+        broker.submit_order(make_request("c-2"))
+
+    assert broker._fill_seq == fill_seq_before
+    assert broker._tick == tick_before
+    assert set(broker._assigned_broker_order_ids) == assigned_before
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.get_order("c-2")
+
+
+def test_order_after_a_duplicate_rejection_gets_contiguous_fill_ids_and_timestamps():
+    from datetime import timedelta
+
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))  # consumes 1 tick
+    broker.script_order("c-2", fb.FillImmediately(price=Decimal("2400"), broker_order_id="DUP"))
+    broker.submit_order(make_request("c-1"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request("c-2"))
+
+    result = broker.submit_order(make_request("c-3"))
+    # first fill ever issued: the rejected c-2 burned neither a fill ID...
+    assert result.fills[0].fill_id == "FILL-1"
+    # ...nor clock ticks: fill at base+2s, result at base+3s (c-1 took +1s)
+    base = fb._CLOCK_BASE
+    assert result.fills[0].filled_at_utc == base + timedelta(seconds=2)
+    assert result.updated_at_utc == base + timedelta(seconds=3)
+    assert result.broker_order_id == "FAKE-1"

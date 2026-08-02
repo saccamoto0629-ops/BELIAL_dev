@@ -1,0 +1,69 @@
+{
+  "scenario_id": "invalid_state_transition_rejected_by_store",
+  "description": "不正な状態遷移: terminal状態(FILLED)からUNKNOWNへの遷移は本番状態機械が拒否し、状態も履歴も変化しない",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "fill_immediately",
+        "price": "150.25",
+        "broker_order_id": "BRK-22"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    },
+    {
+      "action": "record_unknown",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "error",
+        "error_type": "ValueError"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "filled",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "filled",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-22"
+      }
+    ],
+    "history_rows": 2,
+    "broker_submit_calls": 1
+  }
+}

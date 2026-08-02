@@ -32,6 +32,7 @@ second per event) unless the test supplies its own ``clock`` callable.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -85,21 +86,40 @@ def _require_id(client_order_id) -> None:
         )
 
 
+def _require_optional_broker_order_id(value, field_name: str) -> None:
+    # Issue #77: scripts that acknowledge an order may pin the broker-assigned
+    # ID so scenario expectations compare against a fixed value instead of the
+    # FAKE-<n> sequence. None keeps the sequential default.
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise BrokerInvalidRequestError(
+            f"{field_name} must be a non-empty string or None, got {value!r}"
+        )
+
+
 @dataclass(frozen=True)
 class FillImmediately:
     """Fill the whole order at ``price`` (falls back to the request's limit
-    price, then the broker's ``default_fill_price``)."""
+    price, then the broker's ``default_fill_price``). ``broker_order_id``
+    optionally pins the broker-assigned ID (default: next ``FAKE-<n>``)."""
 
     price: Decimal | None = None
+    broker_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.price is not None:
             _require_valid_price(self.price, "FillImmediately.price")
+        _require_optional_broker_order_id(self.broker_order_id, "FillImmediately.broker_order_id")
 
 
 @dataclass(frozen=True)
 class StayPending:
-    """Broker accepts the order but nothing fills (state ``ACCEPTED``)."""
+    """Broker accepts the order but nothing fills (state ``ACCEPTED``).
+    ``broker_order_id`` optionally pins the broker-assigned ID."""
+
+    broker_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_optional_broker_order_id(self.broker_order_id, "StayPending.broker_order_id")
 
 
 @dataclass(frozen=True)
@@ -109,9 +129,10 @@ class PartiallyFill:
     Each price/quantity must be a positive finite Decimal. The comparison
     against the ORDER quantity happens at submit time: the total must be
     strictly less than the requested quantity (use ``FillImmediately`` for a
-    full fill)."""
+    full fill). ``broker_order_id`` optionally pins the broker-assigned ID."""
 
     fills: tuple[tuple[Decimal, Decimal], ...]
+    broker_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.fills, tuple) or not self.fills:
@@ -126,6 +147,7 @@ class PartiallyFill:
             price, quantity = entry
             _require_valid_price(price, "PartiallyFill price")
             _require_valid_price(quantity, "PartiallyFill quantity")
+        _require_optional_broker_order_id(self.broker_order_id, "PartiallyFill.broker_order_id")
 
 
 @dataclass(frozen=True)
@@ -227,6 +249,19 @@ class FakeBroker:
         self._orders: dict[str, OrderResult] = {}
         self._positions: tuple[PositionInfo, ...] = ()
         self.submitted_requests: list[OrderRequest] = []
+        # Issue #77: every cancel ATTEMPT is recorded (like submitted_requests
+        # records every submit attempt), so tests can assert call counts even
+        # for cancels that fail or target unknown orders.
+        self.cancel_requests: list[str] = []
+        # Issue #77 review r1: broker order IDs are unique ACROSS ORDERS,
+        # matching the execution store's DB-wide UNIQUE contract. Pinned and
+        # sequential IDs share this one assignment set; an ID enters it only
+        # together with its stored order, so a rejected submit leaves nothing
+        # behind. submit/cancel run under one lock, making sequencing,
+        # duplicate checks, order storage and call recording atomic for
+        # concurrency tests.
+        self._assigned_broker_order_ids: set[str] = set()
+        self._lock = threading.Lock()
 
     # --- test-side configuration -------------------------------------------
     #
@@ -279,8 +314,14 @@ class FakeBroker:
         return _CLOCK_BASE + timedelta(seconds=self._tick)
 
     def _next_broker_order_id(self) -> str:
-        self._order_seq += 1
-        return f"FAKE-{self._order_seq}"
+        # Sequential IDs share the uniqueness set with pinned IDs: when a
+        # pinned ID already took FAKE-<n>, the sequence safely skips ahead to
+        # the next free number instead of colliding.
+        while True:
+            self._order_seq += 1
+            candidate = f"FAKE-{self._order_seq}"
+            if candidate not in self._assigned_broker_order_ids:
+                return candidate
 
     def _next_fill_id(self) -> str:
         self._fill_seq += 1
@@ -291,6 +332,13 @@ class FakeBroker:
     def submit_order(self, request: OrderRequest) -> OrderResult:
         if not isinstance(request, OrderRequest):
             raise BrokerInvalidRequestError(f"request must be an OrderRequest, got {request!r}")
+        # One lock around duplicate checks, ID assignment, order storage and
+        # call recording: concurrent submitters can never interleave between
+        # "check the ID is free" and "store the order under it".
+        with self._lock:
+            return self._submit_order_locked(request)
+
+    def _submit_order_locked(self, request: OrderRequest) -> OrderResult:
         if request.client_order_id in self._orders:
             raise BrokerInvalidRequestError(
                 f"duplicate client_order_id {request.client_order_id!r}",
@@ -317,6 +365,13 @@ class FakeBroker:
                 client_order_id=request.client_order_id,
             )
 
+        # Rejection atomicity (PR #96 review r2): every branch below runs in
+        # the same strict order -- (1) side-effect-free validation, (2)
+        # broker_order_id resolution incl. the duplicate check, (3) fill /
+        # timestamp generation, (4) result construction, (5) registration.
+        # A submit rejected at (1) or (2) therefore consumes NO fill IDs, NO
+        # clock ticks and NO sequence numbers -- the failed order is
+        # observable only in submitted_requests (the attempt record).
         if isinstance(script, RejectOrder):
             result = self._result(
                 request,
@@ -326,10 +381,11 @@ class FakeBroker:
                 reject_reason=script.reason,
             )
         elif isinstance(script, StayPending):
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
             result = self._result(
                 request,
                 state=OrderState.ACCEPTED,
-                broker_order_id=self._next_broker_order_id(),
+                broker_order_id=broker_order_id,
                 fills=(),
             )
         elif isinstance(script, PartiallyFill):
@@ -340,11 +396,12 @@ class FakeBroker:
                     f"({request.quantity}), got {total}",
                     client_order_id=request.client_order_id,
                 )
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
             fills = self._build_fills(script.fills)
             result = self._result(
                 request,
                 state=OrderState.PARTIALLY_FILLED,
-                broker_order_id=self._next_broker_order_id(),
+                broker_order_id=broker_order_id,
                 fills=fills,
             )
         elif isinstance(script, FillImmediately):
@@ -362,20 +419,30 @@ class FakeBroker:
                     "or configure FakeBroker(default_fill_price=...)",
                     client_order_id=request.client_order_id,
                 )
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
             fills = (Fill(self._next_fill_id(), price, request.quantity, self._now()),)
             result = self._result(
                 request,
                 state=OrderState.FILLED,
-                broker_order_id=self._next_broker_order_id(),
+                broker_order_id=broker_order_id,
                 fills=fills,
             )
         else:  # unreachable while script_order()/__init__ validate script types
             raise BrokerInvalidRequestError(f"unknown submit script {script!r}")
 
+        # The ID joins the assignment set only together with its stored order,
+        # so a submit rejected above leaves neither an order nor a burned ID.
+        if result.broker_order_id is not None:
+            self._assigned_broker_order_ids.add(result.broker_order_id)
         self._orders[request.client_order_id] = result
         return result
 
     def cancel_order(self, client_order_id: str) -> OrderResult:
+        with self._lock:
+            return self._cancel_order_locked(client_order_id)
+
+    def _cancel_order_locked(self, client_order_id: str) -> OrderResult:
+        self.cancel_requests.append(client_order_id)
         current = self._orders.get(client_order_id)
         if current is None:
             raise BrokerOrderNotFoundError(
@@ -435,6 +502,22 @@ class FakeBroker:
         return self._connection_identity
 
     # --- helpers -------------------------------------------------------------
+
+    def _resolve_broker_order_id(self, script, client_order_id: str) -> str:
+        """Resolve the ID an accepting branch WILL use, duplicate check
+        included, BEFORE any fill / timestamp / sequence side effect: a
+        pinned duplicate raises here having consumed nothing (r2 atomicity);
+        an unpinned script advances the sequence only after every validation
+        that could still reject the order has passed."""
+        if script.broker_order_id is not None:
+            if script.broker_order_id in self._assigned_broker_order_ids:
+                raise BrokerInvalidRequestError(
+                    f"broker_order_id {script.broker_order_id!r} is already assigned to "
+                    "another order; broker order IDs are unique across orders",
+                    client_order_id=client_order_id,
+                )
+            return script.broker_order_id
+        return self._next_broker_order_id()
 
     def _build_fills(self, price_qty_pairs: tuple[tuple[Decimal, Decimal], ...]) -> tuple[Fill, ...]:
         return tuple(

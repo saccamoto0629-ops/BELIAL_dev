@@ -1,0 +1,78 @@
+{
+  "scenario_id": "timeout_unknown_no_resend",
+  "description": "Broker受付後のタイムアウト: 注文が受け付けられた可能性がある状態はUNKNOWNになり照会対象として残る。同一Requestの再実行はduplicate_submissionで拒否されBroker呼び出し回数は増えない",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "timeout"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "error",
+        "error_type": "BrokerTimeoutError",
+        "error_code": "timeout"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "rejected",
+        "rejection_codes": [
+          "duplicate_submission"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitting",
+    "final_state": "unknown",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "unknown",
+        "broker_order_id": null
+      }
+    ],
+    "broker_submit_calls": 1,
+    "order_rows": 1,
+    "history_rows": 2,
+    "safety_decisions": 2,
+    "last_decision_allowed": false,
+    "last_decision_codes": [
+      "duplicate_submission"
+    ],
+    "broker_order_id": null,
+    "listed_unknown": true,
+    "listed_unresolved": true
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "scenario_id": "same_request_id_different_payload_suppressed",
+  "description": "同一execution_request_idと異なるpayload: 同じIDで異なる内容の再登録はconflictで抑止され、最初に保存されたpayloadが変化しない",
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-2",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-2",
+      "expect": {
+        "outcome": "conflict"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_state": "filled",
+    "order_rows": 1,
+    "broker_submit_calls": 1,
+    "submitted_request": {
+      "client_order_id": "client-1",
+      "quantity": "1"
+    }
+  }
+}

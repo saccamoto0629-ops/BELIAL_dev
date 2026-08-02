@@ -1,0 +1,53 @@
+{
+  "scenario_id": "multiple_gate_violations",
+  "description": "Safety Gate複数条件違反: 数量上限超過・stale price・kill switchが同時に違反した場合、全違反コードが1つの判定に収集される",
+  "gate": {
+    "kill_switch": true
+  },
+  "market": {
+    "age_seconds": 60
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "20",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "rejected",
+        "rejection_codes": [
+          "kill_switch_enabled",
+          "quantity_limit_exceeded",
+          "reference_price_stale"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "created",
+    "broker_submit_calls": 0,
+    "safety_decisions": 1,
+    "last_decision_allowed": false,
+    "last_decision_codes": [
+      "kill_switch_enabled",
+      "quantity_limit_exceeded",
+      "reference_price_stale"
+    ]
+  }
+}

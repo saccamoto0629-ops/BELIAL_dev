@@ -71,9 +71,19 @@ jobs:
       - name: Run execution tests
         run: python -m pytest execution/tests -q
 
+      # Issue #77: fixed execution scenarios via the runner CLI. The same
+      # scenarios also run inside "Run execution tests" (test_fixed_scenarios
+      # parametrizes per scenario id); this extra step pins the CLI contract
+      # -- human-readable per-scenario PASS/FAIL output and a non-zero exit
+      # code on any mismatch -- and costs ~2s. tmp-dir SQLite + FakeBroker
+      # only: no secrets, no network, fully reproducible.
+      - name: Run fixed execution scenarios (CLI)
+        run: python -m execution.scenario_runner
+
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
-      # the same rule; Issue #75 adds the Safety Gate modules.
+      # the same rule; Issue #75 adds the Safety Gate modules; Issue #77 adds
+      # the scenario runner modules.
       - name: Verify root-level broker package imports
         run: |
           python -c "from broker.broker_interface import Broker"
@@ -84,6 +94,8 @@ jobs:
           python -c "from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy"
           python -c "from execution.safety_store import SQLiteSafetyDecisionStore"
           python -c "from execution.live_submission import LiveOrderSubmissionService"
+          python -c "from execution.scenario_models import load_scenarios, validate_scenario"
+          python -c "from execution.scenario_runner import main, run_scenarios"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot
@@ -111,3 +123,15 @@ jobs:
 
       - name: Run paper-execution tests (Windows)
         run: python -m pytest paper-execution/tests -q
+
+      # PR #96 review r1 (Issue #77): the scenario CLI must not depend on the
+      # console encoding. Windows pipes stdout through the ANSI codepage (not
+      # UTF-8), so an encoding regression that would crash the default
+      # Japanese cp932 console fails here too. PYTHONUTF8 is deliberately NOT
+      # set. Same isolation as the Ubuntu step: FakeBroker + per-scenario
+      # tmp-dir SQLite, no secrets, no network.
+      - name: Run fixed execution scenarios CLI (Windows)
+        run: |
+          python -m execution.scenario_runner
+          python -m execution.scenario_runner --list
+          python -m execution.scenario_runner --json

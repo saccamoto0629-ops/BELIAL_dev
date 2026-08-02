@@ -91,6 +91,7 @@ v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続
 
 - **Paper Execution**(`paper-execution/`): 保存済みPaper Signalから仮想Entry / Position / SL / TP / Exitを判定する別レイヤー。実発注を行うLive Executionは未実装・非スコープ。
 - **外部 Strategy 定義(YAML)の Loader / Validation**(Issue #53): Strategy ごとの可変設定を YAML で外部化し、`--strategy-file <path>`(単一ファイル)または `--strategy <id>`(`backtest/strategies/` ディレクトリ、`STRATEGY_DEFINITIONS_DIR` で上書き可)で opt-in 実行する。現在利用するのはBacktest経路のみであり、Paper Signal / Paper Executionとの定義共有は未実装。スキーマは [Strategy 定義仕様](docs/architecture/strategy_definition.md)、使用方法は [docs/backtest.md](docs/backtest.md) を参照。
+- **Execution 固定シナリオ試験**(Issue #77): 将来の Live Execution 用に実装済みの Execution 基盤(Issue #73–#76)の主要分岐(正常約定 / 拒否 / 部分約定 / timeout=UNKNOWN / DB保存失敗 / Safety Gate 拒否 / 多重起動競合など)を、FakeBroker と一時 DB のみで固定データから再現・検証するシナリオ runner(`python -m execution.scenario_runner`)。外部通信・実発注は一切行わない。詳細は [execution/README.md](execution/README.md) の「固定シナリオ試験」節を参照。
 
 詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
 

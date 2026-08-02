@@ -1,0 +1,58 @@
+{
+  "scenario_id": "resubmit_after_accepted",
+  "description": "ACCEPTED状態の再実行: Brokerに受付済みのRequestを再実行してもduplicate_submissionで拒否され、Broker呼び出し回数は増えない",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-19"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "rejected",
+        "rejection_codes": [
+          "duplicate_submission"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "accepted",
+    "broker_submit_calls": 1,
+    "broker_order_id": "BRK-19",
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

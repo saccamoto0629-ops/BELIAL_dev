@@ -1,0 +1,73 @@
+{
+  "scenario_id": "communication_failure_unknown",
+  "description": "Broker送信中の通信失敗: 例外でも「未送信」へ降格せずUNKNOWNを記録し、再実行してもBrokerへ再送されない",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "fail_communication"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "error",
+        "error_type": "BrokerCommunicationError",
+        "error_code": "communication_failure"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "rejected",
+        "rejection_codes": [
+          "duplicate_submission"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitting",
+    "final_state": "unknown",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "unknown",
+        "broker_order_id": null
+      }
+    ],
+    "broker_submit_calls": 1,
+    "order_rows": 1,
+    "history_rows": 2,
+    "broker_order_id": null,
+    "listed_unknown": true,
+    "listed_unresolved": true
+  }
+}
