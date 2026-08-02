@@ -584,3 +584,80 @@ def test_invalid_pinned_broker_order_id_fails_at_construction(bad_id):
         fb.FillImmediately(broker_order_id=bad_id)
     with pytest.raises(m.BrokerInvalidRequestError):
         fb.PartiallyFill(fills=((Decimal("1"), Decimal("1")),), broker_order_id=bad_id)
+
+
+# --- Issue #77 review r1: broker_order_id uniqueness across orders -----------
+
+def test_same_pinned_broker_order_id_on_two_orders_rejects_the_second():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))
+    broker.script_order("c-2", fb.FillImmediately(price=Decimal("2400"), broker_order_id="DUP"))
+    broker.submit_order(make_request("c-1"))
+    with pytest.raises(m.BrokerInvalidRequestError, match="already assigned"):
+        broker.submit_order(make_request("c-2"))
+
+
+def test_rejected_duplicate_pinned_id_leaves_no_partial_order_behind():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending(broker_order_id="DUP"))
+    broker.script_order("c-2", fb.StayPending(broker_order_id="DUP"))
+    broker.submit_order(make_request("c-1"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request("c-2"))
+    # no half-registered order: c-2 is unknown to the broker...
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.get_order("c-2")
+    # ...the attempt is still recorded, and c-2 can retry under a free ID
+    assert [r.client_order_id for r in broker.submitted_requests] == ["c-1", "c-2"]
+    broker.script_order("c-2", fb.StayPending(broker_order_id="FREE"))
+    assert broker.submit_order(make_request("c-2")).broker_order_id == "FREE"
+
+
+def test_sequential_ids_skip_over_a_pinned_collision():
+    broker = fb.FakeBroker()
+    # pin the value the sequence would produce next
+    broker.script_order("c-1", fb.StayPending(broker_order_id="FAKE-1"))
+    broker.submit_order(make_request("c-1"))
+    result = broker.submit_order(make_request("c-2"))
+    # auto-numbering shares the uniqueness set and safely advances past FAKE-1
+    assert result.broker_order_id == "FAKE-2"
+
+
+def test_pinning_an_already_auto_assigned_id_is_rejected():
+    broker = fb.FakeBroker()
+    first = broker.submit_order(make_request("c-1"))
+    assert first.broker_order_id == "FAKE-1"
+    broker.script_order("c-2", fb.StayPending(broker_order_id="FAKE-1"))
+    with pytest.raises(m.BrokerInvalidRequestError, match="already assigned"):
+        broker.submit_order(make_request("c-2"))
+
+
+def test_unpinned_ids_stay_a_unique_plain_sequence():
+    broker = fb.FakeBroker()
+    ids = [
+        broker.submit_order(make_request(f"c-{n}")).broker_order_id for n in range(1, 4)
+    ]
+    assert ids == ["FAKE-1", "FAKE-2", "FAKE-3"]
+
+
+def test_concurrent_submits_never_share_a_broker_order_id():
+    import threading
+
+    broker = fb.FakeBroker()
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+    results: list[m.OrderResult | None] = [None] * worker_count
+
+    def submit(index: int) -> None:
+        request = make_request(f"c-{index}")
+        barrier.wait(timeout=30)
+        results[index] = broker.submit_order(request)
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assigned = [result.broker_order_id for result in results]
+    assert None not in results
+    assert len(set(assigned)) == worker_count

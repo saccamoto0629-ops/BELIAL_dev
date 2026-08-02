@@ -32,6 +32,7 @@ second per event) unless the test supplies its own ``clock`` callable.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -252,6 +253,15 @@ class FakeBroker:
         # records every submit attempt), so tests can assert call counts even
         # for cancels that fail or target unknown orders.
         self.cancel_requests: list[str] = []
+        # Issue #77 review r1: broker order IDs are unique ACROSS ORDERS,
+        # matching the execution store's DB-wide UNIQUE contract. Pinned and
+        # sequential IDs share this one assignment set; an ID enters it only
+        # together with its stored order, so a rejected submit leaves nothing
+        # behind. submit/cancel run under one lock, making sequencing,
+        # duplicate checks, order storage and call recording atomic for
+        # concurrency tests.
+        self._assigned_broker_order_ids: set[str] = set()
+        self._lock = threading.Lock()
 
     # --- test-side configuration -------------------------------------------
     #
@@ -304,8 +314,14 @@ class FakeBroker:
         return _CLOCK_BASE + timedelta(seconds=self._tick)
 
     def _next_broker_order_id(self) -> str:
-        self._order_seq += 1
-        return f"FAKE-{self._order_seq}"
+        # Sequential IDs share the uniqueness set with pinned IDs: when a
+        # pinned ID already took FAKE-<n>, the sequence safely skips ahead to
+        # the next free number instead of colliding.
+        while True:
+            self._order_seq += 1
+            candidate = f"FAKE-{self._order_seq}"
+            if candidate not in self._assigned_broker_order_ids:
+                return candidate
 
     def _next_fill_id(self) -> str:
         self._fill_seq += 1
@@ -316,6 +332,13 @@ class FakeBroker:
     def submit_order(self, request: OrderRequest) -> OrderResult:
         if not isinstance(request, OrderRequest):
             raise BrokerInvalidRequestError(f"request must be an OrderRequest, got {request!r}")
+        # One lock around duplicate checks, ID assignment, order storage and
+        # call recording: concurrent submitters can never interleave between
+        # "check the ID is free" and "store the order under it".
+        with self._lock:
+            return self._submit_order_locked(request)
+
+    def _submit_order_locked(self, request: OrderRequest) -> OrderResult:
         if request.client_order_id in self._orders:
             raise BrokerInvalidRequestError(
                 f"duplicate client_order_id {request.client_order_id!r}",
@@ -354,7 +377,7 @@ class FakeBroker:
             result = self._result(
                 request,
                 state=OrderState.ACCEPTED,
-                broker_order_id=self._scripted_broker_order_id(script),
+                broker_order_id=self._scripted_broker_order_id(script, request.client_order_id),
                 fills=(),
             )
         elif isinstance(script, PartiallyFill):
@@ -369,7 +392,7 @@ class FakeBroker:
             result = self._result(
                 request,
                 state=OrderState.PARTIALLY_FILLED,
-                broker_order_id=self._scripted_broker_order_id(script),
+                broker_order_id=self._scripted_broker_order_id(script, request.client_order_id),
                 fills=fills,
             )
         elif isinstance(script, FillImmediately):
@@ -391,16 +414,24 @@ class FakeBroker:
             result = self._result(
                 request,
                 state=OrderState.FILLED,
-                broker_order_id=self._scripted_broker_order_id(script),
+                broker_order_id=self._scripted_broker_order_id(script, request.client_order_id),
                 fills=fills,
             )
         else:  # unreachable while script_order()/__init__ validate script types
             raise BrokerInvalidRequestError(f"unknown submit script {script!r}")
 
+        # The ID joins the assignment set only together with its stored order,
+        # so a submit rejected above leaves neither an order nor a burned ID.
+        if result.broker_order_id is not None:
+            self._assigned_broker_order_ids.add(result.broker_order_id)
         self._orders[request.client_order_id] = result
         return result
 
     def cancel_order(self, client_order_id: str) -> OrderResult:
+        with self._lock:
+            return self._cancel_order_locked(client_order_id)
+
+    def _cancel_order_locked(self, client_order_id: str) -> OrderResult:
         self.cancel_requests.append(client_order_id)
         current = self._orders.get(client_order_id)
         if current is None:
@@ -462,8 +493,14 @@ class FakeBroker:
 
     # --- helpers -------------------------------------------------------------
 
-    def _scripted_broker_order_id(self, script) -> str:
+    def _scripted_broker_order_id(self, script, client_order_id: str) -> str:
         if script.broker_order_id is not None:
+            if script.broker_order_id in self._assigned_broker_order_ids:
+                raise BrokerInvalidRequestError(
+                    f"broker_order_id {script.broker_order_id!r} is already assigned to "
+                    "another order; broker order IDs are unique across orders",
+                    client_order_id=client_order_id,
+                )
             return script.broker_order_id
         return self._next_broker_order_id()
 

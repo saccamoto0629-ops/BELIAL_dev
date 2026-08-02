@@ -14,7 +14,7 @@ from broker.fake_broker import FakeBroker
 |---|---|
 | `broker_interface.py` | Broker 共通インターフェース(`Protocol`): 注文送信 / キャンセル / 注文照会 / ポジション照会 / 口座状態照会 |
 | `broker_models.py` | Broker 非依存の共通モデル(`dataclass` + `Enum` + `Decimal` + UTC): 注文要求 / 注文結果 / 注文状態 / 約定情報 / ポジション / 口座状態 / Broker エラー |
-| `fake_broker.py` | 外部通信・DB・sleep・乱数を使わない決定的なテストダブル。client order ID 単位で Scripted Scenario を注入する。呼び出し記録(`submitted_requests` / `cancel_requests`)を持ち、受付系 script(`FillImmediately` / `StayPending` / `PartiallyFill`)は `broker_order_id` を固定値に指定できる(Issue #77: Execution 固定シナリオ試験が期待値比較に使用。未指定なら従来どおり連番 `FAKE-<n>`) |
+| `fake_broker.py` | 外部通信・DB・sleep・乱数を使わない決定的なテストダブル。client order ID 単位で Scripted Scenario を注入する。呼び出し記録(`submitted_requests` / `cancel_requests`)を持ち、受付系 script(`FillImmediately` / `StayPending` / `PartiallyFill`)は `broker_order_id` を固定値に指定できる(Issue #77: Execution 固定シナリオ試験が期待値比較に使用。未指定なら従来どおり連番 `FAKE-<n>`)。**broker_order_id は注文間で一意**(PR #96 レビュー): 固定 ID と連番 ID は同じ割当済み集合で管理され、割当済み ID の固定指定は `BrokerInvalidRequestError` で拒否(不完全な注文は残らない)、連番は固定 ID と衝突する番号を安全にスキップする。submit / cancel は単一 lock 下で実行され、並行 submit でも ID は一意 |
 | `tests/` | `python -m pytest broker/tests -q`(インメモリのみ。一時ファイルも不要) |
 
 ## 位置づけ(誤解しないこと)
