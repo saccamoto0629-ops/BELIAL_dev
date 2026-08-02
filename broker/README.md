@@ -14,7 +14,7 @@ from broker.fake_broker import FakeBroker
 |---|---|
 | `broker_interface.py` | Broker 共通インターフェース(`Protocol`): 注文送信 / キャンセル / 注文照会 / ポジション照会 / 口座状態照会 |
 | `broker_models.py` | Broker 非依存の共通モデル(`dataclass` + `Enum` + `Decimal` + UTC): 注文要求 / 注文結果 / 注文状態 / 約定情報 / ポジション / 口座状態 / Broker エラー |
-| `fake_broker.py` | 外部通信・DB・sleep・乱数を使わない決定的なテストダブル。client order ID 単位で Scripted Scenario を注入する |
+| `fake_broker.py` | 外部通信・DB・sleep・乱数を使わない決定的なテストダブル。client order ID 単位で Scripted Scenario を注入する。呼び出し記録(`submitted_requests` / `cancel_requests`)を持ち、受付系 script(`FillImmediately` / `StayPending` / `PartiallyFill`)は `broker_order_id` を固定値に指定できる(Issue #77: Execution 固定シナリオ試験が期待値比較に使用。未指定なら従来どおり連番 `FAKE-<n>`) |
 | `tests/` | `python -m pytest broker/tests -q`(インメモリのみ。一時ファイルも不要) |
 
 ## 位置づけ(誤解しないこと)

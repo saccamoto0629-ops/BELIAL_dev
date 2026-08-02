@@ -536,3 +536,51 @@ def test_connection_identity_target_comes_from_constructor_config():
 def test_invalid_connection_target_is_rejected_at_construction(bad_target):
     with pytest.raises(m.BrokerInvalidRequestError):
         fb.FakeBroker(connection_target=bad_target)
+
+
+# --- Issue #77 minimal extensions: cancel-call recording / pinned broker id --
+
+def test_fake_broker_records_every_cancel_attempt():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    broker.script_cancel("c-1", fb.FailCancellation(reason="refused"))
+    broker.submit_order(make_request())
+    with pytest.raises(m.BrokerCancellationError):
+        broker.cancel_order("c-1")
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.cancel_order("no-such-order")
+    # failed and not-found cancels are attempts too — both are recorded
+    assert broker.cancel_requests == ["c-1", "no-such-order"]
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        fb.FillImmediately(price=Decimal("2400"), broker_order_id="BRK-PINNED"),
+        fb.StayPending(broker_order_id="BRK-PINNED"),
+        fb.PartiallyFill(
+            fills=((Decimal("2400"), Decimal("4")),), broker_order_id="BRK-PINNED"
+        ),
+    ],
+)
+def test_scripts_can_pin_the_broker_order_id(script):
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", script)
+    result = broker.submit_order(make_request())
+    assert result.broker_order_id == "BRK-PINNED"
+
+
+def test_unpinned_scripts_keep_the_sequential_broker_order_id():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    assert broker.submit_order(make_request()).broker_order_id == "FAKE-1"
+
+
+@pytest.mark.parametrize("bad_id", ["", "   ", 42])
+def test_invalid_pinned_broker_order_id_fails_at_construction(bad_id):
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.StayPending(broker_order_id=bad_id)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.FillImmediately(broker_order_id=bad_id)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.PartiallyFill(fills=((Decimal("1"), Decimal("1")),), broker_order_id=bad_id)

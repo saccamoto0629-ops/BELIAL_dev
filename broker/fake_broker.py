@@ -85,21 +85,40 @@ def _require_id(client_order_id) -> None:
         )
 
 
+def _require_optional_broker_order_id(value, field_name: str) -> None:
+    # Issue #77: scripts that acknowledge an order may pin the broker-assigned
+    # ID so scenario expectations compare against a fixed value instead of the
+    # FAKE-<n> sequence. None keeps the sequential default.
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise BrokerInvalidRequestError(
+            f"{field_name} must be a non-empty string or None, got {value!r}"
+        )
+
+
 @dataclass(frozen=True)
 class FillImmediately:
     """Fill the whole order at ``price`` (falls back to the request's limit
-    price, then the broker's ``default_fill_price``)."""
+    price, then the broker's ``default_fill_price``). ``broker_order_id``
+    optionally pins the broker-assigned ID (default: next ``FAKE-<n>``)."""
 
     price: Decimal | None = None
+    broker_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.price is not None:
             _require_valid_price(self.price, "FillImmediately.price")
+        _require_optional_broker_order_id(self.broker_order_id, "FillImmediately.broker_order_id")
 
 
 @dataclass(frozen=True)
 class StayPending:
-    """Broker accepts the order but nothing fills (state ``ACCEPTED``)."""
+    """Broker accepts the order but nothing fills (state ``ACCEPTED``).
+    ``broker_order_id`` optionally pins the broker-assigned ID."""
+
+    broker_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_optional_broker_order_id(self.broker_order_id, "StayPending.broker_order_id")
 
 
 @dataclass(frozen=True)
@@ -109,9 +128,10 @@ class PartiallyFill:
     Each price/quantity must be a positive finite Decimal. The comparison
     against the ORDER quantity happens at submit time: the total must be
     strictly less than the requested quantity (use ``FillImmediately`` for a
-    full fill)."""
+    full fill). ``broker_order_id`` optionally pins the broker-assigned ID."""
 
     fills: tuple[tuple[Decimal, Decimal], ...]
+    broker_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.fills, tuple) or not self.fills:
@@ -126,6 +146,7 @@ class PartiallyFill:
             price, quantity = entry
             _require_valid_price(price, "PartiallyFill price")
             _require_valid_price(quantity, "PartiallyFill quantity")
+        _require_optional_broker_order_id(self.broker_order_id, "PartiallyFill.broker_order_id")
 
 
 @dataclass(frozen=True)
@@ -227,6 +248,10 @@ class FakeBroker:
         self._orders: dict[str, OrderResult] = {}
         self._positions: tuple[PositionInfo, ...] = ()
         self.submitted_requests: list[OrderRequest] = []
+        # Issue #77: every cancel ATTEMPT is recorded (like submitted_requests
+        # records every submit attempt), so tests can assert call counts even
+        # for cancels that fail or target unknown orders.
+        self.cancel_requests: list[str] = []
 
     # --- test-side configuration -------------------------------------------
     #
@@ -329,7 +354,7 @@ class FakeBroker:
             result = self._result(
                 request,
                 state=OrderState.ACCEPTED,
-                broker_order_id=self._next_broker_order_id(),
+                broker_order_id=self._scripted_broker_order_id(script),
                 fills=(),
             )
         elif isinstance(script, PartiallyFill):
@@ -344,7 +369,7 @@ class FakeBroker:
             result = self._result(
                 request,
                 state=OrderState.PARTIALLY_FILLED,
-                broker_order_id=self._next_broker_order_id(),
+                broker_order_id=self._scripted_broker_order_id(script),
                 fills=fills,
             )
         elif isinstance(script, FillImmediately):
@@ -366,7 +391,7 @@ class FakeBroker:
             result = self._result(
                 request,
                 state=OrderState.FILLED,
-                broker_order_id=self._next_broker_order_id(),
+                broker_order_id=self._scripted_broker_order_id(script),
                 fills=fills,
             )
         else:  # unreachable while script_order()/__init__ validate script types
@@ -376,6 +401,7 @@ class FakeBroker:
         return result
 
     def cancel_order(self, client_order_id: str) -> OrderResult:
+        self.cancel_requests.append(client_order_id)
         current = self._orders.get(client_order_id)
         if current is None:
             raise BrokerOrderNotFoundError(
@@ -435,6 +461,11 @@ class FakeBroker:
         return self._connection_identity
 
     # --- helpers -------------------------------------------------------------
+
+    def _scripted_broker_order_id(self, script) -> str:
+        if script.broker_order_id is not None:
+            return script.broker_order_id
+        return self._next_broker_order_id()
 
     def _build_fills(self, price_qty_pairs: tuple[tuple[Decimal, Decimal], ...]) -> tuple[Fill, ...]:
         return tuple(
