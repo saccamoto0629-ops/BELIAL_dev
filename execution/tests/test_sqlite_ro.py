@@ -116,7 +116,11 @@ def test_corrupted_file_is_not_silently_successful(tmp_path):
 
 
 def test_special_characters_in_the_path_are_handled(tmp_path):
-    weird = tmp_path / "we ird#db?.sqlite3"
+    # Space, '#' and '%' are URI-special but legal filename characters on
+    # every supported platform ('?' is NOT valid on Windows, so it cannot be
+    # part of this fixture); '%' additionally proves the URI encoding escapes
+    # a literal percent instead of misreading it as an escape sequence.
+    weird = tmp_path / "we ird#db%.sqlite3"
     make_db(weird)
     connection = connect_read_only(weird)
     assert connection.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
