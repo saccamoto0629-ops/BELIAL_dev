@@ -58,7 +58,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from broker.broker_models import BrokerError, OrderSide, OrderState, OrderType
+from broker.broker_models import AccountState, BrokerError, OrderSide, OrderState, OrderType
 from broker.fake_broker import (
     FailCommunication,
     FakeBroker,
@@ -68,10 +68,12 @@ from broker.fake_broker import (
     StayPending,
     TimeoutOrder,
 )
-from execution import execution_store
+from execution import execution_store, shadow_store
+from execution.cli_streams import encoding_safe_streams
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
 from execution.safety_gate import (
+    AccountSafetySnapshot,
     BrokerConnection,
     ExecutionMode,
     MarketSafetySnapshot,
@@ -79,7 +81,8 @@ from execution.safety_gate import (
     SafetyPolicy,
     StaticSafetyState,
 )
-from execution.safety_store import SQLiteSafetyDecisionStore
+from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore
+from execution.shadow_execution import ShadowCycleStatus, ShadowExecutionService
 from execution.scenario_models import (
     DEFAULT_SCENARIO_DIR,
     FAULT_BOUNDARIES,
@@ -263,7 +266,8 @@ def _build_policy(definition: ScenarioDefinition) -> SafetyPolicy:
         max_reference_age=timedelta(seconds=gate.get("max_reference_age_seconds", 30)),
         max_spread_by_symbol={**default_spread, **spread_overrides},
         allowed_connection_targets={
-            ExecutionMode.FAKE: frozenset(gate.get("allowed_fake_targets", ["fake"]))
+            ExecutionMode.FAKE: frozenset(gate.get("allowed_fake_targets", ["fake"])),
+            ExecutionMode.SHADOW: frozenset(gate.get("allowed_shadow_targets", ["shadow"])),
         },
         require_stop_loss=gate.get("require_stop_loss", True),
     )
@@ -285,31 +289,49 @@ def _build_market(definition: ScenarioDefinition) -> MarketSafetySnapshot:
 
 # --- fault injection ----------------------------------------------------------
 
+# Boundary name -> (owner object, error type the wrapper raises). The
+# attribute substituted on the owner comes from ``FAULT_BOUNDARIES``
+# (scenario_models validates the names). Issue #78 adds the shadow-store save
+# (module function) and the safety-decision record (class attribute on the
+# sealed store type -- the only substitution point, since instances cannot be
+# injected into the services).
+_FAULT_TARGETS: dict[str, tuple[object, type[Exception]]] = {
+    "initial_save": (execution_store, execution_store.ExecutionStoreError),
+    "mark_submitting": (execution_store, execution_store.ExecutionStoreError),
+    "record_order_result": (execution_store, execution_store.ExecutionStoreError),
+    "record_order_state": (execution_store, execution_store.ExecutionStoreError),
+    "state_history": (execution_store, execution_store.ExecutionStoreError),
+    "shadow_result_save": (shadow_store, shadow_store.ShadowStoreError),
+    "safety_decision_record": (SQLiteSafetyDecisionStore, SafetyStoreError),
+}
+
 
 @contextlib.contextmanager
 def _armed_faults(faults: tuple[dict, ...]):
-    """Substitute the targeted ``execution_store`` functions with raising
-    stubs for the duration of one scenario (restored in reverse order even on
-    error). This is the explicit, test-only dependency substitution Issue #77
-    asks for -- production modules keep no hidden failure switches."""
-    originals: list[tuple[str, object]] = []
+    """Substitute the targeted store functions with raising stubs for the
+    duration of one scenario (restored in reverse order even on error). This
+    is the explicit, test-only dependency substitution Issue #77 asks for --
+    production modules keep no hidden failure switches."""
+    originals: list[tuple[object, str, object]] = []
     try:
         for fault in faults:
-            attribute = FAULT_BOUNDARIES[fault["boundary"]]
-            original = getattr(execution_store, attribute)
-            originals.append((attribute, original))
+            boundary = fault["boundary"]
+            attribute = FAULT_BOUNDARIES[boundary]
+            owner, error_type = _FAULT_TARGETS[boundary]
+            original = getattr(owner, attribute)
+            originals.append((owner, attribute, original))
             setattr(
-                execution_store,
+                owner,
                 attribute,
-                _fault_wrapper(original, fault["boundary"], fault.get("after_calls", 0)),
+                _fault_wrapper(original, boundary, fault.get("after_calls", 0), error_type),
             )
         yield
     finally:
-        for attribute, original in reversed(originals):
-            setattr(execution_store, attribute, original)
+        for owner, attribute, original in reversed(originals):
+            setattr(owner, attribute, original)
 
 
-def _fault_wrapper(original, boundary: str, after_calls: int):
+def _fault_wrapper(original, boundary: str, after_calls: int, error_type: type[Exception]):
     lock = threading.Lock()
     calls = [0]
 
@@ -318,9 +340,7 @@ def _fault_wrapper(original, boundary: str, after_calls: int):
             calls[0] += 1
             call_number = calls[0]
         if call_number > after_calls:
-            raise execution_store.ExecutionStoreError(
-                f"injected fault at boundary {boundary!r} (call {call_number})"
-            )
+            raise error_type(f"injected fault at boundary {boundary!r} (call {call_number})")
         return original(*args, **kwargs)
 
     return wrapper
@@ -336,13 +356,31 @@ class _ScenarioContext:
         self.definition = definition
         self.orders_db = work_dir / "orders.sqlite3"
         self.decisions_db = work_dir / "safety.sqlite3"
-        SQLiteSafetyDecisionStore(self.decisions_db).initialize()
+        self.shadow_db = work_dir / "shadow.sqlite3"
+        # No store is initialized eagerly (Issue #78): dry-run shadow
+        # scenarios observe that NO store file is ever created, so store
+        # initialization happens lazily (and idempotently) in the service
+        # factories the non-dry-run steps use.
         self.broker = _build_broker(definition)
         self.connection = BrokerConnection(broker=self.broker)
         self.policy = _build_policy(definition)
         self.market = _build_market(definition)
         self.state = StaticSafetyState(
             kill_switch_enabled=definition.gate.get("kill_switch", False)
+        )
+        # Injected broker-state context for shadow evaluations: an empty,
+        # fresh snapshot (the required shadow scenarios exercise gate
+        # conditions other than position limits).
+        self.account = AccountSafetySnapshot(
+            positions=(),
+            account=AccountState(
+                account_id="scenario-account",
+                currency="XXX",
+                balance=Decimal("0"),
+                equity=Decimal("0"),
+                margin_available=Decimal("0"),
+                retrieved_at_utc=NOW,
+            ),
         )
         self.client_order_ids: dict[str, str] = {}
         self.step_results: list[dict] = []
@@ -351,6 +389,7 @@ class _ScenarioContext:
         """One service per call: concurrency steps give each worker its own
         instance (multi-process equivalence); sequential steps just use a
         fresh one, which is stateless beyond its injected paths."""
+        SQLiteSafetyDecisionStore(self.decisions_db).initialize()
         return LiveOrderSubmissionService(
             connection=self.connection,
             gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=lambda: NOW),
@@ -358,6 +397,20 @@ class _ScenarioContext:
             order_db_path=self.orders_db,
             clock=lambda: NOW,
         )
+
+    def make_shadow_service(self, *, initialize: bool) -> ShadowExecutionService:
+        """One shadow service per call (same multi-process equivalence as
+        ``make_service``). ``initialize=False`` is the dry-run path: the
+        service must not create any store file."""
+        service = ShadowExecutionService(
+            gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=lambda: NOW),
+            decision_db_path=self.decisions_db,
+            shadow_db_path=self.shadow_db,
+            clock=lambda: NOW,
+        )
+        if initialize:
+            service.initialize_stores()
+        return service
 
 
 def _classify_error(exc: Exception) -> dict:
@@ -467,6 +520,71 @@ def _execute_submit_concurrent(context: _ScenarioContext, step: ScenarioStep) ->
     }
 
 
+def _shadow_step_payload(outcome) -> dict:
+    result = outcome.result
+    payload = {
+        # Scenario vocabulary uses identifier-style outcome names.
+        "outcome": "dry_run" if outcome.status is ShadowCycleStatus.DRY_RUN else outcome.status.value,
+        "allowed": result.allowed,
+        "rejection_codes": sorted(result.rejection_codes),
+    }
+    return payload
+
+
+def _execute_shadow(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    request = _build_request(step.params["request"])
+    dry_run = step.params.get("dry_run", False)
+    try:
+        service = context.make_shadow_service(initialize=not dry_run)
+        run = service.dry_run_cycle if dry_run else service.run_cycle
+        outcome = run(
+            request,
+            market=context.market,
+            account=context.account,
+            client_order_id=step.params["client_order_id"],
+            timeframe=step.params.get("timeframe"),
+        )
+    except Exception as exc:
+        return {"outcome": "error", **_classify_error(exc)}
+    return _shadow_step_payload(outcome)
+
+
+def _execute_shadow_concurrent(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    request = _build_request(step.params["request"])
+    worker_count = step.params["workers"]
+    # Stores are initialized once, sequentially, before the race: the
+    # contested boundary is the shadow store's UNIQUE claim, not init.
+    services = [context.make_shadow_service(initialize=True) for _ in range(worker_count)]
+
+    def work(index: int, barrier: threading.Barrier) -> dict:
+        barrier.wait(timeout=60)
+        try:
+            outcome = services[index].run_cycle(
+                request,
+                market=context.market,
+                account=context.account,
+                client_order_id=step.params["client_order_id"],
+                timeframe=step.params.get("timeframe"),
+            )
+        except Exception as exc:
+            # A locked-DB / store failure is an ``error`` -- it must never be
+            # counted as a recorded result or as duplicate suppression.
+            return {"outcome": "error", **_classify_error(exc)}
+        return _shadow_step_payload(outcome)
+
+    worker_results = _run_workers(worker_count, work)
+    codes = sorted(
+        {code for entry in worker_results for code in entry.get("rejection_codes", [])}
+    )
+    return {
+        "recorded": sum(1 for entry in worker_results if entry["outcome"] == "recorded"),
+        "duplicates": sum(1 for entry in worker_results if entry["outcome"] == "duplicate"),
+        "errors": sum(1 for entry in worker_results if entry["outcome"] == "error"),
+        "rejection_codes": codes,
+        "workers": worker_results,
+    }
+
+
 def _execute_register_concurrent(context: _ScenarioContext, step: ScenarioStep) -> dict:
     registrations = step.params["registrations"]
     requests = [_build_request(entry["request"]) for entry in registrations]
@@ -509,6 +627,8 @@ _STEP_EXECUTORS = {
     "mark_submitting": _execute_mark_submitting,
     "submit_concurrent": _execute_submit_concurrent,
     "register_concurrent": _execute_register_concurrent,
+    "shadow": _execute_shadow,
+    "shadow_concurrent": _execute_shadow_concurrent,
 }
 
 
@@ -532,6 +652,20 @@ def _row_counts(db_path: Path) -> tuple[int, int]:
     finally:
         connection.close()
     return orders, history
+
+
+def _shadow_row_count(db_path: Path) -> int:
+    """Shadow-store row count straight from the scenario's temporary DB,
+    read-only; a missing file counts as zero rows and is never created."""
+    if not db_path.exists():
+        return 0
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return connection.execute(
+            f"SELECT COUNT(*) FROM {shadow_store.RESULTS_TABLE}"
+        ).fetchone()[0]
+    finally:
+        connection.close()
 
 
 def _collect_actual(context: _ScenarioContext) -> dict:
@@ -608,6 +742,33 @@ def _collect_actual(context: _ScenarioContext) -> dict:
         "listed_unknown": primary_id in unknown_ids,
         "listed_unresolved": primary_id in unresolved_ids,
     }
+
+    # --- shadow-store observations (Issue #78) ---------------------------
+    shadow_result = None
+    if primary_id is not None and context.shadow_db.exists():
+        shadow_result = shadow_store.get_shadow_result(primary_id, db_path=context.shadow_db)
+    intended = None if shadow_result is None else shadow_result.intended_order
+    actual.update(
+        {
+            "shadow_rows": _shadow_row_count(context.shadow_db),
+            "shadow_db_created": context.shadow_db.exists(),
+            "decision_db_created": context.decisions_db.exists(),
+            "shadow_allowed": None if shadow_result is None else shadow_result.allowed,
+            "shadow_codes": None
+            if shadow_result is None
+            else sorted(shadow_result.rejection_codes),
+            "shadow_intended_order": None
+            if intended is None
+            else {
+                "client_order_id": intended.client_order_id,
+                "symbol": intended.symbol,
+                "side": intended.side.value,
+                "order_type": intended.order_type.value,
+                "quantity": intended.quantity,
+                "limit_price": intended.limit_price,
+            },
+        }
+    )
     return actual
 
 
@@ -621,9 +782,9 @@ def _values_match(key: str, expected, actual) -> bool:
         return expected is None or Decimal(expected) == actual
     if key == "fill_prices":
         return actual is not None and [Decimal(price) for price in expected] == list(actual)
-    if key == "last_decision_codes":
+    if key in ("last_decision_codes", "shadow_codes"):
         return actual is not None and sorted(expected) == actual
-    if key == "submitted_request":
+    if key in ("submitted_request", "shadow_intended_order"):
         if actual is None:
             return False
         for sub_key, sub_expected in expected.items():
@@ -843,42 +1004,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-@contextlib.contextmanager
-def _encoding_safe_streams():
-    """Never let the console encoding turn an all-PASS run into exit 1 --
-    and never LEAK the changed stream configuration past ``main()``.
-
-    The Windows-ja default console is cp932 and GitHub's Windows runners pipe
-    stdout through the ANSI codepage; scenario descriptions are free text, so
-    a strict-encoding stream would raise ``UnicodeEncodeError`` mid-report.
-    Separators are ASCII and ``--json`` is pure ASCII already; inside this
-    context the remaining free text degrades to escape sequences instead of
-    crashing. The previous ``errors`` policy of each stream is restored in
-    ``finally`` on EVERY exit path -- normal return, usage error
-    (``SystemExit`` from argparse), schema error and unexpected exceptions --
-    so embedding callers (pytest, other CLIs) never observe a leftover
-    configuration. Streams that cannot be reconfigured are left alone.
-    This runs only inside ``main()``; importing the module changes nothing.
-    """
-    restores: list[tuple] = []
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        original_errors = getattr(stream, "errors", None)
-        if not callable(reconfigure) or original_errors is None:
-            continue
-        try:
-            reconfigure(errors="backslashreplace")
-        except (ValueError, OSError):
-            continue
-        restores.append((reconfigure, original_errors))
-    try:
-        yield
-    finally:
-        for reconfigure, original_errors in reversed(restores):
-            try:
-                reconfigure(errors=original_errors)
-            except (ValueError, OSError):
-                pass
+# Console-encoding safety (PR #96 review r1) lives in execution.cli_streams
+# since Issue #78 -- the same contract now covers the shadow CLIs too.
+_encoding_safe_streams = encoding_safe_streams
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -76,3 +76,66 @@ def test_submission_service_holds_exactly_one_submit_order_call():
         "execution/live_submission.py must hold exactly one Broker.submit_order call "
         f"(the gated one in LiveOrderSubmissionService.submit), found lines {sites}"
     )
+
+
+# Issue #78: shadow results are created ONLY by the ShadowExecutionService --
+# the scenario runner (and everything else) may read shadow results but must
+# never record one directly, so the runner cannot synthesize a shadow path.
+RECORD_SHADOW_RESULT_ALLOWED = {
+    "execution/shadow_execution.py",
+    "execution/tests",
+}
+
+
+def test_record_shadow_result_is_called_only_by_the_shadow_service():
+    assert _offenders("record_shadow_result", RECORD_SHADOW_RESULT_ALLOWED) == []
+
+
+def _name_call_sites(path: pathlib.Path, name: str) -> list[int]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+    ]
+
+
+def test_the_scenario_runner_never_constructs_shadow_results():
+    """The runner drives the production shadow API only: it may not build a
+    ``ShadowResult`` / ``ShadowIntendedOrder`` of its own (which is also
+    pinned by it not importing those names)."""
+    runner = REPO_ROOT / "execution" / "scenario_runner.py"
+    for forbidden in ("ShadowResult", "ShadowIntendedOrder", "intended_order_from_request"):
+        assert _name_call_sites(runner, forbidden) == []
+    tree = ast.parse(runner.read_text(encoding="utf-8"))
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+        for alias in node.names
+    }
+    assert imported & {"ShadowResult", "ShadowIntendedOrder", "intended_order_from_request"} == set()
+
+
+def test_shadow_modules_never_import_broker_implementations():
+    """The shadow path owns no broker dependency (Issue #78): the shadow
+    modules may use broker MODELS only -- importing the Broker protocol or
+    FakeBroker would create a call surface the zero-broker-calls contract
+    forbids."""
+    offenders = []
+    for name in ("shadow_execution.py", "shadow_store.py", "shadow_models.py", "shadow_runner.py",
+                 "shadow_report.py"):
+        path = REPO_ROOT / "execution" / name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules = [node.module]
+            for module in modules:
+                if module in ("broker.fake_broker", "broker.broker_interface"):
+                    offenders.append(f"execution/{name}:{node.lineno} imports {module}")
+    assert offenders == []

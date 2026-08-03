@@ -1,0 +1,54 @@
+{
+  "scenario_id": "fake_mode_no_shadow_record",
+  "description": "fake mode回帰: FakeBrokerへ従来どおり送信され既存のExecution状態機械が動作し、Shadow記録は一切作成されない(Shadow DBファイル自体が存在しない)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "fill_immediately",
+        "price": "150.25",
+        "broker_order_id": "BRK-1"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "filled",
+    "broker_submit_calls": 1,
+    "order_rows": 1,
+    "history_rows": 2,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "broker_order_id": "BRK-1",
+    "shadow_rows": 0,
+    "shadow_db_created": false,
+    "shadow_allowed": null
+  }
+}

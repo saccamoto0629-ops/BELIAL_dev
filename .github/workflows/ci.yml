@@ -73,12 +73,26 @@ jobs:
 
       # Issue #77: fixed execution scenarios via the runner CLI. The same
       # scenarios also run inside "Run execution tests" (test_fixed_scenarios
-      # parametrizes per scenario id); this extra step pins the CLI contract
-      # -- human-readable per-scenario PASS/FAIL output and a non-zero exit
-      # code on any mismatch -- and costs ~2s. tmp-dir SQLite + FakeBroker
-      # only: no secrets, no network, fully reproducible.
+      # parametrizes per scenario id) -- including the Issue #78 shadow-mode
+      # scenarios, so they are NOT re-run as a separate CLI step; this extra
+      # step pins the CLI contract -- human-readable per-scenario PASS/FAIL
+      # output and a non-zero exit code on any mismatch -- and costs ~2s.
+      # tmp-dir SQLite + FakeBroker only: no secrets, no network, fully
+      # reproducible.
       - name: Run fixed execution scenarios (CLI)
         run: python -m execution.scenario_runner
+
+      # Issue #78: the shadow-mode CLI contract. dry-run first (must create
+      # nothing), then one recorded shadow cycle and the report CLI (human
+      # and JSON output). Deterministic via --now; tmp-dir SQLite only, no
+      # secrets, no network, no broker anywhere in the path.
+      - name: Run shadow mode CLI (dry-run, cycle, report)
+        run: |
+          python -m execution.shadow_runner --mode dry-run --cycle execution/examples/shadow_cycle_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          test ! -e "$RUNNER_TEMP/shadow-ci" || { echo "dry-run must not create DB files"; exit 1; }
+          python -m execution.shadow_runner --mode shadow --cycle execution/examples/shadow_cycle_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3"
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --json
 
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
@@ -96,6 +110,11 @@ jobs:
           python -c "from execution.live_submission import LiveOrderSubmissionService"
           python -c "from execution.scenario_models import load_scenarios, validate_scenario"
           python -c "from execution.scenario_runner import main, run_scenarios"
+          python -c "from execution.shadow_models import ShadowResult, intended_order_from_request"
+          python -c "from execution import shadow_store"
+          python -c "from execution.shadow_execution import ShadowExecutionService"
+          python -c "from execution.shadow_runner import main"
+          python -c "from execution.shadow_report import main"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot
@@ -135,3 +154,19 @@ jobs:
           python -m execution.scenario_runner
           python -m execution.scenario_runner --list
           python -m execution.scenario_runner --json
+
+      # Issue #78: the shadow CLIs must keep their exit-code contract on the
+      # Windows ANSI-codepage console too (cp932-equivalent; PYTHONUTF8 is
+      # deliberately NOT set). Also pins the execution pytest suite -- which
+      # holds the shadow SQLite file-handle / dry-run no-side-effect tests --
+      # on Windows.
+      - name: Run execution tests (Windows)
+        run: python -m pytest execution/tests -q
+
+      - name: Run shadow mode CLI (Windows)
+        run: |
+          python -m execution.shadow_runner --mode dry-run --cycle execution/examples/shadow_cycle_example.json --data-dir "$env:RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          if (Test-Path "$env:RUNNER_TEMP/shadow-ci") { throw "dry-run must not create DB files" }
+          python -m execution.shadow_runner --mode shadow --cycle execution/examples/shadow_cycle_example.json --data-dir "$env:RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3"
+          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --json

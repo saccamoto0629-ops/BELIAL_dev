@@ -1,0 +1,52 @@
+{
+  "scenario_id": "shadow_gate_pass",
+  "description": "Shadow Mode Gate通過: 実Signal入力からExecution Requestを生成しSafety Gateを通過、Broker呼び出し0でShadow結果1件が保存され、想定注文内容が一致する(Broker状態・fillは存在しない)",
+  "steps": [
+    {
+      "action": "shadow",
+      "request": {
+        "execution_request_id": "shadow-exec-1",
+        "signal_id": "shadow-signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "shadow-client-1",
+      "timeframe": "H1",
+      "expect": {
+        "outcome": "recorded",
+        "allowed": true
+      }
+    }
+  ],
+  "expected": {
+    "broker_submit_calls": 0,
+    "order_rows": 0,
+    "history_rows": 0,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "shadow_rows": 1,
+    "shadow_db_created": true,
+    "decision_db_created": true,
+    "shadow_allowed": true,
+    "shadow_intended_order": {
+      "client_order_id": "shadow-client-1",
+      "symbol": "USD_JPY",
+      "side": "buy",
+      "order_type": "market",
+      "quantity": "1",
+      "limit_price": null
+    },
+    "final_phase": null,
+    "final_state": null,
+    "broker_order_id": null,
+    "filled_quantity": null,
+    "average_fill_price": null,
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

@@ -12,7 +12,7 @@ BELIAL Issue 実装時に参照するコンポーネント・ドキュメント�
 | paper-execution | `paper-execution/` | (なし。設計書を参照) | `paper_execution.md` | `paper-execution/tests/` | `paper_positions.sqlite3` |
 | backtest | `backtest/` | `backtest/strategies/README.md`(Strategy 定義) | `strategy_definition.md`、実行方法は `docs/backtest.md` | `backtest/tests/` | (backtest 結果 DB。`backtest_store.py` 参照) |
 | broker | `broker/` | `broker/README.md` | `broker_interface.md` | `broker/tests/` | なし(インメモリのみ) |
-| execution | `execution/` | `execution/README.md` | `execution_request.md`, `safety_gate.md` | `execution/tests/` | `execution_orders.sqlite3`(Issue #74)+ `safety_gate_decisions.sqlite3`(Safety Gate 判定監査。Issue #75)。いずれも将来のLive Execution用 |
+| execution | `execution/` | `execution/README.md` | `execution_request.md`, `safety_gate.md`, `shadow_execution.md` | `execution/tests/` | `execution_orders.sqlite3`(Issue #74)+ `safety_gate_decisions.sqlite3`(Safety Gate 判定監査。Issue #75)+ `shadow_results.sqlite3`(Shadow Mode 検証記録。Issue #78)。いずれも将来のLive Execution用 |
 
 全体像・DB 構成・データ連携は `docs/architecture/architecture.md`、責務レイヤーと非スコープは `docs/product/concept.md` が正。
 

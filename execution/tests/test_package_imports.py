@@ -17,6 +17,11 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.live_submission import LiveOrderSubmissionService",
     "from execution.scenario_models import load_scenarios, validate_scenario",
     "from execution.scenario_runner import main, run_scenarios",
+    "from execution.shadow_models import ShadowResult, intended_order_from_request",
+    "from execution import shadow_store",
+    "from execution.shadow_execution import ShadowExecutionService",
+    "from execution.shadow_runner import main as shadow_runner_main",
+    "from execution.shadow_report import main as shadow_report_main",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /

@@ -17,6 +17,17 @@ DEFINITIONS = load_scenarios(scenario_files(DEFAULT_SCENARIO_DIR))
 # The scenarios Issue #77 requires, pinned by id: deleting or renaming one of
 # these fixed scenarios must fail loudly here, not silently shrink coverage.
 REQUIRED_SCENARIO_IDS = {
+    # Issue #78 shadow-mode scenarios:
+    "shadow_gate_pass",
+    "shadow_stale_price_rejected",
+    "shadow_kill_switch_rejected",
+    "shadow_mode_mismatch_rejected",
+    "shadow_duplicate_request",
+    "shadow_concurrent_single_record",
+    "shadow_db_failure_initial_save",
+    "shadow_decision_save_failure",
+    "shadow_dry_run_no_side_effects",
+    "fake_mode_no_shadow_record",
     "normal_market_order",
     "duplicate_signal_suppressed",
     "store_failure_before_submit",
@@ -64,3 +75,14 @@ def test_fixed_scenario_passes(definition, tmp_path):
     assert outcome.status == STATUS_PASS, (
         f"{definition.scenario_id}: {outcome.status} {detail or outcome.error}"
     )
+
+
+def test_scenarios_pass_in_reverse_order_too(tmp_path):
+    """Order independence (Issue #78): the whole bundled suite passes when
+    shuffled -- here deterministically reversed, so a failure reproduces --
+    proving no scenario leans on another's leftover state."""
+    from execution.scenario_runner import run_scenarios
+
+    report = run_scenarios(tuple(reversed(DEFINITIONS)), tmp_path)
+    failing = [o.scenario_id for o in report.outcomes if o.status != STATUS_PASS]
+    assert failing == [], f"scenarios fail when run in reverse order: {failing}"

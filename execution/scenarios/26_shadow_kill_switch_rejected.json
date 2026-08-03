@@ -1,0 +1,41 @@
+{
+  "scenario_id": "shadow_kill_switch_rejected",
+  "description": "Shadow Mode kill switch: kill switch有効時はkill_switch_enabledで拒否され、Broker呼び出し0のままkill switch理由がShadow結果へ保存される",
+  "gate": {
+    "kill_switch": true
+  },
+  "steps": [
+    {
+      "action": "shadow",
+      "request": {
+        "execution_request_id": "shadow-exec-1",
+        "signal_id": "shadow-signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "shadow-client-1",
+      "expect": {
+        "outcome": "recorded",
+        "allowed": false,
+        "rejection_codes": [
+          "kill_switch_enabled"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "broker_submit_calls": 0,
+    "safety_decisions": 1,
+    "last_decision_allowed": false,
+    "shadow_rows": 1,
+    "shadow_allowed": false,
+    "shadow_codes": [
+      "kill_switch_enabled"
+    ]
+  }
+}

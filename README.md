@@ -34,7 +34,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | `paper-signal/` | Market Bias + Chart Snapshot から `paper_only` 仮説を生成 | [paper-signal/README.md](paper-signal/README.md) |
 | `paper-execution/` | Paper Signal を入力に仮想ポジションを Open / Close し仮想損益を記録(仮想約定のみ。Broker API・実注文なし) | [Paper Execution 設計](docs/architecture/paper_execution.md) |
 | `broker/` | 将来の Live Execution 用の Broker 境界(共通インターフェース・共通モデル)と、外部通信しないテストダブル FakeBroker(Issue #73)。実発注・OANDA Adapter・Live Execution は未実装のまま | [broker/README.md](broker/README.md) / [設計](docs/architecture/broker_interface.md) |
-| `execution/` | 将来の Live Execution 用の ExecutionRequest モデル・注文状態永続化基盤(Issue #74)と、発注前の fail-closed Safety Gate + 判定監査保存(Issue #75)。注文状態は既存 `broker.OrderState` を再利用。Live Execution 本体・Broker API Adapter・実注文・reconciliation runner は未実装のまま | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) / [Safety Gate](docs/architecture/safety_gate.md) |
+| `execution/` | 将来の Live Execution 用の ExecutionRequest モデル・注文状態永続化基盤(Issue #74)と、発注前の fail-closed Safety Gate + 判定監査保存(Issue #75)、Broker へ送信せず実判定経路を検証記録する Shadow Mode(Issue #78。execution mode `dry-run` / `shadow` / `fake` / `demo` / `live` の統一 validation 含む)。注文状態は既存 `broker.OrderState` を再利用。Live Execution 本体・Broker API Adapter・実注文・reconciliation runner は未実装のまま(`demo` / `live` は mode 定義のみ) | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) / [Safety Gate](docs/architecture/safety_gate.md) / [Shadow Mode](docs/architecture/shadow_execution.md) |
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 
@@ -62,6 +62,7 @@ BELIAL はコンポーネントごとに独立した SQLite ファイルを持�
 | Market Bias DB | `news-feed-bot/data/market_bias.sqlite3` | `news-feed-bot/` | Market Bias(trend/risk/volatility)の評価履歴。Backtest からの時点参照用 |
 | Paper Position DB | `paper-execution/data/paper_positions.sqlite3` | `paper-execution/` | Paper Execution の仮想ポジション(状態・仮想損益)。上書きは `PAPER_POSITION_DB_PATH` |
 | Execution Order DB | `execution/data/execution_orders.sqlite3` | `execution/` | 将来の Live Execution 用の execution request・注文状態・状態履歴(Issue #74。永続化基盤のみ・実注文なし)。上書きは `EXECUTION_ORDER_DB_PATH` |
+| Shadow Result DB | `execution/data/shadow_results.sqlite3` | `execution/` | Shadow Mode の検証記録(Issue #78。Broker 送信なし・仮想約定なし。想定注文内容と Safety Gate 判定の監査保存)。上書きは `SHADOW_RESULT_DB_PATH` |
 
 いずれも `data/` はGit管理しません。詳細スキーマは [Architecture](docs/architecture/architecture.md)、[Market Watch](docs/architecture/market_watch.md)、[Market Bias](docs/architecture/market_bias.md)、[Paper Signal](docs/architecture/paper_signal.md) を参照してください。
 
@@ -92,6 +93,7 @@ v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続
 - **Paper Execution**(`paper-execution/`): 保存済みPaper Signalから仮想Entry / Position / SL / TP / Exitを判定する別レイヤー。実発注を行うLive Executionは未実装・非スコープ。
 - **外部 Strategy 定義(YAML)の Loader / Validation**(Issue #53): Strategy ごとの可変設定を YAML で外部化し、`--strategy-file <path>`(単一ファイル)または `--strategy <id>`(`backtest/strategies/` ディレクトリ、`STRATEGY_DEFINITIONS_DIR` で上書き可)で opt-in 実行する。現在利用するのはBacktest経路のみであり、Paper Signal / Paper Executionとの定義共有は未実装。スキーマは [Strategy 定義仕様](docs/architecture/strategy_definition.md)、使用方法は [docs/backtest.md](docs/backtest.md) を参照。
 - **Execution 固定シナリオ試験**(Issue #77): 将来の Live Execution 用に実装済みの Execution 基盤(Issue #73–#76)の主要分岐(正常約定 / 拒否 / 部分約定 / timeout=UNKNOWN / DB保存失敗 / Safety Gate 拒否 / 多重起動競合など)を、FakeBroker と一時 DB のみで固定データから再現・検証するシナリオ runner(`python -m execution.scenario_runner`)。外部通信・実発注は一切行わない。詳細は [execution/README.md](execution/README.md) の「固定シナリオ試験」節を参照。
+- **Shadow Mode**(Issue #78): 実 Signal・実設定・Safety Gate を通常の Production 経路で実行しつつ、**Broker へは一切送信せず**、生成された注文候補(想定注文内容)と Gate の通過 / 拒否結果を専用 DB へ監査保存する検証モード(`python -m execution.shadow_runner` / `python -m execution.shadow_report`)。仮想約定・仮想 Position・仮想 PnL は計算しない(Paper Execution とは別物)。dry-run は従来どおり完全無副作用のまま分離。Demo / Live 接続は未実装。詳細は [docs/architecture/shadow_execution.md](docs/architecture/shadow_execution.md)。
 
 詳細と非スコープは [Roadmap](docs/product/roadmap.md) を参照してください。
 

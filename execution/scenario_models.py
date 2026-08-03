@@ -61,13 +61,17 @@ _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
 }
 
 # DB boundaries where a fault can be injected (Issue #77): each maps to one
-# execution_store function the runner substitutes for the scenario's duration.
+# store function the runner substitutes for the scenario's duration. Issue #78
+# adds the shadow-store save and the safety-decision record boundaries (the
+# runner resolves each name onto the owning module/class itself).
 FAULT_BOUNDARIES: dict[str, str] = {
     "initial_save": "create_execution_order",
     "mark_submitting": "mark_submitting",
     "record_order_result": "record_order_result",
     "record_order_state": "record_order_state",
     "state_history": "_append_history",
+    "shadow_result_save": "record_shadow_result",
+    "safety_decision_record": "record",
 }
 
 _STEP_ACTIONS = frozenset(
@@ -78,6 +82,8 @@ _STEP_ACTIONS = frozenset(
         "mark_submitting",
         "submit_concurrent",
         "register_concurrent",
+        "shadow",
+        "shadow_concurrent",
     }
 )
 
@@ -87,6 +93,7 @@ _STEP_OUTCOMES: dict[str, frozenset[str]] = {
     "submit": frozenset({"submitted", "rejected", "error"}),
     "record_unknown": frozenset({"recorded", "error"}),
     "mark_submitting": frozenset({"ok", "error"}),
+    "shadow": frozenset({"recorded", "duplicate", "dry_run", "error"}),
 }
 
 _REQUEST_REQUIRED_KEYS = frozenset(
@@ -109,6 +116,7 @@ _GATE_KEYS = frozenset(
         "max_reference_age_seconds",
         "max_spread_by_symbol",
         "allowed_fake_targets",
+        "allowed_shadow_targets",
         "require_stop_loss",
     }
 )
@@ -139,6 +147,8 @@ _STEP_EXTRA_KEYS: dict[str, frozenset[str]] = {
     "mark_submitting": frozenset({"execution_request_id", "reason"}),
     "submit_concurrent": frozenset({"execution_request_id", "workers"}),
     "register_concurrent": frozenset({"registrations"}),
+    "shadow": frozenset({"request", "client_order_id", "timeframe", "dry_run"}),
+    "shadow_concurrent": frozenset({"request", "client_order_id", "timeframe", "workers"}),
 }
 
 # History-entry expectation keys (PR #96 review Minor 1): entries are objects
@@ -150,7 +160,9 @@ _HISTORY_ENTRY_KEYS = _HISTORY_ENTRY_REQUIRED_KEYS | frozenset({"reason", "broke
 
 # Scenario-level expected keys (closed world). ``decimal`` entries are
 # compared as Decimal so "150.0" == "150.00"; DB-assigned values such as
-# history_id are deliberately not comparable.
+# history_id are deliberately not comparable. Issue #78 adds the shadow-store
+# observations: row count, file existence (dry-run must create nothing), the
+# stored gate outcome and the stored intended-order content.
 EXPECTED_KEYS = frozenset(
     {
         "final_phase",
@@ -171,6 +183,12 @@ EXPECTED_KEYS = frozenset(
         "reject_reason",
         "listed_unknown",
         "listed_unresolved",
+        "shadow_rows",
+        "shadow_db_created",
+        "decision_db_created",
+        "shadow_allowed",
+        "shadow_codes",
+        "shadow_intended_order",
     }
 )
 
@@ -179,8 +197,10 @@ _SUBMITTED_REQUEST_KEYS = frozenset(
 )
 
 _STEP_EXPECT_KEYS = frozenset({"outcome", "state", "rejection_codes", "error_type", "error_code"})
+_SHADOW_STEP_EXPECT_KEYS = frozenset({"outcome", "allowed", "rejection_codes", "error_type"})
 _CONCURRENT_SUBMIT_EXPECT_KEYS = frozenset({"submitted", "rejected", "errors", "rejection_codes"})
 _CONCURRENT_REGISTER_EXPECT_KEYS = frozenset({"registered", "conflicts", "errors"})
+_CONCURRENT_SHADOW_EXPECT_KEYS = frozenset({"recorded", "duplicates", "errors", "rejection_codes"})
 
 
 class ScenarioDefinitionError(ValueError):
@@ -348,7 +368,7 @@ def _validate_gate(spec, scenario: str) -> dict:
         _require_bool(gate["kill_switch"], "gate.kill_switch", scenario)
     if "require_stop_loss" in gate:
         _require_bool(gate["require_stop_loss"], "gate.require_stop_loss", scenario)
-    for key in ("allowed_symbols", "allowed_fake_targets"):
+    for key in ("allowed_symbols", "allowed_fake_targets", "allowed_shadow_targets"):
         if key in gate:
             values = gate[key]
             if not isinstance(values, list) or not values:
@@ -400,6 +420,29 @@ def _validate_rejection_codes(codes, name: str, scenario: str) -> None:
 
 def _validate_step_expect(action: str, expect, name: str, scenario: str) -> dict:
     expect = _require_mapping(expect, name, scenario)
+    if action == "shadow":
+        _require_known_keys(expect, _SHADOW_STEP_EXPECT_KEYS, name, scenario)
+        outcome = expect.get("outcome")
+        if outcome not in _STEP_OUTCOMES["shadow"]:
+            raise _fail(
+                scenario,
+                f"{name}.outcome must be one of {sorted(_STEP_OUTCOMES['shadow'])}, got {outcome!r}",
+            )
+        if "allowed" in expect:
+            _require_bool(expect["allowed"], f"{name}.allowed", scenario)
+        if "rejection_codes" in expect:
+            _validate_rejection_codes(expect["rejection_codes"], f"{name}.rejection_codes", scenario)
+        if "error_type" in expect:
+            _require_non_empty_str(expect["error_type"], f"{name}.error_type", scenario)
+        return expect
+    if action == "shadow_concurrent":
+        _require_known_keys(expect, _CONCURRENT_SHADOW_EXPECT_KEYS, name, scenario)
+        for key in ("recorded", "duplicates", "errors"):
+            if key in expect:
+                _require_int(expect[key], f"{name}.{key}", scenario)
+        if "rejection_codes" in expect:
+            _validate_rejection_codes(expect["rejection_codes"], f"{name}.rejection_codes", scenario)
+        return expect
     if action == "submit_concurrent":
         _require_known_keys(expect, _CONCURRENT_SUBMIT_EXPECT_KEYS, name, scenario)
         for key in ("submitted", "rejected", "errors"):
@@ -446,6 +489,15 @@ def _validate_step(spec, index: int, scenario: str) -> ScenarioStep:
     if action == "register":
         params["request"] = _validate_request(step.get("request"), f"{name}.request", scenario)
         _require_non_empty_str(step.get("client_order_id"), f"{name}.client_order_id", scenario)
+    elif action in ("shadow", "shadow_concurrent"):
+        params["request"] = _validate_request(step.get("request"), f"{name}.request", scenario)
+        _require_non_empty_str(step.get("client_order_id"), f"{name}.client_order_id", scenario)
+        if "timeframe" in step:
+            _require_non_empty_str(step["timeframe"], f"{name}.timeframe", scenario)
+        if action == "shadow" and "dry_run" in step:
+            _require_bool(step["dry_run"], f"{name}.dry_run", scenario)
+        if action == "shadow_concurrent":
+            _require_int(step.get("workers"), f"{name}.workers", scenario, minimum=2)
     elif action in ("submit", "record_unknown", "mark_submitting", "submit_concurrent"):
         _require_non_empty_str(step.get("execution_request_id"), f"{name}.execution_request_id", scenario)
         if action == "submit_concurrent":
@@ -510,9 +562,39 @@ def _validate_expected(spec, scenario: str) -> dict:
                 _require_non_empty_str(entry["reason"], f"{name}.reason", scenario)
             if "broker_order_id" in entry and entry["broker_order_id"] is not None:
                 _require_non_empty_str(entry["broker_order_id"], f"{name}.broker_order_id", scenario)
-    for key in ("broker_submit_calls", "order_rows", "history_rows", "safety_decisions"):
+    for key in ("broker_submit_calls", "order_rows", "history_rows", "safety_decisions", "shadow_rows"):
         if key in expected:
             _require_int(expected[key], f"expected.{key}", scenario)
+    for key in ("shadow_db_created", "decision_db_created"):
+        if key in expected:
+            _require_bool(expected[key], f"expected.{key}", scenario)
+    if "shadow_allowed" in expected and expected["shadow_allowed"] is not None:
+        _require_bool(expected["shadow_allowed"], "expected.shadow_allowed", scenario)
+    if "shadow_codes" in expected:
+        _validate_rejection_codes(expected["shadow_codes"], "expected.shadow_codes", scenario)
+    if "shadow_intended_order" in expected:
+        intended = _require_mapping(
+            expected["shadow_intended_order"], "expected.shadow_intended_order", scenario
+        )
+        _require_known_keys(
+            intended, _SUBMITTED_REQUEST_KEYS, "expected.shadow_intended_order", scenario
+        )
+        if not intended:
+            raise _fail(scenario, "expected.shadow_intended_order must declare at least one field")
+        if "side" in intended and intended["side"] not in _SIDE_VALUES:
+            raise _fail(
+                scenario, f"expected.shadow_intended_order.side must be one of {sorted(_SIDE_VALUES)}"
+            )
+        if "order_type" in intended and intended["order_type"] not in _ORDER_TYPE_VALUES:
+            raise _fail(
+                scenario,
+                f"expected.shadow_intended_order.order_type must be one of {sorted(_ORDER_TYPE_VALUES)}",
+            )
+        for key in ("quantity", "limit_price"):
+            if key in intended:
+                _require_optional_decimal_str(
+                    intended[key], f"expected.shadow_intended_order.{key}", scenario
+                )
     if "submitted_request" in expected:
         submitted = _require_mapping(expected["submitted_request"], "expected.submitted_request", scenario)
         _require_known_keys(submitted, _SUBMITTED_REQUEST_KEYS, "expected.submitted_request", scenario)
@@ -605,13 +687,16 @@ def _require_resolvable_primary(definition: ScenarioDefinition) -> None:
         "order_rows",
         "history_rows",
         "submitted_request",
+        "shadow_rows",
+        "shadow_db_created",
+        "decision_db_created",
     }
     used = set(definition.expected) & row_level
     if used:
         raise _fail(
             definition.scenario_id,
             f"expected keys {sorted(used)} need a subject order; declare "
-            "primary_execution_request_id or start with a register step",
+            "primary_execution_request_id or start with a register or shadow step",
         )
 
 
@@ -620,7 +705,7 @@ def resolve_primary_id(definition: ScenarioDefinition) -> str | None:
     if definition.primary_execution_request_id is not None:
         return definition.primary_execution_request_id
     for step in definition.steps:
-        if step.action == "register":
+        if step.action in ("register", "shadow", "shadow_concurrent"):
             return step.params["request"]["execution_request_id"]
     return None
 

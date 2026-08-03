@@ -1,0 +1,37 @@
+{
+  "scenario_id": "shadow_dry_run_no_side_effects",
+  "description": "dry-run無副作用: dry-runモードでは同じ評価経路を通ってもDBファイルは作成されず、migrationもShadow保存もSafety Decision保存もstate更新もBroker呼び出しも発生しない",
+  "steps": [
+    {
+      "action": "shadow",
+      "request": {
+        "execution_request_id": "shadow-exec-1",
+        "signal_id": "shadow-signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "shadow-client-1",
+      "dry_run": true,
+      "expect": {
+        "outcome": "dry_run",
+        "allowed": true
+      }
+    }
+  ],
+  "expected": {
+    "broker_submit_calls": 0,
+    "order_rows": 0,
+    "shadow_rows": 0,
+    "shadow_db_created": false,
+    "decision_db_created": false,
+    "shadow_allowed": null,
+    "safety_decisions": 0,
+    "final_phase": null,
+    "final_state": null
+  }
+}

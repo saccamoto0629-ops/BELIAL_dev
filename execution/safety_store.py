@@ -317,8 +317,10 @@ class SQLiteSafetyDecisionStore:
                 connection.execute("ROLLBACK")
                 raise
 
-    def record(self, decision: SafetyDecision) -> None:
+    def record(self, decision: SafetyDecision) -> int:
         """Persist one decision; raises on ANY failure (fail closed).
+        Returns the assigned ``decision_id`` (Issue #78: shadow results
+        reference the decision row they were built from).
 
         A missing DB file is a failure, not a trigger for implicit creation:
         the audit store must be initialized deliberately, and a submission
@@ -342,11 +344,12 @@ class SQLiteSafetyDecisionStore:
             decision.position_count,
         )
         with _verified_txn(self._path) as connection:
-            connection.execute(
+            cursor = connection.execute(
                 f"INSERT INTO {DECISIONS_TABLE} ({', '.join(_DECISION_COLUMNS)}) "
                 f"VALUES ({', '.join('?' for _ in _DECISION_COLUMNS)})",
                 record,
             )
+            return int(cursor.lastrowid)
 
     def list_for_request(self, execution_request_id: str) -> tuple[SafetyDecision, ...]:
         """All decisions for one request, in recording order.

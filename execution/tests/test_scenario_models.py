@@ -172,6 +172,109 @@ def test_invalid_scenarios_are_rejected(mutate, match):
         validate_scenario(scenario)
 
 
+def shadow_scenario(**overrides):
+    """A fully valid minimal shadow scenario (Issue #78)."""
+    scenario = {
+        "scenario_id": "shadow_ok",
+        "description": "minimal valid shadow scenario",
+        "steps": [
+            {
+                "action": "shadow",
+                "request": {
+                    "execution_request_id": "exec-1",
+                    "signal_id": "signal-1",
+                    "strategy_id": "strategy-1",
+                    "symbol": "USD_JPY",
+                    "side": "buy",
+                    "order_type": "market",
+                    "quantity": "1",
+                    "stop_loss_price": "149.50",
+                    "take_profit_price": "151.50",
+                },
+                "client_order_id": "client-1",
+                "timeframe": "H1",
+                "expect": {"outcome": "recorded", "allowed": True},
+            }
+        ],
+        "expected": {"shadow_rows": 1, "broker_submit_calls": 0, "shadow_allowed": True},
+    }
+    scenario.update(overrides)
+    return scenario
+
+
+def test_shadow_scenario_validates_and_resolves_its_primary_id():
+    definition = validate_scenario(shadow_scenario())
+    assert resolve_primary_id(definition) == "exec-1"
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda s: s["steps"][0].update(surprise=1), "unknown keys"),
+        (lambda s: s["steps"][0].update(dry_run="yes"), "dry_run"),
+        (lambda s: s["steps"][0].update(timeframe=" "), "timeframe"),
+        (lambda s: s["steps"][0]["expect"].update(outcome="submitted"), "outcome"),
+        (lambda s: s["steps"][0]["expect"].update(allowed="yes"), "allowed"),
+        (lambda s: s["steps"][0]["expect"].update(state="filled"), "unknown keys"),
+        (
+            lambda s: s["steps"][0]["expect"].update(rejection_codes=["not_a_code"]),
+            "rejection codes",
+        ),
+        (lambda s: s["expected"].update(shadow_rows="1"), "shadow_rows"),
+        (lambda s: s["expected"].update(shadow_db_created="yes"), "shadow_db_created"),
+        (lambda s: s["expected"].update(shadow_allowed="yes"), "shadow_allowed"),
+        (lambda s: s["expected"].update(shadow_codes=[]), "shadow_codes"),
+        (lambda s: s["expected"].update(shadow_codes=["fabricated"]), "shadow_codes"),
+        (
+            lambda s: s["expected"].update(shadow_intended_order={"colour": "red"}),
+            "unknown keys",
+        ),
+        (
+            lambda s: s["expected"].update(shadow_intended_order={"side": "hold"}),
+            "side",
+        ),
+        (lambda s: s.update(gate={"allowed_shadow_targets": []}), "allowed_shadow_targets"),
+        (
+            lambda s: s["steps"].__setitem__(
+                0,
+                {
+                    "action": "shadow_concurrent",
+                    "request": s["steps"][0]["request"],
+                    "client_order_id": "client-1",
+                    "workers": 1,
+                    "expect": {"recorded": 1},
+                },
+            ),
+            "workers",
+        ),
+        (
+            lambda s: s["steps"].__setitem__(
+                0,
+                {
+                    "action": "shadow_concurrent",
+                    "request": s["steps"][0]["request"],
+                    "client_order_id": "client-1",
+                    "workers": 2,
+                    "expect": {"conflicts": 1},
+                },
+            ),
+            "unknown keys",
+        ),
+    ],
+)
+def test_invalid_shadow_scenarios_are_rejected(mutate, match):
+    scenario = shadow_scenario()
+    mutate(scenario)
+    with pytest.raises(ScenarioDefinitionError, match=match):
+        validate_scenario(scenario)
+
+
+def test_shadow_scenario_null_shadow_allowed_is_valid():
+    scenario = shadow_scenario()
+    scenario["expected"]["shadow_allowed"] = None
+    validate_scenario(scenario)
+
+
 def test_expected_filled_quantity_zero_is_allowed_but_request_quantity_zero_is_not():
     scenario = minimal_scenario()
     scenario["expected"]["filled_quantity"] = "0"
