@@ -24,7 +24,6 @@ deterministic, and expectations reference stable ids only (scenario files pin
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -62,15 +61,17 @@ _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
 
 # DB boundaries where a fault can be injected (Issue #77): each maps to one
 # store function the runner substitutes for the scenario's duration. Issue #78
-# adds the shadow-store save and the safety-decision record boundaries (the
-# runner resolves each name onto the owning module/class itself).
+# adds the shadow-store claim / completion boundaries and the safety-decision
+# record boundary (the runner resolves each name onto the owning
+# module/class itself).
 FAULT_BOUNDARIES: dict[str, str] = {
     "initial_save": "create_execution_order",
     "mark_submitting": "mark_submitting",
     "record_order_result": "record_order_result",
     "record_order_state": "record_order_state",
     "state_history": "_append_history",
-    "shadow_result_save": "record_shadow_result",
+    "shadow_claim": "claim_shadow_cycle",
+    "shadow_result_save": "complete_shadow_cycle",
     "safety_decision_record": "record",
 }
 
@@ -84,6 +85,7 @@ _STEP_ACTIONS = frozenset(
         "register_concurrent",
         "shadow",
         "shadow_concurrent",
+        "shadow_production",
     }
 )
 
@@ -93,7 +95,8 @@ _STEP_OUTCOMES: dict[str, frozenset[str]] = {
     "submit": frozenset({"submitted", "rejected", "error"}),
     "record_unknown": frozenset({"recorded", "error"}),
     "mark_submitting": frozenset({"ok", "error"}),
-    "shadow": frozenset({"recorded", "duplicate", "dry_run", "error"}),
+    "shadow": frozenset({"recorded", "duplicate", "dry_run", "conflict", "error"}),
+    "shadow_production": frozenset({"recorded", "duplicate", "dry_run", "conflict", "error"}),
 }
 
 _REQUEST_REQUIRED_KEYS = frozenset(
@@ -123,7 +126,17 @@ _GATE_KEYS = frozenset(
 
 _BROKER_KEYS = frozenset({"default_fill_price", "connection_target", "scripts"})
 
-_FAULT_KEYS = frozenset({"boundary", "after_calls"})
+# ``after_calls`` lets the first N calls succeed then fails the rest;
+# ``fail_calls`` (Issue #78 stale-claim recovery) fails the FIRST N calls
+# then lets later ones succeed. Mutually exclusive.
+_FAULT_KEYS = frozenset({"boundary", "after_calls", "fail_calls"})
+
+# Stored-signal fixture rows for the production-signal-path scenarios
+# (Issue #78 / PR #100): the runner seeds these into a per-scenario temporary
+# paper-signal DB that the PRODUCTION PaperSignalDbSignalProvider then reads.
+_SIGNAL_KEYS = frozenset({"signal_id", "symbol", "timeframe", "side", "strategy_id", "status"})
+_SIGNAL_REQUIRED_KEYS = frozenset({"signal_id", "symbol", "timeframe", "side"})
+_SIGNAL_SIDES = frozenset({"long", "short"})
 
 _SCENARIO_KEYS = frozenset(
     {
@@ -134,6 +147,8 @@ _SCENARIO_KEYS = frozenset(
         "market",
         "broker",
         "faults",
+        "signals",
+        "production_config",
         "steps",
         "expected",
     }
@@ -147,8 +162,12 @@ _STEP_EXTRA_KEYS: dict[str, frozenset[str]] = {
     "mark_submitting": frozenset({"execution_request_id", "reason"}),
     "submit_concurrent": frozenset({"execution_request_id", "workers"}),
     "register_concurrent": frozenset({"registrations"}),
-    "shadow": frozenset({"request", "client_order_id", "timeframe", "dry_run"}),
+    "shadow": frozenset(
+        {"request", "client_order_id", "timeframe", "dry_run", "owner_id",
+         "at_offset_seconds", "claim_lease_seconds"}
+    ),
     "shadow_concurrent": frozenset({"request", "client_order_id", "timeframe", "workers"}),
+    "shadow_production": frozenset({"signal_id", "owner_id", "at_offset_seconds", "dry_run"}),
 }
 
 # History-entry expectation keys (PR #96 review Minor 1): entries are objects
@@ -184,11 +203,16 @@ EXPECTED_KEYS = frozenset(
         "listed_unknown",
         "listed_unresolved",
         "shadow_rows",
+        "shadow_claim_rows",
         "shadow_db_created",
         "decision_db_created",
         "shadow_allowed",
         "shadow_codes",
         "shadow_intended_order",
+        "shadow_origin",
+        "shadow_phase",
+        "shadow_account_id",
+        "shadow_safety_decision_id",
     }
 )
 
@@ -197,7 +221,9 @@ _SUBMITTED_REQUEST_KEYS = frozenset(
 )
 
 _STEP_EXPECT_KEYS = frozenset({"outcome", "state", "rejection_codes", "error_type", "error_code"})
-_SHADOW_STEP_EXPECT_KEYS = frozenset({"outcome", "allowed", "rejection_codes", "error_type"})
+_SHADOW_STEP_EXPECT_KEYS = frozenset(
+    {"outcome", "allowed", "rejection_codes", "error_type", "conflict_fields"}
+)
 _CONCURRENT_SUBMIT_EXPECT_KEYS = frozenset({"submitted", "rejected", "errors", "rejection_codes"})
 _CONCURRENT_REGISTER_EXPECT_KEYS = frozenset({"registered", "conflicts", "errors"})
 _CONCURRENT_SHADOW_EXPECT_KEYS = frozenset({"recorded", "duplicates", "errors", "rejection_codes"})
@@ -227,6 +253,8 @@ class ScenarioDefinition:
     market: dict
     broker: dict
     faults: tuple[dict, ...]
+    signals: tuple[dict, ...]
+    production_config: dict | None
     steps: tuple[ScenarioStep, ...]
     expected: dict
     source_path: Path | None = field(default=None, compare=False)
@@ -404,10 +432,60 @@ def _validate_faults(spec, scenario: str) -> tuple[dict, ...]:
                 scenario,
                 f"faults[{index}].boundary must be one of {sorted(FAULT_BOUNDARIES)}, got {boundary!r}",
             )
+        if "after_calls" in fault and "fail_calls" in fault:
+            raise _fail(
+                scenario, f"faults[{index}] must not declare both after_calls and fail_calls"
+            )
         if "after_calls" in fault:
             _require_int(fault["after_calls"], f"faults[{index}].after_calls", scenario)
+        if "fail_calls" in fault:
+            _require_int(fault["fail_calls"], f"faults[{index}].fail_calls", scenario, minimum=1)
         faults.append(fault)
     return tuple(faults)
+
+
+def _validate_signals(spec, scenario: str) -> tuple[dict, ...]:
+    if not isinstance(spec, list) or not spec:
+        raise _fail(scenario, "signals must be a non-empty list of stored-signal fixtures")
+    signals = []
+    seen: set[str] = set()
+    for index, entry in enumerate(spec):
+        name = f"signals[{index}]"
+        signal = _require_mapping(entry, name, scenario)
+        _require_known_keys(signal, _SIGNAL_KEYS, name, scenario)
+        missing = _SIGNAL_REQUIRED_KEYS - set(signal)
+        if missing:
+            raise _fail(scenario, f"{name} is missing required keys {sorted(missing)}")
+        for key in ("signal_id", "symbol", "timeframe"):
+            _require_non_empty_str(signal[key], f"{name}.{key}", scenario)
+        if signal["side"] not in _SIGNAL_SIDES:
+            raise _fail(
+                scenario, f"{name}.side must be one of {sorted(_SIGNAL_SIDES)}, got {signal['side']!r}"
+            )
+        for key in ("strategy_id", "status"):
+            if key in signal:
+                _require_non_empty_str(signal[key], f"{name}.{key}", scenario)
+        if signal["signal_id"] in seen:
+            raise _fail(scenario, f"{name}.signal_id {signal['signal_id']!r} is duplicated")
+        seen.add(signal["signal_id"])
+        signals.append(signal)
+    return tuple(signals)
+
+
+def _validate_production_config(spec, scenario: str) -> dict | None:
+    if spec is None:
+        return None
+    config = _require_mapping(spec, "production_config", scenario)
+    # The PRODUCTION parser is the single validation authority (closed world,
+    # every field required) -- the scenario schema defers to it entirely so
+    # the fixture cannot loosen the production contract.
+    from execution.shadow_config import ShadowConfigError, parse_shadow_execution_config
+
+    try:
+        parse_shadow_execution_config(config, source=f"scenario:{scenario}")
+    except ShadowConfigError as exc:
+        raise _fail(scenario, f"production_config is invalid: {exc}")
+    return config
 
 
 def _validate_rejection_codes(codes, name: str, scenario: str) -> None:
@@ -420,20 +498,26 @@ def _validate_rejection_codes(codes, name: str, scenario: str) -> None:
 
 def _validate_step_expect(action: str, expect, name: str, scenario: str) -> dict:
     expect = _require_mapping(expect, name, scenario)
-    if action == "shadow":
+    if action in ("shadow", "shadow_production"):
         _require_known_keys(expect, _SHADOW_STEP_EXPECT_KEYS, name, scenario)
         outcome = expect.get("outcome")
-        if outcome not in _STEP_OUTCOMES["shadow"]:
+        if outcome not in _STEP_OUTCOMES[action]:
             raise _fail(
                 scenario,
-                f"{name}.outcome must be one of {sorted(_STEP_OUTCOMES['shadow'])}, got {outcome!r}",
+                f"{name}.outcome must be one of {sorted(_STEP_OUTCOMES[action])}, got {outcome!r}",
             )
-        if "allowed" in expect:
+        if "allowed" in expect and expect["allowed"] is not None:
             _require_bool(expect["allowed"], f"{name}.allowed", scenario)
         if "rejection_codes" in expect:
             _validate_rejection_codes(expect["rejection_codes"], f"{name}.rejection_codes", scenario)
         if "error_type" in expect:
             _require_non_empty_str(expect["error_type"], f"{name}.error_type", scenario)
+        if "conflict_fields" in expect:
+            fields = expect["conflict_fields"]
+            if not isinstance(fields, list) or not fields:
+                raise _fail(scenario, f"{name}.conflict_fields must be a non-empty list")
+            for entry in fields:
+                _require_non_empty_str(entry, f"{name}.conflict_fields entry", scenario)
         return expect
     if action == "shadow_concurrent":
         _require_known_keys(expect, _CONCURRENT_SHADOW_EXPECT_KEYS, name, scenario)
@@ -496,8 +580,23 @@ def _validate_step(spec, index: int, scenario: str) -> ScenarioStep:
             _require_non_empty_str(step["timeframe"], f"{name}.timeframe", scenario)
         if action == "shadow" and "dry_run" in step:
             _require_bool(step["dry_run"], f"{name}.dry_run", scenario)
+        if action == "shadow":
+            if "owner_id" in step:
+                _require_non_empty_str(step["owner_id"], f"{name}.owner_id", scenario)
+            if "at_offset_seconds" in step:
+                _require_int(step["at_offset_seconds"], f"{name}.at_offset_seconds", scenario)
+            if "claim_lease_seconds" in step:
+                _require_int(step["claim_lease_seconds"], f"{name}.claim_lease_seconds", scenario, minimum=1)
         if action == "shadow_concurrent":
             _require_int(step.get("workers"), f"{name}.workers", scenario, minimum=2)
+    elif action == "shadow_production":
+        _require_non_empty_str(step.get("signal_id"), f"{name}.signal_id", scenario)
+        if "owner_id" in step:
+            _require_non_empty_str(step["owner_id"], f"{name}.owner_id", scenario)
+        if "at_offset_seconds" in step:
+            _require_int(step["at_offset_seconds"], f"{name}.at_offset_seconds", scenario)
+        if "dry_run" in step:
+            _require_bool(step["dry_run"], f"{name}.dry_run", scenario)
     elif action in ("submit", "record_unknown", "mark_submitting", "submit_concurrent"):
         _require_non_empty_str(step.get("execution_request_id"), f"{name}.execution_request_id", scenario)
         if action == "submit_concurrent":
@@ -562,7 +661,10 @@ def _validate_expected(spec, scenario: str) -> dict:
                 _require_non_empty_str(entry["reason"], f"{name}.reason", scenario)
             if "broker_order_id" in entry and entry["broker_order_id"] is not None:
                 _require_non_empty_str(entry["broker_order_id"], f"{name}.broker_order_id", scenario)
-    for key in ("broker_submit_calls", "order_rows", "history_rows", "safety_decisions", "shadow_rows"):
+    for key in (
+        "broker_submit_calls", "order_rows", "history_rows", "safety_decisions",
+        "shadow_rows", "shadow_claim_rows",
+    ):
         if key in expected:
             _require_int(expected[key], f"expected.{key}", scenario)
     for key in ("shadow_db_created", "decision_db_created"):
@@ -570,6 +672,22 @@ def _validate_expected(spec, scenario: str) -> dict:
             _require_bool(expected[key], f"expected.{key}", scenario)
     if "shadow_allowed" in expected and expected["shadow_allowed"] is not None:
         _require_bool(expected["shadow_allowed"], "expected.shadow_allowed", scenario)
+    if "shadow_origin" in expected and expected["shadow_origin"] is not None:
+        origins = frozenset({"production_signal", "cli_fixture", "scenario_fixture"})
+        if expected["shadow_origin"] not in origins:
+            raise _fail(
+                scenario, f"expected.shadow_origin must be one of {sorted(origins)} or null"
+            )
+    if "shadow_phase" in expected and expected["shadow_phase"] is not None:
+        if expected["shadow_phase"] not in ("claimed", "completed"):
+            raise _fail(scenario, "expected.shadow_phase must be 'claimed', 'completed' or null")
+    if "shadow_account_id" in expected and expected["shadow_account_id"] is not None:
+        _require_non_empty_str(expected["shadow_account_id"], "expected.shadow_account_id", scenario)
+    if "shadow_safety_decision_id" in expected and expected["shadow_safety_decision_id"] is not None:
+        _require_int(
+            expected["shadow_safety_decision_id"], "expected.shadow_safety_decision_id",
+            scenario, minimum=1,
+        )
     if "shadow_codes" in expected:
         _validate_rejection_codes(expected["shadow_codes"], "expected.shadow_codes", scenario)
     if "shadow_intended_order" in expected:
@@ -661,6 +779,9 @@ def validate_scenario(raw, *, source_path: Path | None = None) -> ScenarioDefini
     if "expected" not in scenario:
         raise _fail(scenario_id, "expected block is required")
 
+    signals = (
+        _validate_signals(scenario["signals"], scenario_id) if "signals" in scenario else ()
+    )
     definition = ScenarioDefinition(
         scenario_id=scenario_id,
         description=scenario["description"],
@@ -669,10 +790,28 @@ def validate_scenario(raw, *, source_path: Path | None = None) -> ScenarioDefini
         market=_validate_market(scenario.get("market", {}), scenario_id),
         broker=_validate_broker(scenario.get("broker", {}), scenario_id),
         faults=_validate_faults(scenario.get("faults", []), scenario_id),
+        signals=signals,
+        production_config=_validate_production_config(
+            scenario.get("production_config"), scenario_id
+        ),
         steps=steps,
         expected=_validate_expected(scenario["expected"], scenario_id),
         source_path=source_path,
     )
+    if any(step.action == "shadow_production" for step in steps):
+        if not signals or definition.production_config is None:
+            raise _fail(
+                scenario_id,
+                "shadow_production steps require both a signals fixture list and a "
+                "production_config block",
+            )
+        known_ids = {signal["signal_id"] for signal in signals}
+        for step in steps:
+            if step.action == "shadow_production" and step.params["signal_id"] not in known_ids:
+                raise _fail(
+                    scenario_id,
+                    f"shadow_production references unknown signal_id {step.params['signal_id']!r}",
+                )
     _require_resolvable_primary(definition)
     return definition
 
@@ -707,19 +846,26 @@ def resolve_primary_id(definition: ScenarioDefinition) -> str | None:
     for step in definition.steps:
         if step.action in ("register", "shadow", "shadow_concurrent"):
             return step.params["request"]["execution_request_id"]
+        if step.action == "shadow_production":
+            # The production path derives its request id deterministically
+            # from the signal id (execution.shadow_composition).
+            from execution.shadow_composition import EXECUTION_REQUEST_ID_PREFIX
+
+            return f"{EXECUTION_REQUEST_ID_PREFIX}{step.params['signal_id']}"
     return None
 
 
 def load_scenario_file(path: Path) -> ScenarioDefinition:
-    """Load and validate ONE scenario file (one JSON object per file)."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ScenarioDefinitionError(f"cannot read scenario file {path}: {exc}") from exc
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ScenarioDefinitionError(f"scenario file {path} is not valid JSON: {exc}") from exc
+    """Load and validate ONE scenario file (one JSON object per file).
+
+    Scenario files go through the strict JSON loader (Issue #78 / PR #100):
+    duplicate object keys (nested included), invalid UTF-8 / BOM, oversized
+    inputs and non-finite numbers fail the load explicitly."""
+    from execution.strict_json import load_strict_json_file
+
+    raw = load_strict_json_file(
+        path, description="scenario file", error_cls=ScenarioDefinitionError
+    )
     return validate_scenario(raw, source_path=path)
 
 

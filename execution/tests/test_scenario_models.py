@@ -275,6 +275,76 @@ def test_shadow_scenario_null_shadow_allowed_is_valid():
     validate_scenario(scenario)
 
 
+def production_scenario(**overrides):
+    scenario = shadow_scenario(scenario_id="shadow_prod_ok")
+    scenario["signals"] = [
+        {"signal_id": "sig-1", "symbol": "USD_JPY", "timeframe": "H1", "side": "long"}
+    ]
+    scenario["production_config"] = {
+        "config_id": "c1",
+        "policy": {
+            "policy_id": "p1",
+            "allowed_symbols": ["USD_JPY"],
+            "allowed_sides": ["buy", "sell"],
+            "max_order_quantity": "10",
+            "max_positions_per_symbol": 2,
+            "max_positions_account": 5,
+            "max_reference_age_seconds": 30,
+            "max_spread_by_symbol": {"USD_JPY": "0.05"},
+            "allowed_shadow_targets": ["shadow"],
+            "require_stop_loss": False,
+        },
+        "order_quantities": {"USD_JPY": "1"},
+        "kill_switch": False,
+        "connection_target": "shadow",
+    }
+    scenario["steps"] = [
+        {
+            "action": "shadow_production",
+            "signal_id": "sig-1",
+            "expect": {"outcome": "recorded", "allowed": True},
+        }
+    ]
+    scenario.update(overrides)
+    return scenario
+
+
+def test_production_scenario_validates_and_derives_its_primary_id():
+    definition = validate_scenario(production_scenario())
+    assert resolve_primary_id(definition) == "sigreq-sig-1"
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda s: s.pop("signals"), "signals fixture"),
+        (lambda s: s.pop("production_config"), "production_config"),
+        (lambda s: s["signals"][0].update(side="sideways"), "side"),
+        (lambda s: s["signals"][0].update(surprise=1), "unknown keys"),
+        (lambda s: s["production_config"]["policy"].pop("require_stop_loss"), "require_stop_loss"),
+        (lambda s: s["production_config"].update(surprise=1), "unknown keys"),
+        (lambda s: s["steps"][0].update(signal_id="unknown"), "unknown signal_id"),
+        (lambda s: s.update(faults=[{"boundary": "shadow_claim", "after_calls": 1, "fail_calls": 1}]),
+         "must not declare both"),
+        (lambda s: s.update(faults=[{"boundary": "shadow_claim", "fail_calls": 0}]), "fail_calls"),
+    ],
+)
+def test_invalid_production_scenarios_are_rejected(mutate, match):
+    scenario = production_scenario()
+    mutate(scenario)
+    with pytest.raises(ScenarioDefinitionError, match=match):
+        validate_scenario(scenario)
+
+
+def test_duplicate_json_keys_in_a_scenario_file_fail_the_load(tmp_path):
+    path = tmp_path / "dup.json"
+    body = json.dumps(minimal_scenario())
+    duplicated = body.replace('{"scenario_id"', '{"description": "dup", "scenario_id"', 1)
+    path.write_text(duplicated, encoding="utf-8")
+    with pytest.raises(ScenarioDefinitionError, match="duplicate object key"):
+        load_scenario_file(path)
+
+
 def test_expected_filled_quantity_zero_is_allowed_but_request_quantity_zero_is_not():
     scenario = minimal_scenario()
     scenario["expected"]["filled_quantity"] = "0"

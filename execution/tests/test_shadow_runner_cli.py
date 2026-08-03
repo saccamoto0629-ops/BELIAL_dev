@@ -1,10 +1,12 @@
-"""Issue #78: the shadow runner CLI -- mode dispatch (shadow / dry-run run;
-fake / demo / live / unknown refused), cycle-input validation, dry-run
-zero-side-effects, JSON purity, cp932 console survival and stream
-restoration."""
+"""Issue #78: the shadow runner CLI -- the production signal path vs the CLI
+fixture path (provenance separation), mode dispatch (shadow / dry-run run;
+fake / demo / live / unknown refused), strict cycle-input validation
+(duplicate keys / UTF-8 / limits), duplicate-vs-conflict exit codes, dry-run
+zero-side-effects, JSON purity, cp932 survival and stream restoration."""
 
 import io
 import json
+import sqlite3
 import sys
 
 import pytest
@@ -17,6 +19,88 @@ from execution.shadow_runner import (
 )
 
 FIXED_NOW = "2026-01-01T00:00:00+00:00"
+
+
+def seed_signal_db(tmp_path, signal_id="sig-1"):
+    db = tmp_path / "paper_signals.sqlite3"
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE paper_signals (signal_id TEXT PRIMARY KEY, created_at_utc TEXT NOT NULL, "
+        "symbol TEXT NOT NULL, timeframe TEXT NOT NULL, side TEXT NOT NULL, "
+        "strategy_profile TEXT NOT NULL, status TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO paper_signals VALUES (?, ?, 'USD_JPY', 'H1', 'long', 'strategy-1', 'paper_only')",
+        (signal_id, FIXED_NOW),
+    )
+    connection.commit()
+    connection.close()
+    return db
+
+
+def write_production_inputs(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "config_id": "cli-prod-config-1",
+                "policy": {
+                    "policy_id": "cli-prod-policy-1",
+                    "allowed_symbols": ["USD_JPY"],
+                    "allowed_sides": ["buy", "sell"],
+                    "max_order_quantity": "10",
+                    "max_positions_per_symbol": 2,
+                    "max_positions_account": 5,
+                    "max_reference_age_seconds": 30,
+                    "max_spread_by_symbol": {"USD_JPY": "0.05"},
+                    "allowed_shadow_targets": ["shadow"],
+                    "require_stop_loss": False,
+                },
+                "order_quantities": {"USD_JPY": "1"},
+                "kill_switch": False,
+                "connection_target": "shadow",
+            }
+        ),
+        encoding="utf-8",
+    )
+    market = tmp_path / "market.json"
+    market.write_text(
+        json.dumps(
+            {
+                "symbol": "USD_JPY", "reference_price": "150.00", "bid": "149.99",
+                "ask": "150.01", "observed_at_utc": FIXED_NOW, "market_open": True,
+                "tradable": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    account = tmp_path / "account.json"
+    account.write_text(
+        json.dumps(
+            {
+                "account_id": "cli-account", "currency": "JPY", "balance": "1000",
+                "equity": "1000", "margin_available": "1000",
+                "retrieved_at_utc": FIXED_NOW, "positions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config, market, account
+
+
+def run_production(tmp_path, *extra, signal_id="sig-1", mode="shadow"):
+    signal_db = seed_signal_db(tmp_path)
+    config, market, account = write_production_inputs(tmp_path)
+    data_dir = tmp_path / "data"
+    return (
+        main(
+            ["--mode", mode, "--signal-id", signal_id, "--signal-db", str(signal_db),
+             "--execution-config", str(config), "--market-snapshot", str(market),
+             "--account-snapshot", str(account), "--data-dir", str(data_dir),
+             "--now", FIXED_NOW, *extra]
+        ),
+        data_dir,
+    )
 
 
 def cycle_payload(**overrides):
@@ -62,6 +146,88 @@ def run(tmp_path, *extra, payload=None, mode="shadow"):
         ),
         data_dir,
     )
+
+
+# --- production signal path -----------------------------------------------------
+
+
+def test_production_cycle_records_with_production_provenance(tmp_path, capsys):
+    code, data_dir = run_production(tmp_path)
+    assert code == EXIT_OK
+    out = capsys.readouterr().out
+    assert "RECORDED sigreq-sig-1 gate=ALLOWED" in out
+    assert "origin=production_signal" in out
+    assert "paper_signal_db:" in out and "cli-prod-config-1" in out
+    assert (data_dir / "shadow_results.sqlite3").exists()
+
+
+def test_production_json_carries_provenance(tmp_path, capsys):
+    code, _ = run_production(tmp_path, "--json")
+    assert code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    provenance = payload["result"]["provenance"]
+    assert provenance["input_origin"] == "production_signal"
+    assert provenance["config_version"] == "cli-prod-config-1"
+    assert provenance["signal_observed_at_utc"] == FIXED_NOW
+
+
+def test_production_missing_signal_is_a_cycle_failure(tmp_path, capsys):
+    code, _ = run_production(tmp_path, signal_id="missing")
+    assert code == EXIT_CYCLE_FAILURE
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_production_requires_all_provider_flags(tmp_path, capsys):
+    signal_db = seed_signal_db(tmp_path)
+    code = main(["--signal-id", "sig-1", "--signal-db", str(signal_db), "--now", FIXED_NOW,
+                 "--data-dir", str(tmp_path / "data")])
+    assert code == EXIT_USAGE_ERROR
+    err = capsys.readouterr().err
+    assert "--execution-config" in err and "no defaults" in err
+    assert not (tmp_path / "data").exists()
+
+
+def test_production_incomplete_config_is_a_usage_error(tmp_path, capsys):
+    signal_db = seed_signal_db(tmp_path)
+    config, market, account = write_production_inputs(tmp_path)
+    broken = json.loads(config.read_text(encoding="utf-8"))
+    del broken["policy"]["require_stop_loss"]
+    config.write_text(json.dumps(broken), encoding="utf-8")
+    code = main(["--signal-id", "sig-1", "--signal-db", str(signal_db),
+                 "--execution-config", str(config), "--market-snapshot", str(market),
+                 "--account-snapshot", str(account), "--data-dir", str(tmp_path / "data"),
+                 "--now", FIXED_NOW])
+    assert code == EXIT_USAGE_ERROR
+    assert "require_stop_loss" in capsys.readouterr().err
+
+
+def test_production_dry_run_creates_nothing(tmp_path):
+    code, data_dir = run_production(tmp_path, mode="dry-run")
+    assert code == EXIT_OK
+    assert not data_dir.exists()
+
+
+def test_cycle_and_signal_id_are_mutually_exclusive(tmp_path):
+    cycle = write_cycle(tmp_path)
+    with pytest.raises(SystemExit):
+        main(["--cycle", str(cycle), "--signal-id", "sig-1"])
+
+
+# --- duplicate vs conflict at the CLI boundary ----------------------------------
+
+
+def test_conflicting_payload_exits_nonzero_with_the_reason_code(tmp_path, capsys):
+    cycle = write_cycle(tmp_path)
+    data_dir = tmp_path / "data"
+    base = ["--cycle", str(cycle), "--data-dir", str(data_dir), "--now", FIXED_NOW]
+    assert main(base) == EXIT_OK
+    changed = cycle_payload()
+    changed["request"]["quantity"] = "2"
+    conflicting = write_cycle(tmp_path, changed, name="changed.json")
+    code = main(["--cycle", str(conflicting), "--data-dir", str(data_dir), "--now", FIXED_NOW])
+    assert code == EXIT_CYCLE_FAILURE
+    err = capsys.readouterr().err
+    assert "shadow_payload_mismatch" in err and "quantity" in err
 
 
 # --- shadow mode ----------------------------------------------------------------
@@ -162,6 +328,81 @@ def test_unknown_mode_is_refused(tmp_path, capsys):
     code, _ = run(tmp_path, mode="paper")
     assert code == EXIT_USAGE_ERROR
     assert "unknown execution mode" in capsys.readouterr().err
+
+
+# --- strict JSON loader at the CLI boundary --------------------------------------
+
+
+def raw_cycle(tmp_path, data: bytes, name="raw.json"):
+    path = tmp_path / name
+    path.write_bytes(data)
+    return main(["--cycle", str(path), "--data-dir", str(tmp_path / "data"), "--now", FIXED_NOW])
+
+
+def test_duplicate_root_key_is_a_usage_error(tmp_path, capsys):
+    payload = json.dumps(cycle_payload())[:-1] + ', "kill_switch": false}'
+    assert '"kill_switch"' in payload
+    duplicated = payload.replace('{"request"', '{"kill_switch": true, "request"', 1)
+    assert raw_cycle(tmp_path, duplicated.encode("utf-8")) == EXIT_USAGE_ERROR
+    assert "duplicate object key" in capsys.readouterr().err
+
+
+def test_duplicate_nested_key_is_a_usage_error(tmp_path, capsys):
+    payload = cycle_payload()
+    text = json.dumps(payload).replace('"quantity": "1"', '"quantity": "1", "quantity": "1"', 1)
+    assert raw_cycle(tmp_path, text.encode("utf-8")) == EXIT_USAGE_ERROR
+    assert "duplicate object key" in capsys.readouterr().err
+
+
+def test_invalid_utf8_is_a_stable_usage_error(tmp_path, capsys):
+    assert raw_cycle(tmp_path, b'{"request": "\xff\xfe"}') == EXIT_USAGE_ERROR
+    err = capsys.readouterr().err
+    assert "not valid UTF-8" in err and "Traceback" not in err
+
+
+def test_bom_is_rejected(tmp_path, capsys):
+    assert raw_cycle(tmp_path, b"\xef\xbb\xbf" + json.dumps(cycle_payload()).encode()) == EXIT_USAGE_ERROR
+    assert "BOM" in capsys.readouterr().err
+
+
+def test_deep_json_is_rejected(tmp_path, capsys):
+    deep = b'{"request": ' + b"[" * 64 + b"1" + b"]" * 64 + b"}"
+    assert raw_cycle(tmp_path, deep) == EXIT_USAGE_ERROR
+
+
+def test_oversized_file_is_rejected(tmp_path, capsys):
+    blob = b'{"request": "' + b"x" * 300_000 + b'"}'
+    assert raw_cycle(tmp_path, blob) == EXIT_USAGE_ERROR
+    assert "maximum accepted size" in capsys.readouterr().err
+
+
+def test_nan_and_infinity_are_rejected(tmp_path, capsys):
+    assert raw_cycle(tmp_path, b'{"request": NaN}') == EXIT_USAGE_ERROR
+    assert "non-finite" in capsys.readouterr().err
+    assert raw_cycle(tmp_path, b'{"request": Infinity}', ) == EXIT_USAGE_ERROR
+
+
+def test_bool_as_number_is_rejected(tmp_path, capsys):
+    payload = cycle_payload()
+    payload["request"]["quantity"] = True
+    code, _ = run(tmp_path, payload=payload)
+    assert code == EXIT_USAGE_ERROR
+    assert "decimal string" in capsys.readouterr().err
+
+
+def test_huge_exponent_decimals_are_rejected(tmp_path, capsys):
+    payload = cycle_payload()
+    payload["request"]["quantity"] = "1E+999"
+    code, _ = run(tmp_path, payload=payload)
+    assert code == EXIT_USAGE_ERROR
+    assert "exponent" in capsys.readouterr().err
+
+
+def test_valid_japanese_content_survives(tmp_path, capsys):
+    payload = cycle_payload()
+    payload["request"]["strategy_id"] = "戦略-1"
+    code, _ = run(tmp_path, payload=payload)
+    assert code == EXIT_OK
 
 
 # --- cycle input validation -----------------------------------------------------

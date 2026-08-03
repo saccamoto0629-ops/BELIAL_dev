@@ -1,9 +1,9 @@
 {
   "scenario_id": "shadow_db_failure_initial_save",
-  "description": "Shadow Mode DB初期保存失敗: Shadow結果のINSERTが失敗した場合はERRORとなり、Broker呼び出し0のまま不完全なShadow行もidempotencyだけ残る不整合も存在しない",
+  "description": "Shadow Mode claim保存失敗: identity claimのINSERTが失敗した場合はERRORとなり、Gate評価前のためSafety Decisionも0件、Broker呼び出し0のまま不完全なShadow行もclaim残骸も存在しない",
   "faults": [
     {
-      "boundary": "shadow_result_save"
+      "boundary": "shadow_claim"
     }
   ],
   "steps": [
@@ -30,8 +30,9 @@
   "expected": {
     "broker_submit_calls": 0,
     "shadow_rows": 0,
+    "shadow_claim_rows": 0,
     "shadow_allowed": null,
-    "safety_decisions": 1,
-    "last_decision_allowed": true
+    "shadow_phase": null,
+    "safety_decisions": 0
   }
 }

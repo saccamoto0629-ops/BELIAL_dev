@@ -20,6 +20,11 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.shadow_models import ShadowResult, intended_order_from_request",
     "from execution import shadow_store",
     "from execution.shadow_execution import ShadowExecutionService",
+    "from execution.shadow_providers import PaperSignalDbSignalProvider, StoredSignal",
+    "from execution.shadow_config import load_shadow_execution_config",
+    "from execution.shadow_composition import run_production_shadow_cycle",
+    "from execution.sqlite_ro import connect_read_only",
+    "from execution.strict_json import load_strict_json_file",
     "from execution.shadow_runner import main as shadow_runner_main",
     "from execution.shadow_report import main as shadow_report_main",
 )

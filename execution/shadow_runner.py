@@ -1,46 +1,44 @@
-"""Shadow Mode cycle runner CLI (Issue #78): run ONE execution cycle through
-the production Shadow service boundary.
+"""Shadow Mode cycle runner CLI (Issue #78; production-path rework PR #100):
+run ONE execution cycle through the production Shadow service boundary.
 
-*** NOTHING HERE SUBMITS AN ORDER OR TOUCHES A BROKER. The runner only
-validates a cycle-input file, builds the production objects
-(``ExecutionRequest`` / ``MarketSafetySnapshot`` / ``AccountSafetySnapshot`` /
-``SafetyPolicy``) and calls :class:`execution.shadow_execution.
-ShadowExecutionService` -- every decision, every persistence rule and the
-"zero broker calls" guarantee live in the production modules, never here. ***
+*** NOTHING HERE SUBMITS AN ORDER OR TOUCHES A BROKER, and nothing here
+re-implements a production decision: the runner only resolves inputs and
+calls the production composition root / service. ***
 
-Mode dispatch (the configured mode is validated by
-``execution.safety_gate.resolve_execution_mode`` -- unknown modes are refused
-at startup):
+Two clearly separated input paths (recorded as ``input_origin`` provenance):
 
-- ``--mode shadow`` (default): initialize/verify the shadow + decision
-  stores, run the cycle, persist the shadow verification record.
-- ``--mode dry-run``: the same evaluation with ZERO side effects -- no DB
-  creation/migration/write, existing DBs probed read-only, nothing persisted.
-- ``--mode fake``: refused (exit 2) -- fake submission runs exclusively via
-  ``LiveOrderSubmissionService`` (exercised by ``execution.scenario_runner``);
-  the shadow runner never submits anywhere.
-- ``--mode demo`` / ``--mode live``: refused (exit 2) -- these modes are
-  defined for configuration validation only and are NOT implemented; no
-  broker adapter exists for them (``BROKER_TYPE_BY_MODE``).
+- PRODUCTION SIGNAL PATH (``--signal-id``): reads a STORED signal from the
+  Paper Signal store (``--signal-db``), the production execution
+  configuration (``--execution-config``) and provider-maintained market /
+  account snapshot files (``--market-snapshot`` / ``--account-snapshot``),
+  then runs ``execution.shadow_composition.run_production_shadow_cycle``.
+  NO permissive defaults exist here: a missing signal, an unconfigured
+  symbol, an absent snapshot field or an incomplete configuration is an
+  explicit failure. Records carry ``input_origin="production_signal"``.
+- CLI FIXTURE PATH (``--cycle``): a hand-authored cycle-input JSON (request /
+  market / account / policy inline). Fixture-only conveniences (default
+  policy values, placeholder account) are allowed and the record is labelled
+  ``input_origin="cli_fixture"`` -- it never counts as the real signal path.
 
-Cycle input (one JSON object; closed-world validated -- unknown keys are
-errors): a ``request`` block (the real signal's execution intent; mapping
-signal vocabulary to ``side`` is the caller's responsibility, exactly as for
-live submission), ``client_order_id``, optional ``timeframe``, a ``market``
-snapshot block, an optional ``account`` snapshot block (position / account
-context for the gate's limit checks; placeholder identifiers are used when
-omitted -- never fabricated broker responses), an optional ``policy`` block
-(the applied Safety Gate configuration; recorded verbatim in the shadow
-result's policy snapshot) and an optional ``kill_switch`` flag. Prices and
-quantities are decimal STRINGS (floats are refused); timestamps are ISO-8601
-UTC strings, defaulting to the runner clock where omitted.
+Mode dispatch (validated by ``resolve_execution_mode`` -- unknown modes are
+refused at startup): ``shadow`` runs and persists; ``dry-run`` evaluates with
+ZERO side effects (no DB creation / write; existing DBs probed via TRUE
+read-only connections); ``fake`` / ``demo`` / ``live`` are refused explicitly.
+
+All JSON inputs go through the strict loader (``execution.strict_json``):
+duplicate object keys (nested included), invalid UTF-8 / BOM, files over
+256 KiB, nesting deeper than 32, oversized strings/arrays/objects and
+``NaN`` / ``Infinity`` are stable usage errors -- never tracebacks. Decimal
+strings additionally reject non-finite values, out-of-range exponents, and
+booleans-as-numbers (prices/quantities must be strings).
 
 Exit codes: 0 = cycle completed (RECORDED, an explicit DUPLICATE, or a
 dry-run evaluation -- a Safety Gate REJECTION is a recorded outcome, not a
-failure); 1 = cycle failure (store/schema errors); 2 = usage / configuration
-errors (invalid mode, invalid cycle input). ``--json`` prints a pure-ASCII
-machine-readable outcome on stdout with no log lines mixed in (logs go to
-stderr).
+failure); 1 = cycle failure (identity CONFLICT with reason code
+``shadow_payload_mismatch``, unresolved production inputs, store/schema
+errors); 2 = usage / configuration errors (invalid mode, invalid cycle
+input, invalid production configuration). ``--json`` prints a pure-ASCII
+machine-readable outcome on stdout with no log lines mixed in.
 """
 
 from __future__ import annotations
@@ -67,16 +65,31 @@ from execution.safety_gate import (
     resolve_execution_mode,
 )
 from execution.safety_store import safety_db_path
+from execution.shadow_composition import run_production_shadow_cycle
+from execution.shadow_config import ShadowConfigError, load_shadow_execution_config
 from execution.shadow_execution import ShadowExecutionService
-from execution.shadow_report import result_payload
+from execution.shadow_models import INPUT_ORIGIN_CLI_FIXTURE, ShadowProvenance
+from execution.shadow_providers import (
+    AccountSnapshotFileProvider,
+    MarketSnapshotFileProvider,
+    PaperSignalDbSignalProvider,
+    ShadowInputError,
+)
+from execution.shadow_report import claim_payload, result_payload
+from execution.strict_json import load_strict_json_file
 
 EXIT_OK = 0
 EXIT_CYCLE_FAILURE = 1
 EXIT_USAGE_ERROR = 2
 
-# Placeholder identity used when the cycle input carries no account block:
-# clearly non-broker values (the gate only consumes the id and the snapshot
-# freshness; balances are neither checked nor persisted).
+# Bound on decimal exponents in fixture inputs (PR #100 review: giant
+# exponent spellings like 1E+999999 are refused even though Decimal could
+# represent them).
+MAX_DECIMAL_EXPONENT = 28
+
+# Placeholder identity used when the FIXTURE cycle input carries no account
+# block: clearly non-broker values (the gate only consumes the id and the
+# snapshot freshness; balances are neither checked nor persisted as truth).
 _DEFAULT_ACCOUNT_ID = "shadow-unverified-account"
 _DEFAULT_ACCOUNT_CURRENCY = "XXX"
 
@@ -137,12 +150,19 @@ def _require_str(value, name: str) -> str:
 
 
 def _decimal(value, name: str) -> Decimal:
-    if not isinstance(value, str):
-        raise CycleInputError(f"{name} must be a decimal string (floats are refused), got {value!r}")
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise CycleInputError(f"{name} must be a decimal string (numbers/booleans are refused), got {value!r}")
     try:
-        return Decimal(value)
+        parsed = Decimal(value)
     except InvalidOperation:
         raise CycleInputError(f"{name} is not a valid decimal string: {value!r}") from None
+    if not parsed.is_finite():
+        raise CycleInputError(f"{name} must be finite, got {value!r}")
+    if parsed != 0 and abs(parsed.adjusted()) > MAX_DECIMAL_EXPONENT:
+        raise CycleInputError(
+            f"{name} exponent is out of the accepted range (+/-{MAX_DECIMAL_EXPONENT}), got {value!r}"
+        )
+    return parsed
 
 
 def _optional_decimal(mapping: dict, key: str, name: str) -> Decimal | None:
@@ -329,7 +349,7 @@ def _build_policy(spec, request: ExecutionRequest) -> SafetyPolicy:
             raise CycleInputError(f"policy.{key} must be an integer >= 0, got {policy[key]!r}")
     try:
         return SafetyPolicy(
-            policy_id=_require_str(policy.get("policy_id", "shadow-cli-policy"), "policy.policy_id"),
+            policy_id=_require_str(policy.get("policy_id", "shadow-cli-fixture-policy"), "policy.policy_id"),
             allowed_symbols=symbols,
             allowed_sides=sides,
             max_order_quantity=_decimal(
@@ -349,15 +369,9 @@ def _build_policy(spec, request: ExecutionRequest) -> SafetyPolicy:
 
 
 def load_cycle_input(path: Path, now: datetime) -> dict:
-    """Load and validate ONE cycle-input file into production objects."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise CycleInputError(f"cannot read cycle input {path}: {exc}") from exc
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise CycleInputError(f"cycle input {path} is not valid JSON: {exc}") from exc
+    """Load and validate ONE FIXTURE cycle-input file into production
+    objects (strict JSON loader: duplicate keys, UTF-8, size/depth limits)."""
+    raw = load_strict_json_file(path, description="cycle input", error_cls=CycleInputError)
     cycle = _require_mapping(raw, "cycle input")
     _require_known_keys(cycle, _CYCLE_KEYS, "cycle input")
     for key in ("request", "client_order_id", "market"):
@@ -383,8 +397,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python -m execution.shadow_runner",
         description=(
             "Run ONE execution cycle in Shadow Mode (Issue #78): the real "
-            "decision path with zero broker calls; the verification outcome is "
-            "persisted to the shadow store (--mode dry-run persists nothing)."
+            "decision path with zero broker calls. --signal-id runs the "
+            "PRODUCTION stored-signal path; --cycle runs a labelled CLI fixture."
         ),
     )
     parser.add_argument(
@@ -392,8 +406,31 @@ def _build_parser() -> argparse.ArgumentParser:
         default=ExecutionMode.SHADOW.value,
         help="execution mode (shadow / dry-run; fake, demo and live are refused here)",
     )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--signal-id",
+        default=None,
+        help="PRODUCTION path: run the stored signal with this id (requires --signal-db, "
+        "--execution-config, --market-snapshot, --account-snapshot; no defaults)",
+    )
+    source.add_argument(
+        "--cycle",
+        type=Path,
+        default=None,
+        help="FIXTURE path: hand-authored cycle input JSON (recorded as input_origin=cli_fixture)",
+    )
+    parser.add_argument("--signal-db", type=Path, default=None, help="paper signal DB path (production path)")
     parser.add_argument(
-        "--cycle", type=Path, required=True, help="cycle input JSON file (see the module docstring)"
+        "--execution-config", type=Path, default=None,
+        help="production execution configuration JSON (production path)",
+    )
+    parser.add_argument(
+        "--market-snapshot", type=Path, default=None,
+        help="market snapshot JSON file (production path)",
+    )
+    parser.add_argument(
+        "--account-snapshot", type=Path, default=None,
+        help="account/position snapshot JSON file (production path)",
     )
     parser.add_argument(
         "--shadow-db",
@@ -415,6 +452,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "overridden by --shadow-db / --decision-db",
     )
     parser.add_argument(
+        "--owner-id",
+        default=None,
+        help="claim owner identity (default: a per-process value; fixed values make "
+        "crash-retry recovery deterministic for operations)",
+    )
+    parser.add_argument(
         "--now",
         default=None,
         help="fixed ISO-8601 UTC evaluation clock for deterministic verification runs "
@@ -429,6 +472,21 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     with encoding_safe_streams():
         return _run_cli(argv)
+
+
+def _resolve_db_paths(args) -> tuple[Path, Path]:
+    shadow_db = args.shadow_db
+    decision_db = args.decision_db
+    if args.data_dir is not None:
+        shadow_db = shadow_db if shadow_db is not None else args.data_dir / "shadow_results.sqlite3"
+        decision_db = (
+            decision_db if decision_db is not None else args.data_dir / "safety_gate_decisions.sqlite3"
+        )
+    if shadow_db is None:
+        shadow_db = shadow_store.shadow_db_path()
+    if decision_db is None:
+        decision_db = safety_db_path()
+    return Path(shadow_db), Path(decision_db)
 
 
 def _run_cli(argv: list[str] | None) -> int:
@@ -464,25 +522,84 @@ def _run_cli(argv: list[str] | None) -> int:
     else:
         clock = lambda: datetime.now(timezone.utc)  # noqa: E731
 
-    now = clock()
+    shadow_db, decision_db = _resolve_db_paths(args)
+    dry_run = mode is ExecutionMode.DRY_RUN
+
     try:
-        cycle = load_cycle_input(args.cycle, now)
+        if args.signal_id is not None:
+            outcome = _run_production(args, shadow_db, decision_db, clock, dry_run)
+        else:
+            outcome = _run_fixture(args, shadow_db, decision_db, clock, dry_run)
     except CycleInputError as exc:
         print(f"cycle input error: {exc}", file=sys.stderr)
         return EXIT_USAGE_ERROR
-
-    shadow_db = args.shadow_db
-    decision_db = args.decision_db
-    if args.data_dir is not None:
-        shadow_db = shadow_db if shadow_db is not None else args.data_dir / "shadow_results.sqlite3"
-        decision_db = (
-            decision_db if decision_db is not None else args.data_dir / "safety_gate_decisions.sqlite3"
+    except ShadowConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+    except shadow_store.ShadowIdentityConflictError as exc:
+        # Machine-readable conflict record on stderr; a changed payload must
+        # never silently return the stored record (PR #100 review).
+        print(
+            f"shadow identity conflict [{exc.reason_code}]: {exc} "
+            f"(differing fields: {', '.join(exc.differing_fields)})",
+            file=sys.stderr,
         )
-    if shadow_db is None:
-        shadow_db = shadow_store.shadow_db_path()
-    if decision_db is None:
-        decision_db = safety_db_path()
+        return EXIT_CYCLE_FAILURE
+    except ShadowInputError as exc:
+        print(f"production input error: {exc}", file=sys.stderr)
+        return EXIT_CYCLE_FAILURE
+    except Exception as exc:
+        # Store/schema failures and unexpected errors are cycle failures --
+        # never reported as a successful (or silently skipped) cycle.
+        print(f"shadow cycle failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_CYCLE_FAILURE
 
+    return _render_outcome(args, mode, outcome, shadow_db, decision_db)
+
+
+def _run_production(args, shadow_db: Path, decision_db: Path, clock, dry_run: bool):
+    missing = [
+        flag
+        for flag, value in (
+            ("--signal-db", args.signal_db),
+            ("--execution-config", args.execution_config),
+            ("--market-snapshot", args.market_snapshot),
+            ("--account-snapshot", args.account_snapshot),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ShadowConfigError(
+            f"the production signal path requires {', '.join(missing)} (no defaults)"
+        )
+    config = load_shadow_execution_config(args.execution_config)
+    return run_production_shadow_cycle(
+        args.signal_id,
+        signal_provider=PaperSignalDbSignalProvider(args.signal_db),
+        config=config,
+        market_provider=MarketSnapshotFileProvider(args.market_snapshot),
+        account_provider=AccountSnapshotFileProvider(args.account_snapshot),
+        shadow_db_path=shadow_db,
+        decision_db_path=decision_db,
+        clock=clock,
+        owner_id=args.owner_id,
+        dry_run=dry_run,
+    )
+
+
+def _run_fixture(args, shadow_db: Path, decision_db: Path, clock, dry_run: bool):
+    now = clock()
+    cycle = load_cycle_input(args.cycle, now)
+    fixture_source = f"{INPUT_ORIGIN_CLI_FIXTURE}:{args.cycle}"
+    provenance = ShadowProvenance(
+        input_origin=INPUT_ORIGIN_CLI_FIXTURE,
+        signal_source=fixture_source,
+        config_source=fixture_source,
+        config_version=cycle["policy"].policy_id,
+        market_source=fixture_source,
+        account_source=fixture_source,
+        signal_observed_at_utc=cycle["request"].requested_at_utc,
+    )
     gate = SafetyGate(
         policy=cycle["policy"],
         state_provider=StaticSafetyState(kill_switch_enabled=cycle["kill_switch"]),
@@ -493,32 +610,22 @@ def _run_cli(argv: list[str] | None) -> int:
         decision_db_path=decision_db,
         shadow_db_path=shadow_db,
         clock=clock,
+        owner_id=args.owner_id,
     )
+    kwargs = dict(
+        market=cycle["market"],
+        account=cycle["account"],
+        client_order_id=cycle["client_order_id"],
+        provenance=provenance,
+        timeframe=cycle["timeframe"],
+    )
+    if dry_run:
+        return service.dry_run_cycle(cycle["request"], **kwargs)
+    service.initialize_stores()
+    return service.run_cycle(cycle["request"], **kwargs)
 
-    try:
-        if mode is ExecutionMode.DRY_RUN:
-            outcome = service.dry_run_cycle(
-                cycle["request"],
-                market=cycle["market"],
-                account=cycle["account"],
-                client_order_id=cycle["client_order_id"],
-                timeframe=cycle["timeframe"],
-            )
-        else:
-            service.initialize_stores()
-            outcome = service.run_cycle(
-                cycle["request"],
-                market=cycle["market"],
-                account=cycle["account"],
-                client_order_id=cycle["client_order_id"],
-                timeframe=cycle["timeframe"],
-            )
-    except Exception as exc:
-        # Store/schema failures and unexpected errors are cycle failures --
-        # never reported as a successful (or silently skipped) cycle.
-        print(f"shadow cycle failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_CYCLE_FAILURE
 
+def _render_outcome(args, mode, outcome, shadow_db: Path, decision_db: Path) -> int:
     result = outcome.result
     if args.json:
         payload = {
@@ -526,20 +633,39 @@ def _run_cli(argv: list[str] | None) -> int:
             "status": outcome.status.value,
             "shadow_db": str(shadow_db),
             "decision_db": str(decision_db),
-            "result": result_payload(result),
+            "result": None if result is None else result_payload(result),
+            "claim": None if outcome.claim is None else claim_payload(outcome.claim),
         }
         print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return EXIT_OK
+
+    if result is None:
+        claim = outcome.claim
+        print(
+            f"{outcome.status.value.upper()} {claim.execution_request_id} mode={mode.value}"
+        )
+        print(
+            f"  duplicate: a payload-equal cycle is in flight (claim held by "
+            f"{claim.claim_owner_id} until {claim.lease_expires_at_utc.isoformat()}); "
+            "nothing was evaluated or persisted by this call"
+        )
         return EXIT_OK
 
     verdict = "ALLOWED" if result.allowed else "REJECTED"
     print(
         f"{outcome.status.value.upper()} {result.request.execution_request_id} "
-        f"gate={verdict} mode={mode.value}"
+        f"gate={verdict} mode={mode.value} origin={result.provenance.input_origin}"
     )
     print(
         f"  signal={result.request.signal_id} {result.request.symbol} "
         f"{result.request.side.value}/{result.request.order_type.value} "
-        f"qty={result.request.quantity}"
+        f"qty={result.request.quantity} timeframe={result.timeframe}"
+    )
+    provenance = result.provenance
+    print(
+        f"  provenance: signal={provenance.signal_source} config={provenance.config_source} "
+        f"(version {provenance.config_version}) market={provenance.market_source} "
+        f"account={provenance.account_source}"
     )
     intended = result.intended_order
     print(
@@ -556,7 +682,7 @@ def _run_cli(argv: list[str] | None) -> int:
     elif outcome.status.value == "duplicate":
         print(
             f"  duplicate: existing shadow_result_id={result.shadow_result_id} was returned; "
-            "no second record was created"
+            "no second record was created and no decision was written"
         )
     else:
         print("  dry-run: nothing was persisted, no DB file was created")

@@ -14,8 +14,23 @@ from execution.safety_gate import (
     StaticSafetyState,
 )
 from execution.shadow_execution import ShadowExecutionService
+from execution.shadow_models import INPUT_ORIGIN_SCENARIO_FIXTURE, ShadowProvenance
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def make_provenance(**overrides) -> ShadowProvenance:
+    values = dict(
+        input_origin=INPUT_ORIGIN_SCENARIO_FIXTURE,
+        signal_source="test-signal-source",
+        config_source="test-config-source",
+        config_version="test-config-v1",
+        market_source="test-market-source",
+        account_source="test-account-source",
+        signal_observed_at_utc=None,
+    )
+    values.update(overrides)
+    return ShadowProvenance(**values)
 
 
 def make_policy(**overrides) -> SafetyPolicy:
@@ -99,12 +114,19 @@ def make_position(symbol="USD_JPY", retrieved_at_utc=NOW) -> PositionInfo:
     )
 
 
-def make_service(tmp_path, *, gate=None, initialize=True, clock=None) -> ShadowExecutionService:
+def make_service(
+    tmp_path, *, gate=None, initialize=True, clock=None, owner_id=None, claim_lease_seconds=None
+) -> ShadowExecutionService:
+    kwargs = {}
+    if claim_lease_seconds is not None:
+        kwargs["claim_lease_seconds"] = claim_lease_seconds
     service = ShadowExecutionService(
-        gate=gate if gate is not None else make_gate(),
+        gate=gate if gate is not None else make_gate(clock=clock),
         decision_db_path=tmp_path / "safety.sqlite3",
         shadow_db_path=tmp_path / "shadow.sqlite3",
         clock=clock if clock is not None else (lambda: NOW),
+        owner_id=owner_id,
+        **kwargs,
     )
     if initialize:
         service.initialize_stores()

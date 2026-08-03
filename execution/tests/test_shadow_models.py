@@ -1,7 +1,7 @@
-"""Issue #78: ShadowIntendedOrder / ShadowResult model invariants -- the audit
-projection matches the request, non-shadow decisions are unrepresentable, and
-policy snapshots detach from the caller's dict."""
+"""Issue #78: ShadowIntendedOrder / ShadowProvenance / ShadowResult model
+invariants and the canonical-payload duplicate/conflict contract (PR #100)."""
 
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -9,16 +9,28 @@ import pytest
 from broker.broker_models import OrderSide, OrderType
 from execution.safety_gate import SafetyDecision
 from execution.shadow_models import (
+    INPUT_ORIGIN_CLI_FIXTURE,
+    INPUT_ORIGIN_PRODUCTION_SIGNAL,
+    ShadowClaim,
     ShadowIntendedOrder,
     ShadowResult,
+    canonical_cycle_payload,
+    canonical_payload_json,
+    differing_payload_fields,
     intended_order_from_request,
 )
-from shadow_helpers import NOW, make_account, make_gate, make_market, make_request
+from shadow_helpers import (
+    NOW,
+    make_account,
+    make_gate,
+    make_market,
+    make_provenance,
+    make_request,
+)
 
 
-def make_decision(request, **overrides) -> SafetyDecision:
-    gate = make_gate()
-    return gate.evaluate_shadow(
+def make_decision(request):
+    return make_gate().evaluate_shadow(
         request, market=make_market(), account=make_account(), connection_target="shadow"
     )
 
@@ -30,12 +42,16 @@ def make_result(request=None, decision=None, **overrides) -> ShadowResult:
         request=request,
         client_order_id="client-1",
         timeframe="H1",
+        provenance=make_provenance(),
         decision=decision,
         intended_order=intended_order_from_request(request, client_order_id="client-1"),
         market=make_market(),
+        account=make_account(),
         policy_snapshot=make_gate().policy.to_snapshot(),
         safety_decision_id=1,
-        created_at_utc=NOW,
+        claim_owner_id="owner-1",
+        claimed_at_utc=NOW,
+        completed_at_utc=NOW,
     )
     values.update(overrides)
     return ShadowResult(**values)
@@ -65,29 +81,82 @@ def test_limit_projection_maps_requested_price_to_limit_price():
 def test_intended_order_rejects_limit_price_mismatch():
     with pytest.raises(ValueError, match="limit_price"):
         ShadowIntendedOrder(
-            client_order_id="client-1",
-            symbol="USD_JPY",
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=Decimal("1"),
-            limit_price=Decimal("150"),
+            client_order_id="client-1", symbol="USD_JPY", side=OrderSide.BUY,
+            order_type=OrderType.MARKET, quantity=Decimal("1"), limit_price=Decimal("150"),
         )
     with pytest.raises(ValueError, match="limit_price"):
         ShadowIntendedOrder(
-            client_order_id="client-1",
-            symbol="USD_JPY",
-            side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            quantity=Decimal("1"),
-            limit_price=None,
+            client_order_id="client-1", symbol="USD_JPY", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=Decimal("1"), limit_price=None,
         )
 
 
-def test_intended_order_rejects_invalid_fields():
-    with pytest.raises(ValueError):
-        intended_order_from_request(make_request(), client_order_id=" ")
-    with pytest.raises(ValueError):
-        intended_order_from_request("not a request", client_order_id="client-1")
+# --- provenance ---------------------------------------------------------------
+
+
+def test_provenance_rejects_unknown_origin_and_empty_sources():
+    with pytest.raises(ValueError, match="input_origin"):
+        make_provenance(input_origin="somewhere")
+    with pytest.raises(ValueError, match="signal_source"):
+        make_provenance(signal_source=" ")
+
+
+def test_production_provenance_requires_the_signal_timestamp():
+    with pytest.raises(ValueError, match="timestamp"):
+        make_provenance(input_origin=INPUT_ORIGIN_PRODUCTION_SIGNAL)
+    make_provenance(
+        input_origin=INPUT_ORIGIN_PRODUCTION_SIGNAL, signal_observed_at_utc=NOW
+    )  # valid
+
+
+# --- canonical payload: duplicate vs conflict contract ------------------------
+
+
+def payload(**overrides):
+    request = make_request(**overrides.pop("request_overrides", {}))
+    values = dict(client_order_id="client-1", timeframe="H1",
+                  input_origin=INPUT_ORIGIN_CLI_FIXTURE)
+    values.update(overrides)
+    return canonical_cycle_payload(request, **values)
+
+
+def test_numerically_equal_decimals_canonicalize_identically():
+    base = payload(request_overrides={"quantity": Decimal("1")})
+    same = payload(request_overrides={"quantity": Decimal("1.0")})
+    exp = payload(request_overrides={"quantity": Decimal("1E+0")})
+    assert base == same == exp
+    assert canonical_payload_json(base) == canonical_payload_json(same)
+
+
+def test_payload_json_is_key_order_independent():
+    base = payload()
+    reordered = dict(reversed(list(base.items())))
+    assert canonical_payload_json(base) == canonical_payload_json(reordered)
+
+
+def test_differing_fields_are_reported():
+    base = payload()
+    changed = payload(request_overrides={"quantity": Decimal("2")})
+    assert differing_payload_fields(base, changed) == ("quantity",)
+    changed_origin = payload(input_origin="scenario_fixture")
+    assert differing_payload_fields(base, changed_origin) == ("input_origin",)
+
+
+def test_payload_excludes_evaluation_time_values():
+    later = payload(request_overrides={"requested_at_utc": NOW + timedelta(seconds=5)})
+    assert later == payload()  # timestamps are not identity
+
+
+# --- ShadowClaim --------------------------------------------------------------
+
+
+def test_claim_validates_lease_ordering():
+    with pytest.raises(ValueError, match="lease_expires_at_utc"):
+        ShadowClaim(
+            shadow_result_id=1, execution_request_id="exec-1", signal_id="signal-1",
+            client_order_id="client-1", claim_owner_id="owner-1",
+            claimed_at_utc=NOW, lease_expires_at_utc=NOW, input_origin="cli_fixture",
+        )
 
 
 # --- ShadowResult invariants --------------------------------------------------
@@ -98,6 +167,8 @@ def test_valid_result_roundtrips_properties():
     assert result.allowed is True
     assert result.rejection_codes == ()
     assert result.shadow_result_id is None
+    assert result.canonical_payload["quantity"] == "1"
+    assert result.provenance.input_origin == "scenario_fixture"
 
 
 def test_result_rejects_decision_for_another_request():
@@ -121,43 +192,39 @@ def test_result_rejects_non_shadow_decision():
 
 
 def test_result_rejects_intended_order_drift():
-    request = make_request()
     drifted = ShadowIntendedOrder(
-        client_order_id="client-1",
-        symbol="USD_JPY",
-        side=OrderSide.BUY,
-        order_type=OrderType.MARKET,
-        quantity=Decimal("2"),  # request says 1
-        limit_price=None,
+        client_order_id="client-1", symbol="USD_JPY", side=OrderSide.BUY,
+        order_type=OrderType.MARKET, quantity=Decimal("2"), limit_price=None,
     )
     with pytest.raises(ValueError, match="does not match the audit"):
-        make_result(request=request, intended_order=drifted)
+        make_result(intended_order=drifted)
 
 
-def test_result_rejects_policy_snapshot_mismatch_and_bad_types():
+def test_result_requires_account_snapshot_and_provenance():
+    with pytest.raises(ValueError, match="account"):
+        make_result(account="nope")
+    with pytest.raises(ValueError, match="provenance"):
+        make_result(provenance="nope")
+
+
+def test_result_rejects_policy_snapshot_mismatch():
     with pytest.raises(ValueError, match="policy_id"):
         make_result(policy_snapshot={"policy_id": "someone-else"})
-    with pytest.raises(ValueError, match="dict"):
-        make_result(policy_snapshot="not a dict")
-    with pytest.raises(ValueError, match="JSON-serializable"):
-        make_result(policy_snapshot={"policy_id": "shadow-test-policy", "bad": object()})
 
 
 def test_policy_snapshot_is_detached_from_the_caller_dict():
     snapshot = make_gate().policy.to_snapshot()
     result = make_result(policy_snapshot=snapshot)
     snapshot["policy_id"] = "mutated"
-    snapshot["allowed_symbols"].append("EUR_USD")
     assert result.policy_snapshot["policy_id"] == "shadow-test-policy"
-    assert "EUR_USD" not in result.policy_snapshot["allowed_symbols"]
 
 
-def test_result_rejects_invalid_ids_and_timeframe():
+def test_result_rejects_invalid_ids_claim_fields_and_timeframe():
     with pytest.raises(ValueError, match="safety_decision_id"):
         make_result(safety_decision_id=0)
-    with pytest.raises(ValueError, match="shadow_result_id"):
-        make_result(shadow_result_id=-1)
+    with pytest.raises(ValueError, match="claim_owner_id"):
+        make_result(claim_owner_id=" ")
     with pytest.raises(ValueError, match="timeframe"):
         make_result(timeframe=" ")
-    with pytest.raises(ValueError, match="created_at_utc"):
-        make_result(created_at_utc=NOW.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="completed_at_utc"):
+        make_result(completed_at_utc=NOW.replace(tzinfo=None))

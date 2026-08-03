@@ -27,6 +27,8 @@
   "expected": {
     "broker_submit_calls": 0,
     "shadow_rows": 1,
-    "shadow_allowed": true
+    "shadow_claim_rows": 0,
+    "shadow_allowed": true,
+    "safety_decisions": 1
   }
 }

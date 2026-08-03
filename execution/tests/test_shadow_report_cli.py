@@ -1,6 +1,8 @@
-"""Issue #78: the shadow report CLI -- listing, detail lookup, decision
-filtering, JSON purity, missing-DB / unknown-id / empty-store behaviour,
-cp932 survival and stream restoration. Strictly read-only."""
+"""Issue #78: the shadow report CLI -- listing (newest first / --limit),
+detail lookup (request / signal / safety-decision id), decision filtering,
+claims and orphan-decision inspection, provenance display, JSON purity,
+missing-DB / unknown-id / empty-store behaviour, the true read-only
+guarantee, cp932 survival and stream restoration."""
 
 import io
 import json
@@ -9,77 +11,153 @@ import sys
 import pytest
 
 from execution import shadow_store
-from execution.shadow_models import intended_order_from_request, ShadowResult
-from execution.shadow_report import EXIT_FAILURE, EXIT_OK, main
-from shadow_helpers import NOW, make_account, make_gate, make_market, make_request
+from execution.shadow_report import EXIT_FAILURE, EXIT_OK, EXIT_USAGE_ERROR, main
+from shadow_helpers import (
+    make_account,
+    make_market,
+    make_provenance,
+    make_request,
+    make_service,
+)
 
 
 def seed(tmp_path):
-    """Two rows: one allowed, one rejected."""
-    db = tmp_path / "shadow.sqlite3"
-    shadow_store.init_db(db)
-    gate = make_gate()
-    for request, client_order_id, market in (
-        (make_request(), "client-1", make_market()),
-        (
-            make_request(execution_request_id="exec-2", signal_id="signal-2"),
-            "client-2",
-            make_market(market_open=False),
-        ),
-    ):
-        decision = gate.evaluate_shadow(
-            request, market=market, account=make_account(), connection_target="shadow"
-        )
-        shadow_store.record_shadow_result(
-            ShadowResult(
-                request=request,
-                client_order_id=client_order_id,
-                timeframe="H1",
-                decision=decision,
-                intended_order=intended_order_from_request(
-                    request, client_order_id=client_order_id
-                ),
-                market=market,
-                policy_snapshot=gate.policy.to_snapshot(),
-                safety_decision_id=None,
-                created_at_utc=NOW,
-            ),
-            db_path=db,
-        )
-    return db
+    """Two completed rows (one allowed, one rejected) with real decisions."""
+    service = make_service(tmp_path, owner_id="owner-1")
+    service.run_cycle(
+        make_request(),
+        market=make_market(),
+        account=make_account(),
+        client_order_id="client-1",
+        provenance=make_provenance(),
+        timeframe="H1",
+    )
+    service.run_cycle(
+        make_request(execution_request_id="exec-2", signal_id="signal-2"),
+        market=make_market(market_open=False),
+        account=make_account(),
+        client_order_id="client-2",
+        provenance=make_provenance(),
+    )
+    return service.shadow_db_path, service.decision_db_path
 
 
-def test_list_shows_every_result(tmp_path, capsys):
-    db = seed(tmp_path)
+def test_list_shows_every_result_newest_first_with_provenance(tmp_path, capsys):
+    db, _ = seed(tmp_path)
     assert main(["--shadow-db", str(db)]) == EXIT_OK
     out = capsys.readouterr().out
     assert "ALLOWED" in out and "REJECTED" in out and "total 2" in out
-    assert "exec-1" in out and "exec-2" in out
+    assert out.index("exec-2") < out.index("exec-1")  # newest first
+    assert "origin=scenario_fixture" in out
 
 
-def test_detail_by_execution_request_id(tmp_path, capsys):
-    db = seed(tmp_path)
+def test_limit_bounds_the_listing(tmp_path, capsys):
+    db, _ = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--limit", "1"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "exec-2" in out and "exec-1" not in out
+    assert main(["--shadow-db", str(db), "--limit", "0"]) == EXIT_USAGE_ERROR
+    assert main(["--shadow-db", str(db), "--limit", "1001"]) == EXIT_USAGE_ERROR
+
+
+def test_detail_by_execution_request_id_shows_provenance_and_snapshot(tmp_path, capsys):
+    db, _ = seed(tmp_path)
     assert main(["--shadow-db", str(db), "--execution-request-id", "exec-2"]) == EXIT_OK
     out = capsys.readouterr().out
     assert "REJECTED" in out and "market_closed" in out
     assert "intended order (NOT submitted)" in out
+    assert "provenance: origin=scenario_fixture" in out
+    assert "account snapshot: account_id=acct-1" in out
+    assert "claim: owner=owner-1" in out
 
 
-def test_detail_by_source_signal_id(tmp_path, capsys):
-    db = seed(tmp_path)
+def test_detail_by_source_signal_and_decision_id(tmp_path, capsys):
+    db, _ = seed(tmp_path)
     assert main(["--shadow-db", str(db), "--source-signal-id", "signal-1"]) == EXIT_OK
     assert "exec-1" in capsys.readouterr().out
+    assert main(["--shadow-db", str(db), "--safety-decision-id", "2"]) == EXIT_OK
+    assert "exec-2" in capsys.readouterr().out
+    assert main(["--shadow-db", str(db), "--safety-decision-id", "99"]) == EXIT_FAILURE
+    assert "no shadow result references" in capsys.readouterr().err
 
 
 def test_rejected_filter(tmp_path, capsys):
-    db = seed(tmp_path)
+    db, _ = seed(tmp_path)
     assert main(["--shadow-db", str(db), "--decision", "rejected"]) == EXIT_OK
     out = capsys.readouterr().out
     assert "exec-2" in out and "exec-1" not in out
 
 
+def test_claims_listing_shows_in_flight_cycles(tmp_path, capsys, monkeypatch):
+    service = make_service(tmp_path, owner_id="owner-1")
+
+    def explode(*args, **kwargs):
+        raise shadow_store.ShadowStoreError("injected completion failure")
+
+    monkeypatch.setattr(shadow_store, "complete_shadow_cycle", explode)
+    with pytest.raises(shadow_store.ShadowStoreError):
+        service.run_cycle(
+            make_request(), market=make_market(), account=make_account(),
+            client_order_id="client-1", provenance=make_provenance(),
+        )
+    monkeypatch.undo()
+    assert main(["--shadow-db", str(service.shadow_db_path), "--claims"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "CLAIMED" in out and "owner=owner-1" in out and "lease_expires=" in out
+
+
+def test_orphan_decisions_are_searchable(tmp_path, capsys, monkeypatch):
+    service = make_service(tmp_path, owner_id="owner-1")
+    original = shadow_store.complete_shadow_cycle
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise shadow_store.ShadowStoreError("injected completion failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(shadow_store, "complete_shadow_cycle", flaky)
+    with pytest.raises(shadow_store.ShadowStoreError):
+        service.run_cycle(
+            make_request(), market=make_market(), account=make_account(),
+            client_order_id="client-1", provenance=make_provenance(),
+        )
+    retry = service.run_cycle(
+        make_request(), market=make_market(), account=make_account(),
+        client_order_id="client-1", provenance=make_provenance(),
+    )
+    monkeypatch.undo()
+    assert retry.result.safety_decision_id == 2
+    assert (
+        main(
+            ["--shadow-db", str(service.shadow_db_path), "--decision-db",
+             str(service.decision_db_path), "--orphan-decisions"]
+        )
+        == EXIT_OK
+    )
+    out = capsys.readouterr().out
+    assert "decision_id=1" in out and "referenced_decision_id=2" in out and "total 1" in out
+    assert (
+        main(
+            ["--shadow-db", str(service.shadow_db_path), "--decision-db",
+             str(service.decision_db_path), "--orphan-decisions", "--json"]
+        )
+        == EXIT_OK
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1 and payload["orphan_decisions"][0]["decision_id"] == 1
+
+
+def test_no_orphans_for_clean_records(tmp_path, capsys):
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--orphan-decisions"]) == EXIT_OK
+    assert "no orphan decisions" in capsys.readouterr().out
+
+
 def test_unknown_id_exits_nonzero(tmp_path, capsys):
-    db = seed(tmp_path)
+    db, _ = seed(tmp_path)
     assert main(["--shadow-db", str(db), "--execution-request-id", "nope"]) == EXIT_FAILURE
     assert "no shadow result" in capsys.readouterr().err
 
@@ -98,23 +176,31 @@ def test_empty_store_is_a_valid_empty_report(tmp_path, capsys):
     assert "no shadow results" in capsys.readouterr().out
 
 
-def test_json_report_is_machine_readable(tmp_path, capsys):
-    db = seed(tmp_path)
+def test_json_report_is_machine_readable_with_provenance(tmp_path, capsys):
+    db, _ = seed(tmp_path)
     assert main(["--shadow-db", str(db), "--json", "--decision", "rejected"]) == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1
     entry = payload["results"][0]
     assert entry["execution_request_id"] == "exec-2"
     assert entry["allowed"] is False and "market_closed" in entry["rejection_codes"]
-    assert entry["intended_order"]["client_order_id"] == "client-2"
+    assert entry["provenance"]["input_origin"] == "scenario_fixture"
+    assert entry["account_snapshot"]["account_id"] == "acct-1"
+    assert entry["safety_decision_id"] == 2
 
 
-def test_report_is_read_only(tmp_path):
-    db = seed(tmp_path)
+def test_report_is_truly_read_only(tmp_path):
+    db, decisions = seed(tmp_path)
     before = db.read_bytes()
+    stat_before = (db.stat().st_mtime_ns, db.stat().st_size)
+    files_before = sorted(entry.name for entry in tmp_path.iterdir())
     assert main(["--shadow-db", str(db)]) == EXIT_OK
     assert main(["--shadow-db", str(db), "--json"]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--orphan-decisions"]) == EXIT_OK
     assert db.read_bytes() == before
+    assert (db.stat().st_mtime_ns, db.stat().st_size) == stat_before
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == files_before
 
 
 def test_corrupted_db_is_an_explicit_failure(tmp_path, capsys):
@@ -141,7 +227,7 @@ def _cp932_stdout(monkeypatch):
 
 
 def test_report_survives_a_cp932_console(tmp_path, monkeypatch):
-    db = seed(tmp_path)
+    db, _ = seed(tmp_path)
     buffer, stream = _cp932_stdout(monkeypatch)
     assert main(["--shadow-db", str(db)]) == EXIT_OK
     assert sys.stdout.errors == "strict"
@@ -150,7 +236,7 @@ def test_report_survives_a_cp932_console(tmp_path, monkeypatch):
 
 
 def test_json_survives_a_cp932_console(tmp_path, monkeypatch):
-    db = seed(tmp_path)
+    db, _ = seed(tmp_path)
     buffer, stream = _cp932_stdout(monkeypatch)
     assert main(["--shadow-db", str(db), "--json"]) == EXIT_OK
     stream.flush()
@@ -166,7 +252,7 @@ def _stream_settings():
 
 
 def test_streams_are_restored_on_every_exit_path(tmp_path):
-    db = seed(tmp_path)
+    db, _ = seed(tmp_path)
     before = _stream_settings()
     assert main(["--shadow-db", str(db)]) == EXIT_OK
     assert _stream_settings() == before

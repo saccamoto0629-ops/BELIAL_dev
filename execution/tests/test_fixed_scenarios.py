@@ -17,7 +17,10 @@ DEFINITIONS = load_scenarios(scenario_files(DEFAULT_SCENARIO_DIR))
 # The scenarios Issue #77 requires, pinned by id: deleting or renaming one of
 # these fixed scenarios must fail loudly here, not silently shrink coverage.
 REQUIRED_SCENARIO_IDS = {
-    # Issue #78 shadow-mode scenarios:
+    # Issue #78 shadow-mode scenarios (incl. the PR #100 rework):
+    "shadow_payload_conflict",
+    "shadow_stale_claim_recovery",
+    "shadow_production_signal_path",
     "shadow_gate_pass",
     "shadow_stale_price_rejected",
     "shadow_kill_switch_rejected",

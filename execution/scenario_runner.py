@@ -82,7 +82,15 @@ from execution.safety_gate import (
     StaticSafetyState,
 )
 from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore
+from execution.shadow_composition import run_production_shadow_cycle
+from execution.shadow_config import parse_shadow_execution_config
 from execution.shadow_execution import ShadowCycleStatus, ShadowExecutionService
+from execution.shadow_models import INPUT_ORIGIN_SCENARIO_FIXTURE, ShadowProvenance
+from execution.shadow_providers import (
+    PaperSignalDbSignalProvider,
+    StaticAccountSnapshotProvider,
+    StaticMarketSnapshotProvider,
+)
 from execution.scenario_models import (
     DEFAULT_SCENARIO_DIR,
     FAULT_BOUNDARIES,
@@ -301,6 +309,7 @@ _FAULT_TARGETS: dict[str, tuple[object, type[Exception]]] = {
     "record_order_result": (execution_store, execution_store.ExecutionStoreError),
     "record_order_state": (execution_store, execution_store.ExecutionStoreError),
     "state_history": (execution_store, execution_store.ExecutionStoreError),
+    "shadow_claim": (shadow_store, shadow_store.ShadowStoreError),
     "shadow_result_save": (shadow_store, shadow_store.ShadowStoreError),
     "safety_decision_record": (SQLiteSafetyDecisionStore, SafetyStoreError),
 }
@@ -323,7 +332,13 @@ def _armed_faults(faults: tuple[dict, ...]):
             setattr(
                 owner,
                 attribute,
-                _fault_wrapper(original, boundary, fault.get("after_calls", 0), error_type),
+                _fault_wrapper(
+                    original,
+                    boundary,
+                    error_type,
+                    after_calls=fault.get("after_calls"),
+                    fail_calls=fault.get("fail_calls"),
+                ),
             )
         yield
     finally:
@@ -331,7 +346,17 @@ def _armed_faults(faults: tuple[dict, ...]):
             setattr(owner, attribute, original)
 
 
-def _fault_wrapper(original, boundary: str, after_calls: int, error_type: type[Exception]):
+def _fault_wrapper(
+    original,
+    boundary: str,
+    error_type: type[Exception],
+    *,
+    after_calls: int | None,
+    fail_calls: int | None,
+):
+    """``after_calls=N``: pass the first N calls, fail the rest.
+    ``fail_calls=N`` (Issue #78 stale-claim recovery): fail the first N
+    calls, pass the rest. Default (neither): fail every call."""
     lock = threading.Lock()
     calls = [0]
 
@@ -339,7 +364,11 @@ def _fault_wrapper(original, boundary: str, after_calls: int, error_type: type[E
         with lock:
             calls[0] += 1
             call_number = calls[0]
-        if call_number > after_calls:
+        if fail_calls is not None:
+            should_fail = call_number <= fail_calls
+        else:
+            should_fail = call_number > (after_calls or 0)
+        if should_fail:
             raise error_type(f"injected fault at boundary {boundary!r} (call {call_number})")
         return original(*args, **kwargs)
 
@@ -382,6 +411,23 @@ class _ScenarioContext:
                 retrieved_at_utc=NOW,
             ),
         )
+        # Fixture provenance for shadow steps: clearly labelled as the
+        # scenario suite, never as the production signal path.
+        self.provenance = ShadowProvenance(
+            input_origin=INPUT_ORIGIN_SCENARIO_FIXTURE,
+            signal_source=f"scenario:{definition.scenario_id}",
+            config_source=f"scenario:{definition.scenario_id}",
+            config_version="scenario-policy-1",
+            market_source=f"scenario:{definition.scenario_id}",
+            account_source=f"scenario:{definition.scenario_id}",
+        )
+        # Stored-signal fixtures for shadow_production steps: seeded ONCE per
+        # scenario into a private temporary paper-signal DB that the
+        # PRODUCTION PaperSignalDbSignalProvider then reads (fixture
+        # provisioning only -- the decision path stays production code).
+        self.signal_db = work_dir / "paper_signals.sqlite3"
+        if definition.signals:
+            _seed_signal_fixture(self.signal_db, definition.signals)
         self.client_order_ids: dict[str, str] = {}
         self.step_results: list[dict] = []
 
@@ -398,19 +444,70 @@ class _ScenarioContext:
             clock=lambda: NOW,
         )
 
-    def make_shadow_service(self, *, initialize: bool) -> ShadowExecutionService:
+    def step_clock(self, step: ScenarioStep):
+        """The step's evaluation clock: NOW plus the declared offset (used by
+        the stale-claim recovery scenarios to move past a lease expiry)."""
+        offset = step.params.get("at_offset_seconds", 0)
+        moment = NOW + timedelta(seconds=offset)
+        return lambda: moment
+
+    def make_shadow_service(
+        self,
+        *,
+        initialize: bool,
+        clock=None,
+        owner_id: str | None = None,
+        claim_lease_seconds: int | None = None,
+    ) -> ShadowExecutionService:
         """One shadow service per call (same multi-process equivalence as
         ``make_service``). ``initialize=False`` is the dry-run path: the
         service must not create any store file."""
+        clock = clock if clock is not None else (lambda: NOW)
+        kwargs = {}
+        if claim_lease_seconds is not None:
+            kwargs["claim_lease_seconds"] = claim_lease_seconds
         service = ShadowExecutionService(
-            gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=lambda: NOW),
+            gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=clock),
             decision_db_path=self.decisions_db,
             shadow_db_path=self.shadow_db,
-            clock=lambda: NOW,
+            clock=clock,
+            owner_id=owner_id,
+            **kwargs,
         )
         if initialize:
             service.initialize_stores()
         return service
+
+
+def _seed_signal_fixture(db_path: Path, signals: tuple[dict, ...]) -> None:
+    """Write the scenario's stored-signal FIXTURES into a private temporary
+    DB carrying the paper-signal columns the production adapter reads. Pure
+    input provisioning: nothing here decides or evaluates anything."""
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE paper_signals ("
+            "signal_id TEXT PRIMARY KEY, created_at_utc TEXT NOT NULL, "
+            "symbol TEXT NOT NULL, timeframe TEXT NOT NULL, side TEXT NOT NULL, "
+            "strategy_profile TEXT NOT NULL, status TEXT NOT NULL)"
+        )
+        for signal in signals:
+            connection.execute(
+                "INSERT INTO paper_signals (signal_id, created_at_utc, symbol, timeframe, "
+                "side, strategy_profile, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    signal["signal_id"],
+                    NOW.isoformat(),
+                    signal["symbol"],
+                    signal["timeframe"],
+                    signal["side"],
+                    signal.get("strategy_id", "scenario-strategy"),
+                    signal.get("status", "paper_only"),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _classify_error(exc: Exception) -> dict:
@@ -525,27 +622,76 @@ def _shadow_step_payload(outcome) -> dict:
     payload = {
         # Scenario vocabulary uses identifier-style outcome names.
         "outcome": "dry_run" if outcome.status is ShadowCycleStatus.DRY_RUN else outcome.status.value,
-        "allowed": result.allowed,
-        "rejection_codes": sorted(result.rejection_codes),
+        # A duplicate against a still-in-flight claim carries no result:
+        # ``allowed`` is None there (the gate never ran for this call).
+        "allowed": None if result is None else result.allowed,
+        "rejection_codes": [] if result is None else sorted(result.rejection_codes),
     }
     return payload
+
+
+def _classify_shadow_error(exc: Exception) -> dict:
+    if isinstance(exc, shadow_store.ShadowIdentityConflictError):
+        return {
+            "outcome": "conflict",
+            "error_type": type(exc).__name__,
+            "conflict_fields": sorted(exc.differing_fields),
+        }
+    return {"outcome": "error", **_classify_error(exc)}
 
 
 def _execute_shadow(context: _ScenarioContext, step: ScenarioStep) -> dict:
     request = _build_request(step.params["request"])
     dry_run = step.params.get("dry_run", False)
     try:
-        service = context.make_shadow_service(initialize=not dry_run)
+        service = context.make_shadow_service(
+            initialize=not dry_run,
+            clock=context.step_clock(step),
+            owner_id=step.params.get("owner_id"),
+            claim_lease_seconds=step.params.get("claim_lease_seconds"),
+        )
         run = service.dry_run_cycle if dry_run else service.run_cycle
         outcome = run(
             request,
             market=context.market,
             account=context.account,
             client_order_id=step.params["client_order_id"],
+            provenance=context.provenance,
             timeframe=step.params.get("timeframe"),
         )
     except Exception as exc:
-        return {"outcome": "error", **_classify_error(exc)}
+        return _classify_shadow_error(exc)
+    return _shadow_step_payload(outcome)
+
+
+def _execute_shadow_production(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    """Drive the PRODUCTION composition root over the scenario's seeded
+    signal store and validated production configuration -- the runner only
+    provisions inputs and observes."""
+    config = parse_shadow_execution_config(
+        context.definition.production_config,
+        source=f"scenario:{context.definition.scenario_id}",
+    )
+    clock = context.step_clock(step)
+    try:
+        outcome = run_production_shadow_cycle(
+            step.params["signal_id"],
+            signal_provider=PaperSignalDbSignalProvider(context.signal_db),
+            config=config,
+            market_provider=StaticMarketSnapshotProvider(
+                context.market, f"scenario:{context.definition.scenario_id}"
+            ),
+            account_provider=StaticAccountSnapshotProvider(
+                context.account, f"scenario:{context.definition.scenario_id}"
+            ),
+            shadow_db_path=context.shadow_db,
+            decision_db_path=context.decisions_db,
+            clock=clock,
+            owner_id=step.params.get("owner_id"),
+            dry_run=step.params.get("dry_run", False),
+        )
+    except Exception as exc:
+        return _classify_shadow_error(exc)
     return _shadow_step_payload(outcome)
 
 
@@ -553,8 +699,11 @@ def _execute_shadow_concurrent(context: _ScenarioContext, step: ScenarioStep) ->
     request = _build_request(step.params["request"])
     worker_count = step.params["workers"]
     # Stores are initialized once, sequentially, before the race: the
-    # contested boundary is the shadow store's UNIQUE claim, not init.
-    services = [context.make_shadow_service(initialize=True) for _ in range(worker_count)]
+    # contested boundary is the shadow store's claim, not init.
+    services = [
+        context.make_shadow_service(initialize=True, owner_id=f"scenario-worker-{index}")
+        for index in range(worker_count)
+    ]
 
     def work(index: int, barrier: threading.Barrier) -> dict:
         barrier.wait(timeout=60)
@@ -564,12 +713,13 @@ def _execute_shadow_concurrent(context: _ScenarioContext, step: ScenarioStep) ->
                 market=context.market,
                 account=context.account,
                 client_order_id=step.params["client_order_id"],
+                provenance=context.provenance,
                 timeframe=step.params.get("timeframe"),
             )
         except Exception as exc:
             # A locked-DB / store failure is an ``error`` -- it must never be
             # counted as a recorded result or as duplicate suppression.
-            return {"outcome": "error", **_classify_error(exc)}
+            return _classify_shadow_error(exc)
         return _shadow_step_payload(outcome)
 
     worker_results = _run_workers(worker_count, work)
@@ -629,6 +779,7 @@ _STEP_EXECUTORS = {
     "register_concurrent": _execute_register_concurrent,
     "shadow": _execute_shadow,
     "shadow_concurrent": _execute_shadow_concurrent,
+    "shadow_production": _execute_shadow_production,
 }
 
 
@@ -654,18 +805,22 @@ def _row_counts(db_path: Path) -> tuple[int, int]:
     return orders, history
 
 
-def _shadow_row_count(db_path: Path) -> int:
-    """Shadow-store row count straight from the scenario's temporary DB,
-    read-only; a missing file counts as zero rows and is never created."""
+def _shadow_row_counts(db_path: Path) -> tuple[int, int]:
+    """(completed, claimed) row counts straight from the scenario's temporary
+    DB, read-only; a missing file counts as zero rows and is never created."""
     if not db_path.exists():
-        return 0
+        return 0, 0
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        return connection.execute(
-            f"SELECT COUNT(*) FROM {shadow_store.RESULTS_TABLE}"
+        completed = connection.execute(
+            f"SELECT COUNT(*) FROM {shadow_store.RESULTS_TABLE} WHERE phase = 'completed'"
+        ).fetchone()[0]
+        claimed = connection.execute(
+            f"SELECT COUNT(*) FROM {shadow_store.RESULTS_TABLE} WHERE phase = 'claimed'"
         ).fetchone()[0]
     finally:
         connection.close()
+    return completed, claimed
 
 
 def _collect_actual(context: _ScenarioContext) -> dict:
@@ -745,18 +900,41 @@ def _collect_actual(context: _ScenarioContext) -> dict:
 
     # --- shadow-store observations (Issue #78) ---------------------------
     shadow_result = None
+    shadow_claim = None
     if primary_id is not None and context.shadow_db.exists():
         shadow_result = shadow_store.get_shadow_result(primary_id, db_path=context.shadow_db)
+        shadow_claim = shadow_store.get_shadow_claim(primary_id, db_path=context.shadow_db)
     intended = None if shadow_result is None else shadow_result.intended_order
+    completed_rows, claimed_rows = _shadow_row_counts(context.shadow_db)
+    if shadow_result is not None:
+        phase = "completed"
+    elif shadow_claim is not None:
+        phase = "claimed"
+    else:
+        phase = None
+    origin = (
+        shadow_result.provenance.input_origin
+        if shadow_result is not None
+        else (shadow_claim.input_origin if shadow_claim is not None else None)
+    )
     actual.update(
         {
-            "shadow_rows": _shadow_row_count(context.shadow_db),
+            "shadow_rows": completed_rows,
+            "shadow_claim_rows": claimed_rows,
             "shadow_db_created": context.shadow_db.exists(),
             "decision_db_created": context.decisions_db.exists(),
             "shadow_allowed": None if shadow_result is None else shadow_result.allowed,
             "shadow_codes": None
             if shadow_result is None
             else sorted(shadow_result.rejection_codes),
+            "shadow_origin": origin,
+            "shadow_phase": phase,
+            "shadow_account_id": None
+            if shadow_result is None
+            else shadow_result.account.account.account_id,
+            "shadow_safety_decision_id": None
+            if shadow_result is None
+            else shadow_result.safety_decision_id,
             "shadow_intended_order": None
             if intended is None
             else {
@@ -866,7 +1044,7 @@ def _compare_step(index: int, step: ScenarioStep, actual: dict) -> list[Mismatch
     mismatches = []
     for key, expected_value in step.expect.items():
         actual_value = actual.get(key)
-        if key == "rejection_codes":
+        if key in ("rejection_codes", "conflict_fields"):
             matched = actual_value is not None and sorted(expected_value) == sorted(actual_value)
         else:
             matched = expected_value == actual_value

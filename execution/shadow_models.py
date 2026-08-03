@@ -1,26 +1,37 @@
-"""Shadow Mode result models (Issue #78).
+"""Shadow Mode result models (Issue #78; claim / provenance rework PR #100).
 
 *** MODELS ONLY. Nothing here submits, persists or decides anything, and
 nothing here touches the broker boundary: shadow mode audits what WOULD have
 been sent -- it never constructs a ``broker.OrderRequest`` and never fabricates
 a broker outcome (no order state, no broker reference id, no fills). ***
 
-:class:`ShadowIntendedOrder` is the audit projection of the order content that
-would have crossed the broker boundary if the same request had run in a
-submitting mode. It deliberately mirrors the ``broker.OrderRequest`` field set
-(``client_order_id`` / symbol / side / order_type / quantity / ``limit_price``)
-WITHOUT being one: ``ExecutionRequest.to_order_request()`` stays reserved for
-the single sanctioned submission path (``execution/live_submission.py``; the
-AST boundary test pins its call sites), so the shadow layer records the same
-content as plain audit data instead of calling the conversion.
+Input provenance
+----------------
 
-:class:`ShadowResult` is one complete shadow verification record: the full
-``ExecutionRequest``, the Safety Gate decision (with every machine-readable
-rejection code and human-readable message), the intended order content, the
-market snapshot the gate judged against, and the applied policy snapshot.
-Construction validates cross-field consistency, so a shadow record whose parts
-disagree (wrong request id, non-shadow mode, intended order that does not match
-the request) cannot exist in memory, let alone in the store.
+Every shadow record carries WHERE its inputs came from (:class:`ShadowProvenance`):
+
+- ``input_origin`` -- ``production_signal`` (a STORED signal read through the
+  production signal provider + production configuration), ``cli_fixture``
+  (a manually authored cycle-input file) or ``scenario_fixture`` (the fixed
+  scenario suite). Only ``production_signal`` may claim to be "the real
+  signal path"; fixtures are clearly labelled as fixtures.
+- the provider / store identifiers for the signal, configuration, market
+  snapshot and account snapshot, the configuration version, and the source
+  signal's own timestamp.
+
+Duplicate vs conflict (canonical payload)
+-----------------------------------------
+
+Idempotency identity is the key triple (``execution_request_id`` /
+``signal_id`` / ``client_order_id``), but a key match alone never makes a
+DUPLICATE: the CANONICAL PAYLOAD (:func:`canonical_cycle_payload` -- request
+content, provenance origin, mode, timeframe; Decimals compared by numeric
+value, so ``"1"`` == ``"1.0"``) must be byte-identical too. A key match with
+ANY payload difference is an identity CONFLICT (a different order trying to
+reuse an identity) and is surfaced as an explicit error, never silently
+answered with the stored record. Evaluation-time values (market snapshot,
+clock timestamps) are deliberately NOT part of the payload: a crash-retry of
+the same cycle input must classify as duplicate, not conflict.
 """
 
 from __future__ import annotations
@@ -32,7 +43,23 @@ from decimal import Decimal
 
 from broker.broker_models import OrderSide, OrderType
 from execution.execution_models import ExecutionRequest
-from execution.safety_gate import ExecutionMode, MarketSafetySnapshot, SafetyDecision
+from execution.safety_gate import (
+    AccountSafetySnapshot,
+    ExecutionMode,
+    MarketSafetySnapshot,
+    SafetyDecision,
+)
+
+INPUT_ORIGIN_PRODUCTION_SIGNAL = "production_signal"
+INPUT_ORIGIN_CLI_FIXTURE = "cli_fixture"
+INPUT_ORIGIN_SCENARIO_FIXTURE = "scenario_fixture"
+KNOWN_INPUT_ORIGINS: frozenset[str] = frozenset(
+    {INPUT_ORIGIN_PRODUCTION_SIGNAL, INPUT_ORIGIN_CLI_FIXTURE, INPUT_ORIGIN_SCENARIO_FIXTURE}
+)
+
+PHASE_CLAIMED = "claimed"
+PHASE_COMPLETED = "completed"
+KNOWN_SHADOW_PHASES: frozenset[str] = frozenset({PHASE_CLAIMED, PHASE_COMPLETED})
 
 
 def _require_non_empty_str(value, field_name: str) -> None:
@@ -45,6 +72,42 @@ def _require_utc(value, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a timezone-aware datetime, got {value!r}")
     if value.utcoffset().total_seconds() != 0:
         raise ValueError(f"{field_name} must be UTC (utcoffset 0), got {value.tzinfo}")
+
+
+@dataclass(frozen=True)
+class ShadowProvenance:
+    """Where one shadow cycle's inputs came from (see the module docstring).
+
+    ``signal_observed_at_utc`` is the SOURCE SIGNAL's own timestamp; the
+    production path always carries it, fixtures may leave it None.
+    """
+
+    input_origin: str
+    signal_source: str
+    config_source: str
+    config_version: str
+    market_source: str
+    account_source: str
+    signal_observed_at_utc: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.input_origin not in KNOWN_INPUT_ORIGINS:
+            raise ValueError(
+                f"input_origin must be one of {sorted(KNOWN_INPUT_ORIGINS)}, "
+                f"got {self.input_origin!r}"
+            )
+        for name in ("signal_source", "config_source", "config_version", "market_source",
+                     "account_source"):
+            _require_non_empty_str(getattr(self, name), name)
+        if self.signal_observed_at_utc is not None:
+            _require_utc(self.signal_observed_at_utc, "signal_observed_at_utc")
+        if (
+            self.input_origin == INPUT_ORIGIN_PRODUCTION_SIGNAL
+            and self.signal_observed_at_utc is None
+        ):
+            raise ValueError(
+                "production_signal provenance requires the source signal's timestamp"
+            )
 
 
 @dataclass(frozen=True)
@@ -107,24 +170,118 @@ def intended_order_from_request(
     )
 
 
+def _canonical_decimal(value: Decimal | None) -> str | None:
+    """Value-canonical Decimal text: numerically equal inputs (``1`` /
+    ``1.0`` / ``1E+0``) canonicalize to the SAME string, so payload equality
+    follows numeric equality, never surface spelling."""
+    return None if value is None else str(value.normalize())
+
+
+def canonical_cycle_payload(
+    request: ExecutionRequest,
+    *,
+    client_order_id: str,
+    timeframe: str | None,
+    input_origin: str,
+) -> dict:
+    """The canonical identity payload one shadow cycle claims (see the module
+    docstring). Deterministic across retries of the same input: everything
+    here comes from the request / caller identity, nothing from evaluation
+    time."""
+    if not isinstance(request, ExecutionRequest):
+        raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
+    _require_non_empty_str(client_order_id, "client_order_id")
+    if timeframe is not None:
+        _require_non_empty_str(timeframe, "timeframe")
+    if input_origin not in KNOWN_INPUT_ORIGINS:
+        raise ValueError(
+            f"input_origin must be one of {sorted(KNOWN_INPUT_ORIGINS)}, got {input_origin!r}"
+        )
+    return {
+        "execution_request_id": request.execution_request_id,
+        "signal_id": request.signal_id,
+        "client_order_id": client_order_id,
+        "strategy_id": request.strategy_id,
+        "symbol": request.symbol,
+        "side": request.side.value,
+        "order_type": request.order_type.value,
+        "quantity": _canonical_decimal(request.quantity),
+        "requested_price": _canonical_decimal(request.requested_price),
+        "stop_loss_price": _canonical_decimal(request.stop_loss_price),
+        "take_profit_price": _canonical_decimal(request.take_profit_price),
+        "timeframe": timeframe,
+        "execution_mode": ExecutionMode.SHADOW.value,
+        "input_origin": input_origin,
+    }
+
+
+def canonical_payload_json(payload: dict) -> str:
+    """Key-sorted compact JSON: key ordering can never affect equality."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def differing_payload_fields(stored: dict, attempted: dict) -> tuple[str, ...]:
+    """The payload keys whose values differ (for conflict diagnostics)."""
+    keys = sorted(set(stored) | set(attempted))
+    return tuple(key for key in keys if stored.get(key) != attempted.get(key))
+
+
+@dataclass(frozen=True)
+class ShadowClaim:
+    """One claimed-but-not-completed shadow identity row (phase ``claimed``).
+
+    The claim is taken BEFORE the Safety Gate runs: exactly one process may
+    hold it, so exactly one evaluation / decision record exists per cycle.
+    A claim whose lease expired is STALE and may be taken over by a later
+    run of the SAME canonical payload (crash recovery -- no claim can stay
+    unprocessable forever); the same owner may always re-acquire its own
+    claim immediately (in-process retry).
+    """
+
+    shadow_result_id: int
+    execution_request_id: str
+    signal_id: str
+    client_order_id: str
+    claim_owner_id: str
+    claimed_at_utc: datetime
+    lease_expires_at_utc: datetime
+    input_origin: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.shadow_result_id, int)
+            or isinstance(self.shadow_result_id, bool)
+            or self.shadow_result_id < 1
+        ):
+            raise ValueError(f"shadow_result_id must be a positive int, got {self.shadow_result_id!r}")
+        for name in ("execution_request_id", "signal_id", "client_order_id", "claim_owner_id"):
+            _require_non_empty_str(getattr(self, name), name)
+        _require_utc(self.claimed_at_utc, "claimed_at_utc")
+        _require_utc(self.lease_expires_at_utc, "lease_expires_at_utc")
+        if self.lease_expires_at_utc <= self.claimed_at_utc:
+            raise ValueError("lease_expires_at_utc must be after claimed_at_utc")
+        if self.input_origin not in KNOWN_INPUT_ORIGINS:
+            raise ValueError(f"unknown input_origin {self.input_origin!r}")
+
+
 @dataclass(frozen=True)
 class ShadowResult:
-    """One complete shadow verification record (Issue #78).
+    """One COMPLETED shadow verification record (Issue #78).
 
     Cross-field invariants (enforced at construction):
 
     - ``decision`` belongs to ``request`` (same ``execution_request_id``) and
       was evaluated as execution mode ``shadow``;
     - ``intended_order`` is exactly the audit projection of ``request`` under
-      ``client_order_id`` (no drift between the stored intent and the stored
-      "would-have-been order");
+      ``client_order_id``;
+    - ``account`` is the full injected :class:`AccountSafetySnapshot` the
+      gate judged against (persisted for audit replay; no secrets exist in
+      the model);
     - ``policy_snapshot`` is a JSON-able mapping whose ``policy_id`` equals
-      the decision's ``policy_id`` (the snapshot is defensively deep-copied
-      through JSON, so later caller-side mutation cannot alter the record);
+      the decision's ``policy_id`` (defensively deep-copied through JSON);
     - ``shadow_result_id`` / ``safety_decision_id`` are DB-assigned positive
-      integers or None (``shadow_result_id`` is None until persisted;
-      ``safety_decision_id`` is None exactly when decision persistence failed
-      and the decision carries ``decision_persist_failed``).
+      integers or None (``safety_decision_id`` is None exactly when decision
+      persistence failed and the decision carries ``decision_persist_failed``).
 
     Deliberately ABSENT: any broker outcome (order state, broker order id,
     fill price/quantity). A shadow record means "this WOULD have been sent /
@@ -134,12 +291,16 @@ class ShadowResult:
     request: ExecutionRequest
     client_order_id: str
     timeframe: str | None
+    provenance: ShadowProvenance
     decision: SafetyDecision
     intended_order: ShadowIntendedOrder
     market: MarketSafetySnapshot
+    account: AccountSafetySnapshot
     policy_snapshot: dict
     safety_decision_id: int | None
-    created_at_utc: datetime
+    claim_owner_id: str
+    claimed_at_utc: datetime
+    completed_at_utc: datetime
     shadow_result_id: int | None = None
 
     def __post_init__(self) -> None:
@@ -148,6 +309,8 @@ class ShadowResult:
         _require_non_empty_str(self.client_order_id, "client_order_id")
         if self.timeframe is not None:
             _require_non_empty_str(self.timeframe, "timeframe")
+        if not isinstance(self.provenance, ShadowProvenance):
+            raise ValueError(f"provenance must be a ShadowProvenance, got {self.provenance!r}")
         if not isinstance(self.decision, SafetyDecision):
             raise ValueError(f"decision must be a SafetyDecision, got {self.decision!r}")
         if self.decision.execution_request_id != self.request.execution_request_id:
@@ -172,6 +335,8 @@ class ShadowResult:
             )
         if not isinstance(self.market, MarketSafetySnapshot):
             raise ValueError(f"market must be a MarketSafetySnapshot, got {self.market!r}")
+        if not isinstance(self.account, AccountSafetySnapshot):
+            raise ValueError(f"account must be an AccountSafetySnapshot, got {self.account!r}")
         if not isinstance(self.policy_snapshot, dict):
             raise ValueError(
                 f"policy_snapshot must be a dict, got {type(self.policy_snapshot).__name__}"
@@ -194,7 +359,9 @@ class ShadowResult:
                 not isinstance(value, int) or isinstance(value, bool) or value < 1
             ):
                 raise ValueError(f"{name} must be a positive int or None, got {value!r}")
-        _require_utc(self.created_at_utc, "created_at_utc")
+        _require_non_empty_str(self.claim_owner_id, "claim_owner_id")
+        _require_utc(self.claimed_at_utc, "claimed_at_utc")
+        _require_utc(self.completed_at_utc, "completed_at_utc")
 
     @property
     def allowed(self) -> bool:
@@ -203,3 +370,12 @@ class ShadowResult:
     @property
     def rejection_codes(self) -> tuple[str, ...]:
         return self.decision.rejection_codes
+
+    @property
+    def canonical_payload(self) -> dict:
+        return canonical_cycle_payload(
+            self.request,
+            client_order_id=self.client_order_id,
+            timeframe=self.timeframe,
+            input_origin=self.provenance.input_origin,
+        )

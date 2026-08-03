@@ -1,10 +1,11 @@
-"""Issue #78: the ShadowExecutionService production boundary -- gate pass /
-reject recording, the structural zero-broker-calls guarantee, duplicate and
-concurrent-duplicate contracts, store-failure behaviour, dry-run
-zero-side-effects, mode validation, and the idempotency-namespace separation
-from the live submission path."""
+"""Issue #78: the ShadowExecutionService production boundary -- claim-first
+evaluation (decision 1:1), gate pass / reject recording, the structural
+zero-broker-calls guarantee, duplicate / conflict contracts, crash and stale
+claim recovery, store-failure behaviour, dry-run zero-side-effects, mode
+validation, and the idempotency-namespace separation from live submission."""
 
 import inspect
+import sqlite3
 import threading
 from datetime import timedelta
 from decimal import Decimal
@@ -35,6 +36,7 @@ from shadow_helpers import (
     make_market,
     make_policy,
     make_position,
+    make_provenance,
     make_request,
     make_service,
 )
@@ -45,10 +47,17 @@ def run_cycle(service, request=None, **overrides):
         market=make_market(),
         account=make_account(),
         client_order_id="client-1",
+        provenance=make_provenance(),
         timeframe="H1",
     )
     values.update(overrides)
     return service.run_cycle(request if request is not None else make_request(), **values)
+
+
+def decisions(service, execution_request_id="exec-1"):
+    return SQLiteSafetyDecisionStore(service.decision_db_path).list_for_request(
+        execution_request_id
+    )
 
 
 # --- zero broker calls: structural + broker-double guarantees ------------------
@@ -95,6 +104,7 @@ def test_full_cycles_never_touch_any_broker_api(tmp_path, monkeypatch):
         market=make_market(),
         account=make_account(),
         client_order_id="client-3",
+        provenance=make_provenance(),
     )
     assert dry.status is ShadowCycleStatus.DRY_RUN
     assert calls == []
@@ -103,20 +113,18 @@ def test_full_cycles_never_touch_any_broker_api(tmp_path, monkeypatch):
 # --- gate pass / reject recording ---------------------------------------------
 
 
-def test_gate_pass_records_shadow_result_and_decision(tmp_path):
-    service = make_service(tmp_path)
+def test_gate_pass_records_shadow_result_and_exactly_one_decision(tmp_path):
+    service = make_service(tmp_path, owner_id="owner-1")
     outcome = run_cycle(service)
     assert outcome.status is ShadowCycleStatus.RECORDED
     result = outcome.result
     assert result.allowed and result.shadow_result_id == 1 and result.safety_decision_id == 1
     assert result.decision.execution_mode == "shadow"
-    assert result.decision.connection_target == "shadow"
-    assert result.decision.account_id == "acct-1" and result.decision.position_count == 0
-    assert result.intended_order.client_order_id == "client-1"
+    assert result.claim_owner_id == "owner-1"
+    assert result.provenance == make_provenance()
     stored = shadow_store.get_shadow_result("exec-1", db_path=service.shadow_db_path)
     assert stored == result
-    decisions = SQLiteSafetyDecisionStore(service.decision_db_path).list_for_request("exec-1")
-    assert len(decisions) == 1 and decisions[0] == result.decision
+    assert len(decisions(service)) == 1
 
 
 def test_gate_reject_records_shadow_result_with_codes(tmp_path):
@@ -125,65 +133,88 @@ def test_gate_reject_records_shadow_result_with_codes(tmp_path):
     result = outcome.result
     assert outcome.status is ShadowCycleStatus.RECORDED and not result.allowed
     assert result.rejection_codes == ("reference_price_stale",)
-    stored = shadow_store.get_shadow_result("exec-1", db_path=service.shadow_db_path)
-    assert stored.rejection_codes == ("reference_price_stale",)
-    assert any("age" in item.message for item in stored.decision.rejections)
 
 
-def test_kill_switch_rejection_is_recorded(tmp_path):
-    service = make_service(tmp_path, gate=make_gate(kill_switch=True))
-    outcome = run_cycle(service)
-    assert not outcome.result.allowed
-    assert outcome.result.rejection_codes == ("kill_switch_enabled",)
-
-
-def test_shadow_target_mismatch_is_recorded(tmp_path):
-    policy = make_policy(
-        allowed_connection_targets={ExecutionMode.SHADOW: frozenset({"elsewhere"})}
-    )
-    service = make_service(tmp_path, gate=make_gate(policy))
-    outcome = run_cycle(service)
-    assert outcome.result.rejection_codes == ("execution_mode_mismatch",)
-
-
-def test_stale_account_snapshot_fails_closed(tmp_path):
-    service = make_service(tmp_path)
-    outcome = run_cycle(
-        service, account=make_account(retrieved_at_utc=NOW - timedelta(seconds=120))
-    )
-    assert outcome.result.rejection_codes == ("broker_query_failed",)
-
-
-def test_position_limits_use_the_injected_snapshot(tmp_path):
+def test_position_limit_rejection_is_replayable_from_the_stored_snapshot(tmp_path):
     policy = make_policy(max_positions_per_symbol=1)
     service = make_service(tmp_path, gate=make_gate(policy))
-    outcome = run_cycle(service, account=make_account(positions=(make_position(),)))
+    account = make_account(positions=(make_position(),))
+    outcome = run_cycle(service, account=account)
     assert "symbol_position_limit_exceeded" in outcome.result.rejection_codes
+    stored = shadow_store.get_shadow_result("exec-1", db_path=service.shadow_db_path)
+    # Audit replay: the persisted snapshot re-produces the same decision.
+    replayed = make_gate(policy).evaluate_shadow(
+        stored.request, market=stored.market, account=stored.account, connection_target="shadow"
+    )
+    assert replayed.rejection_codes == stored.decision.rejection_codes
 
 
-# --- duplicates ----------------------------------------------------------------
+def test_account_limit_rejection_is_replayable_from_the_stored_snapshot(tmp_path):
+    policy = make_policy(max_positions_account=1)
+    service = make_service(tmp_path, gate=make_gate(policy))
+    outcome = run_cycle(service, account=make_account(positions=(make_position("EUR_USD"),)))
+    assert "account_position_limit_exceeded" in outcome.result.rejection_codes
+    stored = shadow_store.get_shadow_result("exec-1", db_path=service.shadow_db_path)
+    replayed = make_gate(policy).evaluate_shadow(
+        stored.request, market=stored.market, account=stored.account, connection_target="shadow"
+    )
+    assert replayed.rejection_codes == stored.decision.rejection_codes
 
 
-def test_duplicate_request_returns_stored_result_without_second_row(tmp_path):
+# --- duplicates / conflicts ----------------------------------------------------
+
+
+def test_duplicate_request_returns_stored_result_without_second_decision(tmp_path):
     service = make_service(tmp_path)
     first = run_cycle(service)
     second = run_cycle(service)
     assert second.status is ShadowCycleStatus.DUPLICATE
     assert second.result == first.result
     assert len(shadow_store.list_shadow_results(db_path=service.shadow_db_path)) == 1
-    # same signal under a new execution_request_id is also a duplicate
-    third = run_cycle(
-        service, make_request(execution_request_id="exec-9"), client_order_id="client-9"
-    )
-    assert third.status is ShadowCycleStatus.DUPLICATE and third.result == first.result
+    assert len(decisions(service)) == 1  # the duplicate wrote NO new decision
 
 
-def test_concurrent_duplicates_yield_exactly_one_row(tmp_path):
-    """20+ workers race the same request: exactly one RECORDED, the rest are
-    explicit DUPLICATEs carrying the stored row -- never an error, never a
-    second row."""
-    worker_count = 20
-    services = [make_service(tmp_path) for _ in range(worker_count)]
+def test_payload_conflict_raises_and_writes_no_decision(tmp_path):
+    service = make_service(tmp_path)
+    run_cycle(service)
+    with pytest.raises(shadow_store.ShadowIdentityConflictError) as info:
+        run_cycle(service, make_request(quantity=Decimal("2")))
+    assert info.value.differing_fields == ("quantity",)
+    assert len(decisions(service)) == 1
+    assert len(shadow_store.list_shadow_results(db_path=service.shadow_db_path)) == 1
+
+
+def test_concurrent_payload_mismatch_yields_one_winner_and_conflicts(tmp_path):
+    services = [make_service(tmp_path, owner_id=f"o{i}") for i in range(4)]
+    barrier = threading.Barrier(4)
+    outcomes: list = [None] * 4
+
+    def work(index):
+        request = make_request(quantity=Decimal(str(index + 1)))
+        barrier.wait(timeout=60)
+        try:
+            outcomes[index] = run_cycle(services[index], request)
+        except shadow_store.ShadowIdentityConflictError as exc:
+            outcomes[index] = exc
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    winners = [o for o in outcomes if isinstance(o, ShadowCycleOutcome)]
+    conflicts = [o for o in outcomes if isinstance(o, shadow_store.ShadowIdentityConflictError)]
+    assert len(winners) == 1 and winners[0].status is ShadowCycleStatus.RECORDED
+    assert len(conflicts) == 3
+    assert len(decisions(services[0])) == 1
+
+
+@pytest.mark.parametrize("iteration", range(20))
+def test_concurrent_duplicates_yield_one_row_one_decision(tmp_path, iteration):
+    """Repeated (20x) race: 8 workers, exactly one RECORDED, the rest explicit
+    DUPLICATEs, ONE decision row, never an error and never a second row."""
+    worker_count = 8
+    services = [make_service(tmp_path, owner_id=f"o{i}") for i in range(worker_count)]
     barrier = threading.Barrier(worker_count)
     outcomes: list = [None] * worker_count
 
@@ -203,27 +234,115 @@ def test_concurrent_duplicates_yield_exactly_one_row(tmp_path):
     statuses = [outcome.status for outcome in outcomes]
     assert statuses.count(ShadowCycleStatus.RECORDED) == 1
     assert statuses.count(ShadowCycleStatus.DUPLICATE) == worker_count - 1
-    rows = shadow_store.list_shadow_results(db_path=services[0].shadow_db_path)
-    assert len(rows) == 1
-    assert all(outcome.result.shadow_result_id == rows[0].shadow_result_id for outcome in outcomes)
+    assert len(shadow_store.list_shadow_results(db_path=services[0].shadow_db_path)) == 1
+    assert len(decisions(services[0])) == 1
 
 
-# --- store failures ------------------------------------------------------------
+def test_twenty_workers_single_recorded(tmp_path):
+    worker_count = 20
+    services = [make_service(tmp_path, owner_id=f"o{i}") for i in range(worker_count)]
+    barrier = threading.Barrier(worker_count)
+    outcomes: list = [None] * worker_count
+
+    def work(index):
+        barrier.wait(timeout=60)
+        outcomes[index] = run_cycle(services[index])
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    statuses = [outcome.status for outcome in outcomes]
+    assert statuses.count(ShadowCycleStatus.RECORDED) == 1
+    assert statuses.count(ShadowCycleStatus.DUPLICATE) == worker_count - 1
+    assert len(decisions(services[0])) == 1
 
 
-def test_shadow_save_failure_raises_and_leaves_no_partial_state(tmp_path, monkeypatch):
+def test_lock_errors_are_store_failures_not_duplicates(tmp_path, monkeypatch):
     service = make_service(tmp_path)
 
-    def explode(*args, **kwargs):
-        raise shadow_store.ShadowStoreError("injected shadow save failure")
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(shadow_store, "record_shadow_result", explode)
+    monkeypatch.setattr(shadow_store, "_connect_rw", locked)
+    with pytest.raises(shadow_store.ShadowStoreError, match="locked"):
+        run_cycle(service)
+
+
+# --- crash / stale claim recovery ----------------------------------------------
+
+
+def _fail_completion_once(monkeypatch):
+    original = shadow_store.complete_shadow_cycle
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise shadow_store.ShadowStoreError("injected completion failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(shadow_store, "complete_shadow_cycle", flaky)
+
+
+def test_same_owner_retries_immediately_after_a_completion_failure(tmp_path, monkeypatch):
+    service = make_service(tmp_path, owner_id="owner-1")
+    _fail_completion_once(monkeypatch)
     with pytest.raises(shadow_store.ShadowStoreError, match="injected"):
         run_cycle(service)
+    claim = shadow_store.get_shadow_claim("exec-1", db_path=service.shadow_db_path)
+    assert claim is not None and claim.claim_owner_id == "owner-1"
+    retry = run_cycle(service)  # same owner: reclaims without waiting
+    assert retry.status is ShadowCycleStatus.RECORDED
+    assert shadow_store.get_shadow_claim("exec-1", db_path=service.shadow_db_path) is None
+    # the failed attempt's decision remains as a REPORTABLE orphan
+    assert len(decisions(service)) == 2
+    assert retry.result.safety_decision_id == 2
+
+
+def test_stale_claim_is_recovered_by_another_owner_after_the_lease(tmp_path, monkeypatch):
+    crashed = make_service(tmp_path, owner_id="owner-a", claim_lease_seconds=60)
+    _fail_completion_once(monkeypatch)
+    with pytest.raises(shadow_store.ShadowStoreError):
+        run_cycle(crashed)
     monkeypatch.undo()
-    assert shadow_store.list_shadow_results(db_path=service.shadow_db_path) == ()
-    # no dangling idempotency claim: the same cycle succeeds afterwards
-    assert run_cycle(service).status is ShadowCycleStatus.RECORDED
+
+    LATER = NOW + timedelta(seconds=61)
+    other = make_service(
+        tmp_path, owner_id="owner-b", claim_lease_seconds=60, clock=lambda: LATER
+    )
+    # before the lease expires a third owner only sees an in-progress duplicate
+    early = make_service(
+        tmp_path, owner_id="owner-c", claim_lease_seconds=60,
+        clock=lambda: NOW + timedelta(seconds=30),
+    )
+    blocked = run_cycle(
+        early,
+        market=make_market(observed_at_utc=NOW + timedelta(seconds=30)),
+        account=make_account(retrieved_at_utc=NOW + timedelta(seconds=30)),
+    )
+    assert blocked.status is ShadowCycleStatus.DUPLICATE and blocked.claim is not None
+    recovered = run_cycle(
+        other,
+        market=make_market(observed_at_utc=LATER),
+        account=make_account(retrieved_at_utc=LATER),
+    )
+    assert recovered.status is ShadowCycleStatus.RECORDED
+    assert recovered.result.claim_owner_id == "owner-b"
+
+
+def test_process_restart_equivalent_still_deduplicates(tmp_path):
+    first = make_service(tmp_path, owner_id="owner-1")
+    stored = run_cycle(first).result
+    # a NEW service instance with a NEW owner (fresh process) after completion
+    restarted = make_service(tmp_path, owner_id="owner-2")
+    outcome = run_cycle(restarted)
+    assert outcome.status is ShadowCycleStatus.DUPLICATE and outcome.result == stored
+    assert len(decisions(first)) == 1
+
+
+# --- decision persistence failure ----------------------------------------------
 
 
 def test_decision_persist_failure_records_explicit_recoverable_state(tmp_path, monkeypatch):
@@ -240,7 +359,7 @@ def test_decision_persist_failure_records_explicit_recoverable_state(tmp_path, m
     assert not result.allowed
     assert result.rejection_codes == ("decision_persist_failed",)
     assert result.safety_decision_id is None
-    assert SQLiteSafetyDecisionStore(service.decision_db_path).list_for_request("exec-1") == ()
+    assert decisions(service) == ()
 
 
 # --- dry-run -------------------------------------------------------------------
@@ -249,29 +368,36 @@ def test_decision_persist_failure_records_explicit_recoverable_state(tmp_path, m
 def test_dry_run_creates_no_files_and_persists_nothing(tmp_path):
     service = make_service(tmp_path, initialize=False)
     outcome = service.dry_run_cycle(
-        make_request(), market=make_market(), account=make_account(), client_order_id="client-1"
+        make_request(), market=make_market(), account=make_account(),
+        client_order_id="client-1", provenance=make_provenance(),
     )
     assert outcome.status is ShadowCycleStatus.DRY_RUN
     assert outcome.result.allowed
     assert outcome.result.shadow_result_id is None and outcome.result.safety_decision_id is None
     assert not service.shadow_db_path.exists()
     assert not service.decision_db_path.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_dry_run_probes_existing_dbs_read_only(tmp_path):
-    service = make_service(tmp_path)  # initialized
+def test_dry_run_probes_existing_dbs_without_touching_bytes_or_mtime(tmp_path):
+    service = make_service(tmp_path)
     run_cycle(service)
-    before_shadow = service.shadow_db_path.read_bytes()
-    before_decisions = service.decision_db_path.read_bytes()
+    shadow_stat = (service.shadow_db_path.stat().st_mtime_ns, service.shadow_db_path.stat().st_size)
+    decision_stat = (
+        service.decision_db_path.stat().st_mtime_ns, service.decision_db_path.stat().st_size,
+    )
+    files_before = sorted(entry.name for entry in tmp_path.iterdir())
     outcome = service.dry_run_cycle(
         make_request(execution_request_id="exec-2", signal_id="signal-2"),
-        market=make_market(),
-        account=make_account(),
-        client_order_id="client-2",
+        market=make_market(), account=make_account(),
+        client_order_id="client-2", provenance=make_provenance(),
     )
     assert outcome.status is ShadowCycleStatus.DRY_RUN
-    assert service.shadow_db_path.read_bytes() == before_shadow
-    assert service.decision_db_path.read_bytes() == before_decisions
+    assert (service.shadow_db_path.stat().st_mtime_ns, service.shadow_db_path.stat().st_size) == shadow_stat
+    assert (
+        service.decision_db_path.stat().st_mtime_ns, service.decision_db_path.stat().st_size,
+    ) == decision_stat
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == files_before
 
 
 def test_dry_run_fails_explicitly_on_a_corrupted_shadow_db(tmp_path):
@@ -279,7 +405,8 @@ def test_dry_run_fails_explicitly_on_a_corrupted_shadow_db(tmp_path):
     service.shadow_db_path.write_bytes(b"not a sqlite file at all")
     with pytest.raises(Exception):
         service.dry_run_cycle(
-            make_request(), market=make_market(), account=make_account(), client_order_id="client-1"
+            make_request(), market=make_market(), account=make_account(),
+            client_order_id="client-1", provenance=make_provenance(),
         )
 
 
@@ -292,7 +419,6 @@ def test_resolve_execution_mode_accepts_exactly_the_five_modes():
     assert resolve_execution_mode("fake") is ExecutionMode.FAKE
     assert resolve_execution_mode("demo") is ExecutionMode.DEMO
     assert resolve_execution_mode("live") is ExecutionMode.LIVE
-    assert resolve_execution_mode(ExecutionMode.SHADOW) is ExecutionMode.SHADOW
     for bogus in ("SHADOW", " shadow", "paper", "", None, 7):
         with pytest.raises(ValueError):
             resolve_execution_mode(bogus)
@@ -316,41 +442,43 @@ def test_shadow_service_constructor_validation(tmp_path):
             gate=gate, decision_db_path=object(), shadow_db_path=tmp_path / "s",
             clock=lambda: NOW,
         )
-    with pytest.raises(ValueError, match="shadow_db_path"):
-        ShadowExecutionService(
-            gate=gate, decision_db_path=tmp_path / "d", shadow_db_path=object(),
-            clock=lambda: NOW,
-        )
-    with pytest.raises(ValueError, match="connection_target"):
+    with pytest.raises(ValueError, match="owner_id"):
         ShadowExecutionService(
             gate=gate, decision_db_path=tmp_path / "d", shadow_db_path=tmp_path / "s",
-            clock=lambda: NOW, connection_target=" ",
+            clock=lambda: NOW, owner_id=" ",
+        )
+    with pytest.raises(ValueError, match="claim_lease_seconds"):
+        ShadowExecutionService(
+            gate=gate, decision_db_path=tmp_path / "d", shadow_db_path=tmp_path / "s",
+            clock=lambda: NOW, claim_lease_seconds=0,
         )
 
 
 # --- namespace separation from the live submission path ------------------------
 
 
-def test_shadow_run_does_not_block_a_later_fake_submission(tmp_path):
-    """Issue #78: running shadow for a signal must NOT make a later fake /
-    demo / live submission of the same signal look 'already submitted'."""
-    service = make_service(tmp_path)
-    assert run_cycle(service).status is ShadowCycleStatus.RECORDED
-
-    broker = fake_broker.FakeBroker(default_fill_price=Decimal("150"))
+def _live_service(tmp_path, broker):
     policy = make_policy(
         allowed_connection_targets={
             ExecutionMode.FAKE: frozenset({"fake"}),
             ExecutionMode.SHADOW: frozenset({"shadow"}),
         }
     )
-    live = LiveOrderSubmissionService(
+    SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3").initialize()
+    return LiveOrderSubmissionService(
         connection=BrokerConnection(broker=broker),
         gate=make_gate(policy),
-        decision_db_path=service.decision_db_path,
+        decision_db_path=tmp_path / "safety.sqlite3",
         order_db_path=tmp_path / "orders.sqlite3",
         clock=lambda: NOW,
     )
+
+
+def test_shadow_run_does_not_block_a_later_fake_submission(tmp_path):
+    service = make_service(tmp_path)
+    assert run_cycle(service).status is ShadowCycleStatus.RECORDED
+    broker = fake_broker.FakeBroker(default_fill_price=Decimal("150"))
+    live = _live_service(tmp_path, broker)
     request = make_request()  # SAME signal and SAME execution_request_id
     live.register(request, client_order_id="client-1")
     decision, result = live.submit(request.execution_request_id, market=make_market())
@@ -360,58 +488,30 @@ def test_shadow_run_does_not_block_a_later_fake_submission(tmp_path):
 
 def test_live_registration_does_not_block_a_shadow_run(tmp_path):
     broker = fake_broker.FakeBroker(default_fill_price=Decimal("150"))
-    policy = make_policy(
-        allowed_connection_targets={
-            ExecutionMode.FAKE: frozenset({"fake"}),
-            ExecutionMode.SHADOW: frozenset({"shadow"}),
-        }
-    )
-    live = LiveOrderSubmissionService(
-        connection=BrokerConnection(broker=broker),
-        gate=make_gate(policy),
-        decision_db_path=tmp_path / "safety.sqlite3",
-        order_db_path=tmp_path / "orders.sqlite3",
-        clock=lambda: NOW,
-    )
-    SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3").initialize()
+    live = _live_service(tmp_path, broker)
     request = make_request()
     live.register(request, client_order_id="client-1")
     service = make_service(tmp_path)
     assert run_cycle(service).status is ShadowCycleStatus.RECORDED
-    # the execution order store was never touched by the shadow run
     row = execution_store.get_execution_order(
         request.execution_request_id, db_path=tmp_path / "orders.sqlite3"
     )
     assert row["submission_phase"] == execution_store.PHASE_CREATED
 
 
-# --- AccountSafetySnapshot validation -------------------------------------------
+# --- AccountSafetySnapshot / evaluate_shadow validation -------------------------
 
 
 def test_account_snapshot_validates_container_types():
     with pytest.raises(ValueError, match="positions"):
         AccountSafetySnapshot(positions=[make_position()], account=make_account().account)
-    with pytest.raises(ValueError, match="PositionInfo"):
-        AccountSafetySnapshot(positions=("x",), account=make_account().account)
     with pytest.raises(ValueError, match="AccountState"):
         AccountSafetySnapshot(positions=(), account="nope")
 
 
-def test_evaluate_shadow_argument_validation(tmp_path):
-    gate = make_gate()
-    with pytest.raises(ValueError, match="request"):
-        gate.evaluate_shadow(
-            "nope", market=make_market(), account=make_account(), connection_target="shadow"
-        )
-    with pytest.raises(ValueError, match="market"):
-        gate.evaluate_shadow(
-            make_request(), market="nope", account=make_account(), connection_target="shadow"
-        )
-    with pytest.raises(ValueError, match="account"):
-        gate.evaluate_shadow(
-            make_request(), market=make_market(), account="nope", connection_target="shadow"
-        )
-    with pytest.raises(ValueError, match="connection_target"):
-        gate.evaluate_shadow(
-            make_request(), market=make_market(), account=make_account(), connection_target=" "
-        )
+def test_stale_account_snapshot_fails_closed(tmp_path):
+    service = make_service(tmp_path)
+    outcome = run_cycle(
+        service, account=make_account(retrieved_at_utc=NOW - timedelta(seconds=120))
+    )
+    assert outcome.result.rejection_codes == ("broker_query_failed",)

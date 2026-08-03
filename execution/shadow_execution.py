@@ -1,5 +1,5 @@
 """ShadowExecutionService -- THE official Production boundary for Shadow Mode
-(Issue #78).
+(Issue #78; claim-first / provenance rework PR #100).
 
 *** NOTHING HERE TOUCHES A BROKER. The service does not accept, hold or
 construct any ``Broker`` / ``BrokerConnection``: no constructor or method
@@ -7,57 +7,52 @@ parameter for a broker exists, so no broker API (submit / cancel / order
 query / position query / account query) is reachable from the shadow path --
 the "zero broker calls" contract is structural, not a runtime check. ***
 
-Shadow mode runs the REAL decision path -- an ``ExecutionRequest`` built from
-a real signal, the configured ``SafetyPolicy``, the full Safety Gate -- and
-persists the outcome as an audit record instead of submitting:
+Cycle order (claim BEFORE evaluation -- PR #100 review):
 
-    ExecutionRequest (real signal; signal-vocabulary mapping is the caller's
-                      responsibility, exactly as for live submission)
-      -> duplicate pre-check against the shadow store (explicit DUPLICATE)
-      -> SafetyGate.evaluate_shadow()   ... same shared checks as live
-      -> durable SafetyDecision record + READ-BACK verification
-         (same sealed audit store as live submission; failure appends
-          ``decision_persist_failed`` and turns an allow into a rejection)
-      -> ShadowResult persisted in ONE atomic INSERT (UNIQUE-claimed)
+    ExecutionRequest (from the production signal path or a labelled fixture)
+      -> shadow_store.claim_shadow_cycle()      ... DB-owned identity claim
+           ├─ duplicate -> return the stored record; the gate is NOT
+           │              evaluated and NO Safety Decision row is written
+           ├─ conflict  -> ShadowIdentityConflictError (payload differs);
+           │              nothing evaluated, nothing written
+           └─ acquired:
+                -> SafetyGate.evaluate_shadow()  ... same shared checks as live
+                -> durable SafetyDecision record + READ-BACK verification
+                -> shadow_store.complete_shadow_cycle()  phase -> completed
+
+Because losers never evaluate, ONE completed shadow record corresponds to ONE
+Safety Decision row (the referenced ``safety_decision_id``) in the normal
+case. The exceptions are explicit and auditable: decision persistence failure
+completes the record with ``safety_decision_id=None`` plus the
+``decision_persist_failed`` rejection; a crash AFTER the decision was
+recorded but BEFORE completion leaves a reclaimable claim whose retry writes
+a fresh decision -- the earlier row becomes an ORPHAN, searchable via
+``shadow_report --orphan-decisions`` and bounded by the number of retries.
+
+Claim recovery contract (see ``shadow_store`` for the mechanics): the same
+owner re-acquires its claim immediately; other owners take over only after
+the lease expires; every crash point (before evaluation, after decision,
+before completion) therefore converges back to a completed record on retry,
+and no claim can stay unprocessable forever.
 
 Mode dispatch (Issue #78): ``shadow`` runs through THIS service; ``fake``
-submission stays exclusively ``LiveOrderSubmissionService`` (which cannot be
-built without a ``BrokerConnection``); ``demo`` / ``live`` remain
-unconstructible until an adapter type is registered (``BROKER_TYPE_BY_MODE``)
-and must be refused explicitly by any runner; ``dry-run`` uses
-:meth:`ShadowExecutionService.dry_run_cycle`, which persists NOTHING.
+submission stays exclusively ``LiveOrderSubmissionService``; ``demo`` /
+``live`` remain unconstructible (``BROKER_TYPE_BY_MODE``) and must be refused
+explicitly by any runner; ``dry-run`` uses :meth:`dry_run_cycle`, which
+persists NOTHING and probes existing stores strictly read-only.
 
-Idempotency contract (Issue #78):
-
-- NAMESPACE SEPARATION: shadow writes only the shadow store
-  (``shadow_results.sqlite3``). The execution order store
-  (``execution_orders.sqlite3``) is never touched, so a shadow run can never
-  make a later fake / demo / live submission of the same signal look
-  "already submitted" -- and a live registration never blocks shadow.
-- ONE RECORD per execution request AND per source signal AND per client
-  order id: the shadow store's UNIQUE constraints decide the winner inside
-  ``BEGIN IMMEDIATE``; a losing writer (sequential re-run or concurrent
-  race) gets an explicit ``DUPLICATE`` outcome carrying the STORED result --
-  never a second row, and never a lock/persistence error dressed up as
-  duplicate suppression.
-- Re-evaluation of the same request under a changed policy/configuration is
-  deliberately NOT modelled (out of scope): the first recorded evaluation
-  wins; the applied policy snapshot is stored with it.
-
-Dry-run vs shadow (both never call a broker; only shadow persists):
-``dry_run_cycle()`` evaluates the same production checks, creates NO file,
-performs NO insert/update and NO store initialization; existing DB files are
-probed strictly READ-ONLY (an invalid schema is an explicit error, never
-"success"), missing files are left missing. Decision persistence and shadow
-persistence are both skipped, so the returned outcome carries
-``safety_decision_id=None`` and ``shadow_result_id=None``.
+Idempotency namespaces: shadow writes only the shadow store; the execution
+order store is never touched, so a shadow run can never make a later fake /
+demo / live submission of the same signal look "already submitted" -- and a
+live registration never blocks shadow.
 """
 
 from __future__ import annotations
 
 import enum
 import logging
-from dataclasses import dataclass, replace
+import os
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -73,11 +68,17 @@ from execution.safety_gate import (
     SafetyRejectionCode,
 )
 from execution.safety_store import SQLiteSafetyDecisionStore
-from execution.shadow_models import ShadowResult, intended_order_from_request
+from execution.shadow_models import (
+    ShadowClaim,
+    ShadowProvenance,
+    ShadowResult,
+    intended_order_from_request,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SHADOW_CONNECTION_TARGET = "shadow"
+DEFAULT_CLAIM_LEASE_SECONDS = 600
 
 
 class ShadowCycleStatus(enum.Enum):
@@ -90,25 +91,38 @@ class ShadowCycleStatus(enum.Enum):
 
 @dataclass(frozen=True)
 class ShadowCycleOutcome:
-    """One shadow cycle's outcome: ``result`` is the freshly RECORDED record,
-    the pre-existing STORED record (``DUPLICATE``), or the evaluated-but-not-
-    persisted record (``DRY_RUN``, ids all None)."""
+    """One shadow cycle's outcome.
+
+    - ``RECORDED``: THIS call completed the record (``result`` set).
+    - ``DUPLICATE``: a payload-equal record already exists -- ``result`` when
+      it is completed, ``claim`` when another holder is still in flight.
+      Nothing was evaluated and no decision row was written by this call.
+    - ``DRY_RUN``: evaluated but never persisted (``result`` with all ids
+      None).
+    """
 
     status: ShadowCycleStatus
-    result: ShadowResult
+    result: ShadowResult | None = None
+    claim: ShadowClaim | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ShadowCycleStatus):
             raise ValueError(f"status must be a ShadowCycleStatus, got {self.status!r}")
-        if not isinstance(self.result, ShadowResult):
-            raise ValueError(f"result must be a ShadowResult, got {self.result!r}")
-        if self.status is ShadowCycleStatus.DRY_RUN and (
-            self.result.shadow_result_id is not None
-            or self.result.safety_decision_id is not None
-        ):
-            raise ValueError("a dry-run outcome must not carry persisted ids")
-        if self.status is ShadowCycleStatus.RECORDED and self.result.shadow_result_id is None:
-            raise ValueError("a recorded outcome must carry the assigned shadow_result_id")
+        if self.result is not None and not isinstance(self.result, ShadowResult):
+            raise ValueError(f"result must be a ShadowResult or None, got {self.result!r}")
+        if self.claim is not None and not isinstance(self.claim, ShadowClaim):
+            raise ValueError(f"claim must be a ShadowClaim or None, got {self.claim!r}")
+        if self.status is ShadowCycleStatus.RECORDED:
+            if self.result is None or self.result.shadow_result_id is None or self.claim is not None:
+                raise ValueError("a recorded outcome carries exactly the persisted result")
+        elif self.status is ShadowCycleStatus.DUPLICATE:
+            if (self.result is None) == (self.claim is None):
+                raise ValueError("a duplicate outcome carries exactly one of result / claim")
+        else:  # DRY_RUN
+            if self.result is None or self.claim is not None:
+                raise ValueError("a dry-run outcome carries exactly the evaluated result")
+            if self.result.shadow_result_id is not None or self.result.safety_decision_id is not None:
+                raise ValueError("a dry-run outcome must not carry persisted ids")
 
 
 class ShadowExecutionService:
@@ -123,6 +137,8 @@ class ShadowExecutionService:
         shadow_db_path: str | Path,
         clock: Callable[[], datetime],
         connection_target: str = DEFAULT_SHADOW_CONNECTION_TARGET,
+        owner_id: str | None = None,
+        claim_lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
     ) -> None:
         if not isinstance(gate, SafetyGate):
             raise ValueError(f"gate must be a SafetyGate, got {gate!r}")
@@ -144,11 +160,26 @@ class ShadowExecutionService:
             raise ValueError(
                 f"connection_target must be a non-empty string, got {connection_target!r}"
             )
+        if owner_id is not None and (not isinstance(owner_id, str) or not owner_id.strip()):
+            raise ValueError(f"owner_id must be a non-empty string or None, got {owner_id!r}")
+        if (
+            not isinstance(claim_lease_seconds, int)
+            or isinstance(claim_lease_seconds, bool)
+            or claim_lease_seconds < 1
+        ):
+            raise ValueError(
+                f"claim_lease_seconds must be a positive int, got {claim_lease_seconds!r}"
+            )
         self._gate = gate
         self._decision_store = SQLiteSafetyDecisionStore(Path(decision_db_path))
         self._shadow_db_path = Path(shadow_db_path)
         self._clock = clock
         self._connection_target = connection_target
+        # The claim owner identity: unique per process+service instance by
+        # default so an in-process retry re-acquires its own claim while a
+        # DIFFERENT process must wait for the lease (tests inject fixed ids).
+        self._owner_id = owner_id if owner_id is not None else f"pid{os.getpid()}-svc{id(self):x}"
+        self._claim_lease_seconds = claim_lease_seconds
 
     @property
     def shadow_db_path(self) -> Path:
@@ -157,6 +188,10 @@ class ShadowExecutionService:
     @property
     def decision_db_path(self) -> Path:
         return self._decision_store.path
+
+    @property
+    def owner_id(self) -> str:
+        return self._owner_id
 
     # --- store lifecycle -----------------------------------------------------
 
@@ -176,20 +211,38 @@ class ShadowExecutionService:
         market: MarketSafetySnapshot,
         account: AccountSafetySnapshot,
         client_order_id: str,
+        provenance: ShadowProvenance,
         timeframe: str | None = None,
     ) -> ShadowCycleOutcome:
-        """Evaluate the Safety Gate for ``request`` and persist the shadow
-        verification record; returns RECORDED or DUPLICATE (see the module
-        docstring). Store failures raise -- a failed save never leaves a
-        partial row or a dangling idempotency claim (single atomic INSERT).
-        """
-        self._validate_cycle_args(request, market, account, client_order_id, timeframe)
+        """Claim, evaluate, persist -- in that order (module docstring).
 
-        existing = self._find_existing(request)
-        if existing is not None:
-            self._log_duplicate(request, existing, "pre-check found an existing shadow result")
-            return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, result=existing)
+        Returns RECORDED or an explicit DUPLICATE; a payload mismatch raises
+        ``ShadowIdentityConflictError`` and store failures raise
+        ``ShadowStoreError`` (the claim, if held, stays reclaimable)."""
+        self._validate_cycle_args(request, market, account, client_order_id, provenance, timeframe)
 
+        status, record = shadow_store.claim_shadow_cycle(
+            request,
+            client_order_id=client_order_id,
+            timeframe=timeframe,
+            provenance=provenance,
+            owner_id=self._owner_id,
+            now=self._now(),
+            lease_seconds=self._claim_lease_seconds,
+            db_path=self._shadow_db_path,
+        )
+        if status == shadow_store.CLAIM_DUPLICATE:
+            if isinstance(record, ShadowResult):
+                self._log_duplicate(request, "a completed shadow record already exists")
+                return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, result=record)
+            self._log_duplicate(
+                request,
+                f"claim is held by {record.claim_owner_id!r} until "
+                f"{record.lease_expires_at_utc.isoformat()}",
+            )
+            return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, claim=record)
+
+        # --- claim acquired: this caller alone evaluates ---------------------
         decision = self._gate.evaluate_shadow(
             request,
             market=market,
@@ -205,44 +258,29 @@ class ShadowExecutionService:
                 decision.rejection_codes,
             )
 
-        result = ShadowResult(
-            request=request,
-            client_order_id=client_order_id,
-            timeframe=timeframe,
+        result = shadow_store.complete_shadow_cycle(
+            request.execution_request_id,
+            owner_id=self._owner_id,
             decision=decision,
-            intended_order=intended_order_from_request(request, client_order_id=client_order_id),
             market=market,
+            account=account,
             policy_snapshot=self._gate.policy.to_snapshot(),
             safety_decision_id=decision_id,
-            created_at_utc=self._now(),
+            completed_at_utc=self._now(),
+            db_path=self._shadow_db_path,
         )
-        try:
-            shadow_result_id = shadow_store.record_shadow_result(
-                result, db_path=self._shadow_db_path
-            )
-        except shadow_store.ShadowResultConflictError:
-            # A concurrent writer won the UNIQUE claim between the pre-check
-            # and this INSERT: surface the STORED record as an explicit
-            # duplicate. (A conflict whose row cannot be found again is a
-            # store failure and propagates from _find_existing's re-read.)
-            stored = self._find_existing(request)
-            if stored is None:
-                raise
-            self._log_duplicate(request, stored, "lost the concurrent UNIQUE claim")
-            return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, result=stored)
         _LOGGER.info(
             "shadow result recorded execution_request_id=%s signal_id=%s allowed=%s "
-            "shadow_result_id=%s policy_id=%s",
+            "shadow_result_id=%s safety_decision_id=%s policy_id=%s input_origin=%s",
             request.execution_request_id,
             request.signal_id,
             decision.allowed,
-            shadow_result_id,
+            result.shadow_result_id,
+            decision_id,
             decision.policy_id,
+            provenance.input_origin,
         )
-        return ShadowCycleOutcome(
-            status=ShadowCycleStatus.RECORDED,
-            result=replace(result, shadow_result_id=shadow_result_id),
-        )
+        return ShadowCycleOutcome(status=ShadowCycleStatus.RECORDED, result=result)
 
     def dry_run_cycle(
         self,
@@ -251,22 +289,24 @@ class ShadowExecutionService:
         market: MarketSafetySnapshot,
         account: AccountSafetySnapshot,
         client_order_id: str,
+        provenance: ShadowProvenance,
         timeframe: str | None = None,
     ) -> ShadowCycleOutcome:
         """The dry-run mode cycle: the same production evaluation with ZERO
         side effects -- no DB creation, no migration, no INSERT/UPDATE, no
-        state update. Existing store files are probed strictly read-only
-        first (an invalid schema is an explicit failure, never success); a
-        missing file stays missing."""
-        self._validate_cycle_args(request, market, account, client_order_id, timeframe)
+        claim. Existing store files are probed strictly READ-ONLY first (an
+        invalid schema is an explicit failure, never success; probing changes
+        neither content nor mtime); a missing file stays missing."""
+        self._validate_cycle_args(request, market, account, client_order_id, provenance, timeframe)
 
         if self._shadow_db_path.exists():
-            shadow_store.verify_db(self._shadow_db_path)  # read-only probe
+            shadow_store.verify_db(self._shadow_db_path)  # true read-only probe
         if self._decision_store.path.exists():
-            # Read-only probe: list_for_request verifies the schema without
-            # creating or writing anything (missing file would return empty).
+            # Read-only probe: list_for_request verifies the schema over a
+            # mode=ro connection without creating or writing anything.
             self._decision_store.list_for_request(request.execution_request_id)
 
+        now = self._now()
         decision = self._gate.evaluate_shadow(
             request,
             market=market,
@@ -277,19 +317,23 @@ class ShadowExecutionService:
             request=request,
             client_order_id=client_order_id,
             timeframe=timeframe,
+            provenance=provenance,
             decision=decision,
             intended_order=intended_order_from_request(request, client_order_id=client_order_id),
             market=market,
+            account=account,
             policy_snapshot=self._gate.policy.to_snapshot(),
             safety_decision_id=None,
-            created_at_utc=self._now(),
+            claim_owner_id=self._owner_id,
+            claimed_at_utc=now,
+            completed_at_utc=now,
         )
         return ShadowCycleOutcome(status=ShadowCycleStatus.DRY_RUN, result=result)
 
     # --- internals -----------------------------------------------------------
 
     @staticmethod
-    def _validate_cycle_args(request, market, account, client_order_id, timeframe) -> None:
+    def _validate_cycle_args(request, market, account, client_order_id, provenance, timeframe) -> None:
         if not isinstance(request, ExecutionRequest):
             raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
         if not isinstance(market, MarketSafetySnapshot):
@@ -298,6 +342,8 @@ class ShadowExecutionService:
             raise ValueError(f"account must be an AccountSafetySnapshot, got {account!r}")
         if not isinstance(client_order_id, str) or not client_order_id.strip():
             raise ValueError(f"client_order_id must be a non-empty string, got {client_order_id!r}")
+        if not isinstance(provenance, ShadowProvenance):
+            raise ValueError(f"provenance must be a ShadowProvenance, got {provenance!r}")
         if timeframe is not None and (not isinstance(timeframe, str) or not timeframe.strip()):
             raise ValueError(f"timeframe must be a non-empty string or None, got {timeframe!r}")
 
@@ -312,28 +358,13 @@ class ShadowExecutionService:
             raise ValueError(f"clock must return a timezone-aware UTC datetime, got {now!r}")
         return now
 
-    def _find_existing(self, request: ExecutionRequest) -> ShadowResult | None:
-        existing = shadow_store.get_shadow_result(
-            request.execution_request_id, db_path=self._shadow_db_path
-        )
-        if existing is not None:
-            return existing
-        return shadow_store.get_shadow_result_by_signal_id(
-            request.signal_id, db_path=self._shadow_db_path
-        )
-
-    def _log_duplicate(
-        self, request: ExecutionRequest, existing: ShadowResult, reason: str
-    ) -> None:
+    def _log_duplicate(self, request: ExecutionRequest, reason: str) -> None:
         # Issue #76-style suppression log contract, shadow namespace: the
-        # ids, the stored outcome and the suppression reason stay visible.
+        # ids and the suppression reason stay visible.
         _LOGGER.warning(
-            "duplicate shadow cycle suppressed: execution_request_id=%s signal_id=%s "
-            "existing_shadow_result_id=%s existing_allowed=%s reason=%s",
+            "duplicate shadow cycle suppressed: execution_request_id=%s signal_id=%s reason=%s",
             request.execution_request_id,
             request.signal_id,
-            existing.shadow_result_id,
-            existing.allowed,
             reason,
         )
 
@@ -342,7 +373,7 @@ class ShadowExecutionService:
         contract as live submission, Issue #75 review r1). Any failure --
         record exception, read-back miss, read-back mismatch -- appends
         ``decision_persist_failed`` (an allow becomes a rejection) and the
-        shadow record is stored WITHOUT a decision reference
+        shadow record is completed WITHOUT a decision reference
         (``safety_decision_id=None``): no dangling reference, explicitly
         recoverable state (Issue #78)."""
         try:

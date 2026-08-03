@@ -33,10 +33,12 @@
   "expected": {
     "broker_submit_calls": 0,
     "shadow_rows": 1,
+    "shadow_claim_rows": 0,
     "shadow_allowed": false,
     "shadow_codes": [
       "decision_persist_failed"
     ],
+    "shadow_safety_decision_id": null,
     "safety_decisions": 0
   }
 }

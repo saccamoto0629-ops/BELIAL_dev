@@ -78,17 +78,19 @@ def test_submission_service_holds_exactly_one_submit_order_call():
     )
 
 
-# Issue #78: shadow results are created ONLY by the ShadowExecutionService --
-# the scenario runner (and everything else) may read shadow results but must
-# never record one directly, so the runner cannot synthesize a shadow path.
-RECORD_SHADOW_RESULT_ALLOWED = {
+# Issue #78: shadow records are claimed/completed ONLY by the
+# ShadowExecutionService -- the scenario runner (and everything else) may read
+# shadow records but must never write one directly, so the runner cannot
+# synthesize a shadow path.
+SHADOW_WRITE_ALLOWED = {
     "execution/shadow_execution.py",
     "execution/tests",
 }
 
 
-def test_record_shadow_result_is_called_only_by_the_shadow_service():
-    assert _offenders("record_shadow_result", RECORD_SHADOW_RESULT_ALLOWED) == []
+def test_shadow_claim_and_completion_are_called_only_by_the_shadow_service():
+    assert _offenders("claim_shadow_cycle", SHADOW_WRITE_ALLOWED) == []
+    assert _offenders("complete_shadow_cycle", SHADOW_WRITE_ALLOWED) == []
 
 
 def _name_call_sites(path: pathlib.Path, name: str) -> list[int]:
