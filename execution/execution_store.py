@@ -1796,6 +1796,36 @@ def get_execution_order_by_signal_id(
     return None if bundle is None else bundle[0]
 
 
+def get_execution_order_by_broker_order_id(
+    broker_order_id: str, *, db_path: Path | None = None
+) -> dict | None:
+    """The execution order currently OWNING this ``broker_order_id``, or None.
+
+    ``broker_order_id`` is UNIQUE across the whole table (PR #91 review
+    Major 3), so at most one row can hold it -- the same lookup shape as
+    :func:`get_execution_order_by_signal_id`. Callers use it to find out
+    whether a broker-assigned id is already bound to a DIFFERENT execution
+    request BEFORE treating a broker observation as safely recordable
+    (Issue #103 review: reflecting such an observation would collide with
+    the UNIQUE constraint inside ``record_order_result`` and roll back).
+
+    Same read contract as every other read helper: schema verification
+    first, full bundle validation of the row it returns, missing DB -> None
+    without creating the file. An unassigned id simply yields None.
+    """
+    _require_non_empty_str(broker_order_id, "broker_order_id")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return None
+    with _verified_read(db_path) as connection:
+        row = connection.execute(
+            f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE broker_order_id = ?",
+            (broker_order_id,),
+        ).fetchone()
+        bundle = None if row is None else _fetch_and_validate(connection, row[0])
+    return None if bundle is None else bundle[0]
+
+
 def load_execution_request(
     execution_request_id: str, *, db_path: Path | None = None
 ) -> ExecutionRequest | None:

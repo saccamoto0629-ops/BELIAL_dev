@@ -42,14 +42,19 @@ validators and the store's documented preconditions for
 ``record_order_result`` -- ``validate_order_state_transition``,
 ``validate_order_result_update`` against the DB-anchored snapshot, the
 identity fields of the stored intent, the ``broker_order_id`` NULL -> value
--> immutable chain and the no-backwards-timestamp rule. Nothing is
-re-implemented here, and this service does not perform the update; it only
-records whether Issue #104 could.
+-> immutable chain, the DB-WIDE ``broker_order_id`` uniqueness (an id
+already owned by another execution request could never be recorded onto
+this one) and the no-backwards-timestamp rule. Nothing is re-implemented
+here, and this service does not perform the update; it only records whether
+Issue #104 could.
 
 Everything the existing contract cannot absorb -- a forbidden transition, a
 settled outcome contradicted, a snapshot that would drop known fills or a
-known ``broker_order_id``, an order only one side knows about -- is
-``MANUAL_REVIEW``.
+known ``broker_order_id``, a broker order id another request already owns,
+an order only one side knows about -- is ``MANUAL_REVIEW``. So is anything
+the store could not ANSWER: if a read needed to prove repairability fails,
+the discrepancy falls back to ``MANUAL_REVIEW`` with the failure as its
+reason (fail-closed -- repairability is never assumed).
 
 Broker query failures
 ---------------------
@@ -97,6 +102,7 @@ from broker.broker_models import (
 )
 from execution import execution_store
 from execution.execution_models import _require_non_empty_str, _require_utc
+from execution.execution_store import ExecutionStoreError
 from execution.reconciliation_models import (
     DiscrepancyType,
     OrderDiscrepancy,
@@ -371,10 +377,17 @@ class BrokerOrderReconciliationService:
         """Auto-repairable iff Issue #104 could record this observation
         through ``execution_store.record_order_result`` without loss.
 
-        The checks mirror that function's documented preconditions and reuse
-        the Issue #73 validators; the update itself is NOT performed here.
+        The checks mirror that function's documented preconditions -- the
+        DB-wide ``broker_order_id`` uniqueness included -- and reuse the
+        Issue #73 validators; the update itself is NOT performed here.
+
+        Fail-closed: if an execution-store READ needed to prove
+        repairability fails, the discrepancy is classified
+        ``MANUAL_REVIEW`` with the failure as the reason. Repairability is
+        never assumed from a lookup that did not answer.
         """
         blockers: list[str] = []
+        execution_request_id = row["execution_request_id"]
 
         try:
             validate_order_state_transition(internal_state, observed.state)
@@ -392,9 +405,24 @@ class BrokerOrderReconciliationService:
                 f"{observed.broker_order_id!r}"
             )
 
-        anchored = execution_store.load_order_result(
-            row["execution_request_id"], db_path=self._execution_db_path
-        )
+        try:
+            anchored = execution_store.load_order_result(
+                execution_request_id, db_path=self._execution_db_path
+            )
+            owner_problem = self._broker_id_owner_problem(row, observed)
+        except ExecutionStoreError as exc:
+            # The order store could not answer (schema/integrity failure, a
+            # concurrent writer, ...). Nothing is inferred and nothing is
+            # changed: a human decides.
+            return (
+                ResolutionCategory.MANUAL_REVIEW,
+                f"the broker state {observed.state.value!r} could not be proven safely "
+                f"reflectable onto the internal state {internal_state.value!r}: reading the "
+                f"execution order store failed ({type(exc).__name__}: {exc}); no repair "
+                "candidacy is assumed",
+            )
+        if owner_problem is not None:
+            blockers.append(owner_problem)
         if anchored is not None:
             try:
                 validate_order_result_update(anchored, observed)
@@ -420,6 +448,40 @@ class BrokerOrderReconciliationService:
             f"the broker state {observed.state.value!r} is a legal, loss-free resolution of "
             f"the internal state {internal_state.value!r}; no repair was performed "
             "(detection-only run)",
+        )
+
+    def _broker_id_owner_problem(self, row: dict, observed: OrderResult) -> str | None:
+        """Whether the observed ``broker_order_id`` already belongs to a
+        DIFFERENT execution request (Issue #103 review, Major).
+
+        ``broker_order_id`` is UNIQUE across the whole execution order table
+        (PR #91 review Major 3): one broker order can never be attached to
+        two execution requests. A PENDING / UNKNOWN order whose broker
+        snapshot carries an id another request already owns therefore cannot
+        be recorded -- ``record_order_result`` would hit the constraint and
+        roll the whole update back -- so it must never be classified as an
+        auto-repair candidate. The current order owning the id itself is NOT
+        a conflict (that is the normal re-observation case).
+
+        Read-only; a store failure propagates to the caller, which fails
+        closed to ``MANUAL_REVIEW``.
+        """
+        broker_order_id = observed.broker_order_id
+        if broker_order_id is None:
+            return None  # nothing would be assigned, nothing can collide
+        owner = execution_store.get_execution_order_by_broker_order_id(
+            broker_order_id, db_path=self._execution_db_path
+        )
+        if owner is None:
+            return None  # unassigned
+        owner_id = owner["execution_request_id"]
+        if owner_id == row["execution_request_id"]:
+            return None  # this very order already owns it
+        return (
+            f"broker_order_id {broker_order_id!r} is already owned by execution request "
+            f"{owner_id!r}, not by {row['execution_request_id']!r}; broker order IDs are "
+            "UNIQUE across the execution order store, so this observation cannot be "
+            "recorded onto this request"
         )
 
     @staticmethod

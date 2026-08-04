@@ -239,6 +239,31 @@ def seed_internal_accepted(db_path, request_id: str, result: OrderResult) -> Non
     )
 
 
+def filled_result(request_id: str, broker_order_id: str, *, seconds: int = 1) -> OrderResult:
+    return OrderResult(
+        client_order_id=client_id(request_id),
+        broker_order_id=broker_order_id,
+        state=OrderState.FILLED,
+        symbol="XAUUSD",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        requested_quantity=QUANTITY,
+        filled_quantity=QUANTITY,
+        remaining_quantity=Decimal("0"),
+        requested_price=None,
+        average_fill_price=FILL_PRICE,
+        updated_at_utc=INTERNAL_T + timedelta(seconds=seconds),
+        fills=(
+            Fill(
+                fill_id=f"fill-{request_id}",
+                price=FILL_PRICE,
+                quantity=QUANTITY,
+                filled_at_utc=INTERNAL_T + timedelta(seconds=seconds),
+            ),
+        ),
+    )
+
+
 def only(discrepancies):
     assert len(discrepancies) == 1, discrepancies
     return discrepancies[0]
@@ -586,6 +611,126 @@ def test_an_order_the_broker_does_not_know_is_flagged_for_review(paths):
     assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
     assert entry.broker_state is None
     assert entry.internal_state is OrderState.PENDING
+
+
+# --- broker_order_id uniqueness (Issue #103 review, Major) --------------------
+
+
+@pytest.mark.parametrize("internal_state", [OrderState.PENDING, OrderState.UNKNOWN])
+def test_a_broker_id_owned_by_another_request_is_never_an_auto_repair_candidate(
+    paths, internal_state
+):
+    """``broker_order_id`` is UNIQUE DB-wide: recording this observation
+    would collide with the owning request and roll back, so it must not be
+    classified as repairable."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    # A owns B-1 and is settled (not itself a reconciliation target)
+    seed_internal_pending(execution_db, "exec-owner")
+    execution_store.record_order_result(
+        "exec-owner", filled_result("exec-owner", "B-1"), reason="filled",
+        db_path=execution_db,
+    )
+    # B has no broker id yet, and the broker reports B-1 for it
+    if internal_state is OrderState.PENDING:
+        seed_internal_pending(execution_db, "exec-clash")
+    else:
+        seed_internal_unknown(execution_db, "exec-clash")
+    broker.script_order(
+        client_id("exec-clash"), FillImmediately(price=FILL_PRICE, broker_order_id="B-1")
+    )
+    broker.submit_order(broker_request("exec-clash"))
+    before = _order_snapshot(execution_db, ("exec-owner", "exec-clash"))
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-clash")
+
+    entry = only([d for d in run.discrepancies if d.target_id == "exec-clash"])
+    assert entry.internal_state is internal_state
+    assert entry.broker_state is OrderState.FILLED
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+    # the reason names the id, its current owner and the request being compared
+    assert "B-1" in entry.detail
+    assert "exec-owner" in entry.detail
+    assert "exec-clash" in entry.detail
+    # neither side changed
+    assert _order_snapshot(execution_db, ("exec-owner", "exec-clash")) == before
+
+
+def test_an_unassigned_broker_id_stays_an_auto_repair_candidate(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_pending(execution_db, "exec-owner")
+    execution_store.record_order_result(
+        "exec-owner", filled_result("exec-owner", "B-1"), reason="filled",
+        db_path=execution_db,
+    )
+    seed_internal_pending(execution_db, "exec-free")
+    broker.script_order(
+        client_id("exec-free"), FillImmediately(price=FILL_PRICE, broker_order_id="B-2")
+    )
+    broker.submit_order(broker_request("exec-free"))
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-free")
+
+    entry = only([d for d in run.discrepancies if d.target_id == "exec-free"])
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
+    assert entry.broker_order_id == "B-2"
+
+
+def test_an_order_owning_the_broker_id_itself_is_not_a_conflict(paths):
+    """The normal re-observation case: the id the broker reports is the one
+    this very request already holds."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(client_id("exec-self"), StayPending(broker_order_id="B-SELF"))
+    accepted = broker.submit_order(broker_request("exec-self"))
+    seed_internal_accepted(execution_db, "exec-self", accepted)
+    broker.cancel_order(client_id("exec-self"))
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-self")
+
+    entry = only(run.discrepancies)
+    assert entry.broker_order_id == "B-SELF"
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
+
+
+def test_an_observation_without_a_broker_id_keeps_its_existing_classification(paths):
+    """A REJECTED snapshot carries no broker id at all: nothing can collide,
+    and the classification is unchanged by the uniqueness check."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-noid")
+    broker.script_order(client_id("exec-noid"), RejectOrder(reason="rejected by broker"))
+    broker.submit_order(broker_request("exec-noid"))
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-noid")
+
+    entry = only(run.discrepancies)
+    assert entry.broker_order_id is None
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
+
+
+def test_a_failed_owner_lookup_falls_back_to_manual_review(paths, monkeypatch):
+    """Fail-closed: if the execution store cannot answer who owns the id,
+    repairability is not assumed."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_pending(execution_db, "exec-readfail")
+    broker.submit_order(broker_request("exec-readfail"))
+
+    def boom(*args, **kwargs):
+        raise execution_store.ExecutionIntegrityError("order store unreadable")
+
+    monkeypatch.setattr(execution_store, "get_execution_order_by_broker_order_id", boom)
+    before = _order_snapshot(execution_db, ("exec-readfail",))
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-readfail")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.IN_FLIGHT_BROKER_FILLED
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+    assert "ExecutionIntegrityError" in entry.detail
+    assert _order_snapshot(execution_db, ("exec-readfail",)) == before
 
 
 # --- broker-only orders -------------------------------------------------------

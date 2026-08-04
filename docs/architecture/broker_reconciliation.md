@@ -70,10 +70,13 @@ BrokerOrderReconciliationService   ← execution/broker_reconciliation.py
 1. `validate_order_state_transition(内部状態, Broker 状態)` が通ること
 2. Broker snapshot が保存済み intent と一致すること(symbol / side / order_type / quantity / requested_price)
 3. `broker_order_id` が `NULL → 値 → 同値` の連鎖を壊さないこと
-4. history に anchor された snapshot があれば `validate_order_result_update(anchored, observed)` が通ること
-5. `updated_at_utc` が逆行しないこと
+4. **Broker snapshot の `broker_order_id` が他の Execution Request に割当済みでないこと**(`broker_order_id` は execution order テーブル**全体で UNIQUE**。他注文が所有する ID を反映しようとすると `record_order_result` が制約違反で全体 rollback する。所有者が照合中の注文自身である場合は競合ではない)
+5. history に anchor された snapshot があれば `validate_order_result_update(anchored, observed)` が通ること
+6. `updated_at_utc` が逆行しないこと
 
-いずれかを満たさない場合は `manual_review` とし、`detail` に阻害理由を残す。
+いずれかを満たさない場合は `manual_review` とし、`detail` に阻害理由を残す。所有者衝突の場合は **競合した `broker_order_id`・現所有者の `execution_request_id`・照合中の `execution_request_id`・候補にできない理由**を `detail` に記録する(認証情報や Broker レスポンス全体は記録しない)。
+
+**fail-closed**: 上記判定に必要な execution order store の読み取り(anchored snapshot の取得・`broker_order_id` 所有者の照会)が失敗した場合、推測で `auto_repair_candidate` にせず `manual_review` とし、失敗内容を `detail` に残す。`query_failure` を使わないのは、それが **Broker 照会**失敗専用の分類であり型付き `BrokerErrorCode` を必須とするため(内部 DB の読み取り失敗は Broker エラーではない)。run 全体を失敗させないのは、既存設計と同じく対象単位で追跡可能にするためである。
 
 ## 照会失敗の扱い
 
