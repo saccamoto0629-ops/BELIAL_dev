@@ -1,0 +1,141 @@
+# Broker Reconciliation — 差分検出基盤(Issue #103)
+
+BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出専用**基盤。実装は `execution/`(`reconciliation_models.py` / `reconciliation_store.py` / `broker_reconciliation.py`)にある。
+
+> **重要な位置づけ**
+>
+> - **検出専用(detection only)である。** 内部注文状態を変更しない・Broker へ注文を送信しない・Broker 注文をキャンセルしない。Broker へは**照会系操作のみ**(`get_order` / `list_orders`)を発行する。
+> - 検出した差分の**修復は Issue #104**、position / trade / SL・TP の照合と OANDA Demo による手動照合は **Issue #105** の責務であり、本 Issue では実装しない。
+> - scheduler・常駐 Bot への組み込みは行っていない。実行はサービス API の明示的な呼び出しのみ。
+> - 注文状態の唯一の正は既存の `broker.OrderState` と `validate_order_state_transition()` / `validate_order_result_update()`([Broker Interface](broker_interface.md)、Issue #73)。本基盤は**注文状態 Enum・遷移表を新設しない**。
+
+```python
+from execution.broker_reconciliation import BrokerOrderReconciliationService
+from execution.reconciliation_models import DiscrepancyType, ResolutionCategory
+from execution import reconciliation_store
+```
+
+## 依存方向
+
+```text
+BrokerOrderReconciliationService   ← execution/broker_reconciliation.py
+   ├─ read-only → execution_store(execution_orders.sqlite3)
+   ├─ query-only → Broker interface(get_order / list_orders)
+   └─ append   → reconciliation_store(broker_reconciliation.sqlite3)
+```
+
+- execution order DB へは**読み取りのみ**。書き込み API(`create_execution_order` / `mark_submitting` / `record_order_state` / `record_order_result` / `init_db`)は呼ばない(AST 検査で固定)。
+- Broker へは照会のみ。`submit_order` / `cancel_order` の呼び出し箇所はリポジトリ全体の AST 検査で禁止されている(`execution/tests/test_submission_boundary.py`)。
+
+## 共通モデル(`reconciliation_models.py`)
+
+すべて `dataclass(frozen=True)` + `Enum` + timezone-aware UTC。分類軸は文字列ではなく Enum で管理する。
+
+| モデル | 内容 |
+|---|---|
+| `ReconciliationRun` | 1 回の照合結果: `run_id` / `mode` / 開始・終了時刻 / `checked_order_count`(比較した内部注文数)/ `discrepancies` / `broker_listing_error` |
+| `OrderDiscrepancy` | 1 件の差分: 種別 / 対象種別 / 対象 ID / resolution category / 観測時刻 / 判定理由(`detail`)/ 内部観測状態 / Broker 観測状態 / `client_order_id` / `broker_order_id` / `broker_error_code` |
+| `ReconciliationMode` | `detection_only` のみ。run 行へ保存し、「その run が何を許されていたか」をコードのバージョンから推測させない |
+| `ReconciliationTargetType` | `execution_order`(`target_id` = `execution_request_id`)/ `broker_order`(`target_id` = `client_order_id`。内部 ID が存在しない Broker 側のみの注文) |
+
+`checked_order_count` があるため「差分 0 件」と「そもそも 1 件も見ていない」を区別できる。
+
+### discrepancy type
+
+| 種別 | 意味 |
+|---|---|
+| `in_flight_broker_filled` | 内部は発注中(pending / accepted / partially_filled)、Broker は FILLED |
+| `in_flight_broker_cancelled` | 内部は発注中、Broker は CANCELLED |
+| `in_flight_broker_rejected` | 内部は発注中、Broker は REJECTED |
+| `unknown_broker_settled` | 内部は UNKNOWN、Broker 側は状態が確定している(accepted / partially_filled / filled / cancelled / rejected) |
+| `broker_only_order` | Broker にのみ注文が存在する(対応する Execution Request が無い) |
+| `broker_order_missing` | 内部は送信済みだが Broker が当該 `client_order_id` を知らない(`BrokerOrderNotFoundError`)。**「未発注」の証明ではない** |
+| `state_mismatch` | 上記のいずれにも当てはまらない不一致(終端状態同士の矛盾、Broker が別注文について回答した場合など) |
+| `query_failure` | Broker 照会自体が失敗した。状態は一切推測しない |
+
+**両側の状態が一致している注文は discrepancy として記録しない。** 終端状態(filled / cancelled / rejected)の内部注文は照合対象に含めない(結果が変化し得ないため)。
+
+### resolution category
+
+| category | 意味 |
+|---|---|
+| `auto_repair_candidate` | 既存の注文状態機械・execution store の契約で**情報を失わずに**反映できる観測。Issue #103 は分類のみで**修復しない** |
+| `manual_review` | 人手確認が必要。単純反映できない差分・終端状態の矛盾・片側にしか存在しない注文 |
+| `query_failed` | 照会失敗により判定不能。`query_failure` と 1:1(モデル不変条件および DB CHECK で相互に固定) |
+
+`auto_repair_candidate` の判定は、既存 validator と `record_order_result` の前提条件を**再利用**して行う(判定ロジックを再実装しない)。
+
+1. `validate_order_state_transition(内部状態, Broker 状態)` が通ること
+2. Broker snapshot が保存済み intent と一致すること(symbol / side / order_type / quantity / requested_price)
+3. `broker_order_id` が `NULL → 値 → 同値` の連鎖を壊さないこと
+4. history に anchor された snapshot があれば `validate_order_result_update(anchored, observed)` が通ること
+5. `updated_at_utc` が逆行しないこと
+
+いずれかを満たさない場合は `manual_review` とし、`detail` に阻害理由を残す。
+
+## 照会失敗の扱い
+
+- **対象 ID を特定できる失敗**(`get_order` の timeout / 通信失敗 / 認証失敗 / rate limit)は `query_failure` discrepancy として記録する。対象 ID・理由・型付き `BrokerErrorCode` が残り、run は他の注文の照合を続行する(1 件の失敗が成功した観測を隠さない)。
+- **対象 ID に帰属しない失敗**(Broker 側注文の**列挙**失敗、または列挙非対応の Broker)は run 行の `broker_listing_error` に記録する。この間、`broker_only_order` が 0 件であることは「存在しない」ではなく「**確認していない**」を意味する(`ReconciliationRun.broker_orders_enumerated` が機械可読な区別)。
+- いずれの場合も、内部状態を FILLED / CANCELLED / REJECTED や「未発注」へ推測で確定しない。
+
+## Broker 側注文の列挙(`OrderListingBroker`)
+
+Broker 側にのみ存在する注文は、照会だけでは観測できない(存在を知らない ID は照会できない)。そのため `broker/broker_interface.py` に**追加の optional Protocol** `OrderListingBroker`(`list_orders() -> tuple[OrderResult, ...]`)を定義した。
+
+- Issue #73 の `Broker` Protocol は**5 操作のまま変更していない**(テストで固定)。既存実装(FakeBroker / OANDA Demo Adapter / 将来の Adapter)は無変更で `Broker` を満たし続ける = **後方互換**。
+- FakeBroker は既に保持している注文レコードを決定的順序(`client_order_id` 昇順)で返す `list_orders()` を実装する。新しい scripting API は増やしていない。
+- 列挙非対応の Broker(現時点の OANDA Demo Adapter を含む)では、上記のとおり `broker_listing_error` に「未確認」を記録する。
+
+## 永続化(`reconciliation_store.py`)
+
+独立 DB `execution/data/broker_reconciliation.sqlite3`(既定。`BROKER_RECONCILIATION_DB_PATH` で上書き。相対パスは `execution/` 基準)。所有コンポーネントは `execution/` のみ。他 store と同居しない理由は既存 store と同じ(各 store が closed-world で schema を検証するため)。加えて、reconciliation 専用 DB に**注文テーブルが存在しない**こと自体が「照合が注文状態を書き換えられない」構造的保証になる。
+
+### schema(version 1)
+
+| テーブル | 列 |
+|---|---|
+| `broker_reconciliation_runs`(WITHOUT ROWID) | `run_id`(PK)/ `mode` / `started_at_utc` / `finished_at_utc` / `checked_order_count` / `broker_listing_error` |
+| `broker_reconciliation_discrepancies` | `discrepancy_id`(PK AUTOINCREMENT)/ `run_id`(FK → runs)/ `discrepancy_type` / `target_type` / `target_id` / `resolution_category` / `internal_state` / `broker_state` / `client_order_id` / `broker_order_id` / `broker_error_code` / `detail` / `observed_at_utc` |
+
+index: `idx_broker_reconciliation_discrepancies_run (run_id, discrepancy_id)`。CHECK 制約がモデル不変条件を二重化する(既知 enum 値のみ、UTC 接尾辞、非負カウント、`query_failure` ⇔ `query_failed` ⇔ `broker_error_code IS NOT NULL`)。
+
+### 重複方針(明示)
+
+**run 単位の append**。1 run = runs 行 1 件 + discrepancies 行 N 件。**同一内容の観測でも run ごとに独立した行として残す**(dedup・上書き・UPSERT はしない)。これは既存の監査設計(`safety_gate_decisions` は判定を毎回 append、`execution_order_state_history` は観測を毎回 append)と同じ立場であり、「いつ何を観測したか」を再構成可能に保つためである。
+
+`run_id` は呼び出し側が与える PRIMARY KEY。**既存 run_id での再記録は `ReconciliationRunConflictError` で拒否**し、保存済みの run を書き換えない。したがって同じ照合を何度繰り返しても、内部注文状態も既存の記録も壊れない。
+
+### migration / 初期化
+
+新規 schema(v1)であり migration 経路は存在しない。`init_reconciliation_db()` は**冪等**で、pristine な DB(`sqlite_master` 0 件かつ `user_version` 0)にのみ schema を作成し、既存 DB は closed-world 検証のみを行う(既存行は無変更)。それ以外(partial schema・制約欠損 lookalike・trigger / view・他コンポーネントの DB)は **DB を変更せず**明示的に失敗する。読み取りは true read-only 接続(`execution/sqlite_ro.py`)で行い、存在しない DB を作成しない。復元時はモデル不変条件で厳格に再検証する(帯域外改竄は `ReconciliationIntegrityError`)。
+
+## 記録先(3 系統)
+
+| 系統 | 内容 |
+|---|---|
+| 戻り値 | `ReconciliationRun`(discrepancy 全件・分類・件数・列挙可否) |
+| ログ | discrepancy 1 件ごとに WARN(run_id / 種別 / 対象種別 / 対象 ID / client_order_id / 両側状態 / category / error code / 理由)、run 単位で INFO サマリ。**token / account ID / 認証情報は出力しない**(照合は口座情報を参照しない) |
+| DB | 上記 schema(`run()` 実行時。`detect()` は保存しない) |
+
+## API
+
+```python
+service = BrokerOrderReconciliationService(
+    broker=broker,                                   # Broker(照会のみ使用)
+    execution_db_path="execution/data/execution_orders.sqlite3",
+    reconciliation_db_path="execution/data/broker_reconciliation.sqlite3",
+)
+run = service.run(run_id="recon-2026-08-04T00:00Z")   # 検出 + ログ + DB 記録
+run = service.detect(run_id="...")                    # 検出 + ログのみ(DB 無副作用)
+```
+
+`detect()` は reconciliation DB を作成しない(dry-run 的な確認に使える)。`run()` は `init_reconciliation_db()`(冪等)の後に append する。
+
+## 非スコープ(Issue #103 時点)
+
+内部注文状態の自動更新・UNKNOWN からの実遷移(Issue #104)、position / trade / transaction / SL・TP の照合、OANDA Demo Adapter を使った手動照合(Issue #105)、Broker への注文送信・キャンセル、Broker 側のみの注文の自動採用、無条件の自動決済、scheduler / 常駐 Bot への組み込み、Live 接続解禁。
+
+## テスト
+
+`execution/tests/test_reconciliation_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py`、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker のみで、外部通信・Discord・実 DB 更新は発生しない。

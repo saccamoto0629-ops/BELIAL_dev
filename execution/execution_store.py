@@ -199,6 +199,7 @@ from broker.broker_models import (
     OrderSide,
     OrderState,
     OrderType,
+    TERMINAL_ORDER_STATES,
     validate_order_result_update,
     validate_order_state_transition,
 )
@@ -1872,6 +1873,66 @@ def list_unknown_orders(*, db_path: Path | None = None) -> list[dict]:
             if bundle is not None:
                 rows.append(bundle[0])
     return rows
+
+
+def list_in_flight_orders(*, db_path: Path | None = None) -> list[dict]:
+    """Every order whose broker-side outcome is not settled yet (Issue #103).
+
+    Exactly ``order_state IN (pending, accepted, partially_filled,
+    unknown)`` -- the orders a reconciliation run has to compare against the
+    broker: a still-working order may have been filled / cancelled /
+    rejected broker-side without us observing it, and an UNKNOWN order may
+    have been settled all along. Terminal orders (filled / cancelled /
+    rejected) are deliberately excluded: their outcome can never change
+    (``TERMINAL_ORDER_STATES``), and ``created`` intents were never sent.
+
+    Read-only and additive: same contract as the other read helpers (missing
+    DB -> empty list without creating the file, schema verified first, every
+    returned row passed full bundle validation). Oldest ``updated_at_utc``
+    first.
+    """
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    in_flight = sorted(s.value for s in OrderState if s not in TERMINAL_ORDER_STATES)
+    placeholders = ", ".join("?" for _ in in_flight)
+    rows = []
+    with _verified_read(db_path) as connection:
+        ids = [
+            row["execution_request_id"]
+            for row in connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+                f"WHERE order_state IN ({placeholders}) ORDER BY updated_at_utc ASC",
+                tuple(in_flight),
+            ).fetchall()
+        ]
+        for request_id in ids:
+            bundle = _fetch_and_validate(connection, request_id)
+            if bundle is not None:
+                rows.append(bundle[0])
+    return rows
+
+
+def list_client_order_ids(*, db_path: Path | None = None) -> list[str]:
+    """Every ``client_order_id`` bound to an execution request (Issue #103).
+
+    Reconciliation needs the COMPLETE set -- terminal and ``created`` rows
+    included -- to decide whether a broker-side order is unknown to BELIAL:
+    matching only against in-flight orders would report a settled order as
+    "broker-only". Only the binding column is read (no bundle restore), so
+    this stays a cheap membership lookup; every state-bearing read path
+    keeps its full validation. Read-only, never creates a missing DB.
+    """
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    with _verified_read(db_path) as connection:
+        return [
+            row["client_order_id"]
+            for row in connection.execute(
+                f"SELECT client_order_id FROM {ORDERS_TABLE} ORDER BY client_order_id ASC"
+            ).fetchall()
+        ]
 
 
 def list_unresolved_submissions(*, db_path: Path | None = None) -> list[dict]:

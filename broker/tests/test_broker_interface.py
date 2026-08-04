@@ -185,3 +185,30 @@ def test_no_upstream_component_imports_the_broker_layer():
             assert not hits, f"{path} imports broker layer: {sorted(hits)}"
             checked += 1
     assert checked > 0, "dependency scan found no files -- component paths wrong?"
+
+
+def test_order_listing_is_a_separate_optional_protocol():
+    """Issue #103: enumeration is an ADDITIVE capability. ``Broker`` keeps
+    exactly the five Issue #73 operations (pinned above), and an
+    implementation that only provides those still satisfies ``Broker``."""
+    defined = {
+        name for name in vars(broker_interface.OrderListingBroker)
+        if not name.startswith("_")
+        and callable(getattr(broker_interface.OrderListingBroker, name))
+    }
+    assert defined == {"list_orders"}
+    assert "list_orders" not in vars(broker_interface.Broker)
+
+    class FiveOperationBroker:
+        def submit_order(self, request): ...
+        def cancel_order(self, client_order_id): ...
+        def get_order(self, client_order_id): ...
+        def get_positions(self): ...
+        def get_account_state(self): ...
+
+    assert isinstance(FiveOperationBroker(), broker_interface.Broker)
+    assert not isinstance(FiveOperationBroker(), broker_interface.OrderListingBroker)
+
+
+def test_fake_broker_additionally_satisfies_the_order_listing_protocol():
+    assert isinstance(fake_broker.FakeBroker(), broker_interface.OrderListingBroker)

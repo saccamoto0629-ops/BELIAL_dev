@@ -729,3 +729,64 @@ def test_order_after_a_duplicate_rejection_gets_contiguous_fill_ids_and_timestam
     assert result.fills[0].filled_at_utc == base + timedelta(seconds=2)
     assert result.updated_at_utc == base + timedelta(seconds=3)
     assert result.broker_order_id == "FAKE-1"
+
+
+# --- order enumeration (Issue #103, OrderListingBroker) ----------------------
+
+
+def test_list_orders_enumerates_every_recorded_order_deterministically():
+    broker = fb.FakeBroker()
+    broker.script_order("c-2", fb.StayPending())
+    broker.submit_order(make_request("c-2"))
+    broker.submit_order(make_request("c-1"))
+
+    listed = broker.list_orders()
+
+    assert [order.client_order_id for order in listed] == ["c-1", "c-2"]  # sorted, stable
+    assert {order.state for order in listed} == {m.OrderState.FILLED, m.OrderState.ACCEPTED}
+    assert broker.list_orders() == listed  # repeatable, no side effects
+
+
+def test_list_orders_is_empty_before_anything_was_submitted():
+    assert fb.FakeBroker().list_orders() == ()
+
+
+def test_list_orders_reflects_the_current_snapshot_of_each_order():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    broker.submit_order(make_request("c-1"))
+    assert broker.list_orders()[0].state is m.OrderState.ACCEPTED
+
+    broker.cancel_order("c-1")
+
+    assert broker.list_orders()[0].state is m.OrderState.CANCELLED
+
+
+def test_list_orders_omits_orders_whose_request_never_reached_the_broker():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.FailCommunication())
+    with pytest.raises(m.BrokerCommunicationError):
+        broker.submit_order(make_request("c-1"))
+
+    assert broker.list_orders() == ()
+
+
+def test_list_orders_includes_an_unknown_order_left_by_a_timeout():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.TimeoutOrder())
+    with pytest.raises(m.BrokerTimeoutError):
+        broker.submit_order(make_request("c-1"))
+
+    listed = broker.list_orders()
+
+    assert [(o.client_order_id, o.state) for o in listed] == [("c-1", m.OrderState.UNKNOWN)]
+
+
+def test_list_orders_places_no_order_and_records_no_call():
+    broker = fb.FakeBroker()
+    broker.submit_order(make_request("c-1"))
+    submits, cancels = len(broker.submitted_requests), len(broker.cancel_requests)
+
+    broker.list_orders()
+
+    assert (len(broker.submitted_requests), len(broker.cancel_requests)) == (submits, cancels)
