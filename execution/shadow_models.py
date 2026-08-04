@@ -230,12 +230,18 @@ def differing_payload_fields(stored: dict, attempted: dict) -> tuple[str, ...]:
 class ShadowClaim:
     """One claimed-but-not-completed shadow identity row (phase ``claimed``).
 
-    The claim is taken BEFORE the Safety Gate runs: exactly one process may
+    The claim is taken BEFORE the Safety Gate runs: exactly one ATTEMPT may
     hold it, so exactly one evaluation / decision record exists per cycle.
-    A claim whose lease expired is STALE and may be taken over by a later
-    run of the SAME canonical payload (crash recovery -- no claim can stay
-    unprocessable forever); the same owner may always re-acquire its own
-    claim immediately (in-process retry).
+    Ownership is per ``run_cycle()`` ATTEMPT, not per service instance
+    (PR #100 re-review Major 1): ``claim_attempt_id`` identifies the one
+    call that acquired the claim, and ``claim_generation`` is the fencing
+    token -- it increments on every takeover, and completion is accepted only
+    when BOTH still match the row, so a stale holder that comes back after a
+    takeover can never overwrite the new holder's cycle. An ACTIVE claim is
+    never re-acquired by anyone (not even another attempt of the same
+    service); a claim whose lease expired is STALE and is taken over by the
+    next run of the SAME canonical payload (crash recovery -- no claim can
+    stay unprocessable forever).
     """
 
     shadow_result_id: int
@@ -243,6 +249,8 @@ class ShadowClaim:
     signal_id: str
     client_order_id: str
     claim_owner_id: str
+    claim_attempt_id: str
+    claim_generation: int
     claimed_at_utc: datetime
     lease_expires_at_utc: datetime
     input_origin: str
@@ -254,8 +262,15 @@ class ShadowClaim:
             or self.shadow_result_id < 1
         ):
             raise ValueError(f"shadow_result_id must be a positive int, got {self.shadow_result_id!r}")
-        for name in ("execution_request_id", "signal_id", "client_order_id", "claim_owner_id"):
+        for name in ("execution_request_id", "signal_id", "client_order_id", "claim_owner_id",
+                     "claim_attempt_id"):
             _require_non_empty_str(getattr(self, name), name)
+        if (
+            not isinstance(self.claim_generation, int)
+            or isinstance(self.claim_generation, bool)
+            or self.claim_generation < 1
+        ):
+            raise ValueError(f"claim_generation must be an int >= 1, got {self.claim_generation!r}")
         _require_utc(self.claimed_at_utc, "claimed_at_utc")
         _require_utc(self.lease_expires_at_utc, "lease_expires_at_utc")
         if self.lease_expires_at_utc <= self.claimed_at_utc:

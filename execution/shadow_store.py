@@ -81,6 +81,7 @@ from execution.safety_gate import (
     ExecutionMode,
     MarketSafetySnapshot,
     SafetyDecision,
+    SafetyPolicy,
     SafetyRejection,
     SafetyRejectionCode,
 )
@@ -119,6 +120,8 @@ _CLAIM_COLUMNS: tuple[str, ...] = (
     "client_order_id",
     "phase",
     "claim_owner_id",
+    "claim_attempt_id",
+    "claim_generation",
     "claimed_at_utc",
     "lease_expires_at_utc",
     "canonical_payload_json",
@@ -259,6 +262,8 @@ def _create_results_table_sql() -> str:
             client_order_id TEXT NOT NULL UNIQUE CHECK (trim(client_order_id) <> ''),
             phase TEXT NOT NULL CHECK (phase IN ('{PHASE_CLAIMED}', '{PHASE_COMPLETED}')),
             claim_owner_id TEXT NOT NULL CHECK (trim(claim_owner_id) <> ''),
+            claim_attempt_id TEXT NOT NULL CHECK (trim(claim_attempt_id) <> ''),
+            claim_generation INTEGER NOT NULL CHECK (claim_generation >= 1),
             claimed_at_utc TEXT NOT NULL CHECK (claimed_at_utc LIKE '%+00:00'),
             lease_expires_at_utc TEXT NOT NULL CHECK (lease_expires_at_utc LIKE '%+00:00'),
             canonical_payload_json TEXT NOT NULL CHECK (trim(canonical_payload_json) <> ''),
@@ -745,6 +750,7 @@ def _claim_record(
     timeframe: str | None,
     provenance: ShadowProvenance,
     owner_id: str,
+    attempt_id: str,
     now: datetime,
     lease_seconds: int,
 ) -> dict:
@@ -760,6 +766,8 @@ def _claim_record(
         "client_order_id": client_order_id,
         "phase": PHASE_CLAIMED,
         "claim_owner_id": owner_id,
+        "claim_attempt_id": attempt_id,
+        "claim_generation": 1,
         "claimed_at_utc": _iso(now),
         "lease_expires_at_utc": _iso(now + timedelta(seconds=lease_seconds)),
         "canonical_payload_json": canonical_payload_json(payload),
@@ -797,6 +805,8 @@ def _claim_from_row(row: sqlite3.Row) -> ShadowClaim:
         signal_id=row["signal_id"],
         client_order_id=row["client_order_id"],
         claim_owner_id=row["claim_owner_id"],
+        claim_attempt_id=row["claim_attempt_id"],
+        claim_generation=int(row["claim_generation"]),
         claimed_at_utc=_parse_utc(row["claimed_at_utc"]),
         lease_expires_at_utc=_parse_utc(row["lease_expires_at_utc"]),
         input_origin=row["input_origin"],
@@ -810,20 +820,25 @@ def claim_shadow_cycle(
     timeframe: str | None,
     provenance: ShadowProvenance,
     owner_id: str,
+    attempt_id: str,
     now: datetime,
     lease_seconds: int,
     db_path: Path | None = None,
 ) -> tuple[str, ShadowClaim | ShadowResult]:
     """Atomically claim one shadow cycle identity BEFORE any evaluation.
 
-    Returns ``(CLAIM_ACQUIRED, ShadowClaim)`` when this caller owns the claim
-    (fresh insert, same-owner re-acquire, or takeover of an expired lease) or
-    ``(CLAIM_DUPLICATE, ShadowResult | ShadowClaim)`` for a payload-equal
-    existing record (the completed result, or the live claim of the current
-    holder). A payload MISMATCH raises :class:`ShadowIdentityConflictError`;
-    a missing DB, lock error or any other store failure raises
-    :class:`ShadowStoreError` (never classified as duplicate). See the module
-    docstring for the full claim/lease contract.
+    ``attempt_id`` identifies ONE ``run_cycle()`` call (PR #100 re-review
+    Major 1): an ACTIVE claim is never re-acquired -- not by another attempt
+    of the same owner/service either -- so exactly one attempt evaluates the
+    gate. Returns ``(CLAIM_ACQUIRED, ShadowClaim)`` when this attempt owns
+    the claim (fresh insert, or takeover of an EXPIRED lease -- the fencing
+    ``claim_generation`` increments on takeover) or ``(CLAIM_DUPLICATE,
+    ShadowResult | ShadowClaim)`` for a payload-equal existing record (the
+    completed result, or the live claim of the current holder). A payload
+    MISMATCH raises :class:`ShadowIdentityConflictError`; a missing DB, lock
+    error or any other store failure raises :class:`ShadowStoreError` (never
+    classified as duplicate). See the module docstring for the full
+    claim/lease contract.
     """
     if not isinstance(request, ExecutionRequest):
         raise ShadowStoreError(f"request must be an ExecutionRequest, got {request!r}")
@@ -831,6 +846,8 @@ def claim_shadow_cycle(
         raise ShadowStoreError(f"provenance must be a ShadowProvenance, got {provenance!r}")
     if not isinstance(owner_id, str) or not owner_id.strip():
         raise ShadowStoreError(f"owner_id must be a non-empty string, got {owner_id!r}")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise ShadowStoreError(f"attempt_id must be a non-empty string, got {attempt_id!r}")
     if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or lease_seconds < 1:
         raise ShadowStoreError(f"lease_seconds must be a positive int, got {lease_seconds!r}")
     path = Path(db_path) if db_path is not None else shadow_db_path()
@@ -844,6 +861,7 @@ def claim_shadow_cycle(
         timeframe=timeframe,
         provenance=provenance,
         owner_id=owner_id,
+        attempt_id=attempt_id,
         now=now,
         lease_seconds=lease_seconds,
     )
@@ -859,8 +877,8 @@ def claim_shadow_cycle(
                 )
             except sqlite3.IntegrityError as exc:
                 return _resolve_claim_collision(
-                    connection, record, exc, owner_id=owner_id, now=now,
-                    lease_seconds=lease_seconds,
+                    connection, record, exc, owner_id=owner_id, attempt_id=attempt_id,
+                    now=now, lease_seconds=lease_seconds,
                 )
             claim_row = connection.execute(
                 f"SELECT {_SELECT_COLUMNS} FROM {RESULTS_TABLE} WHERE shadow_result_id = ?",
@@ -877,14 +895,16 @@ def _resolve_claim_collision(
     exc: sqlite3.IntegrityError,
     *,
     owner_id: str,
+    attempt_id: str,
     now: datetime,
     lease_seconds: int,
 ):
     """Classify a claim INSERT collision inside the SAME transaction: an
     existing row must provably own one of the identity keys (otherwise the
     IntegrityError is a store failure), the canonical payload decides
-    duplicate vs conflict, and re-acquire / stale takeover update the row
-    atomically."""
+    duplicate vs conflict, and ONLY an expired lease may be taken over
+    (fencing generation + 1) -- an active claim is an in-progress duplicate
+    for every other attempt, the same owner's attempts included."""
     rows: dict[int, sqlite3.Row] = {}
     for column in ("execution_request_id", "signal_id", "client_order_id"):
         row = connection.execute(
@@ -922,28 +942,40 @@ def _resolve_claim_collision(
         ) from exc
     if row["phase"] == PHASE_COMPLETED:
         return CLAIM_DUPLICATE, _restore_result(row)
-    # phase == claimed: same owner may re-acquire; an EXPIRED lease may be
-    # taken over; a live lease held by someone else is an in-progress
-    # duplicate (nothing to evaluate here).
-    lease_expired = _parse_utc(row["lease_expires_at_utc"]) <= now
-    if row["claim_owner_id"] == owner_id or lease_expired:
-        connection.execute(
-            f"UPDATE {RESULTS_TABLE} SET claim_owner_id = ?, claimed_at_utc = ?, "
-            "lease_expires_at_utc = ? WHERE shadow_result_id = ? AND phase = ?",
-            (
-                owner_id,
-                _iso(now),
-                _iso(now + timedelta(seconds=lease_seconds)),
-                row["shadow_result_id"],
-                PHASE_CLAIMED,
-            ),
-        )
-        refreshed = connection.execute(
-            f"SELECT {_SELECT_COLUMNS} FROM {RESULTS_TABLE} WHERE shadow_result_id = ?",
-            (row["shadow_result_id"],),
-        ).fetchone()
-        return CLAIM_ACQUIRED, _claim_from_row(refreshed)
-    return CLAIM_DUPLICATE, _claim_from_row(row)
+    # phase == claimed: an ACTIVE lease is an in-progress duplicate for EVERY
+    # other attempt (owner identity does not grant re-acquisition -- a shared
+    # service's second thread must not enter evaluation). Only an EXPIRED
+    # lease is taken over, with the fencing generation incremented so the
+    # previous holder can never complete over the takeover.
+    if _parse_utc(row["lease_expires_at_utc"]) > now:
+        return CLAIM_DUPLICATE, _claim_from_row(row)
+    connection.execute(
+        f"UPDATE {RESULTS_TABLE} SET claim_owner_id = ?, claim_attempt_id = ?, "
+        "claim_generation = claim_generation + 1, claimed_at_utc = ?, "
+        "lease_expires_at_utc = ? "
+        "WHERE shadow_result_id = ? AND phase = ? AND claim_generation = ?",
+        (
+            owner_id,
+            attempt_id,
+            _iso(now),
+            _iso(now + timedelta(seconds=lease_seconds)),
+            row["shadow_result_id"],
+            PHASE_CLAIMED,
+            row["claim_generation"],
+        ),
+    )
+    refreshed = connection.execute(
+        f"SELECT {_SELECT_COLUMNS} FROM {RESULTS_TABLE} WHERE shadow_result_id = ?",
+        (row["shadow_result_id"],),
+    ).fetchone()
+    if (
+        refreshed["phase"] != PHASE_CLAIMED
+        or refreshed["claim_attempt_id"] != attempt_id
+    ):
+        # Guarded update did not land (defense in depth inside the same
+        # BEGIN IMMEDIATE transaction): treat as an in-progress duplicate.
+        return CLAIM_DUPLICATE, _claim_from_row(refreshed)
+    return CLAIM_ACQUIRED, _claim_from_row(refreshed)
 
 
 # --- completion ---------------------------------------------------------------
@@ -952,7 +984,7 @@ def _resolve_claim_collision(
 def complete_shadow_cycle(
     execution_request_id: str,
     *,
-    owner_id: str,
+    claim: ShadowClaim,
     decision: SafetyDecision,
     market: MarketSafetySnapshot,
     account: AccountSafetySnapshot,
@@ -963,12 +995,23 @@ def complete_shadow_cycle(
 ) -> ShadowResult:
     """Turn the held claim into the COMPLETED shadow record in one UPDATE.
 
-    The caller must still hold the claim (phase ``claimed`` AND matching
-    ``claim_owner_id``): a lost claim (lease expired and taken over) raises
-    :class:`ShadowStoreError` -- the takeover winner owns the cycle now. A
-    failure here leaves the claim row intact and reclaimable (recoverable
-    state; any decision row already written becomes a reportable orphan).
+    ``claim`` is the exact :class:`ShadowClaim` this attempt ACQUIRED: the
+    row must still be phase ``claimed`` with the SAME ``claim_owner_id``,
+    ``claim_attempt_id`` AND fencing ``claim_generation`` (PR #100 re-review
+    Major 1) -- and the UPDATE itself is additionally guarded on the fencing
+    fields. A lost claim (lease expired and taken over; the generation moved
+    on) raises :class:`ShadowStoreError` -- the takeover winner owns the
+    cycle now and can never be overwritten by the stale holder. A failure
+    here leaves the claim row intact and reclaimable (recoverable state; any
+    decision row already written becomes a reportable orphan).
     """
+    if not isinstance(claim, ShadowClaim):
+        raise ShadowStoreError(f"claim must be a ShadowClaim, got {claim!r}")
+    if claim.execution_request_id != execution_request_id:
+        raise ShadowStoreError(
+            f"claim belongs to {claim.execution_request_id!r}, "
+            f"completing {execution_request_id!r}"
+        )
     if not isinstance(decision, SafetyDecision):
         raise ShadowStoreError(f"decision must be a SafetyDecision, got {decision!r}")
     if decision.execution_request_id != execution_request_id:
@@ -1014,20 +1057,30 @@ def complete_shadow_cycle(
                 raise ShadowStoreError(
                     f"shadow cycle {execution_request_id!r} is already {row['phase']!r}"
                 )
-            if row["claim_owner_id"] != owner_id:
+            if (
+                row["claim_owner_id"] != claim.claim_owner_id
+                or row["claim_attempt_id"] != claim.claim_attempt_id
+                or row["claim_generation"] != claim.claim_generation
+            ):
                 raise ShadowStoreError(
                     f"claim for {execution_request_id!r} is now held by "
-                    f"{row['claim_owner_id']!r} (lease takeover); this caller lost the cycle"
+                    f"{row['claim_owner_id']!r} (attempt {row['claim_attempt_id']!r}, "
+                    f"generation {row['claim_generation']}); this attempt "
+                    f"({claim.claim_attempt_id!r}, generation {claim.claim_generation}) "
+                    "lost the cycle and must not overwrite it"
                 )
             assignments = ", ".join(f"{column} = ?" for column in _COMPLETION_COLUMNS)
             connection.execute(
                 f"UPDATE {RESULTS_TABLE} SET phase = ?, {assignments} "
-                "WHERE shadow_result_id = ? AND phase = ?",
+                "WHERE shadow_result_id = ? AND phase = ? "
+                "AND claim_attempt_id = ? AND claim_generation = ?",
                 (
                     PHASE_COMPLETED,
                     *(completion[column] for column in _COMPLETION_COLUMNS),
                     row["shadow_result_id"],
                     PHASE_CLAIMED,
+                    claim.claim_attempt_id,
+                    claim.claim_generation,
                 ),
             )
             completed = connection.execute(
@@ -1040,6 +1093,94 @@ def complete_shadow_cycle(
 
 
 # --- read ---------------------------------------------------------------------
+
+_POLICY_SNAPSHOT_KEYS = frozenset(
+    {
+        "policy_id",
+        "allowed_symbols",
+        "allowed_sides",
+        "max_order_quantity",
+        "max_positions_per_symbol",
+        "max_positions_account",
+        "max_reference_age_seconds",
+        "max_spread_by_symbol",
+        "allowed_connection_targets",
+        "require_stop_loss",
+    }
+)
+
+
+def _snapshot_str_list(value, name: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} must be a non-empty list of strings")
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(f"{name} entries must be strings, got {entry!r}")
+    return value
+
+
+def _policy_from_snapshot(data) -> SafetyPolicy:
+    """Closed-world reconstruction of the stored policy snapshot into a REAL
+    :class:`SafetyPolicy` (PR #100 re-review Major 4): unknown keys, wrong
+    types, invalid Decimals / booleans / modes all fail restore -- a policy
+    snapshot is never accepted as an arbitrary dict."""
+    if not isinstance(data, dict) or set(data) != _POLICY_SNAPSHOT_KEYS:
+        raise ValueError(
+            f"policy snapshot keys {sorted(data) if isinstance(data, dict) else type(data).__name__} "
+            f"do not match the expected set {sorted(_POLICY_SNAPSHOT_KEYS)}"
+        )
+    sides = []
+    for side in _snapshot_str_list(data["allowed_sides"], "policy snapshot allowed_sides"):
+        sides.append(OrderSide(side))
+    for name in ("max_positions_per_symbol", "max_positions_account"):
+        if not isinstance(data[name], int) or isinstance(data[name], bool):
+            raise ValueError(f"policy snapshot {name} must be an integer, got {data[name]!r}")
+    age = data["max_reference_age_seconds"]
+    if isinstance(age, bool) or not isinstance(age, (int, float)) or not age > 0:
+        raise ValueError(
+            f"policy snapshot max_reference_age_seconds must be a positive number, got {age!r}"
+        )
+    spreads_raw = data["max_spread_by_symbol"]
+    if not isinstance(spreads_raw, dict):
+        raise ValueError("policy snapshot max_spread_by_symbol must be an object")
+    spreads = {
+        symbol: _strict_decimal(value, f"policy snapshot max_spread_by_symbol[{symbol}]")
+        for symbol, value in spreads_raw.items()
+    }
+    targets_raw = data["allowed_connection_targets"]
+    if not isinstance(targets_raw, dict):
+        raise ValueError("policy snapshot allowed_connection_targets must be an object")
+    targets = {
+        ExecutionMode(mode): frozenset(
+            _snapshot_str_list(entries, f"policy snapshot allowed_connection_targets[{mode}]")
+        )
+        for mode, entries in targets_raw.items()
+    }
+    if not isinstance(data["require_stop_loss"], bool):
+        raise ValueError(
+            f"policy snapshot require_stop_loss must be a boolean, got {data['require_stop_loss']!r}"
+        )
+    policy = SafetyPolicy(
+        policy_id=data["policy_id"],
+        allowed_symbols=frozenset(
+            _snapshot_str_list(data["allowed_symbols"], "policy snapshot allowed_symbols")
+        ),
+        allowed_sides=frozenset(sides),
+        max_order_quantity=_strict_decimal(
+            data["max_order_quantity"], "policy snapshot max_order_quantity"
+        ),
+        max_positions_per_symbol=data["max_positions_per_symbol"],
+        max_positions_account=data["max_positions_account"],
+        max_reference_age=timedelta(seconds=age),
+        max_spread_by_symbol=spreads,
+        allowed_connection_targets=targets,
+        require_stop_loss=data["require_stop_loss"],
+    )
+    # Round-trip equality: the snapshot was WRITTEN by SafetyPolicy.to_snapshot,
+    # so a snapshot that no longer reproduces itself is tamper evidence.
+    if policy.to_snapshot() != data:
+        raise ValueError("policy snapshot does not round-trip through SafetyPolicy")
+    return policy
 
 
 def _restore_result(row: sqlite3.Row) -> ShadowResult:
@@ -1059,8 +1200,14 @@ def _restore_result(row: sqlite3.Row) -> ShadowResult:
         if row["allowed"] not in (0, 1):
             raise ValueError(f"allowed must be 0 or 1, got {row['allowed']!r}")
         policy_snapshot = json.loads(row["policy_json"])
-        if not isinstance(policy_snapshot, dict):
-            raise ValueError("policy_json must hold a JSON object")
+        # Deep closed-world validation + SafetyPolicy reconstruction (PR #100
+        # re-review Major 4) -- never accepted as an arbitrary dict.
+        reconstructed_policy = _policy_from_snapshot(policy_snapshot)
+        if reconstructed_policy.policy_id != row["policy_id"]:
+            raise ValueError(
+                f"policy snapshot policy_id {reconstructed_policy.policy_id!r} does not "
+                f"match the policy_id column {row['policy_id']!r}"
+            )
         provenance = ShadowProvenance(
             input_origin=row["input_origin"],
             signal_source=row["signal_source"],
@@ -1110,6 +1257,15 @@ def _restore_result(row: sqlite3.Row) -> ShadowResult:
             raise ValueError(
                 f"position_count column ({row['position_count']!r}) does not match the "
                 f"stored account snapshot ({len(account.positions)} positions)"
+            )
+        # account_id must agree across the projection column (= the decision's
+        # recorded value) and the stored account snapshot (PR #100 re-review
+        # Major 4). A NULL column is the explicit "snapshot deemed unreliable"
+        # case and carries no cross-constraint.
+        if row["account_id"] is not None and row["account_id"] != account.account.account_id:
+            raise ValueError(
+                f"account_id column ({row['account_id']!r}) does not match the stored "
+                f"account snapshot ({account.account.account_id!r})"
             )
         decision = SafetyDecision(
             execution_request_id=request.execution_request_id,

@@ -26,12 +26,14 @@ from execution.shadow_config import (
 from execution.shadow_execution import ShadowCycleStatus
 from execution.shadow_providers import (
     AccountSnapshotFileProvider,
+    EXECUTABLE_SIGNAL_STATUSES,
     MarketSnapshotFileProvider,
     PaperSignalDbSignalProvider,
     ShadowInputError,
     StaticAccountSnapshotProvider,
     StaticMarketSnapshotProvider,
     StoredSignal,
+    require_executable_signal_status,
 )
 from shadow_helpers import NOW, make_account, make_market
 
@@ -129,6 +131,72 @@ def test_signal_provider_is_read_only(tmp_path):
     before = db.read_bytes()
     PaperSignalDbSignalProvider(db).get_signal("sig-1")
     assert db.read_bytes() == before
+
+
+# --- executable-status closed set (PR #100 re-review Major 3) --------------------
+
+
+def test_paper_only_is_the_entire_executable_status_set():
+    assert EXECUTABLE_SIGNAL_STATUSES == frozenset({"paper_only"})
+    require_executable_signal_status("sig-1", "paper_only")  # exact match passes
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "archived",
+        "invalid",
+        "executed",
+        "some-future-status",
+        "",
+        "   ",
+        None,
+        "PAPER_ONLY",
+        "Paper_Only",
+        " paper_only",
+        "paper_only ",
+        "paper_only\n",
+    ],
+)
+def test_non_executable_statuses_fail_closed_with_the_signal_id(status):
+    with pytest.raises(ShadowInputError) as excinfo:
+        require_executable_signal_status("sig-9", status)
+    message = str(excinfo.value)
+    assert "sig-9" in message and repr(status) in message
+
+
+def test_signal_provider_refuses_a_non_executable_status_row(tmp_path):
+    rows = [
+        default_signal_row(),
+        ("sig-arch", NOW.isoformat(), "USD_JPY", "H1", "long", "strategy-prod-1", "archived"),
+    ]
+    provider = PaperSignalDbSignalProvider(seed_signal_db(tmp_path, rows))
+    with pytest.raises(ShadowInputError, match="'archived'"):
+        provider.get_signal("sig-arch")
+    assert provider.get_signal("sig-1").status == "paper_only"  # closed set still passes
+
+
+def test_builder_refuses_a_smuggled_status_from_a_custom_provider():
+    # Even if a custom StoredSignalProvider skipped the provider-side gate,
+    # the production request builder itself refuses the status.
+    signal = StoredSignal(
+        signal_id="sig-x", created_at_utc=NOW, symbol="USD_JPY", timeframe="H1",
+        side="long", strategy_id="s", status="archived",
+    )
+    with pytest.raises(ShadowInputError, match="archived"):
+        build_execution_request_from_signal(signal, quantity=Decimal("1"))
+
+
+def test_production_cycle_rejects_a_bad_status_and_creates_nothing(tmp_path):
+    rows = [
+        ("sig-bad", NOW.isoformat(), "USD_JPY", "H1", "long", "strategy-prod-1", "archived"),
+    ]
+    with pytest.raises(ShadowInputError, match="sig-bad"):
+        run_production(tmp_path, "sig-bad", rows=rows)
+    # rejection happens BEFORE any store is touched: no execution request, no
+    # claim, no safety decision, no shadow result
+    assert not (tmp_path / "shadow.sqlite3").exists()
+    assert not (tmp_path / "safety.sqlite3").exists()
 
 
 # --- configuration --------------------------------------------------------------

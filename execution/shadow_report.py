@@ -154,6 +154,8 @@ def claim_payload(claim: ShadowClaim) -> dict:
         "signal_id": claim.signal_id,
         "client_order_id": claim.client_order_id,
         "claim_owner_id": claim.claim_owner_id,
+        "claim_attempt_id": claim.claim_attempt_id,
+        "claim_generation": claim.claim_generation,
         "claimed_at_utc": claim.claimed_at_utc.isoformat(),
         "lease_expires_at_utc": claim.lease_expires_at_utc.isoformat(),
         "input_origin": claim.input_origin,
@@ -247,10 +249,47 @@ def _render_claim_line(claim: ShadowClaim, out) -> None:
     print(
         f"{claim.shadow_result_id:>5} CLAIMED  {claim.execution_request_id} "
         f"origin={claim.input_origin} signal={claim.signal_id} owner={claim.claim_owner_id} "
+        f"attempt={claim.claim_attempt_id} generation={claim.claim_generation} "
         f"claimed={claim.claimed_at_utc.isoformat()} "
         f"lease_expires={claim.lease_expires_at_utc.isoformat()}",
         file=out,
     )
+
+
+def _verify_decision_consistency(results, decision_db: Path) -> str | None:
+    """Cross-check every completed record against its REFERENCED Safety
+    Decision row (PR #100 re-review Major 4): the stored decision must exist
+    and be FIELD-IDENTICAL to the decision embedded in the shadow record
+    (account_id, position_count, execution request id, policy id, mode,
+    codes, timestamps). Any mismatch means a corrupted / inconsistent record
+    and the report fails EXPLICITLY -- never silently displaying it, in text
+    or JSON output alike. Records whose decision persistence failed
+    (``safety_decision_id`` NULL) carry no reference to check; when the
+    decision store file itself is absent the cross-check cannot run and is
+    skipped (a standalone shadow DB copy stays inspectable)."""
+    if not decision_db.exists():
+        return None
+    store = SQLiteSafetyDecisionStore(decision_db)
+    for result in results:
+        if result.safety_decision_id is None:
+            continue
+        stored = dict(
+            store.list_for_request_with_ids(result.request.execution_request_id)
+        ).get(result.safety_decision_id)
+        if stored is None:
+            return (
+                f"shadow record {result.request.execution_request_id!r} references "
+                f"safety_decision_id {result.safety_decision_id}, which does not exist "
+                f"in the decision store at {decision_db}"
+            )
+        if stored != result.decision:
+            return (
+                f"shadow record {result.request.execution_request_id!r} does not match "
+                f"its referenced Safety Decision row {result.safety_decision_id} "
+                "(account_id / position_count / codes / policy or another field "
+                "disagrees); refusing to report a corrupted or inconsistent record"
+            )
+    return None
 
 
 def _find_orphan_decisions(shadow_db: Path, decision_db: Path) -> list[dict]:
@@ -454,6 +493,11 @@ def _run_cli(argv: list[str] | None) -> int:
             )
     except shadow_store.ShadowStoreError as exc:
         print(f"shadow report failed: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    inconsistency = _verify_decision_consistency(results, decision_db)
+    if inconsistency is not None:
+        print(f"shadow report failed: {inconsistency}", file=sys.stderr)
         return EXIT_FAILURE
 
     if args.json:

@@ -27,7 +27,8 @@ def db(tmp_path):
 
 
 def claim(tmp_path, request=None, *, client_order_id="client-1", timeframe="H1",
-          provenance=None, owner_id="owner-1", now=NOW, lease_seconds=600, init=True):
+          provenance=None, owner_id="owner-1", attempt_id="attempt-1", now=NOW,
+          lease_seconds=600, init=True):
     if init:
         shadow_store.init_db(db(tmp_path))
     return shadow_store.claim_shadow_cycle(
@@ -36,24 +37,29 @@ def claim(tmp_path, request=None, *, client_order_id="client-1", timeframe="H1",
         timeframe=timeframe,
         provenance=provenance if provenance is not None else make_provenance(),
         owner_id=owner_id,
+        attempt_id=attempt_id,
         now=now,
         lease_seconds=lease_seconds,
         db_path=db(tmp_path),
     )
 
 
-def complete(tmp_path, request=None, *, owner_id="owner-1", market=None, account=None,
+def complete(tmp_path, request=None, *, held_claim=None, market=None, account=None,
              safety_decision_id=1, completed_at=NOW):
     request = request if request is not None else make_request()
     market = market if market is not None else make_market()
     account = account if account is not None else make_account()
+    if held_claim is None:
+        held_claim = shadow_store.get_shadow_claim(
+            request.execution_request_id, db_path=db(tmp_path)
+        )
     gate = make_gate()
     decision = gate.evaluate_shadow(
         request, market=market, account=account, connection_target="shadow"
     )
     return shadow_store.complete_shadow_cycle(
         request.execution_request_id,
-        owner_id=owner_id,
+        claim=held_claim,
         decision=decision,
         market=market,
         account=account,
@@ -64,10 +70,27 @@ def complete(tmp_path, request=None, *, owner_id="owner-1", market=None, account
     )
 
 
+def synthetic_claim(execution_request_id="exec-1", *, generation=1, attempt_id="attempt-x"):
+    from execution.shadow_models import ShadowClaim
+
+    return ShadowClaim(
+        shadow_result_id=1,
+        execution_request_id=execution_request_id,
+        signal_id="signal-1",
+        client_order_id="client-1",
+        claim_owner_id="owner-x",
+        claim_attempt_id=attempt_id,
+        claim_generation=generation,
+        claimed_at_utc=NOW,
+        lease_expires_at_utc=NOW + timedelta(seconds=600),
+        input_origin="scenario_fixture",
+    )
+
+
 def recorded(tmp_path, request=None, **kwargs):
     status, held = claim(tmp_path, request, **kwargs)
     assert status == shadow_store.CLAIM_ACQUIRED
-    return complete(tmp_path, request, owner_id=kwargs.get("owner_id", "owner-1"))
+    return complete(tmp_path, request, held_claim=held)
 
 
 # --- claim lifecycle ----------------------------------------------------------
@@ -90,55 +113,70 @@ def test_claimed_row_is_visible_as_a_claim_not_a_result(tmp_path):
     assert shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path)) is None
     live = shadow_store.get_shadow_claim("exec-1", db_path=db(tmp_path))
     assert live is not None and live.claim_owner_id == "owner-1"
+    assert live.claim_attempt_id == "attempt-1" and live.claim_generation == 1
     assert live.lease_expires_at_utc == NOW + timedelta(seconds=600)
     assert shadow_store.list_shadow_claims(db_path=db(tmp_path)) == (live,)
 
 
 def test_same_payload_completed_row_is_a_duplicate(tmp_path):
     result = recorded(tmp_path)
-    status, record = claim(tmp_path, init=False, owner_id="someone-else")
+    status, record = claim(
+        tmp_path, init=False, owner_id="someone-else", attempt_id="attempt-9"
+    )
     assert status == shadow_store.CLAIM_DUPLICATE
     assert record == result
 
 
-def test_same_owner_reacquires_its_own_claim_immediately(tmp_path):
+def test_active_claim_is_never_reacquired_not_even_by_the_same_owner(tmp_path):
+    """PR #100 re-review Major 1: ownership is per ATTEMPT. A second attempt
+    from the SAME owner (a shared service's second thread) must see an
+    in-progress duplicate, never re-acquire the active claim."""
     claim(tmp_path)
-    status, held = claim(tmp_path, init=False, now=NOW + timedelta(seconds=1))
-    assert status == shadow_store.CLAIM_ACQUIRED
-    assert held.claimed_at_utc == NOW + timedelta(seconds=1)
+    status, record = claim(
+        tmp_path, init=False, attempt_id="attempt-2", now=NOW + timedelta(seconds=1)
+    )
+    assert status == shadow_store.CLAIM_DUPLICATE
+    assert record.claim_attempt_id == "attempt-1" and record.claim_generation == 1
 
 
 def test_live_lease_of_another_owner_is_an_in_progress_duplicate(tmp_path):
     claim(tmp_path)
     status, record = claim(
-        tmp_path, init=False, owner_id="owner-2", now=NOW + timedelta(seconds=10)
+        tmp_path, init=False, owner_id="owner-2", attempt_id="attempt-2",
+        now=NOW + timedelta(seconds=10),
     )
     assert status == shadow_store.CLAIM_DUPLICATE
     assert record.claim_owner_id == "owner-1"
 
 
-def test_expired_lease_is_taken_over(tmp_path):
-    claim(tmp_path, lease_seconds=60)
+def test_expired_lease_takeover_increments_the_fencing_generation(tmp_path):
+    status, original = claim(tmp_path, lease_seconds=60)
+    assert status == shadow_store.CLAIM_ACQUIRED and original.claim_generation == 1
     status, held = claim(
-        tmp_path, init=False, owner_id="owner-2", now=NOW + timedelta(seconds=61)
+        tmp_path, init=False, owner_id="owner-2", attempt_id="attempt-2",
+        now=NOW + timedelta(seconds=61),
     )
     assert status == shadow_store.CLAIM_ACQUIRED
-    assert held.claim_owner_id == "owner-2"
-    # ...and the original owner can no longer complete (it lost the cycle)
+    assert held.claim_owner_id == "owner-2" and held.claim_generation == 2
+    # ...and the ORIGINAL holder's stale claim can no longer complete: its
+    # attempt id and fencing generation no longer match the row.
     with pytest.raises(shadow_store.ShadowStoreError, match="lost"):
-        complete(tmp_path, owner_id="owner-1")
+        complete(tmp_path, held_claim=original)
+    # the takeover winner completes normally
+    result = complete(tmp_path, held_claim=held)
+    assert result.claim_owner_id == "owner-2"
 
 
 def test_completion_requires_an_existing_claim(tmp_path):
     shadow_store.init_db(db(tmp_path))
     with pytest.raises(shadow_store.ShadowStoreError, match="claim_shadow_cycle"):
-        complete(tmp_path)
+        complete(tmp_path, held_claim=synthetic_claim())
 
 
 def test_completion_of_a_completed_cycle_is_refused(tmp_path):
     recorded(tmp_path)
     with pytest.raises(shadow_store.ShadowStoreError, match="already"):
-        complete(tmp_path)
+        complete(tmp_path, held_claim=synthetic_claim())
 
 
 # --- duplicate vs conflict ----------------------------------------------------
@@ -390,6 +428,67 @@ def test_tampered_account_snapshot_json_is_detected(tmp_path):
         ('{"only":"partial"}',),
     )
     with pytest.raises(shadow_store.ShadowIntegrityError, match="account_snapshot_json"):
+        shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
+
+
+def test_account_id_column_tamper_is_detected(tmp_path):
+    recorded(tmp_path)
+    _update_row(tmp_path, f"UPDATE {shadow_store.RESULTS_TABLE} SET account_id = 'acct-forged'")
+    with pytest.raises(shadow_store.ShadowIntegrityError, match="account_id"):
+        shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
+
+
+def test_account_snapshot_account_id_tamper_is_detected(tmp_path):
+    recorded(tmp_path)
+    connection = sqlite3.connect(db(tmp_path))
+    snapshot_json = connection.execute(
+        f"SELECT account_snapshot_json FROM {shadow_store.RESULTS_TABLE}"
+    ).fetchone()[0]
+    connection.close()
+    tampered = snapshot_json.replace('"acct-1"', '"acct-forged"')
+    assert tampered != snapshot_json
+    _update_row(
+        tmp_path,
+        f"UPDATE {shadow_store.RESULTS_TABLE} SET account_snapshot_json = ?",
+        (tampered,),
+    )
+    with pytest.raises(shadow_store.ShadowIntegrityError, match="account_id"):
+        shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
+
+
+def _tamper_policy(tmp_path, mutate):
+    import json as jsonlib
+
+    connection = sqlite3.connect(db(tmp_path))
+    policy_json = connection.execute(
+        f"SELECT policy_json FROM {shadow_store.RESULTS_TABLE}"
+    ).fetchone()[0]
+    connection.close()
+    data = jsonlib.loads(policy_json)
+    mutate(data)
+    _update_row(
+        tmp_path,
+        f"UPDATE {shadow_store.RESULTS_TABLE} SET policy_json = ?",
+        (jsonlib.dumps(data, sort_keys=True, separators=(",", ":")),),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda data: data.update(surprise=1), "expected set"),
+        (lambda data: data.pop("require_stop_loss"), "expected set"),
+        (lambda data: data.update(require_stop_loss="yes"), "boolean"),
+        (lambda data: data.update(max_order_quantity="not-a-decimal"), "decimal"),
+        (lambda data: data.update(max_order_quantity=10), "decimal"),
+        (lambda data: data.update(max_positions_account="5"), "integer"),
+        (lambda data: data.update(policy_id="policy-forged"), "policy_id"),
+    ],
+)
+def test_policy_snapshot_tamper_is_detected(tmp_path, mutate, match):
+    recorded(tmp_path)
+    _tamper_policy(tmp_path, mutate)
+    with pytest.raises(shadow_store.ShadowIntegrityError, match=match):
         shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
 
 

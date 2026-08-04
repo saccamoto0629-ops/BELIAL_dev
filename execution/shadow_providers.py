@@ -53,6 +53,26 @@ SIGNAL_SIDE_LONG = "long"
 SIGNAL_SIDE_SHORT = "short"
 KNOWN_SIGNAL_SIDES = frozenset({SIGNAL_SIDE_LONG, SIGNAL_SIDE_SHORT})
 
+# The CLOSED set of signal statuses the production shadow path may execute
+# (PR #100 re-review Major 3). Today's Paper Signals are hypotheses stored as
+# ``paper_only`` -- nothing else is runnable. Comparison is EXACT: no case
+# folding, no trimming, no implicit normalization; NULL / empty / unknown /
+# ``archived`` / case variants all fail closed with the signal id and the
+# offending status in the error. A future runnable status is added HERE,
+# deliberately.
+EXECUTABLE_SIGNAL_STATUSES: frozenset[str] = frozenset({"paper_only"})
+
+
+def require_executable_signal_status(signal_id: str, status) -> None:
+    """Fail closed unless ``status`` is EXACTLY one of
+    :data:`EXECUTABLE_SIGNAL_STATUSES` (see the constant's comment)."""
+    if not isinstance(status, str) or status not in EXECUTABLE_SIGNAL_STATUSES:
+        raise ShadowInputError(
+            f"stored signal {signal_id!r} carries status {status!r}, which is not an "
+            f"executable status ({sorted(EXECUTABLE_SIGNAL_STATUSES)}); refusing to "
+            "build an execution request from it"
+        )
+
 
 def _require_non_empty_str(value, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -178,6 +198,10 @@ class PaperSignalDbSignalProvider:
             raise ShadowInputError(
                 f"stored signal {signal_id!r} does not exist in {self._db_path}"
             )
+        # Status gate BEFORE any model construction (PR #100 re-review
+        # Major 3): a non-executable signal never becomes a StoredSignal, so
+        # no execution request, claim, decision or shadow record can follow.
+        require_executable_signal_status(signal_id, row["status"])
         try:
             created_at = datetime.fromisoformat(row["created_at_utc"])
             if created_at.tzinfo is None:

@@ -10,6 +10,15 @@ reads) must therefore connect through :func:`connect_read_only`, which
   file and refuses every write),
 - additionally sets ``PRAGMA query_only = ON`` (defense in depth: any write
   statement fails even if a future change loosened the open mode),
+- installs a ``set_authorizer`` callback that DENIES ``ATTACH`` / ``DETACH``
+  and every schema/data-writing action at STATEMENT-PREPARE time (PR #100
+  re-review Major 2: ``mode=ro`` + ``query_only`` alone still let
+  ``ATTACH DATABASE 'new.sqlite3'`` create a zero-byte file -- the authorizer
+  rejects the statement BEFORE SQLite ever opens the attach target). Value-
+  setting forms of state-changing pragmas (``user_version``,
+  ``journal_mode``, ``writable_schema``, ...) are denied too; read-only
+  pragmas (``table_info`` etc.) that the schema verification needs stay
+  allowed,
 - never creates the file, its parent directory, or ``-wal`` / ``-shm`` side
   files, and works inside a read-only directory,
 - raises :class:`ReadOnlyDbMissingError` for a missing path instead of
@@ -41,6 +50,79 @@ BUSY_TIMEOUT_SECONDS = 30
 class ReadOnlyDbMissingError(FileNotFoundError):
     """The database file (or its parent directory) does not exist. It is
     NEVER created by the read-only path."""
+
+
+# Actions a read-only connection must never perform. ATTACH/DETACH are the
+# critical ones (they touch OTHER files); the data/schema writers are listed
+# as defense in depth on top of mode=ro + query_only.
+_DENIED_ACTIONS: frozenset[int] = frozenset(
+    action
+    for action in (
+        getattr(sqlite3, name, None)
+        for name in (
+            "SQLITE_ATTACH",
+            "SQLITE_DETACH",
+            "SQLITE_INSERT",
+            "SQLITE_UPDATE",
+            "SQLITE_DELETE",
+            "SQLITE_CREATE_INDEX",
+            "SQLITE_CREATE_TABLE",
+            "SQLITE_CREATE_TEMP_INDEX",
+            "SQLITE_CREATE_TEMP_TABLE",
+            "SQLITE_CREATE_TEMP_TRIGGER",
+            "SQLITE_CREATE_TEMP_VIEW",
+            "SQLITE_CREATE_TRIGGER",
+            "SQLITE_CREATE_VIEW",
+            "SQLITE_CREATE_VTABLE",
+            "SQLITE_DROP_INDEX",
+            "SQLITE_DROP_TABLE",
+            "SQLITE_DROP_TEMP_INDEX",
+            "SQLITE_DROP_TEMP_TABLE",
+            "SQLITE_DROP_TEMP_TRIGGER",
+            "SQLITE_DROP_TEMP_VIEW",
+            "SQLITE_DROP_TRIGGER",
+            "SQLITE_DROP_VIEW",
+            "SQLITE_DROP_VTABLE",
+            "SQLITE_ALTER_TABLE",
+            "SQLITE_REINDEX",
+        )
+    )
+    if action is not None
+)
+
+# State-changing pragmas: the VALUE-SETTING form (an argument is present) is
+# denied; the read form stays allowed. Read-only pragmas with arguments that
+# the schema verification needs (table_info(...), index_info(...), ...) are
+# not in this set and remain usable.
+_DENIED_PRAGMA_SETS: frozenset[str] = frozenset(
+    {
+        "user_version",
+        "schema_version",
+        "application_id",
+        "journal_mode",
+        "writable_schema",
+        "wal_checkpoint",
+        "auto_vacuum",
+        "incremental_vacuum",
+        "page_size",
+        "encoding",
+        "query_only",
+        "locking_mode",
+        "synchronous",
+        "cache_size",
+        "mmap_size",
+    }
+)
+
+
+def _read_only_authorizer(action, arg1, arg2, db_name, trigger_or_view):
+    if action in _DENIED_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA:
+        name = (arg1 or "").lower()
+        if name in _DENIED_PRAGMA_SETS and arg2 is not None:
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
 
 
 def _is_wal_header(path: Path) -> bool:
@@ -76,6 +158,10 @@ def connect_read_only(db_path: Path | str) -> sqlite3.Connection:
     try:
         connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
         connection.execute("PRAGMA query_only = ON")
+        # Installed AFTER the two setup pragmas above (which the authorizer
+        # itself would deny): from here on, ATTACH/DETACH, every write action
+        # and every state-changing pragma are rejected at prepare time.
+        connection.set_authorizer(_read_only_authorizer)
     except Exception:
         connection.close()
         raise

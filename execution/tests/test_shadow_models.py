@@ -155,8 +155,29 @@ def test_claim_validates_lease_ordering():
         ShadowClaim(
             shadow_result_id=1, execution_request_id="exec-1", signal_id="signal-1",
             client_order_id="client-1", claim_owner_id="owner-1",
+            claim_attempt_id="owner-1-attempt-1", claim_generation=1,
             claimed_at_utc=NOW, lease_expires_at_utc=NOW, input_origin="cli_fixture",
         )
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"claim_attempt_id": ""}, "claim_attempt_id"),
+        ({"claim_generation": 0}, "claim_generation"),
+    ],
+)
+def test_claim_validates_attempt_identity(overrides, match):
+    values = dict(
+        shadow_result_id=1, execution_request_id="exec-1", signal_id="signal-1",
+        client_order_id="client-1", claim_owner_id="owner-1",
+        claim_attempt_id="owner-1-attempt-1", claim_generation=1,
+        claimed_at_utc=NOW, lease_expires_at_utc=NOW + timedelta(seconds=60),
+        input_origin="cli_fixture",
+    )
+    values.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        ShadowClaim(**values)
 
 
 # --- ShadowResult invariants --------------------------------------------------

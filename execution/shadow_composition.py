@@ -56,6 +56,7 @@ from execution.shadow_providers import (
     SIGNAL_SIDE_SHORT,
     StoredSignal,
     StoredSignalProvider,
+    require_executable_signal_status,
 )
 
 # Deterministic identity derivation (see the module docstring). The prefixes
@@ -82,6 +83,10 @@ def build_execution_request_from_signal(
     """
     if not isinstance(signal, StoredSignal):
         raise ShadowInputError(f"signal must be a StoredSignal, got {signal!r}")
+    # Belt and braces on top of the provider-side gate (PR #100 re-review
+    # Major 3): the production request builder itself refuses non-executable
+    # statuses, so a custom provider cannot smuggle one past the closed set.
+    require_executable_signal_status(signal.signal_id, signal.status)
     side = _SIDE_BY_SIGNAL_SIDE.get(signal.side)
     if side is None:
         raise ShadowInputError(

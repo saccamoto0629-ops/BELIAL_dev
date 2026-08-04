@@ -6,13 +6,16 @@ guarantee, cp932 survival and stream restoration."""
 
 import io
 import json
+import sqlite3
 import sys
+from datetime import timedelta
 
 import pytest
 
 from execution import shadow_store
 from execution.shadow_report import EXIT_FAILURE, EXIT_OK, EXIT_USAGE_ERROR, main
 from shadow_helpers import (
+    NOW,
     make_account,
     make_market,
     make_provenance,
@@ -107,27 +110,32 @@ def test_claims_listing_shows_in_flight_cycles(tmp_path, capsys, monkeypatch):
 
 
 def test_orphan_decisions_are_searchable(tmp_path, capsys, monkeypatch):
-    service = make_service(tmp_path, owner_id="owner-1")
-    original = shadow_store.complete_shadow_cycle
-    calls = {"n": 0}
+    # A completion failure leaves the claim ACTIVE (never re-acquired, PR #100
+    # re-review Major 1), so the orphaned decision is produced by the
+    # lease-expiry takeover path: crash, wait out the lease, recover.
+    service = make_service(tmp_path, owner_id="owner-1", claim_lease_seconds=60)
 
-    def flaky(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise shadow_store.ShadowStoreError("injected completion failure")
-        return original(*args, **kwargs)
+    def explode(*args, **kwargs):
+        raise shadow_store.ShadowStoreError("injected completion failure")
 
-    monkeypatch.setattr(shadow_store, "complete_shadow_cycle", flaky)
+    monkeypatch.setattr(shadow_store, "complete_shadow_cycle", explode)
     with pytest.raises(shadow_store.ShadowStoreError):
         service.run_cycle(
             make_request(), market=make_market(), account=make_account(),
             client_order_id="client-1", provenance=make_provenance(),
         )
-    retry = service.run_cycle(
-        make_request(), market=make_market(), account=make_account(),
-        client_order_id="client-1", provenance=make_provenance(),
-    )
     monkeypatch.undo()
+    LATER = NOW + timedelta(seconds=61)
+    recovery = make_service(
+        tmp_path, owner_id="owner-1", claim_lease_seconds=60, clock=lambda: LATER
+    )
+    retry = recovery.run_cycle(
+        make_request(),
+        market=make_market(observed_at_utc=LATER),
+        account=make_account(retrieved_at_utc=LATER),
+        client_order_id="client-1",
+        provenance=make_provenance(),
+    )
     assert retry.result.safety_decision_id == 2
     assert (
         main(
@@ -147,6 +155,69 @@ def test_orphan_decisions_are_searchable(tmp_path, capsys, monkeypatch):
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1 and payload["orphan_decisions"][0]["decision_id"] == 1
+
+
+# --- restore-time Safety-Decision cross-check (PR #100 re-review Major 4) -------
+
+
+def tamper_decision(decision_db, sql, params=()):
+    connection = sqlite3.connect(decision_db)
+    connection.execute(sql, params)
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE safety_gate_decisions SET account_id = 'tampered-acct' WHERE decision_id = 1",
+        "UPDATE safety_gate_decisions SET position_count = 42 WHERE decision_id = 1",
+        "DELETE FROM safety_gate_decisions WHERE decision_id = 1",
+    ],
+    ids=["account_id", "position_count", "missing_row"],
+)
+def test_tampered_safety_decision_fails_the_report_explicitly(
+    tmp_path, capsys, sql, extra_args
+):
+    db, decisions = seed(tmp_path)
+    tamper_decision(decisions, sql)
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions), *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert "shadow report failed" in captured.err
+    assert "exec-1" in captured.err  # names the corrupted record
+    # the inconsistent record is never displayed -- not even in JSON output
+    assert captured.out == ""
+
+
+def test_detail_view_also_cross_checks_the_referenced_decision(tmp_path, capsys):
+    db, decisions = seed(tmp_path)
+    tamper_decision(
+        decisions,
+        "UPDATE safety_gate_decisions SET account_id = 'tampered-acct' WHERE decision_id = 2",
+    )
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions),
+              "--execution-request-id", "exec-2"])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert "shadow report failed" in captured.err and captured.out == ""
+
+
+def test_report_without_a_decision_db_skips_the_cross_check(tmp_path, capsys):
+    db, decisions = seed(tmp_path)
+    tamper_decision(
+        decisions,
+        "UPDATE safety_gate_decisions SET account_id = 'tampered-acct' WHERE decision_id = 1",
+    )
+    # standalone shadow DB copy (decision store file absent): still inspectable
+    assert main(["--shadow-db", str(db), "--decision-db",
+                 str(tmp_path / "absent.sqlite3")]) == EXIT_OK
+    assert "total 2" in capsys.readouterr().out
 
 
 def test_no_orphans_for_clean_records(tmp_path, capsys):

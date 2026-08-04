@@ -52,6 +52,7 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -175,11 +176,16 @@ class ShadowExecutionService:
         self._shadow_db_path = Path(shadow_db_path)
         self._clock = clock
         self._connection_target = connection_target
-        # The claim owner identity: unique per process+service instance by
-        # default so an in-process retry re-acquires its own claim while a
-        # DIFFERENT process must wait for the lease (tests inject fixed ids).
+        # The claim owner identity (diagnostics; unique per process+service
+        # instance by default, tests inject fixed ids). Ownership itself is
+        # per ATTEMPT: every run_cycle() call claims under its own unique
+        # attempt id, so owner equality never grants claim re-acquisition
+        # (PR #100 re-review Major 1 -- a shared service's threads race the
+        # DB claim exactly like separate processes do).
         self._owner_id = owner_id if owner_id is not None else f"pid{os.getpid()}-svc{id(self):x}"
         self._claim_lease_seconds = claim_lease_seconds
+        self._attempt_lock = threading.Lock()
+        self._attempt_counter = 0
 
     @property
     def shadow_db_path(self) -> Path:
@@ -227,6 +233,7 @@ class ShadowExecutionService:
             timeframe=timeframe,
             provenance=provenance,
             owner_id=self._owner_id,
+            attempt_id=self._next_attempt_id(),
             now=self._now(),
             lease_seconds=self._claim_lease_seconds,
             db_path=self._shadow_db_path,
@@ -237,7 +244,8 @@ class ShadowExecutionService:
                 return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, result=record)
             self._log_duplicate(
                 request,
-                f"claim is held by {record.claim_owner_id!r} until "
+                f"claim is held by {record.claim_owner_id!r} (attempt "
+                f"{record.claim_attempt_id!r}) until "
                 f"{record.lease_expires_at_utc.isoformat()}",
             )
             return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, claim=record)
@@ -260,7 +268,7 @@ class ShadowExecutionService:
 
         result = shadow_store.complete_shadow_cycle(
             request.execution_request_id,
-            owner_id=self._owner_id,
+            claim=record,
             decision=decision,
             market=market,
             account=account,
@@ -346,6 +354,13 @@ class ShadowExecutionService:
             raise ValueError(f"provenance must be a ShadowProvenance, got {provenance!r}")
         if timeframe is not None and (not isinstance(timeframe, str) or not timeframe.strip()):
             raise ValueError(f"timeframe must be a non-empty string or None, got {timeframe!r}")
+
+    def _next_attempt_id(self) -> str:
+        """A unique id per ``run_cycle()`` call: claim ownership and the
+        completion fencing check are keyed on THIS, never on the service."""
+        with self._attempt_lock:
+            self._attempt_counter += 1
+            return f"{self._owner_id}-attempt-{self._attempt_counter}"
 
     def _now(self) -> datetime:
         now = self._clock()

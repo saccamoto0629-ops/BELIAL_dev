@@ -259,6 +259,128 @@ def test_twenty_workers_single_recorded(tmp_path):
     assert len(decisions(services[0])) == 1
 
 
+# --- ONE service instance shared by many threads (PR #100 re-review Major 1) ---
+
+
+def _run_shared_service_race(service, worker_count):
+    barrier = threading.Barrier(worker_count)
+    outcomes: list = [None] * worker_count
+
+    def work(index):
+        barrier.wait(timeout=60)
+        try:
+            outcomes[index] = run_cycle(service)
+        except Exception as exc:  # pragma: no cover - would fail the test
+            outcomes[index] = exc
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    return outcomes
+
+
+def test_shared_service_twenty_threads_single_winner_single_decision(tmp_path, monkeypatch):
+    """20 threads share ONE ShadowExecutionService: attempt-scoped claims must
+    yield exactly one winner, one gate evaluation, one decision row, one
+    completed record, zero live claims, zero errors -- and no broker call."""
+    from execution.safety_gate import SafetyGate
+
+    evaluations = []
+    original_evaluate = SafetyGate.evaluate_shadow
+
+    def counting_evaluate(self, *args, **kwargs):
+        evaluations.append(1)
+        return original_evaluate(self, *args, **kwargs)
+
+    monkeypatch.setattr(SafetyGate, "evaluate_shadow", counting_evaluate)
+
+    calls = []
+    for name in ("submit_order", "cancel_order", "get_order", "get_positions", "get_account_state"):
+        monkeypatch.setattr(
+            fake_broker.FakeBroker, name,
+            lambda self, *a, __n=name, **k: calls.append(__n) or (_ for _ in ()).throw(
+                AssertionError(f"broker API {__n} must never be reached")
+            ),
+        )
+
+    service = make_service(tmp_path, owner_id="shared-owner")
+    outcomes = _run_shared_service_race(service, 20)
+    assert all(isinstance(outcome, ShadowCycleOutcome) for outcome in outcomes), outcomes
+    statuses = [outcome.status for outcome in outcomes]
+    assert statuses.count(ShadowCycleStatus.RECORDED) == 1
+    assert statuses.count(ShadowCycleStatus.DUPLICATE) == 19
+    assert len(evaluations) == 1  # the gate ran exactly once
+    assert calls == []
+    assert len(decisions(service)) == 1
+    assert len(shadow_store.list_shadow_results(db_path=service.shadow_db_path)) == 1
+    assert shadow_store.list_shadow_claims(db_path=service.shadow_db_path) == ()
+
+
+@pytest.mark.parametrize("iteration", range(20))
+def test_shared_service_race_repeats(tmp_path, iteration):
+    """The shared-service race, repeated 20x with 8 threads: never a second
+    evaluation path, never an error, never a lock error dressed as anything."""
+    service = make_service(tmp_path, owner_id="shared-owner")
+    outcomes = _run_shared_service_race(service, 8)
+    assert all(isinstance(outcome, ShadowCycleOutcome) for outcome in outcomes), outcomes
+    statuses = [outcome.status for outcome in outcomes]
+    assert statuses.count(ShadowCycleStatus.RECORDED) == 1
+    assert statuses.count(ShadowCycleStatus.DUPLICATE) == 7
+    assert len(decisions(service)) == 1
+    assert len(shadow_store.list_shadow_results(db_path=service.shadow_db_path)) == 1
+    assert shadow_store.list_shadow_claims(db_path=service.shadow_db_path) == ()
+
+
+def test_stale_holder_cannot_complete_over_a_takeover(tmp_path):
+    """Fencing: after a lease-expiry takeover, the ORIGINAL attempt's claim
+    (older attempt id / generation) is refused at completion."""
+    from shadow_helpers import make_gate as build_gate
+
+    shadow_store.init_db(tmp_path / "shadow.sqlite3")
+    status, original = shadow_store.claim_shadow_cycle(
+        make_request(),
+        client_order_id="client-1",
+        timeframe="H1",
+        provenance=make_provenance(),
+        owner_id="owner-a",
+        attempt_id="owner-a-attempt-1",
+        now=NOW,
+        lease_seconds=60,
+        db_path=tmp_path / "shadow.sqlite3",
+    )
+    assert status == shadow_store.CLAIM_ACQUIRED
+    status, takeover = shadow_store.claim_shadow_cycle(
+        make_request(),
+        client_order_id="client-1",
+        timeframe="H1",
+        provenance=make_provenance(),
+        owner_id="owner-b",
+        attempt_id="owner-b-attempt-1",
+        now=NOW + timedelta(seconds=61),
+        lease_seconds=60,
+        db_path=tmp_path / "shadow.sqlite3",
+    )
+    assert status == shadow_store.CLAIM_ACQUIRED and takeover.claim_generation == 2
+    gate = build_gate()
+    decision = gate.evaluate_shadow(
+        make_request(), market=make_market(), account=make_account(), connection_target="shadow"
+    )
+    with pytest.raises(shadow_store.ShadowStoreError, match="lost"):
+        shadow_store.complete_shadow_cycle(
+            "exec-1",
+            claim=original,  # stale attempt/generation
+            decision=decision,
+            market=make_market(),
+            account=make_account(),
+            policy_snapshot=gate.policy.to_snapshot(),
+            safety_decision_id=None,
+            completed_at_utc=NOW,
+            db_path=tmp_path / "shadow.sqlite3",
+        )
+
+
 def test_lock_errors_are_store_failures_not_duplicates(tmp_path, monkeypatch):
     service = make_service(tmp_path)
 
@@ -286,14 +408,31 @@ def _fail_completion_once(monkeypatch):
     monkeypatch.setattr(shadow_store, "complete_shadow_cycle", flaky)
 
 
-def test_same_owner_retries_immediately_after_a_completion_failure(tmp_path, monkeypatch):
-    service = make_service(tmp_path, owner_id="owner-1")
+def test_active_claim_blocks_retries_until_the_lease_expires(tmp_path, monkeypatch):
+    """PR #100 re-review Major 1: after a completion failure the claim stays
+    ACTIVE until its lease expires -- a retry (same service included) is an
+    in-progress duplicate, and recovery happens via lease-expiry takeover."""
+    service = make_service(tmp_path, owner_id="owner-1", claim_lease_seconds=60)
     _fail_completion_once(monkeypatch)
     with pytest.raises(shadow_store.ShadowStoreError, match="injected"):
         run_cycle(service)
+    monkeypatch.undo()
     claim = shadow_store.get_shadow_claim("exec-1", db_path=service.shadow_db_path)
     assert claim is not None and claim.claim_owner_id == "owner-1"
-    retry = run_cycle(service)  # same owner: reclaims without waiting
+    # a retry on the SAME service before the lease expires does not evaluate
+    blocked = run_cycle(service)
+    assert blocked.status is ShadowCycleStatus.DUPLICATE and blocked.claim is not None
+    assert len(decisions(service)) == 1  # only the crashed attempt evaluated
+    # after the lease expires, a takeover attempt recovers and completes
+    LATER = NOW + timedelta(seconds=61)
+    recovery = make_service(
+        tmp_path, owner_id="owner-1", claim_lease_seconds=60, clock=lambda: LATER
+    )
+    retry = run_cycle(
+        recovery,
+        market=make_market(observed_at_utc=LATER),
+        account=make_account(retrieved_at_utc=LATER),
+    )
     assert retry.status is ShadowCycleStatus.RECORDED
     assert shadow_store.get_shadow_claim("exec-1", db_path=service.shadow_db_path) is None
     # the failed attempt's decision remains as a REPORTABLE orphan

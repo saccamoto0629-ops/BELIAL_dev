@@ -95,13 +95,76 @@ def test_every_write_attempt_fails(tmp_path):
         "CREATE TABLE u (id INTEGER)",
         "PRAGMA user_version = 9",
     ):
-        with pytest.raises(sqlite3.OperationalError):
+        # the authorizer denies at prepare time (DatabaseError "not
+        # authorized"); anything it let through would still die on the
+        # mode=ro/query_only layer (OperationalError)
+        with pytest.raises(sqlite3.Error):
             connection.execute(sql)
     connection.close()
     check = sqlite3.connect(target)
     assert check.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
     assert check.execute("PRAGMA user_version").fetchone()[0] == 0
     check.close()
+
+
+# --- ATTACH / state-change denial (PR #100 re-review Major 2) ------------------
+
+
+def test_attach_is_denied_and_creates_no_file(tmp_path):
+    """mode=ro + query_only alone would let ATTACH create a ZERO-BYTE file;
+    the authorizer must reject the statement before SQLite opens the attach
+    target -- for missing paths, existing paths, and URI-hostile names."""
+    target = tmp_path / "db.sqlite3"
+    make_db(target)
+    existing = tmp_path / "existing.sqlite3"
+    make_db(existing)
+    before = snapshot(tmp_path)
+    connection = connect_read_only(target)
+    attach_targets = [
+        tmp_path / "brand-new.sqlite3",
+        existing,
+        tmp_path / "日本語 スペース.sqlite3",
+        tmp_path / "we ird#q?.sqlite3",  # '?'/'#' stay inside the SQL string
+        "C:/shadow-attach-test/windows-style.sqlite3",
+    ]
+    for attach_target in attach_targets:
+        with pytest.raises(sqlite3.Error):
+            connection.execute(f"ATTACH DATABASE '{attach_target}' AS attached")
+    with pytest.raises(sqlite3.Error):
+        connection.execute("DETACH DATABASE attached")
+    connection.close()
+    assert snapshot(tmp_path) == before
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == [
+        "db.sqlite3", "existing.sqlite3",
+    ]
+
+
+def test_state_changing_statements_leave_the_filesystem_invariant(tmp_path):
+    target = tmp_path / "db.sqlite3"
+    make_db(target)
+    before = snapshot(tmp_path)
+    before_bytes = target.read_bytes()
+    connection = connect_read_only(target)
+    for sql in (
+        "VACUUM",
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA journal_mode = DELETE",
+        "PRAGMA user_version = 9",
+        "PRAGMA writable_schema = ON",
+        "INSERT INTO t (v) VALUES ('y')",
+        "UPDATE t SET v = 'z'",
+        "DELETE FROM t",
+        "CREATE TABLE u (id INTEGER)",
+    ):
+        with pytest.raises(sqlite3.Error):
+            connection.execute(sql)
+    # reads (including argument-taking read pragmas) still work afterwards
+    assert connection.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+    assert list(connection.execute("PRAGMA table_info(t)"))
+    connection.close()
+    assert snapshot(tmp_path) == before
+    assert target.read_bytes() == before_bytes
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["db.sqlite3"]
 
 
 def test_corrupted_file_is_not_silently_successful(tmp_path):
