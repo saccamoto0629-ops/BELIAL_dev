@@ -14,9 +14,10 @@ BELIAL の設計資料を置く。
   [examples/strategy_squeeze_breakout_v1.yaml](examples/strategy_squeeze_breakout_v1.yaml)。
 - [Paper Execution](paper_execution.md)(Issue #49 設計 / #50・#51 実装): 仮想ポジションの状態遷移、
   Entry / Close / SL / TP 約定規則、Position Store と schema migration。実装は `paper-execution/`。
-- [Broker Interface / FakeBroker](broker_interface.md)(Issue #73): 将来の Live Execution に向けた
-  Broker 境界(共通インターフェース・共通モデル)と、外部通信を一切行わないテストダブル FakeBroker。
-  実装は `broker/`。実発注・OANDA Adapter・Live Execution は未実装のまま。
+- [Broker Interface / FakeBroker](broker_interface.md)(Issue #73、Issue #79): 将来の Live Execution に向けた
+  Broker 境界(共通インターフェース・共通モデル)と、外部通信を一切行わないテストダブル FakeBroker、
+  および Demo 専用の OANDA Demo Adapter(Issue #79。Live endpoint は fail-closed で拒否)。
+  実装は `broker/`。Live 接続・Execution 層への組み込み・Live Execution 本体は未実装のまま。
 - [Execution Request / Order Persistence](execution_request.md)(Issue #74): Strategy / Signal から
   将来の Live Execution ユースケースへ渡す ExecutionRequest モデルと、注文状態・状態履歴の SQLite
   永続化基盤。注文状態は既存 `broker.OrderState` を唯一の正として再利用する。実装は `execution/`。

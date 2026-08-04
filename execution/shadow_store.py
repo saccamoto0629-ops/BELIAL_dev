@@ -74,7 +74,14 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from broker.broker_models import OrderSide, OrderType, PositionInfo, PositionSide, AccountState
+from broker.broker_models import (
+    AccountState,
+    OrderSide,
+    OrderType,
+    PositionInfo,
+    PositionSide,
+    safe_account_reference,
+)
 from execution.execution_models import ExecutionRequest
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
 from execution.safety_gate import (
@@ -1273,9 +1280,13 @@ def _restore_result(row: sqlite3.Row) -> ShadowResult:
         # Major 4). A NULL column is the explicit "snapshot deemed unreliable"
         # case and carries no cross-constraint.
         if row["account_id"] is not None and row["account_id"] != account.account.account_id:
+            # The comparison uses the REAL ids; the exception renders the
+            # shared safe references only (PR #101 4th review: no raw
+            # account id in integrity errors).
             raise ValueError(
-                f"account_id column ({row['account_id']!r}) does not match the stored "
-                f"account snapshot ({account.account.account_id!r})"
+                f"account_id column ({safe_account_reference(row['account_id'])!r}) "
+                "does not match the stored account snapshot "
+                f"({safe_account_reference(account.account.account_id)!r})"
             )
         decision = SafetyDecision(
             execution_request_id=request.execution_request_id,

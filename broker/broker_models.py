@@ -45,6 +45,7 @@ Design decisions (Issue #73):
 from __future__ import annotations
 
 import enum
+import hashlib
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
@@ -65,6 +66,11 @@ class BrokerErrorCode(enum.Enum):
     CANCELLATION_FAILURE = "cancellation_failure"
     INVALID_REQUEST = "invalid_request"
     NOT_FOUND = "not_found"
+    # Issue #79: categories a REAL broker endpoint can answer with. They stay
+    # broker-agnostic (HTTP status codes and vendor payloads are adapter
+    # concerns and must be translated before crossing this boundary).
+    AUTHENTICATION_FAILURE = "authentication_failure"
+    RATE_LIMITED = "rate_limited"
 
 
 class BrokerError(Exception):
@@ -109,6 +115,25 @@ class BrokerOrderNotFoundError(BrokerError):
     """No order is known under the given ``client_order_id``."""
 
     code = BrokerErrorCode.NOT_FOUND
+
+
+class BrokerAuthenticationError(BrokerError):
+    """The broker refused the credentials (Issue #79).
+
+    The message must never contain the credential values themselves --
+    adapters raise this with a static description only.
+    """
+
+    code = BrokerErrorCode.AUTHENTICATION_FAILURE
+
+
+class BrokerRateLimitError(BrokerError):
+    """The broker throttled the request (rate limit, Issue #79).
+
+    Retrying is the CALLER's decision; adapters never resend on their own.
+    """
+
+    code = BrokerErrorCode.RATE_LIMITED
 
 
 # --- enums ------------------------------------------------------------------
@@ -644,15 +669,80 @@ class PositionInfo:
 
 
 @dataclass(frozen=True)
-class AccountState:
-    """Broker account snapshot (broker-agnostic, minimal)."""
+class TradeInfo:
+    """One broker-side OPEN TRADE snapshot (broker-agnostic, Issue #79).
 
-    account_id: str
+    A trade is one opened exposure unit as the broker tracks it;
+    ``PositionInfo`` is the per-symbol / per-side AGGREGATE. Both views stay
+    separate vocabularies — adapters may expose either without merging them.
+    ``opened_at_utc`` is the broker-reported open time, ``retrieved_at_utc``
+    is when the adapter observed the snapshot.
+    """
+
+    trade_id: str
+    symbol: str
+    side: PositionSide
+    quantity: Decimal
+    open_price: Decimal
+    opened_at_utc: datetime
+    retrieved_at_utc: datetime
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.trade_id, "trade_id")
+        _require_non_empty_str(self.symbol, "symbol")
+        if not isinstance(self.side, PositionSide):
+            raise BrokerInvalidRequestError(f"side must be a PositionSide, got {self.side!r}")
+        _require_positive_decimal(self.quantity, "quantity")
+        _require_positive_decimal(self.open_price, "open_price")
+        _require_utc(self.opened_at_utc, "opened_at_utc")
+        _require_utc(self.retrieved_at_utc, "retrieved_at_utc")
+
+
+def safe_account_reference(account_id: str | None) -> str | None:
+    """Display-safe reference for a broker account id (Issue #79 / PR #101).
+
+    The COMMON display helper for every boundary that stringifies an account
+    id (repr, logs, reports, integrity exceptions): a truncated SHA-256
+    digest — non-reversible, stable per account (same account -> same
+    reference) and collision-resistant across accounts (unlike prefix/suffix
+    masking, where real broker ids sharing common prefixes would collide).
+    ``None`` passes through so optional fields keep their absence semantics.
+    Identifier semantics stay untouched: stores / comparisons keep the REAL
+    id and call this only when rendering.
+    """
+    if account_id is None:
+        return None
+    text = account_id if isinstance(account_id, str) else str(account_id)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"account-{digest}"
+
+
+@dataclass(frozen=True)
+class AccountState:
+    """Broker account snapshot (broker-agnostic, minimal).
+
+    ``account_id`` holds the REAL broker account identifier — downstream
+    layers (Safety Decision, audit store, shadow report, connection
+    consistency checks) use it as an identifier, so its meaning must never
+    be replaced by a display mask (Issue #79 / PR #101 re-review).
+    Concealment happens at the DISPLAY boundary instead: the field is
+    excluded from ``repr()``, and ``display_account_id`` provides a
+    non-reversible, collision-resistant digest for logs / reports.
+    """
+
+    account_id: str = field(repr=False)
     currency: str
     balance: Decimal
     equity: Decimal
     margin_available: Decimal
     retrieved_at_utc: datetime
+
+    @property
+    def display_account_id(self) -> str:
+        """Display-safe form of ``account_id`` (see
+        :func:`safe_account_reference` — the shared helper every display
+        boundary uses)."""
+        return safe_account_reference(self.account_id)
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.account_id, "account_id")

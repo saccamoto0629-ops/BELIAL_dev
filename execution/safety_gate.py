@@ -509,7 +509,11 @@ class SafetyDecision:
     rejections: tuple[SafetyRejection, ...] = ()
     execution_mode: str | None = None
     connection_target: str | None = None
-    account_id: str | None = None
+    # The REAL broker account id (identifier semantics — stores and
+    # comparisons rely on it), excluded from repr(): display boundaries use
+    # broker.broker_models.safe_account_reference instead (Issue #79 /
+    # PR #101 4th review).
+    account_id: str | None = field(default=None, repr=False)
     position_count: int | None = None
 
     def __post_init__(self) -> None:

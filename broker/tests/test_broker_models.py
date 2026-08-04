@@ -156,6 +156,53 @@ def test_timeout_and_communication_failure_are_different_codes():
     assert m.BrokerErrorCode.TIMEOUT is not m.BrokerErrorCode.COMMUNICATION_FAILURE
 
 
+def test_account_state_keeps_the_real_id_and_conceals_it_in_repr():
+    # Issue #79 / PR #101 re-review: account_id is an IDENTIFIER (Safety
+    # Decision / audit / shadow report rely on it) — the field keeps the
+    # real value; only repr and display_account_id conceal it.
+    state = m.AccountState(
+        account_id="101-004-1234567-001",
+        currency="JPY",
+        balance=Decimal("1"),
+        equity=Decimal("1"),
+        margin_available=Decimal("1"),
+        retrieved_at_utc=UTC_NOW,
+    )
+    assert state.account_id == "101-004-1234567-001"
+    assert "101-004-1234567-001" not in repr(state)
+    display = state.display_account_id
+    assert "101-004-1234567-001" not in display
+    # non-reversible digest, stable per id, distinct across accounts
+    other = m.AccountState(
+        account_id="101-004-7654321-001",
+        currency="JPY",
+        balance=Decimal("1"),
+        equity=Decimal("1"),
+        margin_available=Decimal("1"),
+        retrieved_at_utc=UTC_NOW,
+    )
+    assert state.display_account_id == display
+    assert other.display_account_id != display
+
+
+def test_authentication_and_rate_limit_errors_join_the_taxonomy():
+    # Issue #79: real-endpoint failure categories, still broker-agnostic.
+    codes = {
+        m.BrokerTimeoutError("x").code,
+        m.BrokerCommunicationError("x").code,
+        m.BrokerCancellationError("x").code,
+        m.BrokerInvalidRequestError("x").code,
+        m.BrokerOrderNotFoundError("x").code,
+        m.BrokerAuthenticationError("x").code,
+        m.BrokerRateLimitError("x").code,
+    }
+    assert len(codes) == 7
+    assert m.BrokerAuthenticationError("x").code is m.BrokerErrorCode.AUTHENTICATION_FAILURE
+    assert m.BrokerRateLimitError("x").code is m.BrokerErrorCode.RATE_LIMITED
+    assert isinstance(m.BrokerAuthenticationError("x", client_order_id="c-1"), m.BrokerError)
+    assert m.BrokerRateLimitError("x").client_order_id is None
+
+
 # --- OrderRequest validation ------------------------------------------------
 
 def test_order_request_accepts_a_valid_limit_order():
