@@ -48,6 +48,7 @@ from execution.safety_gate import (
     ExecutionMode,
     MarketSafetySnapshot,
     SafetyDecision,
+    SafetyRejectionCode,
 )
 
 INPUT_ORIGIN_PRODUCTION_SIGNAL = "production_signal"
@@ -295,8 +296,12 @@ class ShadowResult:
     - ``policy_snapshot`` is a JSON-able mapping whose ``policy_id`` equals
       the decision's ``policy_id`` (defensively deep-copied through JSON);
     - ``shadow_result_id`` / ``safety_decision_id`` are DB-assigned positive
-      integers or None (``safety_decision_id`` is None exactly when decision
-      persistence failed and the decision carries ``decision_persist_failed``).
+      integers or None. For a PERSISTED record (``shadow_result_id`` set),
+      ``safety_decision_id is None`` EXACTLY when decision persistence failed
+      and the decision carries ``decision_persist_failed`` -- enforced in both
+      directions, so a lost reference and a persistence failure that still
+      points at a row are equally refused. The dry-run projection persists
+      nothing (both ids None) and references nothing.
 
     Deliberately ABSENT: any broker outcome (order state, broker order id,
     fill price/quantity). A shadow record means "this WOULD have been sent /
@@ -374,6 +379,32 @@ class ShadowResult:
                 not isinstance(value, int) or isinstance(value, bool) or value < 1
             ):
                 raise ValueError(f"{name} must be a positive int or None, got {value!r}")
+        # For a PERSISTED record (``shadow_result_id`` assigned by the store):
+        # safety_decision_id IS NULL <=> decision persistence failed, BOTH
+        # directions (PR #100 4th-review Major 2). A missing reference is only
+        # ever the explicit `decision_persist_failed` recovery state, and a
+        # record in that state must not claim a decision row it never wrote.
+        # The dry-run projection persists NOTHING (both ids None) and so
+        # references nothing -- the reverse direction still binds it.
+        persist_failed = SafetyRejectionCode.DECISION_PERSIST_FAILED in {
+            entry.code for entry in self.decision.rejections
+        }
+        if (
+            self.shadow_result_id is not None
+            and self.safety_decision_id is None
+            and not persist_failed
+        ):
+            raise ValueError(
+                "safety_decision_id may only be None when the decision carries "
+                f"{SafetyRejectionCode.DECISION_PERSIST_FAILED.value!r}, but the "
+                f"decision rejections are {self.decision.rejection_codes}"
+            )
+        if self.safety_decision_id is not None and persist_failed:
+            raise ValueError(
+                f"decision carries {SafetyRejectionCode.DECISION_PERSIST_FAILED.value!r} "
+                f"but safety_decision_id is {self.safety_decision_id!r}; a failed "
+                "decision persistence must leave no reference"
+            )
         _require_non_empty_str(self.claim_owner_id, "claim_owner_id")
         _require_utc(self.claimed_at_utc, "claimed_at_utc")
         _require_utc(self.completed_at_utc, "completed_at_utc")

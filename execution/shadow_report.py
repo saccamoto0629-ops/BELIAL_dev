@@ -27,6 +27,13 @@ a shadow request that are NOT the one referenced by the completed record are
 orphans -- audit leftovers of completion failures that were later retried
 (see ``execution/shadow_execution.py``); bounded by the number of retries.
 
+Before anything is printed, every displayed record is cross-checked against
+the Safety Decision store it references; ANY failure of that check --
+including a decision store that is unusable as a database -- is normalized
+into :class:`ShadowReportIntegrityError` and reported as a stable
+``shadow report failed: ...`` line, never a traceback and never a partially
+displayed record.
+
 Exit codes: 0 = report produced (an initialized-but-empty store IS a valid
 report); 1 = missing DB file, unknown id, schema/integrity failure; 2 = usage
 error. ``--json`` output is pure ASCII and carries no log lines (production
@@ -37,17 +44,46 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from execution import shadow_store
 from execution.cli_streams import encoding_safe_streams
-from execution.safety_store import SQLiteSafetyDecisionStore, safety_db_path
+from execution.safety_gate import SafetyRejectionCode
+from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore, safety_db_path
 from execution.shadow_models import ShadowClaim, ShadowResult
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE_ERROR = 2
+
+
+class ShadowReportIntegrityError(RuntimeError):
+    """The report cannot vouch for what it would display.
+
+    Every failure of the Safety Decision cross-check funnels through this
+    type (PR #100 4th-review Major 1): a decision store that is empty, not a
+    SQLite file, schema-broken, version-mismatched, physically corrupted or
+    holds an unrestorable row is an integrity failure of the REPORT, not a
+    crash. The CLI turns it into the same stable ``shadow report failed:
+    ...`` line + exit 1 as every other integrity failure, so no traceback is
+    ever shown and no unverifiable record reaches stdout.
+    """
+
+
+# Anything the decision-store read path can raise: the store's own errors
+# (SafetySchemaError / SafetyIntegrityError share SafetyStoreError), raw
+# SQLite failures for files that are not usable databases at all, and the
+# value/type/key errors a JSON or column restore can produce.
+_DECISION_STORE_FAILURES = (
+    SafetyStoreError,
+    sqlite3.Error,
+    ValueError,  # includes json.JSONDecodeError
+    TypeError,
+    KeyError,
+)
 
 
 def result_payload(result: ShadowResult) -> dict:
@@ -256,59 +292,131 @@ def _render_claim_line(claim: ShadowClaim, out) -> None:
     )
 
 
-def _verify_decision_consistency(results, decision_db: Path) -> str | None:
+def _decision_persistence_failed(result: ShadowResult) -> bool:
+    """Whether this record's decision carries ``decision_persist_failed`` --
+    the ONLY state in which ``safety_decision_id`` may be NULL."""
+    return SafetyRejectionCode.DECISION_PERSIST_FAILED in {
+        entry.code for entry in result.decision.rejections
+    }
+
+
+def _verify_decision_reference_invariant(result: ShadowResult) -> None:
+    """``safety_decision_id IS NULL`` <=> decision persistence failed, BOTH
+    directions (PR #100 4th-review Major 2).
+
+    A NULL reference is legitimate ONLY for the explicit recoverable state
+    the service records when the decision could not be persisted / read back
+    (``decision_persist_failed``); a NULL on any other record means the
+    reference was lost, and a decision-persistence failure that still carries
+    a reference means the record points at a row it never wrote. Neither may
+    be skipped silently -- both are integrity failures. (The same invariant
+    is enforced when a :class:`ShadowResult` is constructed, so a stored row
+    fails at restore time too; this is the report-boundary guarantee. The
+    report only ever displays PERSISTED records, which is the scope of the
+    NULL direction -- the unpersisted dry-run projection is not reported.)"""
+    persist_failed = _decision_persistence_failed(result)
+    if result.safety_decision_id is None and not persist_failed:
+        raise ShadowReportIntegrityError(
+            f"shadow record {result.request.execution_request_id!r} has no "
+            "safety_decision_id but does not carry the 'decision_persist_failed' "
+            "rejection; a missing decision reference is only valid for a recorded "
+            "decision-persistence failure"
+        )
+    if result.safety_decision_id is not None and persist_failed:
+        raise ShadowReportIntegrityError(
+            f"shadow record {result.request.execution_request_id!r} carries the "
+            "'decision_persist_failed' rejection but still references "
+            f"safety_decision_id {result.safety_decision_id}"
+        )
+
+
+def _verify_decision_consistency(results, decision_db: Path) -> None:
     """Cross-check every completed record against its REFERENCED Safety
     Decision row (PR #100 re-review Major 4): the stored decision must exist
     and be FIELD-IDENTICAL to the decision embedded in the shadow record
     (account_id, position_count, execution request id, policy id, mode,
     codes, timestamps). Any mismatch means a corrupted / inconsistent record
     and the report fails EXPLICITLY -- never silently displaying it, in text
-    or JSON output alike. Records whose decision persistence failed
-    (``safety_decision_id`` NULL) carry no reference to check. A MISSING
-    decision store file is itself an integrity failure whenever any displayed
-    record references a decision id (PR #100 3rd-review Major 2): the report
-    fails closed instead of silently showing unverifiable records. Only
-    records with no references at all render without the store."""
+    or JSON output alike.
+
+    A NULL ``safety_decision_id`` is not a free pass: it is verified against
+    the decision-persistence-failure invariant first (PR #100 4th-review
+    Major 2). A MISSING decision store file is itself an integrity failure
+    whenever any displayed record references a decision id (PR #100
+    3rd-review Major 2): the report fails closed instead of silently showing
+    unverifiable records. Only records with no references at all render
+    without the store.
+
+    Raises :class:`ShadowReportIntegrityError` -- every failure of the store
+    read path is normalized into it (PR #100 4th-review Major 1)."""
+    for result in results:
+        _verify_decision_reference_invariant(result)
+
+    referencing = [
+        result.request.execution_request_id
+        for result in results
+        if result.safety_decision_id is not None
+    ]
     if not decision_db.exists():
-        referencing = [
-            result.request.execution_request_id
-            for result in results
-            if result.safety_decision_id is not None
-        ]
         if referencing:
-            return (
+            raise ShadowReportIntegrityError(
                 f"the decision store at {decision_db} does not exist, but "
                 f"{len(referencing)} shadow record(s) (e.g. {referencing[0]!r}) "
                 "reference safety decision ids that cannot be verified"
             )
-        return None
-    store = SQLiteSafetyDecisionStore(decision_db)
-    for result in results:
-        if result.safety_decision_id is None:
-            continue
-        stored = dict(
-            store.list_for_request_with_ids(result.request.execution_request_id)
-        ).get(result.safety_decision_id)
-        if stored is None:
-            return (
-                f"shadow record {result.request.execution_request_id!r} references "
-                f"safety_decision_id {result.safety_decision_id}, which does not exist "
-                f"in the decision store at {decision_db}"
-            )
-        if stored != result.decision:
-            return (
-                f"shadow record {result.request.execution_request_id!r} does not match "
-                f"its referenced Safety Decision row {result.safety_decision_id} "
-                "(account_id / position_count / codes / policy or another field "
-                "disagrees); refusing to report a corrupted or inconsistent record"
-            )
-    return None
+        return
+    if not referencing:
+        return
+
+    with _decision_store_boundary(decision_db):
+        store = SQLiteSafetyDecisionStore(decision_db)
+        for result in results:
+            if result.safety_decision_id is None:
+                continue
+            stored = dict(
+                store.list_for_request_with_ids(result.request.execution_request_id)
+            ).get(result.safety_decision_id)
+            if stored is None:
+                raise ShadowReportIntegrityError(
+                    f"shadow record {result.request.execution_request_id!r} references "
+                    f"safety_decision_id {result.safety_decision_id}, which does not exist "
+                    f"in the decision store at {decision_db}"
+                )
+            if stored != result.decision:
+                raise ShadowReportIntegrityError(
+                    f"shadow record {result.request.execution_request_id!r} does not match "
+                    f"its referenced Safety Decision row {result.safety_decision_id} "
+                    "(account_id / position_count / codes / policy or another field "
+                    "disagrees); refusing to report a corrupted or inconsistent record"
+                )
+
+
+@contextmanager
+def _decision_store_boundary(decision_db: Path):
+    """Normalize EVERY decision-store read failure into
+    :class:`ShadowReportIntegrityError` (PR #100 4th-review Major 1).
+
+    An empty file, a file that is not SQLite at all, a missing table or
+    column, a mismatched ``user_version``, a physically corrupted image and
+    an unrestorable row all raise different exception types from the store /
+    sqlite3 layers. Letting any of them escape would print a traceback and
+    break the CLI's stable failure contract, so they are converted here --
+    reading NEVER creates or modifies the file either way."""
+    try:
+        yield
+    except ShadowReportIntegrityError:
+        raise
+    except _DECISION_STORE_FAILURES as exc:
+        raise ShadowReportIntegrityError(
+            f"the decision store at {decision_db} could not be read for "
+            f"verification ({type(exc).__name__}: {exc})"
+        ) from exc
 
 
 def _find_orphan_decisions(shadow_db: Path, decision_db: Path) -> list[dict]:
     """Decision rows for shadow requests that are NOT referenced by the
-    completed record (module docstring). Read-only on both stores."""
-    store = SQLiteSafetyDecisionStore(decision_db)
+    completed record (module docstring). Read-only on both stores; decision
+    store failures are normalized like every other read (Major 1)."""
     orphans: list[dict] = []
     records: list[tuple[str, int | None]] = [
         (result.request.execution_request_id, result.safety_decision_id)
@@ -318,18 +426,20 @@ def _find_orphan_decisions(shadow_db: Path, decision_db: Path) -> list[dict]:
         (claim.execution_request_id, None)
         for claim in shadow_store.list_shadow_claims(db_path=shadow_db)
     )
-    for execution_request_id, referenced_id in records:
-        for decision_id, decision in store.list_for_request_with_ids(execution_request_id):
-            if decision_id != referenced_id:
-                orphans.append(
-                    {
-                        "decision_id": decision_id,
-                        "execution_request_id": execution_request_id,
-                        "allowed": decision.allowed,
-                        "checked_at_utc": decision.checked_at_utc.isoformat(),
-                        "referenced_decision_id": referenced_id,
-                    }
-                )
+    with _decision_store_boundary(decision_db):
+        store = SQLiteSafetyDecisionStore(decision_db)
+        for execution_request_id, referenced_id in records:
+            for decision_id, decision in store.list_for_request_with_ids(execution_request_id):
+                if decision_id != referenced_id:
+                    orphans.append(
+                        {
+                            "decision_id": decision_id,
+                            "execution_request_id": execution_request_id,
+                            "allowed": decision.allowed,
+                            "checked_at_utc": decision.checked_at_utc.isoformat(),
+                            "referenced_decision_id": referenced_id,
+                        }
+                    )
     return orphans
 
 
@@ -504,13 +614,14 @@ def _run_cli(argv: list[str] | None) -> int:
             results = shadow_store.list_shadow_results(
                 allowed=allowed, limit=args.limit, db_path=db_path
             )
-    except shadow_store.ShadowStoreError as exc:
+    except (shadow_store.ShadowStoreError, ShadowReportIntegrityError) as exc:
         print(f"shadow report failed: {exc}", file=sys.stderr)
         return EXIT_FAILURE
 
-    inconsistency = _verify_decision_consistency(results, decision_db)
-    if inconsistency is not None:
-        print(f"shadow report failed: {inconsistency}", file=sys.stderr)
+    try:
+        _verify_decision_consistency(results, decision_db)
+    except (shadow_store.ShadowStoreError, ShadowReportIntegrityError) as exc:
+        print(f"shadow report failed: {exc}", file=sys.stderr)
         return EXIT_FAILURE
 
     if args.json:

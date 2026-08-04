@@ -404,6 +404,17 @@ def _update_row(tmp_path, sql, params=()):
     connection.close()
 
 
+def test_null_decision_reference_without_a_persist_failure_is_detected(tmp_path):
+    # PR #100 4th-review Major 2: a persisted record may only lose its
+    # decision reference when the decision records the persistence failure.
+    recorded(tmp_path)
+    _update_row(
+        tmp_path, f"UPDATE {shadow_store.RESULTS_TABLE} SET safety_decision_id = NULL"
+    )
+    with pytest.raises(shadow_store.ShadowIntegrityError, match="decision_persist_failed"):
+        shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
+
+
 def test_out_of_band_column_edit_is_detected(tmp_path):
     recorded(tmp_path)
     _update_row(tmp_path, f"UPDATE {shadow_store.RESULTS_TABLE} SET quantity = '999'")

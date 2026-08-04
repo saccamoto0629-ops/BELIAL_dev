@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from broker.broker_models import OrderSide, OrderType
-from execution.safety_gate import SafetyDecision
+from execution.safety_gate import SafetyDecision, SafetyRejection, SafetyRejectionCode
 from execution.shadow_models import (
     INPUT_ORIGIN_CLI_FIXTURE,
     INPUT_ORIGIN_PRODUCTION_SIGNAL,
@@ -210,6 +210,64 @@ def test_result_rejects_non_shadow_decision():
     )
     with pytest.raises(ValueError, match="shadow"):
         make_result(request=request, decision=live_like)
+
+
+# --- safety_decision_id <=> decision_persist_failed (PR #100 4th review) -------
+
+
+def make_persist_failed_decision(request):
+    """The decision the service records when persistence / read-back failed."""
+    base = make_decision(request)
+    return SafetyDecision(
+        execution_request_id=request.execution_request_id,
+        allowed=False,
+        checked_at_utc=base.checked_at_utc,
+        policy_id=base.policy_id,
+        rejections=(
+            SafetyRejection(
+                code=SafetyRejectionCode.DECISION_PERSIST_FAILED,
+                message="decision could not be persisted",
+            ),
+        ),
+        execution_mode=base.execution_mode,
+        connection_target=base.connection_target,
+        account_id=base.account_id,
+        position_count=base.position_count,
+    )
+
+
+def test_persisted_record_may_not_drop_its_decision_reference():
+    with pytest.raises(ValueError, match="decision_persist_failed"):
+        make_result(safety_decision_id=None, shadow_result_id=7)
+
+
+def test_persist_failure_record_may_not_carry_a_decision_reference():
+    request = make_request()
+    with pytest.raises(ValueError, match="must leave no reference"):
+        make_result(
+            request=request,
+            decision=make_persist_failed_decision(request),
+            safety_decision_id=3,
+            shadow_result_id=7,
+        )
+
+
+def test_persist_failure_record_with_no_reference_is_valid():
+    request = make_request()
+    result = make_result(
+        request=request,
+        decision=make_persist_failed_decision(request),
+        safety_decision_id=None,
+        shadow_result_id=7,
+    )
+    assert result.safety_decision_id is None
+    assert result.rejection_codes == ("decision_persist_failed",)
+
+
+def test_unpersisted_dry_run_projection_references_nothing():
+    # both ids None: nothing was written, so nothing is referenced
+    result = make_result(safety_decision_id=None, shadow_result_id=None)
+    assert result.safety_decision_id is None and result.shadow_result_id is None
 
 
 def test_result_rejects_intended_order_drift():

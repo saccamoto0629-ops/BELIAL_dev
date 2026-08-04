@@ -198,6 +198,201 @@ def test_tampered_safety_decision_fails_the_report_explicitly(
     assert captured.out == ""
 
 
+# --- unusable decision stores are normalized (PR #100 4th-review Major 1) ------
+
+
+def break_empty(path):
+    path.write_bytes(b"")
+
+
+def break_non_sqlite(path):
+    path.write_bytes(b"this file is not a SQLite database\n" * 20)
+
+
+def break_table_missing(path):
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE safety_gate_decisions")
+    connection.commit()
+    connection.close()
+
+
+def break_column_missing(path):
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE safety_gate_decisions")
+    connection.execute(
+        "CREATE TABLE safety_gate_decisions ("
+        "decision_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "execution_request_id TEXT NOT NULL)"
+    )
+    connection.commit()
+    connection.close()
+
+
+def break_user_version(path):
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version = 99")
+    connection.commit()
+    connection.close()
+
+
+def break_malformed_row(path):
+    tamper_decision(
+        path,
+        "UPDATE safety_gate_decisions SET checked_at_utc = 'not-a-timestamp+00:00' "
+        "WHERE decision_id = 1",
+    )
+
+
+def break_corrupted_json(path):
+    tamper_decision(
+        path,
+        "UPDATE safety_gate_decisions SET rejections_json = '{not json' WHERE decision_id = 2",
+    )
+
+
+def break_corrupted_image(path):
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        break_empty,
+        break_non_sqlite,
+        break_table_missing,
+        break_column_missing,
+        break_user_version,
+        break_malformed_row,
+        break_corrupted_json,
+        break_corrupted_image,
+    ],
+    ids=[
+        "empty", "non_sqlite", "table_missing", "column_missing",
+        "wrong_user_version", "malformed_row", "corrupted_json", "corrupted_image",
+    ],
+)
+def test_unusable_decision_store_fails_stably_without_a_traceback(
+    tmp_path, capsys, corrupt, extra_args
+):
+    db, decisions = seed(tmp_path)
+    corrupt(decisions)
+    before = sorted((entry.name, entry.stat().st_size) for entry in tmp_path.iterdir())
+    shadow_bytes = db.read_bytes()
+    decision_bytes = decisions.read_bytes()
+
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions), *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert captured.err.startswith("shadow report failed: ")
+    assert "Traceback" not in captured.err
+    # nothing unverifiable reaches stdout, in text or JSON output
+    assert captured.out == ""
+    # read-only contract holds even on the failing path
+    assert sorted((entry.name, entry.stat().st_size) for entry in tmp_path.iterdir()) == before
+    assert db.read_bytes() == shadow_bytes
+    assert decisions.read_bytes() == decision_bytes
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+def test_unusable_decision_store_also_fails_the_orphan_search(tmp_path, capsys, extra_args):
+    db, decisions = seed(tmp_path)
+    break_non_sqlite(decisions)
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions),
+              "--orphan-decisions", *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert captured.err.startswith("shadow report failed: ")
+    assert "Traceback" not in captured.err and captured.out == ""
+
+
+# --- NULL safety_decision_id invariant (PR #100 4th-review Major 2) -------------
+
+
+def seed_persist_failure(tmp_path, monkeypatch):
+    """One completed record whose decision could NOT be persisted: the only
+    legitimate NULL ``safety_decision_id``."""
+    from execution.safety_store import SQLiteSafetyDecisionStore
+
+    service = make_service(tmp_path, owner_id="owner-1")
+
+    def explode(self, decision):
+        raise RuntimeError("injected decision store failure")
+
+    monkeypatch.setattr(SQLiteSafetyDecisionStore, "record", explode)
+    service.run_cycle(
+        make_request(), market=make_market(), account=make_account(),
+        client_order_id="client-1", provenance=make_provenance(),
+    )
+    monkeypatch.undo()
+    return service.shadow_db_path, service.decision_db_path
+
+
+def test_legitimate_persist_failure_record_reports_normally(tmp_path, capsys, monkeypatch):
+    db, decisions = seed_persist_failure(tmp_path, monkeypatch)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "decision_persist_failed" in out and "total 1" in out
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+def test_null_decision_reference_without_a_persist_failure_is_refused(
+    tmp_path, capsys, extra_args
+):
+    db, decisions = seed(tmp_path)
+    # a normal record loses its decision reference: NULL is NOT a free pass
+    tamper_decision(
+        db, f"UPDATE {shadow_store.RESULTS_TABLE} SET safety_decision_id = NULL "
+            "WHERE execution_request_id = 'exec-1'"
+    )
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions), *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert captured.err.startswith("shadow report failed: ")
+    assert "Traceback" not in captured.err and captured.out == ""
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+def test_persist_failure_record_with_a_reference_is_refused(
+    tmp_path, capsys, monkeypatch, extra_args
+):
+    db, decisions = seed_persist_failure(tmp_path, monkeypatch)
+    # the reverse direction: a decision_persist_failed record must reference
+    # no decision row at all
+    tamper_decision(
+        db, f"UPDATE {shadow_store.RESULTS_TABLE} SET safety_decision_id = 1 "
+            "WHERE execution_request_id = 'exec-1'"
+    )
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions), *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert captured.err.startswith("shadow report failed: ")
+    assert "Traceback" not in captured.err and captured.out == ""
+
+
+def test_report_boundary_refuses_an_in_memory_invariant_violation(tmp_path):
+    """The report verifies the invariant itself, not only via restore: a
+    record doctored in memory (bypassing the frozen model's validation) is
+    still refused."""
+    from execution import shadow_report
+
+    db, decisions = seed(tmp_path)
+    results = shadow_store.list_shadow_results(db_path=db)
+    doctored = results[0]
+    object.__setattr__(doctored, "safety_decision_id", None)
+    with pytest.raises(shadow_report.ShadowReportIntegrityError, match="decision_persist_failed"):
+        shadow_report._verify_decision_consistency((doctored,), decisions)
+
+
 def test_detail_view_also_cross_checks_the_referenced_decision(tmp_path, capsys):
     db, decisions = seed(tmp_path)
     tamper_decision(

@@ -82,7 +82,7 @@ identity キー(`execution_request_id` / `signal_id` / `client_order_id`。各 U
 
 claim-first により **completed Shadow 記録 1 件 : Safety Decision 1 件**が通常形(`safety_decision_id` で参照)。duplicate / conflict は decision を作らない。例外は明示的:
 
-- decision 保存 / read-back 失敗 → allow は `decision_persist_failed` の拒否へ転じ、Shadow 記録は `safety_decision_id = NULL` で完了(明示的な回復可能状態)。
+- decision 保存 / read-back 失敗 → allow は `decision_persist_failed` の拒否へ転じ、Shadow 記録は `safety_decision_id = NULL` で完了(明示的な回復可能状態)。**`safety_decision_id = NULL` が正当なのはこの状態だけ**であり、`safety_decision_id IS NULL` ⇔ `decision_persist_failed` を**双方向**で強制する(参照を失った通常記録も、参照を持つ persist-failure 記録も、model 構築時 = 復元時に `ShadowIntegrityError`、report 境界でも明示失敗)。未永続の dry-run 投影は両 id とも NULL で何も参照しない。
 - complete 失敗後の retry → 新 decision で完了し、先行 decision が orphan になる(`--orphan-decisions` で追跡可能・retry 回数で有界)。
 - Shadow 保存(complete)失敗時に残る decision の契約は上記 (b) のとおり: claim が残り、回収時の新 decision が正となる。
 
@@ -95,6 +95,8 @@ Safety Decision store 自体への schema 変更はない(additive の read API 
 **account / position snapshot の監査保存**: Gate が判定に使った注入 `AccountSafetySnapshot` **全体**を `account_snapshot_json` に保存する(account_id / currency / balance / equity / margin_available / retrieved_at + 各 position の symbol / side / quantity / average_entry_price / retrieved_at)。Decimal は文字列・時刻は UTC tz-aware・復元は closed-world(未知フィールド拒否・投影列 `position_count` との整合検証・改ざんは `ShadowIntegrityError`)。ポジション上限・口座上限の拒否は保存 snapshot から**事後再現可能**(pytest で固定)。モデルに secret(API token / password / credential)は存在せず、保存もされない。なお `AccountState` に used margin / position opened_at のフィールドは存在しないため保存対象外(モデル追加は Broker 境界 Issue の範囲)。
 
 **復元時の整合検証(3-way)**: strict restore は投影列と snapshot JSON を突き合わせる — `account_id` 列 ⇔ `account_snapshot_json` 内の account_id、`position_count` 列 ⇔ snapshot 内 position 件数、canonical payload 列の再計算一致、`policy_id` 列 ⇔ `policy_snapshot_json` 内の policy_id。`policy_snapshot_json` は closed-world で `SafetyPolicy` へ**再構築**し、`to_snapshot()` round-trip が保存値と一致することまで検証する(未知キー・欠損キー・型違い・forged policy_id はすべて `ShadowIntegrityError`)。さらに report は各 completed 記録の `safety_decision_id` が参照する Safety Decision row を実際に読み、**埋め込み decision とフィールド一致**(account_id / position_count / codes / policy / mode / 時刻)することを検証する — 不一致・参照先欠損の記録は text / `--json` どちらの出力でも**黙って表示されず**、レポート全体が exit 1 で明示失敗する。**Decision store ファイル自体の欠落も、decision id を参照する記録が 1 件でもあれば同じ integrity failure**(fail-closed)であり、store なしで閲覧できるのは参照を一切持たない記録(decision 保存失敗の `safety_decision_id = NULL`)だけである。policy snapshot の数値は有限値のみ受理し(`Infinity` / `NaN` の注入は `OverflowError` にならず安定した integrity error)、復元境界は `OverflowError` も integrity error へ正規化する。
+
+**Decision store 読み取り失敗の正規化**: 空ファイル・SQLite でないファイル・table / column 欠損・`user_version` 不一致・物理破損・復元不能な row は、それぞれ `SafetySchemaError` / `SafetyIntegrityError` / `sqlite3.DatabaseError` など異なる型で上がるが、report はすべてを `ShadowReportIntegrityError` へ正規化する(cross-check 経路・`--orphan-decisions` 経路とも)。CLI 契約は text / `--json` 共通で **exit 1・`shadow report failed: ...` の安定メッセージ・traceback 非表示・stdout へ部分表示なし・DB / directory を作らず内容も変更しない**。
 
 schema 方針は従来どおり(pristine 初期化・closed-world 検証・strict restore)。
 
