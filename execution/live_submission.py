@@ -392,11 +392,18 @@ class LiveOrderSubmissionService:
         decision that survives both may allow a submit (Issue #75 review r1).
 
         Any failure -- record exception, read-back miss, read-back mismatch --
-        appends ``DECISION_PERSIST_FAILED`` (an allow becomes a rejection)."""
+        appends ``DECISION_PERSIST_FAILED`` (an allow becomes a rejection).
+
+        The read-back checks MEMBERSHIP, not last position (PR #101 review):
+        concurrent losers of the same intent each record their own rejection
+        decision, so another caller's decision may land between this record
+        and its read-back. What durability requires is that THIS decision
+        survives a re-read -- being the newest row is not part of the
+        contract and made the check racy."""
         try:
             self._decision_store.record(decision)
             stored = self._decision_store.list_for_request(decision.execution_request_id)
-            if not stored or stored[-1] != decision:
+            if decision not in stored:
                 raise RuntimeError(
                     "decision read-back did not return the recorded decision"
                 )

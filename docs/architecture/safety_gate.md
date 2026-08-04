@@ -156,7 +156,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - `initialize()` は **pristine な DB のみ**へ schema を新規作成(オブジェクト 0 件 + `user_version` 0)。それ以外は完全検証し、不一致なら **DB 無変更で** `SafetySchemaError`。
 - 全 read / write が「open → **closed-world schema 検証**(sqlite_master 全 object 集合 + token 正規化 DDL + PRAGMA 構造 signature + version)→ トランザクション」で動作。trigger / view / 制約欠損 lookalike / 他コンポーネント DB は黙って受け入れない。
 - `record()` は**あらゆる失敗で例外**を送出する(DB ファイル欠損 = 未初期化も失敗であり、暗黙にファイルを作らない)。
-- **監査 store は送信サービス内部に封印される**: `LiveOrderSubmissionService` のコンストラクタは **filesystem パス(`decision_db_path`)しか受け取らず**、具体実装 `SQLiteSafetyDecisionStore` をサービス内部で生成する。recorder オブジェクトの注入点自体が存在しないため、`record()` / read-back を override して永続化を偽装できる注入経路はない(InMemory / NoOp recorder は構造的に排除)。さらに record 後に **read-back で保存内容を検証**し、保存が黙って失われた場合も送信は行われない(`decision_persist_failed`)。
+- **監査 store は送信サービス内部に封印される**: `LiveOrderSubmissionService` のコンストラクタは **filesystem パス(`decision_db_path`)しか受け取らず**、具体実装 `SQLiteSafetyDecisionStore` をサービス内部で生成する。recorder オブジェクトの注入点自体が存在しないため、`record()` / read-back を override して永続化を偽装できる注入経路はない(InMemory / NoOp recorder は構造的に排除)。さらに record 後に **read-back で保存内容を検証**し、保存が黙って失われた場合も送信は行われない(`decision_persist_failed`)。read-back は**自分の判定が再読で見つかること(membership)**を検証する(PR #101): 同一 intent の並行敗者はそれぞれ自分の拒否判定を記録するため、record と read-back の間に他の呼び出しの判定が割り込み得る。「最新行であること」は契約に含まれない(旧実装はこれを要求しており、並行時に誤って `decision_persist_failed` が付く flake の原因だった)。
 - 読み取りは missing DB を**作成しない**(空タプル)。保存行は厳格に再検証(拒否 JSON のキー集合完全一致・既知コードのみ・UTC・allow/拒否整合)し、帯域外編集は `SafetyIntegrityError` で拒否する。DB CHECK 制約(allow ⇔ `rejections_json = '[]'`、UTC サフィックス等)を二重の防御とする。
 - 接続は常に明示 close(Windows のファイルハンドル衛生。Issue #83 r2)。
 

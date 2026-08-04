@@ -478,6 +478,37 @@ def test_silently_lost_decision_write_is_caught_by_readback(tmp_path, monkeypatc
     assert broker.submitted_requests == []
 
 
+def test_readback_tolerates_a_concurrent_decision_landing_after_ours(tmp_path, monkeypatch):
+    # PR #101 review (Linux CI flake): concurrent losers of the same intent
+    # each record their own rejection decision, so ANOTHER caller's decision
+    # can land between this caller's record() and its read-back. Durability
+    # requires OUR decision to survive a re-read -- being the newest row is
+    # not part of the contract. Simulate the interleaving deterministically
+    # by appending an interloper decision to every read-back result; the
+    # submit must still proceed without DECISION_PERSIST_FAILED.
+    from dataclasses import replace
+
+    original = SQLiteSafetyDecisionStore.list_for_request
+
+    def racy_list_for_request(self, execution_request_id):
+        stored = original(self, execution_request_id)
+        if not stored:
+            return stored
+        interloper = replace(
+            stored[-1],
+            checked_at_utc=stored[-1].checked_at_utc + timedelta(seconds=1),
+        )
+        return tuple(stored) + (interloper,)
+
+    monkeypatch.setattr(SQLiteSafetyDecisionStore, "list_for_request", racy_list_for_request)
+    decision, result, broker, _, _ = run(tmp_path)
+
+    assert SafetyRejectionCode.DECISION_PERSIST_FAILED not in codes(decision)
+    assert decision.allowed is True
+    assert result is not None
+    assert len(broker.submitted_requests) == 1
+
+
 def test_uninitialized_decision_store_prevents_submit(tmp_path):
     decision, result, broker, _, _ = run(tmp_path, initialize_decisions=False)
     assert decision.rejection_codes == (SafetyRejectionCode.DECISION_PERSIST_FAILED.value,)

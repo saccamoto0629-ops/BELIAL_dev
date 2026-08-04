@@ -121,8 +121,8 @@ def test_config_requires_token_and_account_id():
         make_config(account_id="")
 
 
-def test_config_rejects_a_non_positive_timeout():
-    for timeout in (0, -1, "10", True):
+def test_config_rejects_a_non_positive_or_non_finite_timeout():
+    for timeout in (0, -1, "10", True, float("inf"), float("nan")):
         with pytest.raises(ValueError):
             make_config(timeout_seconds=timeout)
 
@@ -182,11 +182,22 @@ def test_config_error_messages_never_echo_the_secret_values():
         assert ACCOUNT not in text
 
 
-def test_config_repr_hides_token_and_account_id():
+def test_config_repr_hides_token_account_id_and_endpoint():
+    # PR #101 review: the endpoint is environment-managed like the
+    # credentials and must not surface in repr either.
     text = repr(make_config())
     assert TOKEN not in text
     assert ACCOUNT not in text
-    assert oa.OANDA_DEMO_API_URL in text
+    assert oa.OANDA_DEMO_API_URL not in text
+
+
+def test_masked_account_id_never_contains_the_full_account_id():
+    config = make_config()
+    masked = config.masked_account_id()
+    assert ACCOUNT not in masked
+    assert masked != ACCOUNT
+    # short ids collapse entirely
+    assert make_config(account_id="short").masked_account_id() == "***"
 
 
 # --- protocol conformance / connection identity --------------------------------
@@ -196,12 +207,15 @@ def test_adapter_satisfies_the_broker_protocol():
     assert isinstance(adapter, Broker)
 
 
-def test_connection_identity_is_demo_with_the_demo_endpoint():
+def test_connection_identity_is_demo_with_a_non_secret_target_label():
+    # PR #101 review: the target is the constant "oanda-demo" label, never
+    # the environment-managed endpoint URL.
     adapter, _ = make_adapter()
     identity = adapter.connection_identity()
     assert isinstance(identity, m.BrokerConnectionIdentity)
     assert identity.mode == "demo"
-    assert identity.target == oa.OANDA_DEMO_API_URL
+    assert identity.target == oa.OANDA_DEMO_CONNECTION_TARGET
+    assert oa.OANDA_DEMO_API_URL not in identity.target
     # constant for the instance lifetime (Issue #75)
     assert adapter.connection_identity() == identity
 
@@ -217,19 +231,30 @@ def test_adapter_rejects_non_config_and_broken_injectables():
 
 # --- submit_order: request translation -----------------------------------------
 
-FILL_RESPONSE = (
-    201,
-    {
-        "orderCreateTransaction": {"id": "1001", "time": "2026-01-02T03:04:05.123456789Z"},
-        "orderFillTransaction": {
-            "id": "1002",
-            "orderID": "1001",
-            "units": "1",
-            "price": "155.123",
-            "time": "2026-01-02T03:04:05.123456789Z",
+def fill_response(client_order_id="c-1", units="1", price="155.123"):
+    """A 201 create+fill response with the correlation fields OANDA echoes
+    (clientExtensions on the create tx, clientOrderID on the fill tx)."""
+    return (
+        201,
+        {
+            "orderCreateTransaction": {
+                "id": "1001",
+                "time": "2026-01-02T03:04:05.123456789Z",
+                "clientExtensions": {"id": client_order_id},
+            },
+            "orderFillTransaction": {
+                "id": "1002",
+                "orderID": "1001",
+                "clientOrderID": client_order_id,
+                "units": units,
+                "price": price,
+                "time": "2026-01-02T03:04:05.123456789Z",
+            },
         },
-    },
-)
+    )
+
+
+FILL_RESPONSE = fill_response()
 
 
 def test_submit_market_buy_sends_the_oanda_order_payload():
@@ -249,7 +274,7 @@ def test_submit_market_buy_sends_the_oanda_order_payload():
 def test_submit_sends_the_client_order_id_as_client_extension():
     # client_order_id is the execution store's 1:1 key to the
     # execution_request_id (Issue #74); OANDA must persist it.
-    adapter, transport = make_adapter(FILL_RESPONSE)
+    adapter, transport = make_adapter(fill_response(client_order_id="c-linked-42"))
     adapter.submit_order(make_request(client_order_id="c-linked-42"))
     body = json.loads(transport.calls[0]["body"])
     assert body["order"]["clientExtensions"]["id"] == "c-linked-42"
@@ -260,10 +285,11 @@ def test_submit_market_sell_uses_negative_units():
         (
             201,
             {
-                "orderCreateTransaction": {"id": "2001"},
+                "orderCreateTransaction": {"id": "2001", "clientExtensions": {"id": "c-1"}},
                 "orderFillTransaction": {
                     "id": "2002",
                     "orderID": "2001",
+                    "clientOrderID": "c-1",
                     "units": "-3",
                     "price": "155.001",
                     "time": "2026-01-02T03:04:06Z",
@@ -279,7 +305,7 @@ def test_submit_market_sell_uses_negative_units():
 
 def test_submit_limit_sends_price_and_gtc():
     adapter, transport = make_adapter(
-        (201, {"orderCreateTransaction": {"id": "3001"}})
+        (201, {"orderCreateTransaction": {"id": "3001", "clientExtensions": {"id": "c-1"}}})
     )
     result = adapter.submit_order(
         make_request(order_type=m.OrderType.LIMIT, limit_price=Decimal("50.000"))
@@ -322,8 +348,9 @@ def test_submit_fok_cancel_translates_to_cancelled():
         (
             201,
             {
-                "orderCreateTransaction": {"id": "4001"},
+                "orderCreateTransaction": {"id": "4001", "clientExtensions": {"id": "c-1"}},
                 "orderCancelTransaction": {"id": "4002", "orderID": "4001",
+                                           "clientOrderID": "c-1",
                                            "reason": "INSUFFICIENT_LIQUIDITY"},
             },
         )
@@ -478,6 +505,7 @@ def test_get_order_filled_market_fetches_the_filling_transaction():
                     "units": "-5",
                     "state": "FILLED",
                     "fillingTransactionID": "7002",
+                    "clientExtensions": {"id": "c-8"},
                 }
             },
         ),
@@ -514,6 +542,7 @@ def test_get_order_cancelled_translates_to_cancelled():
                     "units": "1",
                     "price": "50.000",
                     "state": "CANCELLED",
+                    "clientExtensions": {"id": "c-9"},
                 }
             },
         )
@@ -550,6 +579,7 @@ def test_cancel_order_returns_the_post_cancel_snapshot():
                     "units": "1",
                     "price": "50.000",
                     "state": "CANCELLED",
+                    "clientExtensions": {"id": "c-10"},
                 }
             },
         ),
@@ -574,6 +604,7 @@ def test_cancel_of_a_terminal_order_is_a_cancellation_failure():
                     "units": "1",
                     "state": "FILLED",
                     "fillingTransactionID": "10002",
+                    "clientExtensions": {"id": "c-11"},
                 }
             },
         ),
@@ -658,7 +689,9 @@ def test_get_account_state_translates_the_summary():
         )
     )
     state = adapter.get_account_state()
-    assert state.account_id == ACCOUNT
+    # the account id crosses the boundary masked (PR #101 review)
+    assert state.account_id == make_config().masked_account_id()
+    assert ACCOUNT not in state.account_id
     assert state.currency == "JPY"
     assert state.balance == Decimal("3000000.0000")
     assert state.equity == Decimal("3000123.4567")
@@ -687,6 +720,383 @@ def test_malformed_query_responses_fail_as_communication_errors():
         adapter, _ = make_adapter(scripted)
         with pytest.raises(m.BrokerCommunicationError):
             call(adapter)
+
+
+# --- PR #101 review: redirects are never followed --------------------------------
+
+def test_redirect_on_submit_is_refused_with_a_single_connection():
+    # A 30x answer must not trigger a second exchange (allow_redirects=False
+    # in the default transport; the adapter converts the 3xx itself).
+    for status in (301, 302, 307, 308):
+        adapter, transport = make_adapter((status, ""))
+        with pytest.raises(m.BrokerTimeoutError):
+            adapter.submit_order(make_request())
+        assert len(transport.calls) == 1
+
+
+def test_redirect_on_a_read_is_a_communication_failure_without_follow_up():
+    adapter, transport = make_adapter((302, ""))
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_account_state()
+    assert len(transport.calls) == 1
+    assert "redirect" in str(exc_info.value)
+
+
+def test_default_transport_disables_redirect_following():
+    import inspect
+
+    source = inspect.getsource(oa._requests_transport)
+    assert "allow_redirects=False" in source
+
+
+# --- PR #101 review: secret redaction / correlation --------------------------------
+
+def test_broker_echoed_error_messages_are_redacted():
+    # The broker may reflect request values (account id, token) back in
+    # errorMessage / rejectReason; both must be scrubbed.
+    adapter, _ = make_adapter(
+        (400, {"errorMessage": f"account {ACCOUNT} rejected token {TOKEN}"})
+    )
+    with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
+        adapter.submit_order(make_request())
+    text = str(exc_info.value)
+    assert ACCOUNT not in text
+    assert TOKEN not in text
+    assert "***" in text
+
+
+def test_broker_echoed_reject_reason_is_redacted_in_the_result():
+    adapter, _ = make_adapter(
+        (
+            400,
+            {
+                "orderRejectTransaction": {
+                    "id": "5001",
+                    "rejectReason": f"MARGIN for {ACCOUNT}",
+                }
+            },
+        )
+    )
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert ACCOUNT not in result.reject_reason
+
+
+def test_account_state_carries_a_masked_account_id():
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "account": {
+                    "id": ACCOUNT,
+                    "currency": "JPY",
+                    "balance": "1",
+                    "NAV": "1",
+                    "marginAvailable": "1",
+                }
+            },
+        )
+    )
+    state = adapter.get_account_state()
+    assert ACCOUNT not in state.account_id
+    assert ACCOUNT not in repr(state)
+
+
+def test_account_state_for_a_different_account_id_fails_closed():
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "account": {
+                    "id": "999-000-9999999-999",
+                    "currency": "JPY",
+                    "balance": "1",
+                    "NAV": "1",
+                    "marginAvailable": "1",
+                }
+            },
+        )
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_account_state()
+    text = str(exc_info.value)
+    assert ACCOUNT not in text
+    assert "999-000-9999999-999" not in text
+
+
+def test_submit_fill_without_client_order_id_echo_is_refused():
+    response = fill_response()
+    del response[1]["orderFillTransaction"]["clientOrderID"]
+    adapter, _ = make_adapter(response)
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.submit_order(make_request())
+
+
+def test_submit_fill_with_a_different_client_order_id_echo_is_refused():
+    adapter, _ = make_adapter(fill_response(client_order_id="c-SOMEONE-ELSE"))
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.submit_order(make_request())
+
+
+def test_submit_create_without_client_extension_echo_is_refused():
+    adapter, _ = make_adapter((201, {"orderCreateTransaction": {"id": "3001"}}))
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.submit_order(
+            make_request(order_type=m.OrderType.LIMIT, limit_price=Decimal("50.000"))
+        )
+
+
+def test_get_order_with_missing_or_mismatched_client_extension_is_refused():
+    for extensions in ({}, {"clientExtensions": {"id": "c-OTHER"}}):
+        order = {
+            "id": "6001",
+            "type": "LIMIT",
+            "instrument": "USD_JPY",
+            "units": "2",
+            "price": "50.000",
+            "state": "PENDING",
+        }
+        order.update(extensions)
+        adapter, _ = make_adapter((200, {"order": order}))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-7")
+
+
+# --- PR #101 review: client_order_id URL safety -------------------------------------
+
+def test_url_unsafe_or_oversized_client_order_ids_are_rejected():
+    adapter, transport = make_adapter()
+    for bad in ("a/b", "a?b", "a#b", "a%b", "a@b", "a b", "日本語", ".leading-dot",
+                "x" * 129):
+        with pytest.raises(m.BrokerInvalidRequestError):
+            adapter.get_order(bad)
+        with pytest.raises(m.BrokerInvalidRequestError):
+            adapter.cancel_order(bad)
+    # nothing ever reached the transport
+    assert transport.calls == []
+
+
+def test_url_unsafe_client_order_id_is_rejected_before_submit():
+    adapter, transport = make_adapter()
+    request = m.OrderRequest(
+        client_order_id="bad/id",
+        symbol="USD_JPY",
+        side=m.OrderSide.BUY,
+        order_type=m.OrderType.MARKET,
+        quantity=Decimal("1"),
+        created_at_utc=NOW,
+    )
+    with pytest.raises(m.BrokerInvalidRequestError):
+        adapter.submit_order(request)
+    assert transport.calls == []
+
+
+def test_max_length_url_safe_client_order_id_is_accepted():
+    cid = "x" * 128
+    adapter, _ = make_adapter(fill_response(client_order_id=cid))
+    assert adapter.submit_order(make_request(client_order_id=cid)).state is m.OrderState.FILLED
+
+
+# --- PR #101 review: duplicate contract / partial fills ------------------------------
+
+def test_duplicate_client_order_id_rejection_maps_to_invalid_request():
+    # Broker-boundary contract (Issue #73 / FakeBroker parity): a duplicate
+    # client_order_id is BrokerInvalidRequestError, not an ordinary REJECTED.
+    adapter, _ = make_adapter(
+        (
+            400,
+            {
+                "orderRejectTransaction": {
+                    "id": "5002",
+                    "rejectReason": "CLIENT_ORDER_ID_ALREADY_EXISTS",
+                }
+            },
+        )
+    )
+    with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
+        adapter.submit_order(make_request())
+    assert exc_info.value.code is m.BrokerErrorCode.INVALID_REQUEST
+    assert "duplicate" in str(exc_info.value)
+
+
+def test_partial_fill_with_working_remainder_is_partially_filled():
+    adapter, _ = make_adapter(fill_response(units="2", price="155.000"))
+    result = adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
+    assert result.broker_order_id == "1001"
+
+
+def test_partial_fill_with_reissue_rejection_is_cancelled():
+    response = fill_response(units="2", price="155.000")
+    response[1]["orderReissueRejectTransaction"] = {"id": "1003"}
+    adapter, _ = make_adapter(response)
+    result = adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert result.state is m.OrderState.CANCELLED
+    assert result.filled_quantity == Decimal("2")
+
+
+def test_partial_fill_with_cancelled_remainder_is_cancelled():
+    response = fill_response(units="2", price="155.000")
+    response[1]["orderCancelTransaction"] = {
+        "id": "1004", "orderID": "1001", "clientOrderID": "c-1",
+    }
+    adapter, _ = make_adapter(response)
+    result = adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert result.state is m.OrderState.CANCELLED
+
+
+def test_overfill_or_zero_fill_responses_are_communication_errors_not_value_errors():
+    for units in ("9", "0"):
+        adapter, _ = make_adapter(fill_response(units=units))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+
+
+def test_inconsistent_filled_order_query_raises_a_common_error_not_value_error():
+    # order says 5 units but the filling transaction reports 3: the common
+    # model's FILLED invariant would raise ValueError; the adapter must wrap
+    # it (PR #101 review).
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "7001",
+                    "type": "MARKET",
+                    "instrument": "USD_JPY",
+                    "units": "5",
+                    "state": "FILLED",
+                    "fillingTransactionID": "7002",
+                    "clientExtensions": {"id": "c-8"},
+                }
+            },
+        ),
+        (
+            200,
+            {
+                "transaction": {
+                    "id": "7002",
+                    "units": "3",
+                    "price": "154.500",
+                    "time": "2026-01-02T03:04:07Z",
+                }
+            },
+        ),
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.get_order("c-8")
+
+
+def test_unknown_broker_order_type_is_a_communication_error():
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "6001",
+                    "type": "STOP",
+                    "instrument": "USD_JPY",
+                    "units": "1",
+                    "state": "PENDING",
+                    "clientExtensions": {"id": "c-7"},
+                }
+            },
+        )
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.get_order("c-7")
+
+
+def test_missing_instrument_in_order_is_a_communication_error():
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "6001",
+                    "type": "MARKET",
+                    "units": "1",
+                    "state": "PENDING",
+                    "clientExtensions": {"id": "c-7"},
+                }
+            },
+        )
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.get_order("c-7")
+
+
+# --- PR #101 review: open trades ------------------------------------------------------
+
+def test_get_open_trades_translates_long_and_short_trades():
+    adapter, transport = make_adapter(
+        (
+            200,
+            {
+                "trades": [
+                    {
+                        "id": "T-1",
+                        "instrument": "USD_JPY",
+                        "currentUnits": "4",
+                        "price": "155.200",
+                        "openTime": "2026-01-02T03:00:00.000000000Z",
+                    },
+                    {
+                        "id": "T-2",
+                        "instrument": "EUR_USD",
+                        "currentUnits": "-1",
+                        "price": "1.0900",
+                        "openTime": "2026-01-02T03:01:00Z",
+                    },
+                ]
+            },
+        )
+    )
+    trades = adapter.get_open_trades()
+    assert transport.calls[0]["url"].endswith(f"/v3/accounts/{ACCOUNT}/openTrades")
+    assert len(trades) == 2
+    long_trade, short_trade = trades
+    assert isinstance(long_trade, m.TradeInfo)
+    assert long_trade.trade_id == "T-1"
+    assert long_trade.side is m.PositionSide.LONG
+    assert long_trade.quantity == Decimal("4")
+    assert long_trade.open_price == Decimal("155.200")
+    assert long_trade.opened_at_utc == datetime(2026, 1, 2, 3, 0, 0, tzinfo=timezone.utc)
+    assert long_trade.retrieved_at_utc == NOW
+    assert short_trade.side is m.PositionSide.SHORT
+    assert short_trade.quantity == Decimal("1")
+
+
+def test_get_open_trades_empty_account_returns_an_empty_tuple():
+    adapter, _ = make_adapter((200, {"trades": []}))
+    assert adapter.get_open_trades() == ()
+
+
+def test_get_open_trades_malformed_responses_are_communication_errors():
+    for scripted in (
+        (200, {}),
+        (200, {"trades": ["not-an-object"]}),
+        (200, {"trades": [{"instrument": "USD_JPY", "currentUnits": "1"}]}),
+        (200, {"trades": [{"id": "T-1", "instrument": "USD_JPY", "currentUnits": "0"}]}),
+        (500, {}),
+    ):
+        adapter, _ = make_adapter(scripted)
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_open_trades()
+
+
+def test_get_open_trades_auth_and_rate_limit_translate_like_other_reads():
+    adapter, _ = make_adapter((401, {}))
+    with pytest.raises(m.BrokerAuthenticationError):
+        adapter.get_open_trades()
+    adapter, _ = make_adapter((429, {}))
+    with pytest.raises(m.BrokerRateLimitError):
+        adapter.get_open_trades()
+    adapter, _ = make_adapter((404, {"errorMessage": "account not found"}))
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.get_open_trades()
 
 
 # --- timestamp parsing ----------------------------------------------------------

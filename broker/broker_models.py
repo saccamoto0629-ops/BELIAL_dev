@@ -668,6 +668,36 @@ class PositionInfo:
 
 
 @dataclass(frozen=True)
+class TradeInfo:
+    """One broker-side OPEN TRADE snapshot (broker-agnostic, Issue #79).
+
+    A trade is one opened exposure unit as the broker tracks it;
+    ``PositionInfo`` is the per-symbol / per-side AGGREGATE. Both views stay
+    separate vocabularies — adapters may expose either without merging them.
+    ``opened_at_utc`` is the broker-reported open time, ``retrieved_at_utc``
+    is when the adapter observed the snapshot.
+    """
+
+    trade_id: str
+    symbol: str
+    side: PositionSide
+    quantity: Decimal
+    open_price: Decimal
+    opened_at_utc: datetime
+    retrieved_at_utc: datetime
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.trade_id, "trade_id")
+        _require_non_empty_str(self.symbol, "symbol")
+        if not isinstance(self.side, PositionSide):
+            raise BrokerInvalidRequestError(f"side must be a PositionSide, got {self.side!r}")
+        _require_positive_decimal(self.quantity, "quantity")
+        _require_positive_decimal(self.open_price, "open_price")
+        _require_utc(self.opened_at_utc, "opened_at_utc")
+        _require_utc(self.retrieved_at_utc, "retrieved_at_utc")
+
+
+@dataclass(frozen=True)
 class AccountState:
     """Broker account snapshot (broker-agnostic, minimal)."""
 

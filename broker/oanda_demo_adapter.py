@@ -27,14 +27,23 @@ Responsibility boundary (Issue #79 / Issues #73–#78):
   after exactly one attempt and the outcome stays UNKNOWN until a later
   query resolves it (Issue #74 contract).
 
-Secrets (Issue #79):
+Secrets (Issue #79 / PR #101 review):
 
 - API token / account id / endpoint come from environment variables only
   (``OandaDemoConfig.from_env``). The adapter performs NO logging, its
   exception messages are built from static text plus short broker-supplied
-  reason strings, and transport-level exceptions are re-raised ``from None``
-  so URL/header-bearing library errors never leak into tracebacks.
-  ``OandaDemoConfig`` excludes the token and account id from ``repr()``.
+  reason strings — with the token / account id values SCRUBBED out of any
+  broker-echoed text — and transport-level exceptions are re-raised
+  ``from None`` so URL/header-bearing library errors never leak into
+  tracebacks. ``OandaDemoConfig`` excludes token, account id AND endpoint
+  from ``repr()``. Nothing secret crosses the boundary either:
+  ``connection_identity().target`` is the constant label ``"oanda-demo"``
+  (never the URL) and ``AccountState.account_id`` carries a MASKED account
+  identifier (the response id is verified against the configured one, then
+  masked before it leaves the adapter).
+- Redirects are never followed (``allow_redirects=False``): a 3xx answer
+  cannot pull the connection off the demo endpoint and is converted to a
+  common error instead (fail-closed).
 
 Error translation (everything crossing the boundary is a common type):
 
@@ -56,7 +65,9 @@ Error translation (everything crossing the boundary is a common type):
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -81,6 +92,7 @@ from .broker_models import (
     OrderType,
     PositionInfo,
     PositionSide,
+    TradeInfo,
     weighted_average_price,
 )
 
@@ -89,6 +101,22 @@ from .broker_models import (
 # Issue #79).
 OANDA_DEMO_API_URL = "https://api-fxpractice.oanda.com"
 _OANDA_LIVE_HOST_MARKER = "fxtrade"
+
+# The connection-identity target label (Issue #75 contract). A constant,
+# NON-SECRET label — never the endpoint URL — so nothing configured via
+# environment variables crosses into the execution layer (PR #101 review).
+OANDA_DEMO_CONNECTION_TARGET = "oanda-demo"
+
+# client_order_id charset accepted by this adapter (PR #101 review): the id
+# is embedded in URL paths as the "@<id>" order specifier, so it is
+# restricted to unreserved URL characters up to 128 chars. The execution
+# layer generates ids well inside this alphabet.
+_CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# OANDA's definitive duplicate-id rejection. The Broker boundary contract
+# (Issue #73 / FakeBroker) models a duplicate client_order_id as
+# ``BrokerInvalidRequestError``, not as an ordinary REJECTED result.
+_OANDA_DUPLICATE_ID_REASON = "CLIENT_ORDER_ID_ALREADY_EXISTS"
 
 # Environment variable names (values are read from the process environment
 # only; never hard-code or log the values — docs/operations/operations.md).
@@ -147,6 +175,10 @@ def _requests_transport(
             headers=dict(headers),
             data=body.encode("utf-8") if body is not None else None,
             timeout=timeout_seconds,
+            # Fail-closed (PR #101 review): a redirect must never pull the
+            # connection off the demo endpoint. 3xx answers are returned
+            # as-is and converted to a common error by the adapter.
+            allow_redirects=False,
         )
     except requests.exceptions.Timeout:
         raise TransportTimeoutError("HTTP request to the OANDA demo endpoint timed out") from None
@@ -181,7 +213,9 @@ class OandaDemoConfig:
 
     api_token: str = field(repr=False)
     account_id: str = field(repr=False)
-    endpoint: str = OANDA_DEMO_API_URL
+    # The endpoint is environment-managed like the credentials (Issue #79);
+    # it is excluded from repr() as well (PR #101 review).
+    endpoint: str = field(default=OANDA_DEMO_API_URL, repr=False)
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
@@ -206,11 +240,21 @@ class OandaDemoConfig:
         if (
             isinstance(self.timeout_seconds, bool)
             or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
             or not self.timeout_seconds > 0
         ):
             raise ValueError(
-                f"timeout_seconds must be a positive number, got {self.timeout_seconds!r}"
+                f"timeout_seconds must be a positive finite number, got {self.timeout_seconds!r}"
             )
+
+    def masked_account_id(self) -> str:
+        """A display-safe account identifier: the real id never crosses the
+        adapter boundary (PR #101 review). Long ids keep a short prefix and
+        suffix for recognisability; short ids are fully masked."""
+        value = self.account_id
+        if len(value) <= 8:
+            return "***"
+        return f"{value[:3]}***{value[-3:]}"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "OandaDemoConfig":
@@ -341,9 +385,11 @@ class OandaDemoAdapter:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         # Immutable identity derived from the construction-time config
         # (Issue #75): the mode is ALWAYS "demo" — the config cannot hold
-        # anything but the demo endpoint in the first place.
+        # anything but the demo endpoint in the first place. The target is
+        # the constant, non-secret label (PR #101 review: the URL is
+        # environment-managed and must not cross into the execution layer).
         self._connection_identity = BrokerConnectionIdentity(
-            mode="demo", target=config.endpoint
+            mode="demo", target=OANDA_DEMO_CONNECTION_TARGET
         )
 
     # --- Broker interface -----------------------------------------------------
@@ -357,6 +403,7 @@ class OandaDemoAdapter:
         """
         if not isinstance(request, OrderRequest):
             raise BrokerInvalidRequestError(f"request must be an OrderRequest, got {request!r}")
+        self._require_client_order_id(request.client_order_id)
         units = request.quantity if request.side is OrderSide.BUY else -request.quantity
         order: dict = {
             "type": request.order_type.value.upper(),
@@ -385,13 +432,30 @@ class OandaDemoAdapter:
         if status in (400, 404):
             reject = payload.get("orderRejectTransaction")
             if isinstance(reject, Mapping):
-                # A definitive business rejection is a RESULT, not an
-                # exception (Issue #73 error style).
                 reason = (
                     _short_reason(reject, "rejectReason")
                     or _short_reason(payload, "errorMessage")
                     or "rejected by broker"
                 )
+                reason = self._redact(reason)
+                # A duplicate client_order_id is a boundary-contract error
+                # (Issue #73 / FakeBroker parity), not an ordinary broker
+                # rejection (PR #101 review).
+                if _OANDA_DUPLICATE_ID_REASON in reason:
+                    raise BrokerInvalidRequestError(
+                        f"duplicate client_order_id {request.client_order_id!r}",
+                        client_order_id=request.client_order_id,
+                    )
+                # The reject transaction may echo the client extensions; if
+                # it does, it must echo OURS (response correlation).
+                self._verify_client_correlation(
+                    self._client_extension_id(reject),
+                    request.client_order_id,
+                    required=False,
+                    context="orderRejectTransaction",
+                )
+                # A definitive business rejection is a RESULT, not an
+                # exception (Issue #73 error style).
                 return self._result_from_request(
                     request, state=OrderState.REJECTED, reject_reason=reason
                 )
@@ -409,28 +473,72 @@ class OandaDemoAdapter:
         fill_tx = payload.get("orderFillTransaction")
         cancel_tx = payload.get("orderCancelTransaction")
         create_tx = payload.get("orderCreateTransaction")
+        reissue_reject_tx = payload.get("orderReissueRejectTransaction")
         if isinstance(fill_tx, Mapping):
+            # The fill transaction must be correlated to OUR order before it
+            # may be bound to this client_order_id (PR #101 review).
+            self._verify_client_correlation(
+                fill_tx.get("clientOrderID"),
+                request.client_order_id,
+                required=True,
+                context="orderFillTransaction",
+            )
             broker_order_id = self._tx_order_id(fill_tx, create_tx)
+            filled_quantity = abs(
+                _parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")
+            )
+            # Partial fills (PR #101 review): the response may fill less
+            # than the requested quantity. If the remainder was cancelled or
+            # its reissue was rejected the order is done (CANCELLED with the
+            # partial fills kept); otherwise it is still working
+            # (PARTIALLY_FILLED). An orderReissueTransaction alone means the
+            # remainder keeps working, which is also PARTIALLY_FILLED. A
+            # zero or over-requested fill quantity is a malformed response,
+            # detected BEFORE any model construction.
+            if filled_quantity == request.quantity:
+                state = OrderState.FILLED
+            elif 0 < filled_quantity < request.quantity:
+                remainder_done = isinstance(cancel_tx, Mapping) or isinstance(
+                    reissue_reject_tx, Mapping
+                )
+                state = OrderState.CANCELLED if remainder_done else OrderState.PARTIALLY_FILLED
+            else:
+                raise BrokerCommunicationError(
+                    "broker fill quantity is inconsistent with the requested quantity",
+                    client_order_id=request.client_order_id,
+                )
             fill = Fill(
                 fill_id=self._tx_id(fill_tx, "orderFillTransaction.id"),
                 price=_parse_decimal(fill_tx.get("price"), "orderFillTransaction.price"),
-                quantity=abs(_parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")),
+                quantity=filled_quantity,
                 filled_at_utc=_parse_utc_time(fill_tx.get("time"), "orderFillTransaction.time"),
             )
             return self._result_from_request(
                 request,
-                state=OrderState.FILLED,
+                state=state,
                 broker_order_id=broker_order_id,
                 fills=(fill,),
             )
         if isinstance(cancel_tx, Mapping):
             # e.g. a FOK market order the demo book could not fill in full.
+            self._verify_client_correlation(
+                cancel_tx.get("clientOrderID"),
+                request.client_order_id,
+                required=True,
+                context="orderCancelTransaction",
+            )
             return self._result_from_request(
                 request,
                 state=OrderState.CANCELLED,
                 broker_order_id=self._tx_order_id(cancel_tx, create_tx),
             )
         if isinstance(create_tx, Mapping):
+            self._verify_client_correlation(
+                self._client_extension_id(create_tx),
+                request.client_order_id,
+                required=True,
+                context="orderCreateTransaction",
+            )
             return self._result_from_request(
                 request,
                 state=OrderState.ACCEPTED,
@@ -465,9 +573,11 @@ class OandaDemoAdapter:
                     f"no order under client_order_id {client_order_id!r}",
                     client_order_id=client_order_id,
                 ) from None
+            reason = _short_reason(payload, "errorMessage")
             reason = (
-                _short_reason(payload, "errorMessage")
-                or f"order is not cancellable (state {current.state.value!r})"
+                self._redact(reason)
+                if reason
+                else f"order is not cancellable (state {current.state.value!r})"
             )
             raise BrokerCancellationError(reason, client_order_id=client_order_id)
         if status != 200:
@@ -562,11 +672,18 @@ class OandaDemoAdapter:
         account_id = account.get("id")
         if not isinstance(account_id, str) or not account_id.strip():
             raise BrokerCommunicationError("broker account object carries no id")
+        if account_id != self._config.account_id:
+            # Correlation check, statically worded (neither id is echoed).
+            raise BrokerCommunicationError(
+                "broker response describes a different account than configured"
+            )
         currency = account.get("currency")
         if not isinstance(currency, str) or not currency.strip():
             raise BrokerCommunicationError("broker account object carries no currency")
         return AccountState(
-            account_id=account_id,
+            # The REAL account id never leaves the adapter (PR #101 review):
+            # AccountState reprs plainly, so it carries the masked form.
+            account_id=self._config.masked_account_id(),
             currency=currency,
             balance=_parse_decimal(account.get("balance"), "account.balance"),
             equity=_parse_decimal(account.get("NAV"), "account.NAV"),
@@ -582,6 +699,52 @@ class OandaDemoAdapter:
         """The immutable identity derived from the construction-time config
         (Issue #75): always mode ``"demo"`` with the demo endpoint as target."""
         return self._connection_identity
+
+    def get_open_trades(self) -> tuple[TradeInfo, ...]:
+        """Return the open trades of the demo account as common models
+        (Issue #79 scope: open trade query; adapter extra beyond the
+        Issue #73 five-operation Protocol, like ``get_tradable_instruments``)."""
+        status, payload = self._request(
+            "GET", f"/v3/accounts/{self._config.account_id}/openTrades"
+        )
+        if status != 200:
+            raise BrokerCommunicationError(
+                self._message(f"open-trade lookup failed with HTTP status {status}", payload)
+            )
+        raw_trades = payload.get("trades")
+        if not isinstance(raw_trades, list):
+            raise BrokerCommunicationError("broker response carried no trades list")
+        retrieved_at = self._now()
+        trades: list[TradeInfo] = []
+        for entry in raw_trades:
+            if not isinstance(entry, Mapping):
+                raise BrokerCommunicationError("broker trades entry is not an object")
+            trade_id = entry.get("id")
+            if not isinstance(trade_id, str) or not trade_id.strip():
+                raise BrokerCommunicationError("broker trades entry carries no id")
+            instrument = entry.get("instrument")
+            if not isinstance(instrument, str) or not instrument.strip():
+                raise BrokerCommunicationError("broker trades entry carries no instrument")
+            units = _parse_decimal(entry.get("currentUnits"), "trade.currentUnits")
+            if units == 0:
+                raise BrokerCommunicationError("broker open trade carries zero units")
+            try:
+                trades.append(
+                    TradeInfo(
+                        trade_id=trade_id,
+                        symbol=instrument,
+                        side=PositionSide.LONG if units > 0 else PositionSide.SHORT,
+                        quantity=abs(units),
+                        open_price=_parse_decimal(entry.get("price"), "trade.price"),
+                        opened_at_utc=_parse_utc_time(entry.get("openTime"), "trade.openTime"),
+                        retrieved_at_utc=retrieved_at,
+                    )
+                )
+            except ValueError as exc:
+                raise BrokerCommunicationError(
+                    self._redact(f"broker trade violated common-model invariants: {exc}")
+                ) from None
+        return tuple(trades)
 
     def get_tradable_instruments(self) -> tuple[str, ...]:
         """Return the instrument names tradable on the demo account (sorted).
@@ -669,6 +832,22 @@ class OandaDemoAdapter:
                 client_order_id=client_order_id,
             ) from None
 
+        if 300 <= status < 400:
+            # Redirects are never followed (allow_redirects=False in the
+            # default transport): following one could carry the Authorization
+            # header off the demo endpoint (PR #101 review, fail-closed).
+            if outcome_unknown_on_ambiguity:
+                raise BrokerTimeoutError(
+                    f"the OANDA demo endpoint answered with a redirect (HTTP {status}); "
+                    "redirects are never followed (demo-only fail-closed) and the "
+                    "outcome is unknown — resolve by a later query, never by resending",
+                    client_order_id=client_order_id,
+                )
+            raise BrokerCommunicationError(
+                f"the OANDA demo endpoint answered with a redirect (HTTP {status}); "
+                "redirects are never followed (demo-only fail-closed)",
+                client_order_id=client_order_id,
+            )
         if status in (401, 403):
             raise BrokerAuthenticationError(
                 f"the OANDA demo endpoint rejected the credentials (HTTP {status})",
@@ -726,20 +905,65 @@ class OandaDemoAdapter:
 
     @staticmethod
     def _require_client_order_id(client_order_id) -> None:
-        if not isinstance(client_order_id, str) or not client_order_id.strip():
+        # The id is embedded in URL paths ("@<id>" specifier), so beyond
+        # non-emptiness it must stay inside unreserved URL characters and a
+        # bounded length (PR #101 review) — otherwise query/cancel could not
+        # resolve an already-submitted order.
+        if not isinstance(client_order_id, str) or not _CLIENT_ORDER_ID_RE.fullmatch(
+            client_order_id
+        ):
             raise BrokerInvalidRequestError(
-                f"client_order_id must be a non-empty string, got {client_order_id!r}"
+                "client_order_id must be 1-128 characters of [A-Za-z0-9._-] "
+                f"(URL-safe, starting with a letter or digit), got {client_order_id!r}"
             )
 
     @staticmethod
     def _order_specifier(client_order_id: str) -> str:
-        # "@<id>" is OANDA's client-order-id specifier form.
+        # "@<id>" is OANDA's client-order-id specifier form. The id has been
+        # validated against _CLIENT_ORDER_ID_RE, so it is URL-path-safe as-is.
         return f"@{client_order_id}"
 
-    @staticmethod
-    def _message(prefix: str, payload: Mapping) -> str:
+    def _redact(self, text: str) -> str:
+        """Scrub the secret values out of broker-echoed text before it can
+        reach an exception message or a returned reject_reason (PR #101
+        review: the broker may reflect request values back)."""
+        for secret in (self._config.api_token, self._config.account_id):
+            if secret:
+                text = text.replace(secret, "***")
+        return text
+
+    def _message(self, prefix: str, payload: Mapping) -> str:
         reason = _short_reason(payload, "errorMessage", "rejectReason")
-        return f"{prefix}: {reason}" if reason else prefix
+        return f"{prefix}: {self._redact(reason)}" if reason else prefix
+
+    @staticmethod
+    def _client_extension_id(tx: Mapping):
+        extensions = tx.get("clientExtensions")
+        if isinstance(extensions, Mapping):
+            return extensions.get("id")
+        return None
+
+    def _verify_client_correlation(
+        self, echoed, client_order_id: str, *, required: bool, context: str
+    ) -> None:
+        """The broker's echo of the client identifier must match the request
+        before a response may be bound to this ``client_order_id`` (PR #101
+        review): a missing (where required) or different echo means the
+        response cannot be trusted to describe OUR order."""
+        if echoed is None:
+            if required:
+                raise BrokerCommunicationError(
+                    f"broker response ({context}) did not echo the client order "
+                    "identifier; refusing to bind the response to this order",
+                    client_order_id=client_order_id,
+                )
+            return
+        if echoed != client_order_id:
+            raise BrokerCommunicationError(
+                f"broker response ({context}) echoed a different client order "
+                "identifier; refusing to bind the response to this order",
+                client_order_id=client_order_id,
+            )
 
     @staticmethod
     def _tx_id(tx: Mapping, field_name: str) -> str:
@@ -769,37 +993,65 @@ class OandaDemoAdapter:
         reject_reason: str | None = None,
     ) -> OrderResult:
         filled = sum((f.quantity for f in fills), Decimal(0))
-        return OrderResult(
-            client_order_id=request.client_order_id,
-            broker_order_id=broker_order_id,
-            state=state,
-            symbol=request.symbol,
-            side=request.side,
-            order_type=request.order_type,
-            requested_quantity=request.quantity,
-            filled_quantity=filled,
-            remaining_quantity=request.quantity - filled,
-            requested_price=request.limit_price
-            if request.order_type is OrderType.LIMIT
-            else None,
-            average_fill_price=weighted_average_price(fills),
-            updated_at_utc=self._now(),
-            fills=fills,
-            reject_reason=reject_reason,
-        )
+        try:
+            return OrderResult(
+                client_order_id=request.client_order_id,
+                broker_order_id=broker_order_id,
+                state=state,
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                requested_quantity=request.quantity,
+                filled_quantity=filled,
+                remaining_quantity=request.quantity - filled,
+                requested_price=request.limit_price
+                if request.order_type is OrderType.LIMIT
+                else None,
+                average_fill_price=weighted_average_price(fills),
+                updated_at_utc=self._now(),
+                fills=fills,
+                reject_reason=reject_reason,
+            )
+        except ValueError as exc:
+            # A broker answer inconsistent with the common-model invariants
+            # must cross the boundary as a common BrokerError, never as a
+            # naked ValueError (PR #101 review).
+            raise BrokerCommunicationError(
+                self._redact(f"broker response violated common-model invariants: {exc}"),
+                client_order_id=request.client_order_id,
+            ) from None
 
     def _result_from_order(self, order: Mapping, client_order_id: str) -> OrderResult:
         """Translate an OANDA order object (GET orders/@id) into the common
-        ``OrderResult``, fetching the filling transaction for fill details."""
+        ``OrderResult``, fetching the filling transaction for fill details.
+
+        The order's echoed client extension id is verified against the
+        queried ``client_order_id`` first: a missing or different echo is a
+        broken response correlation (PR #101 review)."""
+        self._verify_client_correlation(
+            self._client_extension_id(order),
+            client_order_id,
+            required=True,
+            context="order.clientExtensions",
+        )
+        # A broker-side answer with an unexpected shape is a RESPONSE
+        # problem (communication failure), not a caller mistake (PR #101
+        # review): this adapter only ever creates MARKET/LIMIT orders.
         oanda_type = order.get("type")
         if oanda_type == "MARKET":
             order_type = OrderType.MARKET
         elif oanda_type == "LIMIT":
             order_type = OrderType.LIMIT
         else:
-            raise BrokerInvalidRequestError(
-                f"order under client_order_id {client_order_id!r} has an unsupported "
-                f"type {oanda_type!r} (this adapter handles MARKET/LIMIT only)",
+            raise BrokerCommunicationError(
+                f"broker order object carries an unsupported type {oanda_type!r} "
+                "(this adapter handles MARKET/LIMIT only)",
+                client_order_id=client_order_id,
+            )
+        instrument = order.get("instrument")
+        if not isinstance(instrument, str) or not instrument.strip():
+            raise BrokerCommunicationError(
+                "broker order object carries no instrument",
                 client_order_id=client_order_id,
             )
         units = _parse_decimal(order.get("units"), "order.units")
@@ -831,21 +1083,27 @@ class OandaDemoAdapter:
                 client_order_id=client_order_id,
             )
         filled = sum((f.quantity for f in fills), Decimal(0))
-        return OrderResult(
-            client_order_id=client_order_id,
-            broker_order_id=broker_order_id,
-            state=state,
-            symbol=str(order.get("instrument")),
-            side=side,
-            order_type=order_type,
-            requested_quantity=quantity,
-            filled_quantity=filled,
-            remaining_quantity=quantity - filled,
-            requested_price=requested_price,
-            average_fill_price=weighted_average_price(fills),
-            updated_at_utc=self._now(),
-            fills=fills,
-        )
+        try:
+            return OrderResult(
+                client_order_id=client_order_id,
+                broker_order_id=broker_order_id,
+                state=state,
+                symbol=instrument,
+                side=side,
+                order_type=order_type,
+                requested_quantity=quantity,
+                filled_quantity=filled,
+                remaining_quantity=quantity - filled,
+                requested_price=requested_price,
+                average_fill_price=weighted_average_price(fills),
+                updated_at_utc=self._now(),
+                fills=fills,
+            )
+        except ValueError as exc:
+            raise BrokerCommunicationError(
+                self._redact(f"broker response violated common-model invariants: {exc}"),
+                client_order_id=client_order_id,
+            ) from None
 
     def _fetch_fill(self, order: Mapping, client_order_id: str) -> Fill:
         """Fetch the ORDER_FILL transaction referenced by a FILLED order to

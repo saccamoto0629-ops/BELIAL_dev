@@ -83,6 +83,8 @@ def test_demo_account_state_can_be_fetched(adapter):
     assert isinstance(state, m.AccountState)
     assert state.currency
     assert state.retrieved_at_utc.tzinfo is not None
+    # the real account id never crosses the boundary (PR #101 review)
+    assert os.environ[oa.ENV_ACCOUNT_ID] not in state.account_id
 
 
 def test_demo_tradable_instruments_include_the_test_instrument(adapter):
@@ -94,30 +96,43 @@ def test_demo_market_order_lifecycle_submit_query_positions_flatten(adapter):
     client_order_id = _new_client_order_id()
     result = adapter.submit_order(make_request(client_order_id))
     # A 1-unit FOK market order on a major pair fills immediately on demo.
-    assert result.state is m.OrderState.FILLED
-    assert result.client_order_id == client_order_id
-    assert result.broker_order_id
-    assert result.filled_quantity == Decimal("1")
-    assert result.fills and result.average_fill_price is not None
+    # Whatever got filled is flattened again in the finally block, even when
+    # an assertion in between fails (PR #101 review). NOTE: the opposite
+    # MARKET order nets the exposure on a NETTING demo account; on a hedging
+    # demo account it opens an opposing trade instead — use a netting
+    # (default) demo account for this suite.
+    try:
+        assert result.state is m.OrderState.FILLED
+        assert result.client_order_id == client_order_id
+        assert result.broker_order_id
+        assert result.filled_quantity == Decimal("1")
+        assert result.fills and result.average_fill_price is not None
 
-    # Query the order back through the client-side identifier.
-    queried = adapter.get_order(client_order_id)
-    assert queried.state is m.OrderState.FILLED
-    assert queried.broker_order_id == result.broker_order_id
+        # Query the order back through the client-side identifier.
+        queried = adapter.get_order(client_order_id)
+        assert queried.state is m.OrderState.FILLED
+        assert queried.broker_order_id == result.broker_order_id
 
-    # The fill must be visible as an open position.
-    positions = adapter.get_positions()
-    assert any(p.symbol == INSTRUMENT for p in positions)
+        # The fill must be visible as an open position and as an open trade.
+        positions = adapter.get_positions()
+        assert any(p.symbol == INSTRUMENT for p in positions)
+        trades = adapter.get_open_trades()
+        assert any(t.symbol == INSTRUMENT for t in trades)
 
-    # A filled order can no longer be cancelled (common taxonomy, not OANDA).
-    with pytest.raises(m.BrokerCancellationError):
-        adapter.cancel_order(client_order_id)
-
-    # Flatten the exposure again (opposite market order).
-    flatten = adapter.submit_order(
-        make_request(_new_client_order_id(), side=m.OrderSide.SELL)
-    )
-    assert flatten.state is m.OrderState.FILLED
+        # A filled order can no longer be cancelled (common taxonomy, not OANDA).
+        with pytest.raises(m.BrokerCancellationError):
+            adapter.cancel_order(client_order_id)
+    finally:
+        if result.filled_quantity > 0:
+            flatten = adapter.submit_order(
+                make_request(
+                    _new_client_order_id(),
+                    side=m.OrderSide.SELL
+                    if result.side is m.OrderSide.BUY
+                    else m.OrderSide.BUY,
+                )
+            )
+            assert flatten.state is m.OrderState.FILLED
 
 
 def test_demo_limit_order_can_be_queried_and_cancelled(adapter):
@@ -129,15 +144,18 @@ def test_demo_limit_order_can_be_queried_and_cancelled(adapter):
             limit_price=SAFE_LIMIT_PRICE,
         )
     )
-    assert submitted.state is m.OrderState.ACCEPTED
-    assert submitted.broker_order_id
+    try:
+        assert submitted.state is m.OrderState.ACCEPTED
+        assert submitted.broker_order_id
 
-    queried = adapter.get_order(client_order_id)
-    assert queried.state is m.OrderState.ACCEPTED
-    assert queried.requested_price == SAFE_LIMIT_PRICE
-
-    cancelled = adapter.cancel_order(client_order_id)
-    assert cancelled.state is m.OrderState.CANCELLED
+        queried = adapter.get_order(client_order_id)
+        assert queried.state is m.OrderState.ACCEPTED
+        assert queried.requested_price == SAFE_LIMIT_PRICE
+    finally:
+        # cancel runs even when an assertion above fails, so no pending
+        # order is left behind on the demo account (PR #101 review)
+        cancelled = adapter.cancel_order(client_order_id)
+        assert cancelled.state is m.OrderState.CANCELLED
     assert adapter.get_order(client_order_id).state is m.OrderState.CANCELLED
 
 
