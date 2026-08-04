@@ -156,6 +156,24 @@ def test_timeout_and_communication_failure_are_different_codes():
     assert m.BrokerErrorCode.TIMEOUT is not m.BrokerErrorCode.COMMUNICATION_FAILURE
 
 
+def test_authentication_and_rate_limit_errors_join_the_taxonomy():
+    # Issue #79: real-endpoint failure categories, still broker-agnostic.
+    codes = {
+        m.BrokerTimeoutError("x").code,
+        m.BrokerCommunicationError("x").code,
+        m.BrokerCancellationError("x").code,
+        m.BrokerInvalidRequestError("x").code,
+        m.BrokerOrderNotFoundError("x").code,
+        m.BrokerAuthenticationError("x").code,
+        m.BrokerRateLimitError("x").code,
+    }
+    assert len(codes) == 7
+    assert m.BrokerAuthenticationError("x").code is m.BrokerErrorCode.AUTHENTICATION_FAILURE
+    assert m.BrokerRateLimitError("x").code is m.BrokerErrorCode.RATE_LIMITED
+    assert isinstance(m.BrokerAuthenticationError("x", client_order_id="c-1"), m.BrokerError)
+    assert m.BrokerRateLimitError("x").client_order_id is None
+
+
 # --- OrderRequest validation ------------------------------------------------
 
 def test_order_request_accepts_a_valid_limit_order():

@@ -13,7 +13,7 @@ from broker.fake_broker import FakeBroker
 > - Broker interface / FakeBroker は**将来の Live Execution 用の基盤(境界の定義)**である。
 > - FakeBroker は**外部通信しないテストダブル**である。ネットワーク・実DB・Discord・S3・sleep・乱数を使わない。
 > - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、本境界を使わない・使わせない。
-> - **実発注・OANDA Adapter・Live Execution runner は未実装**である。FakeBroker が存在しても Live Execution が実装済みになったわけではない。発注前の Safety Gate は Issue #75 で `execution/` に実装済み([Safety Gate](safety_gate.md))だが、Broker 実装からは独立した検証部品であり、本境界には何も追加しない。
+> - **OANDA Demo Adapter は Issue #79 で実装済み**(下記「OANDA Demo Adapter」節)。ただし **Live 口座接続・Live Execution runner・Execution 層への組み込み(`BROKER_TYPE_BY_MODE` への `demo` 登録)は未実装**であり、FakeBroker / Demo Adapter が存在しても Live Execution が実装済みになったわけではない。発注前の Safety Gate は Issue #75 で `execution/` に実装済み([Safety Gate](safety_gate.md))だが、Broker 実装からは独立した検証部品であり、本境界には何も追加しない。
 
 ## 依存方向
 
@@ -26,11 +26,11 @@ Broker interface / 共通モデル   ← broker/broker_interface.py, broker/brok
     ↑
 FakeBroker                      ← broker/fake_broker.py(テストダブル)
     ↑
-(将来の) OANDA Adapter          ← 未実装
+OANDA Demo Adapter              ← broker/oanda_demo_adapter.py(Issue #79。Demo 専用)
 ```
 
-- Strategy / Paper Signal / Paper Execution から FakeBroker・将来の OANDA 実装を**直接 import しない**(`broker/tests/test_broker_interface.py` が回帰として固定)。
-- FakeBroker と将来の Adapter は Broker interface に依存する。逆方向の依存はない。
+- Strategy / Paper Signal / Paper Execution から FakeBroker・OANDA Demo Adapter を**直接 import しない**(`broker/tests/test_broker_interface.py` が回帰として固定)。
+- FakeBroker と OANDA Demo Adapter は Broker interface / 共通モデルに依存する。逆方向の依存はない。
 - 「(将来の) Execution use case」のうち、ExecutionRequest(BELIAL 内部の発注意図)と注文状態の永続化基盤は Issue #74 で `execution/` に実装済み([Execution Request / Order Persistence](execution_request.md))。依存は `execution → broker` の一方向のみで、本パッケージは `execution/` を知らない。
 
 ## Broker interface(`broker_interface.py`)
@@ -57,7 +57,8 @@ FakeBroker                      ← broker/fake_broker.py(テストダブル)
 - `OrderResult` — 注文スナップショット。`requested_quantity` / `filled_quantity` / `remaining_quantity`(= requested − filled を検証)、`requested_price` と `average_fill_price` / `fills`(約定明細)を**別々に保持**し、約定価格の乖離(`price_deviation`)をテストで比較できる。構築時のクロスフィールド検証(`ValueError`): LIMIT は `requested_price` 必須・MARKET は `None` 必須、`pending`(Broker 未確認)は `broker_order_id` 禁止、`fill_id` は snapshot 内で一意(重複 fill による同一約定の二重計上を構築時に拒否。更新時も追加 fill の ID 重複を検証)。
 - `Fill` — 約定明細(fill_id / price / quantity / filled_at_utc)。
 - `PositionInfo` / `AccountState` — Broker 側スナップショット。
-- Broker 固有フィールドは共通モデルへ**漏らさない**。Broker 固有レスポンス → 共通モデルの変換は将来の Adapter 内部で完結させる。
+- Broker 固有フィールドは共通モデルへ**漏らさない**。Broker 固有レスポンス → 共通モデルの変換は Adapter 内部で完結させる(OANDA Demo Adapter は Issue #79 でこの契約に従って実装済み)。
+- エラー分類には Issue #79 で実 endpoint 由来の 2 分類が追加された: `BrokerAuthenticationError`(`authentication_failure`)/ `BrokerRateLimitError`(`rate_limited`)。いずれも Broker 非依存の分類であり、HTTP status やベンダー固有 payload は Adapter 内で変換してから境界を越える。
 
 ### 注文状態(`OrderState`)
 
@@ -111,13 +112,19 @@ broker.set_positions([...]); broker.set_account_state(...)              # 照会
 - Paper Execution は保存済み Paper Signal を入力とする独立した仮想執行レイヤーであり、**本境界の追加による変更は一切ない**(FakeBroker への置き換え、Position Store の Broker 照会化、Signal→Broker 直接呼び出しはすべて禁止)。
 - Paper Execution の仮想約定モデル(`position_models.py`: long/short・pending/open/closed/...)と本境界の注文モデル(buy/sell・accepted/filled/...)は**別ドメインの語彙**であり統合しない。
 
-## 将来の OANDA Adapter の拡張点
+## OANDA Demo Adapter(`oanda_demo_adapter.py`、Issue #79)
 
-1. `broker/` 配下(または独立コンポーネント)に Adapter モジュールを追加し、`Broker` Protocol を構造的に実装する。
-2. OANDA 固有のレスポンス→ `broker_models` 共通モデルへの変換は Adapter 内部で完結させ、OANDA 固有フィールドを境界の外へ出さない。
-3. HTTP タイムアウト・接続断は `BrokerTimeoutError` / `BrokerCommunicationError` へマッピングし、タイムアウト後の注文状態は `unknown` として扱う(後続照会・照合で解決)。
-4. 実発注に進む場合も認証情報管理・再接続・定期照合は本 Issue の非スコープであり、別 Issue で設計する。発注前の Safety Gate は Issue #75 で `execution/` に実装済みであり、Adapter は Gate のロジックを持たない(送信は `LiveOrderSubmissionService` 経由のみ)。Adapter は自身の**実接続 config に由来する不変の identity** を `connection_identity()`(→ `broker_models.BrokerConnectionIdentity`)で自己申告し、`execution.safety_gate.BROKER_TYPE_BY_MODE` へ型を登録して型付き接続 identity に束縛する(mode / 接続先を接続 config と別に申告する経路は存在しない。[Safety Gate](safety_gate.md))。
+**Demo 専用**の `Broker` Protocol 実装。OANDA v20 REST(fxpractice)と `broker_models` 共通モデルの**変換のみ**を担う translation layer であり、Strategy 判定・Execution 判断・Safety Gate 判定・idempotency 判断・Shadow Mode 判定は一切持ち込まない(それらは既存の execution 層の責務)。
 
-## 非スコープ(Issue #73 時点で未実装)
+- **Demo 限定(fail-closed)**: 接続先は `OANDA_API_URL`(既定 `https://api-fxpractice.oanda.com`)を **allowlist で検証**し、Live host(`fxtrade` を含む)もその他の未知 URL も `OandaDemoConfig` 構築時に `ValueError` で起動拒否する。Live へ到達できる設定は表現不能。
+- **Secrets**: `OANDA_API_TOKEN` / `OANDA_ACCOUNT_ID` / `OANDA_API_URL` は環境変数のみ(`OandaDemoConfig.from_env()`)。token / account id は `repr` から除外。Adapter はログ出力を一切持たず、例外メッセージは静的文言+Broker の短い reason 文字列のみで構成し、URL(account id を含む)や credential を載せない(transport 例外は `from None` で再送出し、URL を含むライブラリ例外を traceback へ漏らさない)。
+- **操作**: 口座情報(`get_account_state`)/ tradable instrument 確認(Protocol 外の追加操作 `get_tradable_instruments()`)/ 成行注文(FOK)・指値注文(GTC)の送信(`submit_order`)/ 注文照会(`get_order`)/ キャンセル(`cancel_order`)/ open position 照会(`get_positions`)/ fill・transaction 結果の取得(FILLED 注文は filling transaction を照会して `Fill` へ変換)。STOP 等の高度な注文種別は非対応(`BrokerInvalidRequestError`)。
+- **client ID 関連付け**: `client_order_id` を OANDA `clientExtensions.id` として送信し、`get_order` / `cancel_order` は OANDA の `@<client id>` 指定子で照会する。`client_order_id` は execution store が `execution_request_id` と 1:1 に束縛するため(Issue #74)、Broker 側の注文・取引記録は Execution Request まで追跡できる。
+- **エラー変換**(共通 taxonomy 以外は境界を越えない): transport timeout → `BrokerTimeoutError`(注文状態 UNKNOWN・**自動再送なし、1 回で送信を打ち切る**)/ 接続確立失敗 → `BrokerCommunicationError` / HTTP 401・403 → `BrokerAuthenticationError` / HTTP 429 → `BrokerRateLimitError`(Adapter は retry しない)/ **submit 後の 5xx・不正 body・分類不能な transport 失敗 → `BrokerTimeoutError`**(サーバは要求を受領し得たため「未発注」へ降格させない。読み取り系の同種失敗は `BrokerCommunicationError`)/ OANDA の注文拒否(`orderRejectTransaction`)→ 例外ではなく `OrderState.REJECTED` + `reject_reason` の `OrderResult` / 不正要求 → `BrokerInvalidRequestError` / 未知の注文指定子 → `BrokerOrderNotFoundError` / キャンセル拒否 → `BrokerCancellationError`(404 は `get_order` で「注文が存在しない」と「terminal でキャンセル不能」を判別)。
+- **connection identity**(Issue #75): `connection_identity()` は構築時 config に由来する不変の `BrokerConnectionIdentity(mode="demo", target=<Demo endpoint>)` を自己申告する。
+- **HTTP transport は注入可能**: 単体テストは fake transport で全変換経路を検証し、ネットワークへ一切出ない(socket 無効化下でも PASS)。実 Demo API を叩くテストは `broker/tests/test_oanda_demo_adapter_demo_api.py` に分離され、`BELIAL_RUN_OANDA_DEMO_API_TESTS=1` + Demo credentials の明示 opt-in でのみ実行される(通常 CI では skip)。
+- **Execution 層への組み込みは未実装**: `execution.safety_gate.BROKER_TYPE_BY_MODE` に `demo` は登録されておらず、`BrokerConnection(broker=OandaDemoAdapter(...))` は構築できない(fail-closed 維持)。登録・runner 対応・定期照合(reconciliation)は Live/統合の別 Issue で設計する。Adapter は Gate のロジックを持たず、送信経路は将来も `LiveOrderSubmissionService` 経由のみ([Safety Gate](safety_gate.md))。
 
-OANDA Demo/Live API 連携、実 HTTP クライアント、実発注、ロット計算、レバレッジ計算、資金管理、Broker との定期照合、再接続ループ、認証情報管理、Discord 通知、Live Execution runner。(Safety Gate は Issue #73 時点では非スコープだったが、その後 Issue #75 で `execution/` に実装済み。)
+## 非スコープ(Issue #79 時点で未実装)
+
+Live 口座接続・Live 用認証情報、`BROKER_TYPE_BY_MODE` への `demo` 登録(Execution 統合)、Live Execution runner、ロット計算、レバレッジ計算、資金管理、Broker との定期照合、再接続ループ、pricing/stream API、Discord 通知。(Safety Gate は Issue #75 で `execution/` に実装済み。)

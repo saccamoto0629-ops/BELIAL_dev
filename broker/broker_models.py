@@ -65,6 +65,11 @@ class BrokerErrorCode(enum.Enum):
     CANCELLATION_FAILURE = "cancellation_failure"
     INVALID_REQUEST = "invalid_request"
     NOT_FOUND = "not_found"
+    # Issue #79: categories a REAL broker endpoint can answer with. They stay
+    # broker-agnostic (HTTP status codes and vendor payloads are adapter
+    # concerns and must be translated before crossing this boundary).
+    AUTHENTICATION_FAILURE = "authentication_failure"
+    RATE_LIMITED = "rate_limited"
 
 
 class BrokerError(Exception):
@@ -109,6 +114,25 @@ class BrokerOrderNotFoundError(BrokerError):
     """No order is known under the given ``client_order_id``."""
 
     code = BrokerErrorCode.NOT_FOUND
+
+
+class BrokerAuthenticationError(BrokerError):
+    """The broker refused the credentials (Issue #79).
+
+    The message must never contain the credential values themselves --
+    adapters raise this with a static description only.
+    """
+
+    code = BrokerErrorCode.AUTHENTICATION_FAILURE
+
+
+class BrokerRateLimitError(BrokerError):
+    """The broker throttled the request (rate limit, Issue #79).
+
+    Retrying is the CALLER's decision; adapters never resend on their own.
+    """
+
+    code = BrokerErrorCode.RATE_LIMITED
 
 
 # --- enums ------------------------------------------------------------------

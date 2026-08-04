@@ -54,7 +54,7 @@ mode の唯一の正は `execution.safety_gate.ExecutionMode`。設定文字列�
 - `dry-run`: 副作用ゼロ(Broker 呼び出し・DB 作成・migration・INSERT/UPDATE・state 更新・Discord いずれもなし。既存 DB は read-only probe のみ)。
 - `shadow`: 実 Signal・実設定・Safety Gate を通常経路で実行し、**Broker へは送信せず**検証記録を保存する(下記)。仮想約定・仮想 Position・仮想 PnL は計算しない(それは Paper Execution の責務)。
 - `fake`: FakeBroker へ送信(`LiveOrderSubmissionService` 経由。既存の注文状態機械・保存を使用)。
-- `demo` / `live`: **mode 定義と validation のみ。未実装**。`BROKER_TYPE_BY_MODE` に Adapter 型が登録されるまで `BrokerConnection` を構築できず、runner は明示的に拒否する。
+- `demo` / `live`: **mode 定義と validation のみ。Execution 層への組み込みは未実装**。OANDA Demo Adapter 自体は Issue #79 で `broker/oanda_demo_adapter.py` に実装済みだが、`BROKER_TYPE_BY_MODE` に Adapter 型が登録されるまで `BrokerConnection` を構築できず、runner は明示的に拒否する(登録は別 Issue)。
 
 ## Shadow Mode(Issue #78 / PR #100)
 

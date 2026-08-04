@@ -5,7 +5,7 @@
 > **重要な位置づけ**
 >
 > - Safety Gate / 送信サービスは**将来の Live Execution 送信経路を安全にする部品のみ**を実装する。
-> - **OANDA Adapter・Live 接続・実発注・Live Execution runner は引き続き未実装**である。現在構築可能な Broker 接続は FakeBroker(`fake` mode)だけであり(下記「型付き接続 identity」)、実発注経路は存在しない。
+> - **Live 接続・実発注・Live Execution runner は引き続き未実装**である。OANDA **Demo** Adapter は Issue #79 で `broker/` に実装済みだが `BROKER_TYPE_BY_MODE` に `demo` は未登録のため、現在構築可能な Broker **接続**は FakeBroker(`fake` mode)だけであり(下記「型付き接続 identity」)、実発注経路は存在しない。
 > - **Paper Execution とは無関係・独立**である。Paper Execution(`paper-execution/`)は Broker 境界に触れない仮想執行レイヤーであり、Safety Gate を通らないし通る必要もない。
 > - Safety Gate は **Strategy からも Broker Adapter からも独立**する: Strategy は安全ポリシーを持たず、Broker 実装は Gate のロジックを持たない。依存は `execution → broker`(境界モデルのみ)の一方向。
 
