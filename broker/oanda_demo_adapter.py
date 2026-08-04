@@ -63,9 +63,11 @@ Error translation (everything crossing the boundary is a common type):
 - malformed / unsupported call -> ``BrokerInvalidRequestError``
 - unknown order specifier      -> ``BrokerOrderNotFoundError``
 - refused cancellation         -> ``BrokerCancellationError``
-- order reissue after partial fill -> ``BrokerTimeoutError`` (deliberately
-  UNSUPPORTED pending Issue #102; the response is not interpreted at all —
-  fail-closed toward UNKNOWN, resolved by a later query)
+- any submit response carrying an order reissue field (2xx / 400 / 404
+  alike, checked BEFORE business interpretation; value type irrelevant)
+  -> ``BrokerTimeoutError`` (deliberately UNSUPPORTED pending Issue #102;
+  the response is not interpreted at all — fail-closed toward UNKNOWN,
+  resolved by a later query)
 """
 
 from __future__ import annotations
@@ -345,6 +347,49 @@ def _parse_decimal(value, field_name: str) -> Decimal:
     )
 
 
+def _redact_secrets(text: str, secrets) -> str:
+    """Interval-based redaction (PR #101 5th review).
+
+    Sequential ``str.replace`` cannot handle secrets that PARTIALLY overlap
+    (e.g. token ``abcdef`` + account ``defghi`` inside ``abcdefghi``: after
+    replacing the token, the account no longer matches and ``ghi`` survives).
+    Instead every match interval of every secret is collected on the
+    ORIGINAL text, overlapping/adjacent intervals are merged, and the text
+    is rewritten in one pass with each merged interval collapsed to ``***``.
+    Empty secrets are ignored; duplicate registrations and repeated
+    occurrences are handled by the interval merge.
+    """
+    unique_secrets = {secret for secret in secrets if secret}
+    intervals: list[tuple[int, int]] = []
+    for secret in unique_secrets:
+        start = 0
+        while True:
+            index = text.find(secret, start)
+            if index == -1:
+                break
+            intervals.append((index, index + len(secret)))
+            # advance by one so overlapping occurrences of the SAME secret
+            # (e.g. "aaa" inside "aaaa") are collected too
+            start = index + 1
+    if not intervals:
+        return text
+    intervals.sort()
+    merged: list[list[int]] = [list(intervals[0])]
+    for begin, end in intervals[1:]:
+        if begin <= merged[-1][1]:  # overlapping or adjacent -> one interval
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([begin, end])
+    pieces: list[str] = []
+    cursor = 0
+    for begin, end in merged:
+        pieces.append(text[cursor:begin])
+        pieces.append("***")
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def _extract_reason(payload: Mapping, *keys: str) -> str | None:
     """Extract the FULL broker reason string (``rejectReason`` /
     ``errorMessage`` style). No truncation here: redaction must see the
@@ -434,6 +479,29 @@ class OandaDemoAdapter:
             outcome_unknown_on_ambiguity=True,
         )
 
+        # Order Reissue check comes BEFORE any business interpretation —
+        # 2xx, 400 and 404 alike (PR #101 5th review): a reject/fill/cancel
+        # transaction sharing the body with a reissue field must not be
+        # confirmed as REJECTED / FILLED / PARTIALLY_FILLED / CANCELLED.
+        # KEY PRESENCE alone triggers the refusal: reissue handling is
+        # deliberately unsupported here (Issue #102 owns it across the state
+        # machine / audit / query / cancel paths), and a reissue field whose
+        # value is a string, an array, null or a malformed mapping must not
+        # be silently skipped as "absent" either. Fail closed toward UNKNOWN
+        # so the recorded state can never misrepresent a reissued order; a
+        # later query (never a resend) resolves it.
+        if (
+            "orderReissueTransaction" in payload
+            or "orderReissueRejectTransaction" in payload
+        ):
+            raise BrokerTimeoutError(
+                "broker response carries an order reissue field; reissue "
+                "handling is deliberately unsupported by this adapter "
+                "(Issue #102) — the outcome is treated as unknown and is "
+                "resolved by a later query, never by resending",
+                client_order_id=request.client_order_id,
+            )
+
         if status in (400, 404):
             reject = payload.get("orderRejectTransaction")
             if isinstance(reject, Mapping):
@@ -472,27 +540,6 @@ class OandaDemoAdapter:
             raise BrokerTimeoutError(
                 f"unexpected HTTP status {status} after submit; outcome unknown — "
                 "resolve by a later query, never by resending",
-                client_order_id=request.client_order_id,
-            )
-
-        # Order Reissue after a partial fill is DELIBERATELY unsupported here
-        # (Issue #102 owns reissue across the state machine / audit / query /
-        # cancel paths). KEY PRESENCE alone triggers the refusal (PR #101
-        # 4th review): a reissue field whose value is a string, an array, a
-        # malformed mapping or anything else must not be silently skipped as
-        # "absent" — well-formed or not, the response is not interpreted at
-        # all. Fail closed toward UNKNOWN so the recorded state can never
-        # misrepresent a reissued order; a later query (never a resend)
-        # resolves it.
-        if (
-            "orderReissueTransaction" in payload
-            or "orderReissueRejectTransaction" in payload
-        ):
-            raise BrokerTimeoutError(
-                "broker response carries an order reissue field after a "
-                "partial fill; reissue handling is deliberately unsupported by "
-                "this adapter (Issue #102) — the outcome is treated as unknown "
-                "and is resolved by a later query, never by resending",
                 client_order_id=request.client_order_id,
             )
 
@@ -995,25 +1042,18 @@ class OandaDemoAdapter:
         reach an exception message or a returned reject_reason (PR #101
         review: the broker may reflect request values back). The configured
         endpoint is environment-managed like the credentials and is scrubbed
-        too (PR #101 re-review). Secrets are replaced LONGEST FIRST so one
-        secret containing another (or overlapping it) can never leave a
-        recognisable fragment behind (PR #101 4th review)."""
-        secrets = sorted(
+        too (PR #101 re-review). Redaction is INTERVAL-BASED (PR #101 5th
+        review): all match intervals on the original text are merged and
+        replaced in one pass, so partially-overlapping secrets can never
+        leave a fragment behind (see :func:`_redact_secrets`)."""
+        return _redact_secrets(
+            text,
             (
-                value
-                for value in (
-                    self._config.api_token,
-                    self._config.account_id,
-                    self._config.endpoint,
-                )
-                if value
+                self._config.api_token,
+                self._config.account_id,
+                self._config.endpoint,
             ),
-            key=len,
-            reverse=True,
         )
-        for secret in secrets:
-            text = text.replace(secret, "***")
-        return text
 
     def _safe_reason(self, payload: Mapping, *keys: str) -> str | None:
         """Broker free text made safe for exceptions / reject_reason:

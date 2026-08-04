@@ -1051,10 +1051,8 @@ def test_endpoint_straddling_the_truncation_boundary_leaves_no_fragment():
     assert "api-fxpractice" not in text
 
 
-def test_overlapping_secrets_are_scrubbed_longest_first():
-    # The token CONTAINS the account id: replacing the shorter secret first
-    # would break the longer one into surviving fragments. Longest-first
-    # replacement scrubs both completely.
+def test_containing_secrets_are_scrubbed_completely():
+    # The token CONTAINS the account id: both must vanish entirely.
     overlap_token = f"tok-{ACCOUNT}-suffix"
     config = oa.OandaDemoConfig(api_token=overlap_token, account_id=ACCOUNT)
     transport = FakeTransport(
@@ -1067,6 +1065,58 @@ def test_overlapping_secrets_are_scrubbed_longest_first():
     assert overlap_token not in text
     assert ACCOUNT not in text
     assert "tok-***" not in text  # no partial survivor of the longer secret
+
+
+def test_partially_overlapping_secrets_leave_no_fragment():
+    # PR #101 5th review: token=abcdef and account=defghi overlap (not
+    # containment) inside "abcdefghi". Sequential replace would leave "ghi";
+    # interval-based redaction must scrub the whole merged span.
+    config = oa.OandaDemoConfig(api_token="abcdef", account_id="defghi")
+    transport = FakeTransport((400, {"errorMessage": "reflected abcdefghi back"}))
+    adapter = oa.OandaDemoAdapter(config, transport=transport, clock=lambda: NOW)
+    with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
+        adapter.submit_order(make_request())
+    text = str(exc_info.value)
+    for fragment in ("abcdef", "defghi", "abc", "def", "ghi", "abcdefghi"):
+        assert fragment not in text
+    assert "reflected *** back" in text
+
+
+def test_redact_secrets_interval_merging_matrix():
+    # direct unit coverage of the pure interval-merger
+    redact = oa._redact_secrets
+    # multiple occurrences of the same secret
+    assert redact("a SEC b SEC c", ("SEC",)) == "a *** b *** c"
+    # three match intervals chaining into one merged span
+    #   token "abcdef" @0 and @6, account "defabc" @3 -> one interval 0..12
+    assert redact("abcdefabcdef!", ("abcdef", "defabc")) == "***!"
+    # duplicate registrations of the same secret
+    assert redact("x SEC y", ("SEC", "SEC", "SEC")) == "x *** y"
+    # empty secrets are ignored (never treated as a match-everything value)
+    assert redact("plain text", ("", "")) == "plain text"
+    assert redact("a SEC b", ("", "SEC")) == "a *** b"
+    # adjacent intervals merge
+    assert redact("ABCDEF", ("ABC", "DEF")) == "***"
+    # overlapping occurrences of one secret ("aaa" twice inside "aaaa")
+    assert redact("aaaa", ("aaa",)) == "***"
+    # no matches -> unchanged
+    assert redact("nothing here", ("SEC",)) == "nothing here"
+
+
+def test_overlapping_secrets_across_the_truncation_boundary_leave_no_fragment():
+    # redaction happens on the FULL text before the 200-char cut, with the
+    # overlapping pair straddling the boundary
+    config = oa.OandaDemoConfig(api_token="abcdef", account_id="defghi")
+    reason = "x" * 195 + "abcdefghi"
+    transport = FakeTransport(
+        (400, {"orderRejectTransaction": {"id": "5001", "rejectReason": reason}})
+    )
+    adapter = oa.OandaDemoAdapter(config, transport=transport, clock=lambda: NOW)
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    for fragment in ("abcdef", "defghi", "ghi"):
+        assert fragment not in result.reject_reason
+    assert len(result.reject_reason) <= 200
 
 
 # --- PR #101 4th review: submit-side cancel/create correlation ---------------------
@@ -1139,6 +1189,45 @@ def test_malformed_reissue_values_fail_closed_like_wellformed_ones():
         with pytest.raises(m.BrokerTimeoutError):
             adapter.submit_order(make_request(quantity=Decimal("5")))
         assert len(transport.calls) == 1  # no resend
+
+
+def test_reissue_key_beats_reject_interpretation_on_400_and_404():
+    # PR #101 5th review: the reissue-key check runs BEFORE the business
+    # interpretation, so a reject transaction sharing the body with a
+    # reissue field is never confirmed as REJECTED — on 400 and 404 alike,
+    # for malformed and well-formed reissue values, and for the reissue
+    # REJECT transaction key too.
+    reject_tx = {"id": "5001", "rejectReason": "INSUFFICIENT_MARGIN"}
+    cases = [
+        (400, {"orderRejectTransaction": reject_tx,
+               "orderReissueTransaction": "malformed"}),
+        (400, {"orderRejectTransaction": reject_tx,
+               "orderReissueTransaction": {"id": "6001", "orderID": "1"}}),
+        (404, {"orderRejectTransaction": reject_tx,
+               "orderReissueTransaction": ["x"]}),
+        (400, {"orderRejectTransaction": reject_tx,
+               "orderReissueRejectTransaction": {}}),
+    ]
+    for status, payload in cases:
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request())
+        assert "reissue" in str(exc_info.value)
+        # the reject reason never wins over the reissue fail-closed
+        assert "INSUFFICIENT_MARGIN" not in str(exc_info.value)
+        assert len(transport.calls) == 1  # no automatic resend
+
+
+def test_reject_transaction_alone_still_translates_to_rejected():
+    # regression guard for the reordered check: a reject WITHOUT any reissue
+    # key keeps its normal REJECTED-result translation
+    adapter, _ = make_adapter(
+        (400, {"orderRejectTransaction": {"id": "5001",
+                                          "rejectReason": "INSUFFICIENT_MARGIN"}})
+    )
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert result.reject_reason == "INSUFFICIENT_MARGIN"
 
 
 # --- PR #101 4th review: GET-order taxonomy for invalid broker payloads ------------
