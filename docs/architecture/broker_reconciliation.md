@@ -1,17 +1,19 @@
-# Broker Reconciliation — 差分検出基盤(Issue #103)
+# Broker Reconciliation — 差分検出基盤(Issue #103)と安全な注文状態修復(Issue #104)
 
-BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出専用**基盤。実装は `execution/`(`reconciliation_models.py` / `reconciliation_store.py` / `broker_reconciliation.py`)にある。
+BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出専用**基盤(#103)と、その結果のうち安全に確定できる注文状態だけを既存の注文状態機械経由で反映する**修復サービス**(#104)。実装は `execution/`(`reconciliation_models.py` / `reconciliation_store.py` / `broker_reconciliation.py` / `reconciliation_repair.py`)にある。
 
 > **重要な位置づけ**
 >
-> - **検出専用(detection only)である。** 内部注文状態を変更しない・Broker へ注文を送信しない・Broker 注文をキャンセルしない。Broker へは**照会系操作のみ**(`get_order` / `list_orders`)を発行する。
-> - 検出した差分の**修復は Issue #104**、position / trade / SL・TP の照合と OANDA Demo による手動照合は **Issue #105** の責務であり、本 Issue では実装しない。
+> - **検出は detection only である。** `BrokerOrderReconciliationService` は内部注文状態を変更しない・Broker へ注文を送信しない・Broker 注文をキャンセルしない。Broker へは**照会系操作のみ**(`get_order` / `list_orders`)を発行する。
+> - **修復(#104)は検出結果を入力とする別サービス**であり、`auto_repair_candidate` に分類された注文状態のみを対象に、書き込みは `execution_store.record_order_result`(Issue #74 の状態機械・store 契約)の 1 経路だけで行う。Broker へは修復時も照会のみ。
+> - position / trade / SL・TP の照合と OANDA Demo による手動照合は **Issue #105** の責務であり、実装していない。
 > - scheduler・常駐 Bot への組み込みは行っていない。実行はサービス API の明示的な呼び出しのみ。
 > - 注文状態の唯一の正は既存の `broker.OrderState` と `validate_order_state_transition()` / `validate_order_result_update()`([Broker Interface](broker_interface.md)、Issue #73)。本基盤は**注文状態 Enum・遷移表を新設しない**。
 
 ```python
 from execution.broker_reconciliation import BrokerOrderReconciliationService
 from execution.reconciliation_models import DiscrepancyType, ResolutionCategory
+from execution.reconciliation_repair import BrokerOrderRepairService, RepairMode
 from execution import reconciliation_store
 ```
 
@@ -22,10 +24,16 @@ BrokerOrderReconciliationService   ← execution/broker_reconciliation.py
    ├─ read-only → execution_store(execution_orders.sqlite3)
    ├─ query-only → Broker interface(get_order / list_orders)
    └─ append   → reconciliation_store(broker_reconciliation.sqlite3)
+
+BrokerOrderRepairService           ← execution/reconciliation_repair.py(Issue #104)
+   ├─ 入力     → ReconciliationRun(#103 の検出結果)
+   ├─ query-only → Broker interface(get_order のみ)
+   └─ 書き込み → execution_store.record_order_result のみ(#74 状態機械経由)
 ```
 
-- execution order DB へは**読み取りのみ**。書き込み API(`create_execution_order` / `mark_submitting` / `record_order_state` / `record_order_result` / `init_db`)は呼ばない(AST 検査で固定)。
-- Broker へは照会のみ。`submit_order` / `cancel_order` の呼び出し箇所はリポジトリ全体の AST 検査で禁止されている(`execution/tests/test_submission_boundary.py`)。
+- 検出サービスは execution order DB へは**読み取りのみ**。書き込み API(`create_execution_order` / `mark_submitting` / `record_order_state` / `record_order_result` / `init_db`)は呼ばない(AST 検査で固定)。
+- 修復サービスの書き込みは `record_order_result` **のみ**(注文作成・phase 遷移・state-only 記録・DB 初期化・reconciliation store への書き込み・SQLite 直接接続はすべて AST 検査で禁止)。
+- Broker へは両サービスとも照会のみ。`submit_order` / `cancel_order` の呼び出し箇所はリポジトリ全体の AST 検査で禁止されている(`execution/tests/test_submission_boundary.py`)。
 
 ## 共通モデル(`reconciliation_models.py`)
 
@@ -139,10 +147,47 @@ run = service.detect(run_id="...")                    # 検出 + ログのみ(DB
 
 `detect()` は reconciliation DB を作成しない(dry-run 的な確認に使える)。`run()` は `init_reconciliation_db()`(冪等)の後に append する。
 
-## 非スコープ(Issue #103 時点)
+## 安全な注文状態修復(Issue #104。`reconciliation_repair.py`)
 
-内部注文状態の自動更新・UNKNOWN からの実遷移(Issue #104)、position / trade / transaction / SL・TP の照合、OANDA Demo Adapter を使った手動照合(Issue #105)、Broker への注文送信・キャンセル、Broker 側のみの注文の自動採用、無条件の自動決済、scheduler / 常駐 Bot への組み込み、Live 接続解禁。
+`BrokerOrderRepairService.repair(run, mode=...)` は #103 の `ReconciliationRun` を入力に、discrepancy 1 件につき 1 件の `OrderRepairAction` を返す(対象外もスキップ理由付きで返し、黙って落とさない)。
+
+```python
+repair = BrokerOrderRepairService(broker=broker, execution_db_path=...)
+result = repair.repair(run, mode=RepairMode.DRY_RUN)  # 照合のみモード: 完全無副作用
+result = repair.repair(run, mode=RepairMode.APPLY)    # 安全な修復のみ適用
+```
+
+### 修復の対象と手順
+
+1. **対象は `auto_repair_candidate` かつ `execution_order` の discrepancy のみ。** `manual_review`(要確認対象)・`query_failed`・`broker_order`(Broker のみの注文)は Broker へ照会すらせず `not_eligible`。
+2. **修復時に Broker へ再照会する**(`get_order`)。検出時の観測を信用して適用することはない。照会失敗(型付き `BrokerError`・contract 違反の想定外例外)は `query_failed`、応答が確定状態でない場合(UNKNOWN・PENDING・not found)は `broker_state_unconfirmed` として**内部状態を一切変更しない**。
+3. **現在の内部状態を再読込する。** 既に観測状態と一致していれば `already_consistent`(書き込みゼロ)。検出時の状態から動いていれば `internal_state_changed`(stale な結果は適用せず、再検出を促す)。
+4. **許可される修復元は UNKNOWN / PENDING(= SUBMITTING)/ ACCEPTED / PARTIALLY_FILLED のみ**、反映できるのは Broker が確定回答した状態(accepted / partially_filled / filled / cancelled / rejected)のみ。terminal 状態からの離脱は拒否。
+5. **repairability を修復時に再証明する**: 検出と同じ共有判定 `classify_order_repairability()`(遷移検証・intent 一致・broker_order_id 不変性と DB 全体 UNIQUE の所有者確認・anchored snapshot 更新契約・時刻の非逆行。store 読み取り失敗は fail-closed)。阻害があれば `refused`。
+6. **apply モードのみ** `execution_store.record_order_result()` で反映する。状態機械・store 契約の全検証が単一トランザクション内で再実行され、拒否は全体 rollback + `refused`。**状態を直接 DB 更新する経路は存在しない**(AST 検査で固定)。
+
+### 記録内容
+
+- execution store の履歴行に **Broker snapshot 全体**(fills・`broker_order_id`)が anchor され、`changed_at_utc` = Broker snapshot の `updated_at_utc`、`reason` に**修復元 run ID・Broker 確定状態・修復時観測時刻・`client_order_id` / `broker_order_id`** が入る。
+- 戻り値 `OrderRepairRun` は action ごとに**対象 ID・修復前状態・修復後状態・観測 Broker 状態・理由・観測時刻**を持つ(モデル不変条件で強制)。
+- 修復結果自体は**永続化しない**(戻り値 + ログのみ)。注文に何が起きたかの監査は従来どおり execution store の状態履歴が担い、reconciliation DB(#103)は検出専用のまま。
+
+### Dry Run(照合のみモード)
+
+`RepairMode.DRY_RUN` は Broker 照会・store 読み取り・判定まで同一に行い、**DB 更新・履歴追加・状態変更を一切行わない**(execution DB はバイト単位で不変。テストで固定)。全チェックを通過した対象は `would_repair` として報告される。
+
+### Idempotency
+
+同じ `ReconciliationRun` を何度 apply しても壊れない: 1 回目で修復された注文は 2 回目以降 `already_consistent` となり**書き込みゼロ**(履歴も増えない)。二重更新は発生せず、修復後の再検出は discrepancy 0 件になる。
+
+### 禁止事項(#104 で実装しないこと)
+
+Broker のみの注文の自動採用、Broker が知らない内部注文の close 扱い、position / trade / transaction の照合、SL・TP の再作成、Live 注文、Broker 照会失敗・UNKNOWN 応答での状態更新、要確認対象の自動修復。
+
+## 非スコープ(Issue #103 / #104 時点)
+
+position / trade / transaction / SL・TP の照合、OANDA Demo Adapter を使った手動照合(Issue #105)、Broker への注文送信・キャンセル、Broker 側のみの注文の自動採用、無条件の自動決済、scheduler / 常駐 Bot への組み込み、Live 接続解禁。
 
 ## テスト
 
-`execution/tests/test_reconciliation_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py`、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker のみで、外部通信・Discord・実 DB 更新は発生しない。
+`execution/tests/test_reconciliation_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py` / `test_reconciliation_repair.py`、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker のみで、外部通信・Discord・実 DB 更新は発生しない。

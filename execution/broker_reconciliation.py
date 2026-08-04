@@ -4,8 +4,10 @@
 the broker's and CLASSIFIES what it finds. It never updates an internal
 order state, never submits an order and never cancels one -- the broker is
 used through query operations exclusively (``get_order`` /
-``list_orders``). Repairing what a run finds is Issue #104; positions /
-trades / SL / TP are Issue #105. ***
+``list_orders``). Repairing what a run finds is Issue #104
+(``execution/reconciliation_repair.py`` -- a separate service that consumes
+this run's result; detection itself stays read-only); positions / trades /
+SL / TP are Issue #105. ***
 
 What a run compares
 -------------------
@@ -136,6 +138,160 @@ _TERMINAL_BROKER_DISCREPANCY: dict[OrderState, DiscrepancyType] = {
 }
 
 
+# --- shared repairability classification -------------------------------------
+# Module-level so Issue #104's repair service applies EXACTLY the judgement
+# Issue #103's detection recorded -- one implementation, two callers, and
+# neither re-implements the order state machine or the store contract.
+
+
+def classify_order_repairability(
+    row: dict,
+    internal_state: OrderState,
+    observed: OrderResult,
+    *,
+    execution_db_path: Path,
+) -> tuple[ResolutionCategory, str]:
+    """Auto-repairable iff the observation could be recorded through
+    ``execution_store.record_order_result`` without loss.
+
+    The checks mirror that function's documented preconditions -- the
+    DB-wide ``broker_order_id`` uniqueness included -- and reuse the
+    Issue #73 validators; the update itself is NOT performed here. Used by
+    detection (Issue #103) to classify a discrepancy and by the repair
+    service (Issue #104) to re-prove repairability at repair time.
+
+    Fail-closed: if an execution-store READ needed to prove repairability
+    fails, the observation is classified ``MANUAL_REVIEW`` with the failure
+    as the reason. Repairability is never assumed from a lookup that did
+    not answer.
+    """
+    blockers: list[str] = []
+
+    try:
+        validate_order_state_transition(internal_state, observed.state)
+    except (ValueError, BrokerInvalidRequestError) as exc:
+        blockers.append(str(exc))
+
+    identity_problem = _identity_problem(row, observed)
+    if identity_problem is not None:
+        blockers.append(identity_problem)
+
+    stored_broker_id = row["broker_order_id"]
+    if stored_broker_id is not None and observed.broker_order_id != stored_broker_id:
+        blockers.append(
+            f"broker_order_id is immutable once known: {stored_broker_id!r} -> "
+            f"{observed.broker_order_id!r}"
+        )
+
+    try:
+        anchored = execution_store.load_order_result(
+            row["execution_request_id"], db_path=execution_db_path
+        )
+        owner_problem = _broker_id_owner_problem(row, observed, execution_db_path)
+    except ExecutionStoreError as exc:
+        # The order store could not answer (schema/integrity failure, a
+        # concurrent writer, ...). Nothing is inferred and nothing is
+        # changed: a human decides.
+        return (
+            ResolutionCategory.MANUAL_REVIEW,
+            f"the broker state {observed.state.value!r} could not be proven safely "
+            f"reflectable onto the internal state {internal_state.value!r}: reading the "
+            f"execution order store failed ({type(exc).__name__}: {exc}); no repair "
+            "candidacy is assumed",
+        )
+    if owner_problem is not None:
+        blockers.append(owner_problem)
+    if anchored is not None:
+        try:
+            validate_order_result_update(anchored, observed)
+        except (ValueError, BrokerInvalidRequestError) as exc:
+            blockers.append(f"snapshot update contract: {exc}")
+
+    stored_updated_at = datetime.fromisoformat(row["updated_at_utc"])
+    if observed.updated_at_utc < stored_updated_at:
+        blockers.append(
+            f"the broker snapshot is older than the stored state "
+            f"({observed.updated_at_utc.isoformat()} < {row['updated_at_utc']})"
+        )
+
+    if blockers:
+        return (
+            ResolutionCategory.MANUAL_REVIEW,
+            f"the broker state {observed.state.value!r} cannot be reflected onto the "
+            f"internal state {internal_state.value!r} by the existing order state "
+            f"machine / store contract: " + "; ".join(blockers),
+        )
+    return (
+        ResolutionCategory.AUTO_REPAIR_CANDIDATE,
+        f"the broker state {observed.state.value!r} is a legal, loss-free resolution of "
+        f"the internal state {internal_state.value!r}",
+    )
+
+
+def _broker_id_owner_problem(
+    row: dict, observed: OrderResult, execution_db_path: Path
+) -> str | None:
+    """Whether the observed ``broker_order_id`` already belongs to a
+    DIFFERENT execution request (Issue #103 review, Major).
+
+    ``broker_order_id`` is UNIQUE across the whole execution order table
+    (PR #91 review Major 3): one broker order can never be attached to
+    two execution requests. A PENDING / UNKNOWN order whose broker
+    snapshot carries an id another request already owns therefore cannot
+    be recorded -- ``record_order_result`` would hit the constraint and
+    roll the whole update back -- so it must never be classified as an
+    auto-repair candidate. The current order owning the id itself is NOT
+    a conflict (that is the normal re-observation case).
+
+    Read-only; a store failure propagates to the caller, which fails
+    closed to ``MANUAL_REVIEW``.
+    """
+    broker_order_id = observed.broker_order_id
+    if broker_order_id is None:
+        return None  # nothing would be assigned, nothing can collide
+    owner = execution_store.get_execution_order_by_broker_order_id(
+        broker_order_id, db_path=execution_db_path
+    )
+    if owner is None:
+        return None  # unassigned
+    owner_id = owner["execution_request_id"]
+    if owner_id == row["execution_request_id"]:
+        return None  # this very order already owns it
+    return (
+        f"broker_order_id {broker_order_id!r} is already owned by execution request "
+        f"{owner_id!r}, not by {row['execution_request_id']!r}; broker order IDs are "
+        "UNIQUE across the execution order store, so this observation cannot be "
+        "recorded onto this request"
+    )
+
+
+def _identity_problem(row: dict, observed: OrderResult) -> str | None:
+    """Whether the broker snapshot describes the STORED intent.
+
+    Same comparison ``record_order_result`` performs against the stored
+    row: a mismatch means the snapshot belongs to a different order and
+    must never be reflected onto this execution request.
+    """
+    stored_price = None if row["requested_price"] is None else Decimal(row["requested_price"])
+    mismatches = [
+        name
+        for name, stored, seen in (
+            ("symbol", row["symbol"], observed.symbol),
+            ("side", row["side"], observed.side.value),
+            ("order_type", row["order_type"], observed.order_type.value),
+            ("quantity", Decimal(row["quantity"]), observed.requested_quantity),
+            ("requested_price", stored_price, observed.requested_price),
+        )
+        if stored != seen
+    ]
+    if not mismatches:
+        return None
+    return (
+        "the broker snapshot does not describe the stored execution request "
+        f"(differing: {', '.join(mismatches)})"
+    )
+
+
 class BrokerOrderReconciliationService:
     """Detect and classify order differences between BELIAL and a broker.
 
@@ -241,7 +397,6 @@ class BrokerOrderReconciliationService:
     # --- internal-order comparison ------------------------------------------
 
     def _reconcile_internal_order(self, row: dict) -> tuple[OrderDiscrepancy, ...]:
-        execution_request_id = row["execution_request_id"]
         client_order_id = row["client_order_id"]
         internal_state = OrderState(row["order_state"])
 
@@ -343,7 +498,11 @@ class BrokerOrderReconciliationService:
                 ),
             )
 
-        category, detail = self._classify_resolution(row, internal_state, observed)
+        category, detail = classify_order_repairability(
+            row, internal_state, observed, execution_db_path=self._execution_db_path
+        )
+        if category is ResolutionCategory.AUTO_REPAIR_CANDIDATE:
+            detail += "; no repair was performed (detection-only run)"
         if observed.state is internal_state and category is ResolutionCategory.AUTO_REPAIR_CANDIDATE:
             return ()  # state and the complete stored identity/snapshot contract agree
 
@@ -370,146 +529,6 @@ class BrokerOrderReconciliationService:
         # a working-state disagreement, a terminal internal state contradicted
         # by the broker -- is a plain mismatch for a human to look at.
         return DiscrepancyType.STATE_MISMATCH
-
-    def _classify_resolution(
-        self, row: dict, internal_state: OrderState, observed: OrderResult
-    ) -> tuple[ResolutionCategory, str]:
-        """Auto-repairable iff Issue #104 could record this observation
-        through ``execution_store.record_order_result`` without loss.
-
-        The checks mirror that function's documented preconditions -- the
-        DB-wide ``broker_order_id`` uniqueness included -- and reuse the
-        Issue #73 validators; the update itself is NOT performed here.
-
-        Fail-closed: if an execution-store READ needed to prove
-        repairability fails, the discrepancy is classified
-        ``MANUAL_REVIEW`` with the failure as the reason. Repairability is
-        never assumed from a lookup that did not answer.
-        """
-        blockers: list[str] = []
-        execution_request_id = row["execution_request_id"]
-
-        try:
-            validate_order_state_transition(internal_state, observed.state)
-        except (ValueError, BrokerInvalidRequestError) as exc:
-            blockers.append(str(exc))
-
-        identity_problem = self._identity_problem(row, observed)
-        if identity_problem is not None:
-            blockers.append(identity_problem)
-
-        stored_broker_id = row["broker_order_id"]
-        if stored_broker_id is not None and observed.broker_order_id != stored_broker_id:
-            blockers.append(
-                f"broker_order_id is immutable once known: {stored_broker_id!r} -> "
-                f"{observed.broker_order_id!r}"
-            )
-
-        try:
-            anchored = execution_store.load_order_result(
-                execution_request_id, db_path=self._execution_db_path
-            )
-            owner_problem = self._broker_id_owner_problem(row, observed)
-        except ExecutionStoreError as exc:
-            # The order store could not answer (schema/integrity failure, a
-            # concurrent writer, ...). Nothing is inferred and nothing is
-            # changed: a human decides.
-            return (
-                ResolutionCategory.MANUAL_REVIEW,
-                f"the broker state {observed.state.value!r} could not be proven safely "
-                f"reflectable onto the internal state {internal_state.value!r}: reading the "
-                f"execution order store failed ({type(exc).__name__}: {exc}); no repair "
-                "candidacy is assumed",
-            )
-        if owner_problem is not None:
-            blockers.append(owner_problem)
-        if anchored is not None:
-            try:
-                validate_order_result_update(anchored, observed)
-            except (ValueError, BrokerInvalidRequestError) as exc:
-                blockers.append(f"snapshot update contract: {exc}")
-
-        stored_updated_at = datetime.fromisoformat(row["updated_at_utc"])
-        if observed.updated_at_utc < stored_updated_at:
-            blockers.append(
-                f"the broker snapshot is older than the stored state "
-                f"({observed.updated_at_utc.isoformat()} < {row['updated_at_utc']})"
-            )
-
-        if blockers:
-            return (
-                ResolutionCategory.MANUAL_REVIEW,
-                f"the broker state {observed.state.value!r} cannot be reflected onto the "
-                f"internal state {internal_state.value!r} by the existing order state "
-                f"machine / store contract: " + "; ".join(blockers),
-            )
-        return (
-            ResolutionCategory.AUTO_REPAIR_CANDIDATE,
-            f"the broker state {observed.state.value!r} is a legal, loss-free resolution of "
-            f"the internal state {internal_state.value!r}; no repair was performed "
-            "(detection-only run)",
-        )
-
-    def _broker_id_owner_problem(self, row: dict, observed: OrderResult) -> str | None:
-        """Whether the observed ``broker_order_id`` already belongs to a
-        DIFFERENT execution request (Issue #103 review, Major).
-
-        ``broker_order_id`` is UNIQUE across the whole execution order table
-        (PR #91 review Major 3): one broker order can never be attached to
-        two execution requests. A PENDING / UNKNOWN order whose broker
-        snapshot carries an id another request already owns therefore cannot
-        be recorded -- ``record_order_result`` would hit the constraint and
-        roll the whole update back -- so it must never be classified as an
-        auto-repair candidate. The current order owning the id itself is NOT
-        a conflict (that is the normal re-observation case).
-
-        Read-only; a store failure propagates to the caller, which fails
-        closed to ``MANUAL_REVIEW``.
-        """
-        broker_order_id = observed.broker_order_id
-        if broker_order_id is None:
-            return None  # nothing would be assigned, nothing can collide
-        owner = execution_store.get_execution_order_by_broker_order_id(
-            broker_order_id, db_path=self._execution_db_path
-        )
-        if owner is None:
-            return None  # unassigned
-        owner_id = owner["execution_request_id"]
-        if owner_id == row["execution_request_id"]:
-            return None  # this very order already owns it
-        return (
-            f"broker_order_id {broker_order_id!r} is already owned by execution request "
-            f"{owner_id!r}, not by {row['execution_request_id']!r}; broker order IDs are "
-            "UNIQUE across the execution order store, so this observation cannot be "
-            "recorded onto this request"
-        )
-
-    @staticmethod
-    def _identity_problem(row: dict, observed: OrderResult) -> str | None:
-        """Whether the broker snapshot describes the STORED intent.
-
-        Same comparison ``record_order_result`` performs against the stored
-        row: a mismatch means the snapshot belongs to a different order and
-        must never be reflected onto this execution request.
-        """
-        stored_price = None if row["requested_price"] is None else Decimal(row["requested_price"])
-        mismatches = [
-            name
-            for name, stored, seen in (
-                ("symbol", row["symbol"], observed.symbol),
-                ("side", row["side"], observed.side.value),
-                ("order_type", row["order_type"], observed.order_type.value),
-                ("quantity", Decimal(row["quantity"]), observed.requested_quantity),
-                ("requested_price", stored_price, observed.requested_price),
-            )
-            if stored != seen
-        ]
-        if not mismatches:
-            return None
-        return (
-            "the broker snapshot does not describe the stored execution request "
-            f"(differing: {', '.join(mismatches)})"
-        )
 
     # --- broker-side enumeration --------------------------------------------
 

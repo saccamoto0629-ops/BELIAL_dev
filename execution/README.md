@@ -13,6 +13,7 @@ from execution.live_submission import LiveOrderSubmissionService
 from execution.shadow_execution import ShadowExecutionService
 from execution import shadow_store
 from execution.broker_reconciliation import BrokerOrderReconciliationService
+from execution.reconciliation_repair import BrokerOrderRepairService, RepairMode
 from execution import reconciliation_store
 ```
 
@@ -34,6 +35,7 @@ from execution import reconciliation_store
 | `reconciliation_models.py` | Broker reconciliation(Issue #103)のモデル: `ReconciliationRun` / `OrderDiscrepancy` + Enum(`DiscrepancyType` / `ResolutionCategory` / `ReconciliationTargetType` / `ReconciliationMode`)。両側の観測状態・対象 ID・判定理由・観測時刻・`BrokerErrorCode` を保持。注文状態 Enum・遷移表は**新設しない**(既存 `broker.OrderState` を再利用) |
 | `reconciliation_store.py` | 照合結果の SQLite 保存(`broker_reconciliation.sqlite3`。`BROKER_RECONCILIATION_DB_PATH`)。**run 単位の append**(同一内容の再照合も別 run として残す。既存 `run_id` の再記録は `ReconciliationRunConflictError` で拒否 = 既存記録を上書きしない)。他 store と同方針の closed-world schema 検証・pristine 判定・冪等 init(migration 経路なし)・true read-only 読み取り・厳格復元。**注文テーブルを持たない**ため照合が注文状態を書き換えられない |
 | `broker_reconciliation.py` | **検出専用**の照合サービス `BrokerOrderReconciliationService`(Issue #103): Broker state を持つ内部注文(pending / accepted / partially_filled / unknown / terminal)を Broker へ照会し、不一致を分類する(`created` は未送信なので除外)。**内部注文状態を変更しない・Broker へ送信/キャンセルしない**(Broker は `get_order` / `list_orders` のみ、execution store は読み取りのみ。いずれも AST 検査で固定)。`auto_repair_candidate` の判定は既存 validator と `record_order_result` の前提条件(遷移・intent 一致・broker_order_id 不変性と **DB 全体 UNIQUE の所有者確認**・snapshot 更新契約・時刻の非逆行)の**再利用**で行い、修復は行わない(Issue #104)。判定に必要な store 読み取りが失敗した場合は推測せず `manual_review`(fail-closed)。照会失敗は `query_failure` discrepancy(対象 ID + 理由 + 型付き code)、Broker 側注文の列挙失敗・列挙非対応は run の `broker_listing_error`(= 「Broker のみの注文なし」ではなく「未確認」)。`detect()` は DB 無副作用、`run()` は戻り値 + ログ + DB へ記録 |
+| `reconciliation_repair.py` | **安全な注文状態修復**サービス `BrokerOrderRepairService`(Issue #104): #103 の `ReconciliationRun` を入力に、`auto_repair_candidate` かつ `execution_order` 対象のみを修復時再照会 → 現在状態の再読込 → **共有判定 `classify_order_repairability` の再証明** → `execution_store.record_order_result`(#74 の状態機械・store 契約。唯一の書き込み API)で反映する。修復可能な内部状態は UNKNOWN / PENDING(=SUBMITTING)/ ACCEPTED / PARTIALLY_FILLED、反映できるのは Broker が確定回答した状態のみ(修復時の照会失敗・UNKNOWN 応答・not found・要確認対象・terminal 離脱はすべて無変更)。現在状態が観測状態と一致なら `already_consistent` として**書き込みゼロでスキップ = 冪等**、検出後に内部状態が動いていれば stale として不適用。`RepairMode.DRY_RUN` は照会・判定のみで DB 更新・履歴・状態変更ゼロ、結果(`OrderRepairRun` / `OrderRepairAction`: 対象 ID・修復前後状態・観測 Broker 状態・理由・観測時刻)は戻り値 + ログのみ(修復結果の専用 DB は持たない。SQLite 直接接続なし・submit / cancel 呼び出しゼロは AST 検査で固定) |
 | `sqlite_ro.py` | **true read-only SQLite 接続**(`mode=ro` + `PRAGMA query_only` + **authorizer**): missing DB / parent / WAL / SHM を作らず、mtime 不変、write は必ず失敗。`set_authorizer` が **`ATTACH` / `DETACH`**・DDL・状態変更 PRAGMA の値設定を対象ファイルを開く前に `SQLITE_DENY` で拒否するため、ATTACH による 0 バイトファイル生成も起きない(ファイルシステム完全不変)。全読み取り経路(safety store 含む)が使用 |
 | `strict_json.py` | JSON 入力の strict loader: **重複キー拒否(ネスト含む)**・不正 UTF-8 / BOM・サイズ / 深さ / 文字列 / 配列 / object キー数上限・NaN / Infinity 拒否を安定エラーへ変換 |
 | `cli_streams.py` | CLI 共通の encoding-safe stream 処理(Issue #77 / PR #96 の cp932 対策を scenario runner と Shadow CLI で共有) |
@@ -84,22 +86,27 @@ python -m execution.shadow_report --shadow-db ... --claims | --orphan-decisions 
 
 設計の詳細(provenance / claim / lease / duplicate と conflict / decision 1:1 / account snapshot / true read-only / JSON 入力制限)は [docs/architecture/shadow_execution.md](../docs/architecture/shadow_execution.md) を参照。
 
-## Broker Reconciliation(Issue #103)
+## Broker Reconciliation(Issue #103 / #104)
 
-内部注文状態と Broker 注文状態を照合し、不一致を分類・記録する**検出専用**基盤。**内部注文状態を変更せず、Broker へ注文を送信・キャンセルしない**(Broker は照会系 `get_order` / `list_orders` のみ)。
+内部注文状態と Broker 注文状態を照合し、不一致を分類・記録する**検出専用**基盤(#103)と、その結果のうち**安全に確定できる注文状態だけ**を状態機械経由で反映する修復サービス(#104)。検出は**内部注文状態を変更せず、Broker へ注文を送信・キャンセルしない**(Broker は照会系 `get_order` / `list_orders` のみ)。修復も Broker へは照会のみで、書き込みは `execution_store.record_order_result` の 1 経路だけ。
 
 ```python
 service = BrokerOrderReconciliationService(
     broker=broker, execution_db_path=..., reconciliation_db_path=...)
 run = service.run(run_id="recon-...")     # 検出 + ログ + DB append
 run = service.detect(run_id="recon-...")  # 検出 + ログのみ(DB を作らない)
+
+repair = BrokerOrderRepairService(broker=broker, execution_db_path=...)
+result = repair.repair(run, mode=RepairMode.DRY_RUN)  # 照合のみ: 完全無副作用
+result = repair.repair(run, mode=RepairMode.APPLY)    # 安全な修復のみ適用
 ```
 
 - 検出する差分: 内部発注中 × Broker FILLED / CANCELLED / REJECTED、内部 UNKNOWN × Broker 確定、終端状態同士の矛盾、Broker 側のみの注文、Broker が知らない注文、その他の不一致、照会失敗。**状態・注文 identity・snapshot 契約がすべて一致する場合のみ差分としない**。終端状態も外部事実との矛盾検出のため照合し、`created` intent のみ除外する。
-- 分類: `auto_repair_candidate`(既存状態機械・store 契約で情報を失わず反映できる。**修復は Issue #104**)/ `manual_review`(他注文が所有する `broker_order_id` の観測・store 読み取り失敗を含む)/ `query_failed`。
+- 分類: `auto_repair_candidate`(既存状態機械・store 契約で情報を失わず反映できる)/ `manual_review`(他注文が所有する `broker_order_id` の観測・store 読み取り失敗を含む)/ `query_failed`。
 - 照会失敗は状態を推測しない: 対象特定できる失敗は `query_failure` discrepancy、Broker 側注文の列挙失敗・列挙非対応は run の `broker_listing_error`(「Broker のみの注文なし」ではなく「未確認」)。`has_partial_failures` で query/listing の部分失敗を機械判定できる。
 - Broker 側注文の列挙には追加の optional Protocol `broker.broker_interface.OrderListingBroker` を使う(既存 `Broker` の 5 操作は無変更 = 後方互換。FakeBroker が実装)。
-- 非スコープ: 自動修復、position / trade / SL・TP 照合、OANDA Demo での手動照合、scheduler 組み込み(Issue #104 / #105)。
+- 修復(#104)は `auto_repair_candidate` の execution order のみ対象: 修復時に Broker へ再照会し、Broker が確定回答した状態(accepted / partially_filled / filled / cancelled / rejected)だけを、UNKNOWN / PENDING / ACCEPTED / PARTIALLY_FILLED の内部状態から状態機械が許可する遷移に限って反映する。照会失敗・UNKNOWN 応答・not found・要確認対象・terminal 離脱は無変更。既に一致していれば書き込みゼロでスキップ(**同じ結果を何度適用しても状態・履歴は不変**)。修復結果(対象 ID・修復前後状態・理由・Broker 参照 ID・観測時刻)は戻り値 + ログで返し、状態変更理由・Broker snapshot は execution store の履歴に残る。
+- 非スコープ: Broker のみの注文の自動採用、Broker に無い内部注文の自動 close、position / trade / SL・TP 照合、OANDA Demo での手動照合、scheduler 組み込み、Live 接続(#105 ほか)。
 
 設計の詳細は [docs/architecture/broker_reconciliation.md](../docs/architecture/broker_reconciliation.md) を参照。
 
@@ -159,7 +166,7 @@ DB 保存失敗は、シナリオ実行中だけ `execution_store` の対象関�
 ## 位置づけ(誤解しないこと)
 
 - 注文状態の唯一の正は既存の `broker.OrderState` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)。**本パッケージは注文状態 Enum・遷移表を新設しない。** CREATED / SUBMITTING は注文状態ではなく Execution Request 側の**送信フェーズ**(別フィールド)である。
-- Safety Gate は将来の Live Execution 送信経路を安全にする**部品のみ**であり、OANDA Adapter・Live 接続・実注文 runner は**未実装**。reconciliation は Issue #103 で**差分検出のみ**実装済みで、自動修復・定期実行は未実装。`ExecutionMode` に `paper` は存在しない(Paper Execution は Broker 境界を使わず、Safety Gate を通らない)。
+- Safety Gate は将来の Live Execution 送信経路を安全にする**部品のみ**であり、OANDA Adapter・Live 接続・実注文 runner は**未実装**。reconciliation は Issue #103 の**差分検出**と Issue #104 の**注文状態の安全修復**(状態機械経由・注文状態のみ)まで実装済みで、position / trade / SL・TP の照合と定期実行は未実装。`ExecutionMode` に `paper` は存在しない(Paper Execution は Broker 境界を使わず、Safety Gate を通らない)。
 - **Paper Signal / Paper Execution は本パッケージを使わない**(`tests/test_package_imports.py` が回帰として固定)。
 - UNKNOWN は即時再送可能状態ではない。照会対象として抽出し、後続照会結果の記録によってのみ確定状態へ解決する。state-only で記録できるのは UNKNOWN のみで、他のすべての観測は完全な `OrderResult` を `record_order_result` で記録する(stale snapshot による fill 消失・巻き戻しを DB 側 snapshot 検証で拒否)。
 
