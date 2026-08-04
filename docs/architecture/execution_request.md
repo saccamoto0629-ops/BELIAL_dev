@@ -179,6 +179,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - **タイムアウト・結果不明は UNKNOWN として保存**され、即時再送しない(上記「UNKNOWN の扱い」)。
 - **重複抑止ログ**: 抑止時は WARN で `execution_request_id`・`signal_id`・現在の `submission_phase` / `order_state`・抑止理由を必ず出力する(store の作成時 conflict と送信サービスの `duplicate_submission` の両方)。
 - `get_execution_order_by_signal_id()`: signal からの逆引き read helper(高々 1 件)。missing DB はファイルを作らず None。
+- **Shadow Mode(Issue #78)は本 store の idempotency namespace に参加しない**: Shadow 検証記録は専用の shadow store(`shadow_results.sqlite3`)にのみ保存され、`execution_orders` へは登録されない。したがって Shadow を実行しても同一 signal の将来の fake / demo / live 送信が「既に送信済み」と判定されることはなく、逆に live 側の register が Shadow 実行をブロックすることもない([Shadow Mode](shadow_execution.md))。
 
 ### schema 管理・読み取り経路
 

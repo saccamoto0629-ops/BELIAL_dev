@@ -1,0 +1,43 @@
+{
+  "scenario_id": "shadow_mode_mismatch_rejected",
+  "description": "Shadow Mode execution mode不整合: shadow接続先がpolicyの許可集合にない場合はexecution_mode_mismatchで拒否され、Broker呼び出し0のままmode mismatch理由がShadow結果へ保存される",
+  "gate": {
+    "allowed_shadow_targets": [
+      "some-other-target"
+    ]
+  },
+  "steps": [
+    {
+      "action": "shadow",
+      "request": {
+        "execution_request_id": "shadow-exec-1",
+        "signal_id": "shadow-signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "shadow-client-1",
+      "expect": {
+        "outcome": "recorded",
+        "allowed": false,
+        "rejection_codes": [
+          "execution_mode_mismatch"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "broker_submit_calls": 0,
+    "safety_decisions": 1,
+    "last_decision_allowed": false,
+    "shadow_rows": 1,
+    "shadow_allowed": false,
+    "shadow_codes": [
+      "execution_mode_mismatch"
+    ]
+  }
+}

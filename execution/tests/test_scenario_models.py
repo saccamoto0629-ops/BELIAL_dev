@@ -172,6 +172,179 @@ def test_invalid_scenarios_are_rejected(mutate, match):
         validate_scenario(scenario)
 
 
+def shadow_scenario(**overrides):
+    """A fully valid minimal shadow scenario (Issue #78)."""
+    scenario = {
+        "scenario_id": "shadow_ok",
+        "description": "minimal valid shadow scenario",
+        "steps": [
+            {
+                "action": "shadow",
+                "request": {
+                    "execution_request_id": "exec-1",
+                    "signal_id": "signal-1",
+                    "strategy_id": "strategy-1",
+                    "symbol": "USD_JPY",
+                    "side": "buy",
+                    "order_type": "market",
+                    "quantity": "1",
+                    "stop_loss_price": "149.50",
+                    "take_profit_price": "151.50",
+                },
+                "client_order_id": "client-1",
+                "timeframe": "H1",
+                "expect": {"outcome": "recorded", "allowed": True},
+            }
+        ],
+        "expected": {"shadow_rows": 1, "broker_submit_calls": 0, "shadow_allowed": True},
+    }
+    scenario.update(overrides)
+    return scenario
+
+
+def test_shadow_scenario_validates_and_resolves_its_primary_id():
+    definition = validate_scenario(shadow_scenario())
+    assert resolve_primary_id(definition) == "exec-1"
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda s: s["steps"][0].update(surprise=1), "unknown keys"),
+        (lambda s: s["steps"][0].update(dry_run="yes"), "dry_run"),
+        (lambda s: s["steps"][0].update(timeframe=" "), "timeframe"),
+        (lambda s: s["steps"][0]["expect"].update(outcome="submitted"), "outcome"),
+        (lambda s: s["steps"][0]["expect"].update(allowed="yes"), "allowed"),
+        (lambda s: s["steps"][0]["expect"].update(state="filled"), "unknown keys"),
+        (
+            lambda s: s["steps"][0]["expect"].update(rejection_codes=["not_a_code"]),
+            "rejection codes",
+        ),
+        (lambda s: s["expected"].update(shadow_rows="1"), "shadow_rows"),
+        (lambda s: s["expected"].update(shadow_db_created="yes"), "shadow_db_created"),
+        (lambda s: s["expected"].update(shadow_allowed="yes"), "shadow_allowed"),
+        (lambda s: s["expected"].update(shadow_codes=[]), "shadow_codes"),
+        (lambda s: s["expected"].update(shadow_codes=["fabricated"]), "shadow_codes"),
+        (
+            lambda s: s["expected"].update(shadow_intended_order={"colour": "red"}),
+            "unknown keys",
+        ),
+        (
+            lambda s: s["expected"].update(shadow_intended_order={"side": "hold"}),
+            "side",
+        ),
+        (lambda s: s.update(gate={"allowed_shadow_targets": []}), "allowed_shadow_targets"),
+        (
+            lambda s: s["steps"].__setitem__(
+                0,
+                {
+                    "action": "shadow_concurrent",
+                    "request": s["steps"][0]["request"],
+                    "client_order_id": "client-1",
+                    "workers": 1,
+                    "expect": {"recorded": 1},
+                },
+            ),
+            "workers",
+        ),
+        (
+            lambda s: s["steps"].__setitem__(
+                0,
+                {
+                    "action": "shadow_concurrent",
+                    "request": s["steps"][0]["request"],
+                    "client_order_id": "client-1",
+                    "workers": 2,
+                    "expect": {"conflicts": 1},
+                },
+            ),
+            "unknown keys",
+        ),
+    ],
+)
+def test_invalid_shadow_scenarios_are_rejected(mutate, match):
+    scenario = shadow_scenario()
+    mutate(scenario)
+    with pytest.raises(ScenarioDefinitionError, match=match):
+        validate_scenario(scenario)
+
+
+def test_shadow_scenario_null_shadow_allowed_is_valid():
+    scenario = shadow_scenario()
+    scenario["expected"]["shadow_allowed"] = None
+    validate_scenario(scenario)
+
+
+def production_scenario(**overrides):
+    scenario = shadow_scenario(scenario_id="shadow_prod_ok")
+    scenario["signals"] = [
+        {"signal_id": "sig-1", "symbol": "USD_JPY", "timeframe": "H1", "side": "long"}
+    ]
+    scenario["production_config"] = {
+        "config_id": "c1",
+        "policy": {
+            "policy_id": "p1",
+            "allowed_symbols": ["USD_JPY"],
+            "allowed_sides": ["buy", "sell"],
+            "max_order_quantity": "10",
+            "max_positions_per_symbol": 2,
+            "max_positions_account": 5,
+            "max_reference_age_seconds": 30,
+            "max_spread_by_symbol": {"USD_JPY": "0.05"},
+            "allowed_shadow_targets": ["shadow"],
+            "require_stop_loss": False,
+        },
+        "order_quantities": {"USD_JPY": "1"},
+        "kill_switch": False,
+        "connection_target": "shadow",
+    }
+    scenario["steps"] = [
+        {
+            "action": "shadow_production",
+            "signal_id": "sig-1",
+            "expect": {"outcome": "recorded", "allowed": True},
+        }
+    ]
+    scenario.update(overrides)
+    return scenario
+
+
+def test_production_scenario_validates_and_derives_its_primary_id():
+    definition = validate_scenario(production_scenario())
+    assert resolve_primary_id(definition) == "sigreq-sig-1"
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda s: s.pop("signals"), "signals fixture"),
+        (lambda s: s.pop("production_config"), "production_config"),
+        (lambda s: s["signals"][0].update(side="sideways"), "side"),
+        (lambda s: s["signals"][0].update(surprise=1), "unknown keys"),
+        (lambda s: s["production_config"]["policy"].pop("require_stop_loss"), "require_stop_loss"),
+        (lambda s: s["production_config"].update(surprise=1), "unknown keys"),
+        (lambda s: s["steps"][0].update(signal_id="unknown"), "unknown signal_id"),
+        (lambda s: s.update(faults=[{"boundary": "shadow_claim", "after_calls": 1, "fail_calls": 1}]),
+         "must not declare both"),
+        (lambda s: s.update(faults=[{"boundary": "shadow_claim", "fail_calls": 0}]), "fail_calls"),
+    ],
+)
+def test_invalid_production_scenarios_are_rejected(mutate, match):
+    scenario = production_scenario()
+    mutate(scenario)
+    with pytest.raises(ScenarioDefinitionError, match=match):
+        validate_scenario(scenario)
+
+
+def test_duplicate_json_keys_in_a_scenario_file_fail_the_load(tmp_path):
+    path = tmp_path / "dup.json"
+    body = json.dumps(minimal_scenario())
+    duplicated = body.replace('{"scenario_id"', '{"description": "dup", "scenario_id"', 1)
+    path.write_text(duplicated, encoding="utf-8")
+    with pytest.raises(ScenarioDefinitionError, match="duplicate object key"):
+        load_scenario_file(path)
+
+
 def test_expected_filled_quantity_zero_is_allowed_but_request_quantity_zero_is_not():
     scenario = minimal_scenario()
     scenario["expected"]["filled_quantity"] = "0"

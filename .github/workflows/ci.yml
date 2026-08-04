@@ -73,12 +73,42 @@ jobs:
 
       # Issue #77: fixed execution scenarios via the runner CLI. The same
       # scenarios also run inside "Run execution tests" (test_fixed_scenarios
-      # parametrizes per scenario id); this extra step pins the CLI contract
-      # -- human-readable per-scenario PASS/FAIL output and a non-zero exit
-      # code on any mismatch -- and costs ~2s. tmp-dir SQLite + FakeBroker
-      # only: no secrets, no network, fully reproducible.
+      # parametrizes per scenario id) -- including the Issue #78 shadow-mode
+      # scenarios, so they are NOT re-run as a separate CLI step; this extra
+      # step pins the CLI contract -- human-readable per-scenario PASS/FAIL
+      # output and a non-zero exit code on any mismatch -- and costs ~2s.
+      # tmp-dir SQLite + FakeBroker only: no secrets, no network, fully
+      # reproducible.
       - name: Run fixed execution scenarios (CLI)
         run: python -m execution.scenario_runner
+
+      # Issue #78 / PR #100: the shadow-mode CLI contract, end to end. dry-run
+      # first (must create nothing), a CLI FIXTURE cycle (labelled
+      # cli_fixture), a PRODUCTION SIGNAL cycle (a signal stored via the real
+      # Paper Signal store, resolved through the production providers), a
+      # dry-run over the EXISTING stores (file list must stay identical), and
+      # the report CLI whose --json output is parsed for real. Deterministic
+      # via --now; tmp-dir SQLite only, no secrets, no network, no broker
+      # anywhere in the path.
+      - name: Run shadow mode CLI (dry-run, fixture + production cycles, report)
+        run: |
+          set -e
+          python -m execution.shadow_runner --mode dry-run --cycle execution/examples/shadow_cycle_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          test ! -e "$RUNNER_TEMP/shadow-ci" || { echo "dry-run must not create DB files"; exit 1; }
+          python -m execution.shadow_runner --mode shadow --cycle execution/examples/shadow_cycle_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00 | tee fixture-cycle.out
+          grep -q "origin=cli_fixture" fixture-cycle.out
+          python -c "import sys,os; sys.path.insert(0,'paper-signal'); from pathlib import Path; import paper_signal_store; db=Path(os.environ['RUNNER_TEMP'])/'shadow-ci-signals'/'paper_signals.sqlite3'; db.parent.mkdir(parents=True,exist_ok=True); paper_signal_store.save_signal({'signal_id':'ci-signal-1','created_at_utc':'2026-01-01T00:00:00+00:00','symbol':'USD_JPY','timeframe':'H1','side':'long','market_bias':'Bull','confidence':0.9,'macd_state':'bullish','trend':'up','state':'trend','freshness':'fresh','reason':'ci seed','status':'paper_only'}, db_path=db)"
+          python -m execution.shadow_runner --mode shadow --signal-id ci-signal-1 --signal-db "$RUNNER_TEMP/shadow-ci-signals/paper_signals.sqlite3" --execution-config execution/examples/shadow_execution_config_example.json --market-snapshot execution/examples/market_snapshot_example.json --account-snapshot execution/examples/account_snapshot_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00 | tee production-cycle.out
+          grep -q "origin=production_signal" production-cycle.out
+          find "$RUNNER_TEMP/shadow-ci" -type f | sort > files-before.txt
+          python -m execution.shadow_runner --mode dry-run --cycle execution/examples/shadow_cycle_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          find "$RUNNER_TEMP/shadow-ci" -type f | sort > files-after.txt
+          diff files-before.txt files-after.txt
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" | tee report.out
+          grep -q "origin=production_signal" report.out
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --json > shadow-report.json
+          python -c "import json; data=json.load(open('shadow-report.json', encoding='ascii')); assert data['count'] == 2, data"
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --orphan-decisions
 
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
@@ -96,6 +126,16 @@ jobs:
           python -c "from execution.live_submission import LiveOrderSubmissionService"
           python -c "from execution.scenario_models import load_scenarios, validate_scenario"
           python -c "from execution.scenario_runner import main, run_scenarios"
+          python -c "from execution.shadow_models import ShadowResult, intended_order_from_request"
+          python -c "from execution import shadow_store"
+          python -c "from execution.shadow_execution import ShadowExecutionService"
+          python -c "from execution.shadow_providers import PaperSignalDbSignalProvider, StoredSignal"
+          python -c "from execution.shadow_config import load_shadow_execution_config"
+          python -c "from execution.shadow_composition import run_production_shadow_cycle"
+          python -c "from execution.sqlite_ro import connect_read_only"
+          python -c "from execution.strict_json import load_strict_json_file"
+          python -c "from execution.shadow_runner import main"
+          python -c "from execution.shadow_report import main"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot
@@ -135,3 +175,31 @@ jobs:
           python -m execution.scenario_runner
           python -m execution.scenario_runner --list
           python -m execution.scenario_runner --json
+
+      # Issue #78: the shadow CLIs must keep their exit-code contract on the
+      # Windows ANSI-codepage console too (cp932-equivalent; PYTHONUTF8 is
+      # deliberately NOT set). Also pins the execution pytest suite -- which
+      # holds the shadow SQLite file-handle / dry-run no-side-effect tests --
+      # on Windows.
+      - name: Run execution tests (Windows)
+        run: python -m pytest execution/tests -q
+
+      - name: Run shadow mode CLI (Windows)
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m execution.shadow_runner --mode dry-run --cycle execution/examples/shadow_cycle_example.json --data-dir "$env:RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          if ($LASTEXITCODE -ne 0) { throw "dry-run failed" }
+          if (Test-Path "$env:RUNNER_TEMP/shadow-ci") { throw "dry-run must not create DB files" }
+          python -m execution.shadow_runner --mode shadow --cycle execution/examples/shadow_cycle_example.json --data-dir "$env:RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
+          if ($LASTEXITCODE -ne 0) { throw "fixture cycle failed" }
+          python -c "import sys,os; sys.path.insert(0,'paper-signal'); from pathlib import Path; import paper_signal_store; db=Path(os.environ['RUNNER_TEMP'])/'shadow-ci-signals'/'paper_signals.sqlite3'; db.parent.mkdir(parents=True,exist_ok=True); paper_signal_store.save_signal({'signal_id':'ci-signal-1','created_at_utc':'2026-01-01T00:00:00+00:00','symbol':'USD_JPY','timeframe':'H1','side':'long','market_bias':'Bull','confidence':0.9,'macd_state':'bullish','trend':'up','state':'trend','freshness':'fresh','reason':'ci seed','status':'paper_only'}, db_path=db)"
+          if ($LASTEXITCODE -ne 0) { throw "signal seeding failed" }
+          python -m execution.shadow_runner --mode shadow --signal-id ci-signal-1 --signal-db "$env:RUNNER_TEMP/shadow-ci-signals/paper_signals.sqlite3" --execution-config execution/examples/shadow_execution_config_example.json --market-snapshot execution/examples/market_snapshot_example.json --account-snapshot execution/examples/account_snapshot_example.json --data-dir "$env:RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00 | Tee-Object production-cycle.out
+          if ($LASTEXITCODE -ne 0) { throw "production cycle failed" }
+          if (-not (Select-String -Path production-cycle.out -Pattern "origin=production_signal" -Quiet)) { throw "production provenance missing" }
+          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$env:RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3"
+          if ($LASTEXITCODE -ne 0) { throw "report failed" }
+          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$env:RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --json > shadow-report.json
+          if ($LASTEXITCODE -ne 0) { throw "json report failed" }
+          python -c "import json; data=json.load(open('shadow-report.json', encoding='ascii')); assert data['count'] == 2, data"
+          if ($LASTEXITCODE -ne 0) { throw "json parse failed" }

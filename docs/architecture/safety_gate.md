@@ -45,6 +45,18 @@ service.submit(execution_request_id, market=...)
 - **Broker 呼び出し後の失敗は拒否へ変換しない**: 注文が存在しうるため、例外はそのまま伝播する。**受領済み `OrderResult` の保存(`record_order_result`)が失敗した場合も、state-only UNKNOWN へのフォールバック記録を試みてから元例外を re-raise する** — Broker に存在する注文が永続化エラーの陰に消えることはない。フォールバックまで失敗した場合(order DB 全体の障害)は critical ログを残し、注文は phase `submitting` / state `pending` のまま **`execution_store.list_unresolved_submissions()`** で照会対象として取得できる(下記)。
 - **未解決 submission の照会**: `execution_store.list_unresolved_submissions()` は、`state = 'unknown'`(従来の照会対象)に加え、**`phase = 'submitting'` かつ `state = 'pending'`**(遷移獲得後に Broker 観測が一度も記録されないまま停止したケース — 送信前クラッシュ、または結果保存とUNKNOWNフォールバックの二重失敗)を返す read-only API。実注文が存在しうる submission は必ず reconciliation から見える。`created`(送信試行なし)と確定観測済み(phase `submitted`)は含まない。
 
+## execution mode と Shadow 評価(Issue #78)
+
+execution mode の統一語彙は `ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)であり、設定文字列は `resolve_execution_mode()` がロード時に解決する(未知 mode は明示拒否)。`demo` / `live` は引き続き**定義と validation のみ**で、Adapter 型が登録されるまで接続を構築できない。
+
+Shadow Mode(Issue #78)では Gate を `SafetyGate.evaluate_shadow(request, market=..., account=..., connection_target=...)` で評価する。live の `evaluate()` と**同一の共有チェック実装**を通るが、Broker connection を一切受け取らない:
+
+- ポジション / 口座上限が必要とする Broker 状態は、呼び出し側が注入する `AccountSafetySnapshot`(positions + `AccountState`)から評価する。信頼性検証(型・未来時刻・stale)は live の Broker 照会結果と同一ルールで、不正なら `broker_query_failed`(fail-closed)。
+- 接続 identity 検査は「shadow 接続先が `allowed_connection_targets[SHADOW]` にあるか」に縮退し、不一致は `execution_mode_mismatch`。
+- 判定は `execution_mode = "shadow"` として同じ監査 store へ保存される。
+
+詳細は [Shadow Mode / Shadow Execution](shadow_execution.md) を参照。
+
 ## 型付き接続 identity(`BrokerConnection` — Broker 実体から導出)
 
 execution mode / 接続先は**呼び出し側が申告する文字列ではない**。すべての Broker 実装は、自身の**構築時接続 config に由来する不変の identity**(`broker_models.BrokerConnectionIdentity`)を `connection_identity()` で自己申告する義務を負い、`BrokerConnection` は mode・接続先を **Broker インスタンスから導出**する(申告用の引数は存在せず、渡そうとすると `TypeError`):

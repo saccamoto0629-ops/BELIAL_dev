@@ -1,0 +1,50 @@
+{
+  "scenario_id": "shadow_duplicate_request",
+  "description": "Shadow Mode duplicate: 同じExecution Requestを2回処理しても2回目は明示的なduplicateとなり、Shadow結果は1件のまま重複保存されずBroker呼び出しも0",
+  "steps": [
+    {
+      "action": "shadow",
+      "request": {
+        "execution_request_id": "shadow-exec-1",
+        "signal_id": "shadow-signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "shadow-client-1",
+      "expect": {
+        "outcome": "recorded",
+        "allowed": true
+      }
+    },
+    {
+      "action": "shadow",
+      "request": {
+        "execution_request_id": "shadow-exec-1",
+        "signal_id": "shadow-signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "shadow-client-1",
+      "expect": {
+        "outcome": "duplicate",
+        "allowed": true
+      }
+    }
+  ],
+  "expected": {
+    "broker_submit_calls": 0,
+    "safety_decisions": 1,
+    "shadow_rows": 1,
+    "shadow_allowed": true
+  }
+}

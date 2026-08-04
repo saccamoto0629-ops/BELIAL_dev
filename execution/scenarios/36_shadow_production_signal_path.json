@@ -1,0 +1,60 @@
+{
+  "scenario_id": "shadow_production_signal_path",
+  "description": "Production Signal provider経路: 保存済みSignalをsignal providerで解決し、Production設定(明示policy・銘柄別数量)からExecution Requestを生成してGateを通過、input_origin=production_signalのShadow結果が保存される。Broker呼び出しは0",
+  "signals": [
+    {
+      "signal_id": "stored-signal-1",
+      "symbol": "USD_JPY",
+      "timeframe": "H1",
+      "side": "long",
+      "strategy_id": "strategy-prod-1",
+      "status": "paper_only"
+    }
+  ],
+  "production_config": {
+    "config_id": "scenario-prod-config-1",
+    "policy": {
+      "policy_id": "scenario-prod-policy-1",
+      "allowed_symbols": ["USD_JPY"],
+      "allowed_sides": ["buy", "sell"],
+      "max_order_quantity": "10",
+      "max_positions_per_symbol": 2,
+      "max_positions_account": 5,
+      "max_reference_age_seconds": 30,
+      "max_spread_by_symbol": {"USD_JPY": "0.05"},
+      "allowed_shadow_targets": ["shadow"],
+      "require_stop_loss": false
+    },
+    "order_quantities": {"USD_JPY": "3"},
+    "kill_switch": false,
+    "connection_target": "shadow"
+  },
+  "steps": [
+    {
+      "action": "shadow_production",
+      "signal_id": "stored-signal-1",
+      "expect": {
+        "outcome": "recorded",
+        "allowed": true
+      }
+    }
+  ],
+  "expected": {
+    "broker_submit_calls": 0,
+    "order_rows": 0,
+    "shadow_rows": 1,
+    "shadow_claim_rows": 0,
+    "shadow_allowed": true,
+    "shadow_origin": "production_signal",
+    "shadow_phase": "completed",
+    "safety_decisions": 1,
+    "shadow_intended_order": {
+      "client_order_id": "sigord-stored-signal-1",
+      "symbol": "USD_JPY",
+      "side": "buy",
+      "order_type": "market",
+      "quantity": "3",
+      "limit_price": null
+    }
+  }
+}

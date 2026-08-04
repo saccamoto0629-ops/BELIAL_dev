@@ -72,23 +72,71 @@ from execution.execution_models import ExecutionRequest
 
 
 class ExecutionMode(enum.Enum):
-    """Where an order submission believes it is running.
+    """The configured execution mode (Issue #78) -- the ONE mode vocabulary;
+    no module may re-model modes as loose strings.
 
-    ``FAKE`` is the test / development mode (FakeBroker only). It is
-    deliberately NOT named "paper": Paper Execution (``paper-execution/``) is
-    an independent virtual-execution layer that never touches the broker
-    boundary and never passes through this gate.
+    - ``DRY_RUN``: zero side effects -- no broker call, no DB creation /
+      migration / write, no state update, no Discord (Issue #78; the
+      repository-wide dry-run contract in docs/architecture/architecture.md).
+    - ``SHADOW``: the real decision path (ExecutionRequest -> Safety Gate)
+      runs, NOTHING is sent to any broker, and the audit outcome is persisted
+      to the shadow store (``execution/shadow_store.py``). No virtual fills,
+      no virtual positions, no virtual PnL -- that is Paper Execution's
+      separate layer, not shadow mode.
+    - ``FAKE``: the test / development submission mode (FakeBroker only). It
+      is deliberately NOT named "paper": Paper Execution
+      (``paper-execution/``) is an independent virtual-execution layer that
+      never touches the broker boundary and never passes through this gate.
+    - ``DEMO`` / ``LIVE``: defined for configuration validation ONLY. No
+      adapter type is registered, so no such connection can be constructed
+      (fail closed by unrepresentability); a runner asked to use them must
+      refuse explicitly as unimplemented.
     """
 
+    DRY_RUN = "dry-run"
+    SHADOW = "shadow"
     FAKE = "fake"
     DEMO = "demo"
     LIVE = "live"
 
 
+# Mode groups (Issue #78): which configured modes may ever reach a broker.
+# DRY_RUN / SHADOW structurally never submit; DEMO / LIVE are defined but
+# unimplemented -- a dispatcher must reject them explicitly, never fall
+# through to a submission path.
+NON_SUBMITTING_MODES: frozenset[ExecutionMode] = frozenset(
+    {ExecutionMode.DRY_RUN, ExecutionMode.SHADOW}
+)
+UNIMPLEMENTED_BROKER_MODES: frozenset[ExecutionMode] = frozenset(
+    {ExecutionMode.DEMO, ExecutionMode.LIVE}
+)
+
+
+def resolve_execution_mode(value) -> ExecutionMode:
+    """Resolve a configured mode string into :class:`ExecutionMode` at
+    configuration-load time (Issue #78). Anything but an exact known mode
+    value -- unknown strings, case variants, surrounding whitespace, non-str
+    values -- raises ``ValueError`` so a mistyped configuration is rejected
+    at startup instead of silently selecting some default behaviour."""
+    if isinstance(value, ExecutionMode):
+        return value
+    known = sorted(mode.value for mode in ExecutionMode)
+    if not isinstance(value, str):
+        raise ValueError(f"execution mode must be one of {known}, got {value!r}")
+    try:
+        return ExecutionMode(value)
+    except ValueError:
+        raise ValueError(
+            f"unknown execution mode {value!r}; must be exactly one of {known}"
+        ) from None
+
+
 # Typed connection identity registry (Issue #75 review r1): which concrete
 # broker type may claim which execution mode. DEMO / LIVE deliberately have
 # NO entry -- no such adapter exists, so no such connection can be built.
-# A future adapter is added HERE, never by loosening BrokerConnection.
+# DRY_RUN / SHADOW also have NO entry: those modes never own a broker
+# connection at all (Issue #78). A future adapter is added HERE, never by
+# loosening BrokerConnection.
 BROKER_TYPE_BY_MODE: dict[ExecutionMode, type] = {
     ExecutionMode.FAKE: FakeBroker,
 }
@@ -359,6 +407,61 @@ class SafetyPolicy:
             MappingProxyType(dict(self.allowed_connection_targets)),
         )
 
+    def to_snapshot(self) -> dict:
+        """JSON-able snapshot of the FULL validated policy content (Issue
+        #78): shadow results persist this next to ``policy_id`` so an audit
+        can reconstruct exactly which configuration produced a decision even
+        after the policy behind the id changed. Decimals become canonical
+        strings, enums their values; keys are emitted in sorted order."""
+        return {
+            "policy_id": self.policy_id,
+            "allowed_symbols": sorted(self.allowed_symbols),
+            "allowed_sides": sorted(side.value for side in self.allowed_sides),
+            "max_order_quantity": str(self.max_order_quantity),
+            "max_positions_per_symbol": self.max_positions_per_symbol,
+            "max_positions_account": self.max_positions_account,
+            "max_reference_age_seconds": self.max_reference_age.total_seconds(),
+            "max_spread_by_symbol": {
+                symbol: str(spread)
+                for symbol, spread in sorted(self.max_spread_by_symbol.items())
+            },
+            "allowed_connection_targets": {
+                mode.value: sorted(targets)
+                for mode, targets in sorted(
+                    self.allowed_connection_targets.items(), key=lambda item: item[0].value
+                )
+            },
+            "require_stop_loss": self.require_stop_loss,
+        }
+
+
+@dataclass(frozen=True)
+class AccountSafetySnapshot:
+    """Injected broker-state context for a SHADOW evaluation (Issue #78).
+
+    Shadow mode owns no broker connection, so the position / account state
+    the gate's limit checks need is supplied by the CALLER as this immutable
+    snapshot (captured from whatever provider the future live-preparation
+    layer uses) -- the gate itself performs no broker I/O in shadow mode.
+    Construction validates only the container types; freshness (stale /
+    future-dated ``retrieved_at_utc``) is judged at evaluation time against
+    the gate clock with exactly the same rules as a live broker answer.
+    """
+
+    positions: tuple[PositionInfo, ...]
+    account: AccountState
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.positions, tuple):
+            raise ValueError(
+                f"positions must be a tuple of PositionInfo, got {type(self.positions).__name__}"
+            )
+        for position in self.positions:
+            if not isinstance(position, PositionInfo):
+                raise ValueError(f"positions entries must be PositionInfo, got {position!r}")
+        if not isinstance(self.account, AccountState):
+            raise ValueError(f"account must be an AccountState, got {self.account!r}")
+
 
 @dataclass(frozen=True)
 class SafetyRejection:
@@ -490,6 +593,12 @@ class SafetyGate:
     def policy_id(self) -> str:
         return self._policy.policy_id
 
+    @property
+    def policy(self) -> SafetyPolicy:
+        """The gate's deep-immutable policy (Issue #78: the shadow service
+        persists ``policy.to_snapshot()`` next to every shadow result)."""
+        return self._policy
+
     def evaluate(
         self,
         request: ExecutionRequest,
@@ -506,12 +615,132 @@ class SafetyGate:
         now = self._clock()
         _require_utc(now, "SafetyGate clock value")
 
-        policy = self._policy
         rejections: list[SafetyRejection] = []
 
         def reject(code: SafetyRejectionCode, message: str) -> None:
             rejections.append(SafetyRejection(code=code, message=message))
 
+        self._collect_request_and_market_rejections(request, market, now, reject)
+        self._collect_connection_identity_rejections(connection, reject)
+        self._collect_kill_switch_rejections(reject)
+
+        # --- broker safety queries: positions / account ----------------------
+        positions: tuple[PositionInfo, ...] | None = None
+        account: AccountState | None = None
+        try:
+            positions = self._reliable_positions(connection.broker.get_positions(), now)
+            account = self._reliable_account(connection.broker.get_account_state(), now)
+        except Exception as exc:
+            reject(SafetyRejectionCode.BROKER_QUERY_FAILED, f"broker safety query failed: {exc}")
+
+        if positions is not None:
+            self._collect_position_limit_rejections(request, positions, reject)
+
+        deduped = dedupe_rejections(rejections)
+        return SafetyDecision(
+            execution_request_id=request.execution_request_id,
+            allowed=not deduped,
+            checked_at_utc=now,
+            policy_id=self._policy.policy_id,
+            rejections=deduped,
+            execution_mode=connection.execution_mode.value,
+            connection_target=connection.connection_target,
+            account_id=account.account_id if account is not None else None,
+            position_count=len(positions) if positions is not None else None,
+        )
+
+    def evaluate_shadow(
+        self,
+        request: ExecutionRequest,
+        *,
+        market: MarketSafetySnapshot,
+        account: AccountSafetySnapshot,
+        connection_target: str,
+    ) -> SafetyDecision:
+        """Shadow-mode evaluation (Issue #78): the SAME checks as
+        :meth:`evaluate`, evaluated by the SAME shared helpers, with no
+        broker anywhere in the call.
+
+        There is deliberately no ``BrokerConnection`` parameter -- shadow
+        mode owns no broker dependency, so no broker API (submit / cancel /
+        order / position / account query) is reachable from this path. The
+        broker-state context the position / account limit checks need is
+        supplied as an injected :class:`AccountSafetySnapshot` and validated
+        with exactly the same reliability rules as a live broker answer
+        (wrong type, future-dated or stale snapshots -> ``BROKER_QUERY_FAILED``,
+        fail closed). The connection-identity check degenerates to the policy
+        allow-list for ``ExecutionMode.SHADOW``: an unlisted shadow target is
+        rejected with ``EXECUTION_MODE_MISMATCH``, mirroring the live target
+        check. The returned decision records ``execution_mode = "shadow"``.
+        """
+        if not isinstance(request, ExecutionRequest):
+            raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
+        if not isinstance(market, MarketSafetySnapshot):
+            raise ValueError(f"market must be a MarketSafetySnapshot, got {market!r}")
+        if not isinstance(account, AccountSafetySnapshot):
+            raise ValueError(f"account must be an AccountSafetySnapshot, got {account!r}")
+        _require_non_empty_str(connection_target, "connection_target")
+        now = self._clock()
+        _require_utc(now, "SafetyGate clock value")
+
+        rejections: list[SafetyRejection] = []
+
+        def reject(code: SafetyRejectionCode, message: str) -> None:
+            rejections.append(SafetyRejection(code=code, message=message))
+
+        self._collect_request_and_market_rejections(request, market, now, reject)
+
+        # --- execution mode: shadow target vs policy allow-list --------------
+        allowed_targets = self._policy.allowed_connection_targets.get(
+            ExecutionMode.SHADOW, frozenset()
+        )
+        if connection_target not in allowed_targets:
+            reject(
+                SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
+                f"connection target {connection_target!r} is not allowed for "
+                f"execution mode {ExecutionMode.SHADOW.value!r}",
+            )
+
+        self._collect_kill_switch_rejections(reject)
+
+        # --- injected broker-state snapshot: positions / account -------------
+        positions: tuple[PositionInfo, ...] | None = None
+        validated_account: AccountState | None = None
+        try:
+            positions = self._reliable_positions(account.positions, now)
+            validated_account = self._reliable_account(account.account, now)
+        except Exception as exc:
+            reject(
+                SafetyRejectionCode.BROKER_QUERY_FAILED,
+                f"injected account/position snapshot is unreliable: {exc}",
+            )
+
+        if positions is not None:
+            self._collect_position_limit_rejections(request, positions, reject)
+
+        deduped = dedupe_rejections(rejections)
+        return SafetyDecision(
+            execution_request_id=request.execution_request_id,
+            allowed=not deduped,
+            checked_at_utc=now,
+            policy_id=self._policy.policy_id,
+            rejections=deduped,
+            execution_mode=ExecutionMode.SHADOW.value,
+            connection_target=connection_target,
+            account_id=validated_account.account_id if validated_account is not None else None,
+            position_count=len(positions) if positions is not None else None,
+        )
+
+    # --- shared check helpers (one implementation for live AND shadow) -------
+
+    def _collect_request_and_market_rejections(
+        self,
+        request: ExecutionRequest,
+        market: MarketSafetySnapshot,
+        now: datetime,
+        reject: Callable[[SafetyRejectionCode, str], None],
+    ) -> None:
+        policy = self._policy
         # --- static policy: symbol / side / quantity -------------------------
         if request.symbol not in policy.allowed_symbols:
             reject(SafetyRejectionCode.SYMBOL_NOT_ALLOWED, f"symbol {request.symbol!r} is not allowed")
@@ -565,6 +794,11 @@ class SafetyGate:
             reject(SafetyRejectionCode.STOP_LOSS_REQUIRED, "stop loss is required")
         self._validate_protective_prices(request, market, reject)
 
+    def _collect_connection_identity_rejections(
+        self,
+        connection: BrokerConnection,
+        reject: Callable[[SafetyRejectionCode, str], None],
+    ) -> None:
         # --- execution mode vs connection target -----------------------------
         # The identity is RE-derived from the broker instance itself at
         # evaluation time (not read from the connection's cached fields): a
@@ -598,7 +832,7 @@ class SafetyGate:
                     f"broker type {type(connection.broker).__name__} does not match execution "
                     f"mode {derived_mode.value!r}",
                 )
-        allowed_targets = policy.allowed_connection_targets.get(
+        allowed_targets = self._policy.allowed_connection_targets.get(
             connection.execution_mode, frozenset()
         )
         if connection.connection_target not in allowed_targets:
@@ -608,6 +842,9 @@ class SafetyGate:
                 f"execution mode {connection.execution_mode.value!r}",
             )
 
+    def _collect_kill_switch_rejections(
+        self, reject: Callable[[SafetyRejectionCode, str], None]
+    ) -> None:
         # --- kill switch (absolute: any enabled state rejects every order) ---
         try:
             kill_switch = self._state_provider.is_kill_switch_enabled()
@@ -626,43 +863,27 @@ class SafetyGate:
                     "kill switch is enabled; all new orders are rejected",
                 )
 
-        # --- broker safety queries: positions / account ----------------------
-        positions: tuple[PositionInfo, ...] | None = None
-        account: AccountState | None = None
-        try:
-            positions = self._reliable_positions(connection.broker.get_positions(), now)
-            account = self._reliable_account(connection.broker.get_account_state(), now)
-        except Exception as exc:
-            reject(SafetyRejectionCode.BROKER_QUERY_FAILED, f"broker safety query failed: {exc}")
-
-        if positions is not None:
-            # Count-based limits, new order counted as +1 (module docstring).
-            symbol_count = sum(1 for position in positions if position.symbol == request.symbol)
-            if symbol_count >= policy.max_positions_per_symbol:
-                reject(
-                    SafetyRejectionCode.SYMBOL_POSITION_LIMIT_EXCEEDED,
-                    f"{symbol_count} open position(s) for {request.symbol!r} already reach the "
-                    f"per-symbol limit {policy.max_positions_per_symbol}",
-                )
-            if len(positions) >= policy.max_positions_account:
-                reject(
-                    SafetyRejectionCode.ACCOUNT_POSITION_LIMIT_EXCEEDED,
-                    f"{len(positions)} open position(s) already reach the account limit "
-                    f"{policy.max_positions_account}",
-                )
-
-        deduped = dedupe_rejections(rejections)
-        return SafetyDecision(
-            execution_request_id=request.execution_request_id,
-            allowed=not deduped,
-            checked_at_utc=now,
-            policy_id=policy.policy_id,
-            rejections=deduped,
-            execution_mode=connection.execution_mode.value,
-            connection_target=connection.connection_target,
-            account_id=account.account_id if account is not None else None,
-            position_count=len(positions) if positions is not None else None,
-        )
+    def _collect_position_limit_rejections(
+        self,
+        request: ExecutionRequest,
+        positions: tuple[PositionInfo, ...],
+        reject: Callable[[SafetyRejectionCode, str], None],
+    ) -> None:
+        policy = self._policy
+        # Count-based limits, new order counted as +1 (module docstring).
+        symbol_count = sum(1 for position in positions if position.symbol == request.symbol)
+        if symbol_count >= policy.max_positions_per_symbol:
+            reject(
+                SafetyRejectionCode.SYMBOL_POSITION_LIMIT_EXCEEDED,
+                f"{symbol_count} open position(s) for {request.symbol!r} already reach the "
+                f"per-symbol limit {policy.max_positions_per_symbol}",
+            )
+        if len(positions) >= policy.max_positions_account:
+            reject(
+                SafetyRejectionCode.ACCOUNT_POSITION_LIMIT_EXCEEDED,
+                f"{len(positions)} open position(s) already reach the account limit "
+                f"{policy.max_positions_account}",
+            )
 
     def _reliable_positions(self, raw, now: datetime) -> tuple[PositionInfo, ...]:
         """Validate the broker's position answer before trusting it for limits.

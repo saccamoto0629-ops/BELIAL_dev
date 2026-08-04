@@ -17,6 +17,16 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.live_submission import LiveOrderSubmissionService",
     "from execution.scenario_models import load_scenarios, validate_scenario",
     "from execution.scenario_runner import main, run_scenarios",
+    "from execution.shadow_models import ShadowResult, intended_order_from_request",
+    "from execution import shadow_store",
+    "from execution.shadow_execution import ShadowExecutionService",
+    "from execution.shadow_providers import PaperSignalDbSignalProvider, StoredSignal",
+    "from execution.shadow_config import load_shadow_execution_config",
+    "from execution.shadow_composition import run_production_shadow_cycle",
+    "from execution.sqlite_ro import connect_read_only",
+    "from execution.strict_json import load_strict_json_file",
+    "from execution.shadow_runner import main as shadow_runner_main",
+    "from execution.shadow_report import main as shadow_report_main",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /
@@ -66,9 +76,9 @@ def test_paper_and_observation_layers_never_import_the_execution_package():
 def test_execution_package_only_depends_on_stdlib_and_broker():
     allowed = {
         "annotations", "argparse", "ast", "collections", "contextlib", "dataclasses",
-        "datetime", "decimal", "enum", "json", "logging", "os", "pathlib", "re",
-        "sqlite3", "sys", "tempfile", "threading", "time", "traceback", "types",
-        "typing", "broker", "execution", "__future__",
+        "datetime", "decimal", "enum", "json", "logging", "math", "os", "pathlib",
+        "re", "sqlite3", "sys", "tempfile", "threading", "time", "traceback",
+        "types", "typing", "broker", "execution", "__future__",
     }
     for path in (REPO_ROOT / "execution").glob("*.py"):
         names = _imported_top_level_names(path)

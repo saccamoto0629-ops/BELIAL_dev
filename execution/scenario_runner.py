@@ -58,7 +58,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from broker.broker_models import BrokerError, OrderSide, OrderState, OrderType
+from broker.broker_models import AccountState, BrokerError, OrderSide, OrderState, OrderType
 from broker.fake_broker import (
     FailCommunication,
     FakeBroker,
@@ -68,10 +68,12 @@ from broker.fake_broker import (
     StayPending,
     TimeoutOrder,
 )
-from execution import execution_store
+from execution import execution_store, shadow_store
+from execution.cli_streams import encoding_safe_streams
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
 from execution.safety_gate import (
+    AccountSafetySnapshot,
     BrokerConnection,
     ExecutionMode,
     MarketSafetySnapshot,
@@ -79,7 +81,16 @@ from execution.safety_gate import (
     SafetyPolicy,
     StaticSafetyState,
 )
-from execution.safety_store import SQLiteSafetyDecisionStore
+from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore
+from execution.shadow_composition import run_production_shadow_cycle
+from execution.shadow_config import parse_shadow_execution_config
+from execution.shadow_execution import ShadowCycleStatus, ShadowExecutionService
+from execution.shadow_models import INPUT_ORIGIN_SCENARIO_FIXTURE, ShadowProvenance
+from execution.shadow_providers import (
+    PaperSignalDbSignalProvider,
+    StaticAccountSnapshotProvider,
+    StaticMarketSnapshotProvider,
+)
 from execution.scenario_models import (
     DEFAULT_SCENARIO_DIR,
     FAULT_BOUNDARIES,
@@ -263,7 +274,8 @@ def _build_policy(definition: ScenarioDefinition) -> SafetyPolicy:
         max_reference_age=timedelta(seconds=gate.get("max_reference_age_seconds", 30)),
         max_spread_by_symbol={**default_spread, **spread_overrides},
         allowed_connection_targets={
-            ExecutionMode.FAKE: frozenset(gate.get("allowed_fake_targets", ["fake"]))
+            ExecutionMode.FAKE: frozenset(gate.get("allowed_fake_targets", ["fake"])),
+            ExecutionMode.SHADOW: frozenset(gate.get("allowed_shadow_targets", ["shadow"])),
         },
         require_stop_loss=gate.get("require_stop_loss", True),
     )
@@ -285,31 +297,66 @@ def _build_market(definition: ScenarioDefinition) -> MarketSafetySnapshot:
 
 # --- fault injection ----------------------------------------------------------
 
+# Boundary name -> (owner object, error type the wrapper raises). The
+# attribute substituted on the owner comes from ``FAULT_BOUNDARIES``
+# (scenario_models validates the names). Issue #78 adds the shadow-store save
+# (module function) and the safety-decision record (class attribute on the
+# sealed store type -- the only substitution point, since instances cannot be
+# injected into the services).
+_FAULT_TARGETS: dict[str, tuple[object, type[Exception]]] = {
+    "initial_save": (execution_store, execution_store.ExecutionStoreError),
+    "mark_submitting": (execution_store, execution_store.ExecutionStoreError),
+    "record_order_result": (execution_store, execution_store.ExecutionStoreError),
+    "record_order_state": (execution_store, execution_store.ExecutionStoreError),
+    "state_history": (execution_store, execution_store.ExecutionStoreError),
+    "shadow_claim": (shadow_store, shadow_store.ShadowStoreError),
+    "shadow_result_save": (shadow_store, shadow_store.ShadowStoreError),
+    "safety_decision_record": (SQLiteSafetyDecisionStore, SafetyStoreError),
+}
+
 
 @contextlib.contextmanager
 def _armed_faults(faults: tuple[dict, ...]):
-    """Substitute the targeted ``execution_store`` functions with raising
-    stubs for the duration of one scenario (restored in reverse order even on
-    error). This is the explicit, test-only dependency substitution Issue #77
-    asks for -- production modules keep no hidden failure switches."""
-    originals: list[tuple[str, object]] = []
+    """Substitute the targeted store functions with raising stubs for the
+    duration of one scenario (restored in reverse order even on error). This
+    is the explicit, test-only dependency substitution Issue #77 asks for --
+    production modules keep no hidden failure switches."""
+    originals: list[tuple[object, str, object]] = []
     try:
         for fault in faults:
-            attribute = FAULT_BOUNDARIES[fault["boundary"]]
-            original = getattr(execution_store, attribute)
-            originals.append((attribute, original))
+            boundary = fault["boundary"]
+            attribute = FAULT_BOUNDARIES[boundary]
+            owner, error_type = _FAULT_TARGETS[boundary]
+            original = getattr(owner, attribute)
+            originals.append((owner, attribute, original))
             setattr(
-                execution_store,
+                owner,
                 attribute,
-                _fault_wrapper(original, fault["boundary"], fault.get("after_calls", 0)),
+                _fault_wrapper(
+                    original,
+                    boundary,
+                    error_type,
+                    after_calls=fault.get("after_calls"),
+                    fail_calls=fault.get("fail_calls"),
+                ),
             )
         yield
     finally:
-        for attribute, original in reversed(originals):
-            setattr(execution_store, attribute, original)
+        for owner, attribute, original in reversed(originals):
+            setattr(owner, attribute, original)
 
 
-def _fault_wrapper(original, boundary: str, after_calls: int):
+def _fault_wrapper(
+    original,
+    boundary: str,
+    error_type: type[Exception],
+    *,
+    after_calls: int | None,
+    fail_calls: int | None,
+):
+    """``after_calls=N``: pass the first N calls, fail the rest.
+    ``fail_calls=N`` (Issue #78 stale-claim recovery): fail the first N
+    calls, pass the rest. Default (neither): fail every call."""
     lock = threading.Lock()
     calls = [0]
 
@@ -317,10 +364,12 @@ def _fault_wrapper(original, boundary: str, after_calls: int):
         with lock:
             calls[0] += 1
             call_number = calls[0]
-        if call_number > after_calls:
-            raise execution_store.ExecutionStoreError(
-                f"injected fault at boundary {boundary!r} (call {call_number})"
-            )
+        if fail_calls is not None:
+            should_fail = call_number <= fail_calls
+        else:
+            should_fail = call_number > (after_calls or 0)
+        if should_fail:
+            raise error_type(f"injected fault at boundary {boundary!r} (call {call_number})")
         return original(*args, **kwargs)
 
     return wrapper
@@ -336,7 +385,11 @@ class _ScenarioContext:
         self.definition = definition
         self.orders_db = work_dir / "orders.sqlite3"
         self.decisions_db = work_dir / "safety.sqlite3"
-        SQLiteSafetyDecisionStore(self.decisions_db).initialize()
+        self.shadow_db = work_dir / "shadow.sqlite3"
+        # No store is initialized eagerly (Issue #78): dry-run shadow
+        # scenarios observe that NO store file is ever created, so store
+        # initialization happens lazily (and idempotently) in the service
+        # factories the non-dry-run steps use.
         self.broker = _build_broker(definition)
         self.connection = BrokerConnection(broker=self.broker)
         self.policy = _build_policy(definition)
@@ -344,6 +397,37 @@ class _ScenarioContext:
         self.state = StaticSafetyState(
             kill_switch_enabled=definition.gate.get("kill_switch", False)
         )
+        # Injected broker-state context for shadow evaluations: an empty,
+        # fresh snapshot (the required shadow scenarios exercise gate
+        # conditions other than position limits).
+        self.account = AccountSafetySnapshot(
+            positions=(),
+            account=AccountState(
+                account_id="scenario-account",
+                currency="XXX",
+                balance=Decimal("0"),
+                equity=Decimal("0"),
+                margin_available=Decimal("0"),
+                retrieved_at_utc=NOW,
+            ),
+        )
+        # Fixture provenance for shadow steps: clearly labelled as the
+        # scenario suite, never as the production signal path.
+        self.provenance = ShadowProvenance(
+            input_origin=INPUT_ORIGIN_SCENARIO_FIXTURE,
+            signal_source=f"scenario:{definition.scenario_id}",
+            config_source=f"scenario:{definition.scenario_id}",
+            config_version="scenario-policy-1",
+            market_source=f"scenario:{definition.scenario_id}",
+            account_source=f"scenario:{definition.scenario_id}",
+        )
+        # Stored-signal fixtures for shadow_production steps: seeded ONCE per
+        # scenario into a private temporary paper-signal DB that the
+        # PRODUCTION PaperSignalDbSignalProvider then reads (fixture
+        # provisioning only -- the decision path stays production code).
+        self.signal_db = work_dir / "paper_signals.sqlite3"
+        if definition.signals:
+            _seed_signal_fixture(self.signal_db, definition.signals)
         self.client_order_ids: dict[str, str] = {}
         self.step_results: list[dict] = []
 
@@ -351,6 +435,7 @@ class _ScenarioContext:
         """One service per call: concurrency steps give each worker its own
         instance (multi-process equivalence); sequential steps just use a
         fresh one, which is stateless beyond its injected paths."""
+        SQLiteSafetyDecisionStore(self.decisions_db).initialize()
         return LiveOrderSubmissionService(
             connection=self.connection,
             gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=lambda: NOW),
@@ -358,6 +443,71 @@ class _ScenarioContext:
             order_db_path=self.orders_db,
             clock=lambda: NOW,
         )
+
+    def step_clock(self, step: ScenarioStep):
+        """The step's evaluation clock: NOW plus the declared offset (used by
+        the stale-claim recovery scenarios to move past a lease expiry)."""
+        offset = step.params.get("at_offset_seconds", 0)
+        moment = NOW + timedelta(seconds=offset)
+        return lambda: moment
+
+    def make_shadow_service(
+        self,
+        *,
+        initialize: bool,
+        clock=None,
+        owner_id: str | None = None,
+        claim_lease_seconds: int | None = None,
+    ) -> ShadowExecutionService:
+        """One shadow service per call (same multi-process equivalence as
+        ``make_service``). ``initialize=False`` is the dry-run path: the
+        service must not create any store file."""
+        clock = clock if clock is not None else (lambda: NOW)
+        kwargs = {}
+        if claim_lease_seconds is not None:
+            kwargs["claim_lease_seconds"] = claim_lease_seconds
+        service = ShadowExecutionService(
+            gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=clock),
+            decision_db_path=self.decisions_db,
+            shadow_db_path=self.shadow_db,
+            clock=clock,
+            owner_id=owner_id,
+            **kwargs,
+        )
+        if initialize:
+            service.initialize_stores()
+        return service
+
+
+def _seed_signal_fixture(db_path: Path, signals: tuple[dict, ...]) -> None:
+    """Write the scenario's stored-signal FIXTURES into a private temporary
+    DB carrying the paper-signal columns the production adapter reads. Pure
+    input provisioning: nothing here decides or evaluates anything."""
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE paper_signals ("
+            "signal_id TEXT PRIMARY KEY, created_at_utc TEXT NOT NULL, "
+            "symbol TEXT NOT NULL, timeframe TEXT NOT NULL, side TEXT NOT NULL, "
+            "strategy_profile TEXT NOT NULL, status TEXT NOT NULL)"
+        )
+        for signal in signals:
+            connection.execute(
+                "INSERT INTO paper_signals (signal_id, created_at_utc, symbol, timeframe, "
+                "side, strategy_profile, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    signal["signal_id"],
+                    NOW.isoformat(),
+                    signal["symbol"],
+                    signal["timeframe"],
+                    signal["side"],
+                    signal.get("strategy_id", "scenario-strategy"),
+                    signal.get("status", "paper_only"),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _classify_error(exc: Exception) -> dict:
@@ -467,6 +617,124 @@ def _execute_submit_concurrent(context: _ScenarioContext, step: ScenarioStep) ->
     }
 
 
+def _shadow_step_payload(outcome) -> dict:
+    result = outcome.result
+    payload = {
+        # Scenario vocabulary uses identifier-style outcome names.
+        "outcome": "dry_run" if outcome.status is ShadowCycleStatus.DRY_RUN else outcome.status.value,
+        # A duplicate against a still-in-flight claim carries no result:
+        # ``allowed`` is None there (the gate never ran for this call).
+        "allowed": None if result is None else result.allowed,
+        "rejection_codes": [] if result is None else sorted(result.rejection_codes),
+    }
+    return payload
+
+
+def _classify_shadow_error(exc: Exception) -> dict:
+    if isinstance(exc, shadow_store.ShadowIdentityConflictError):
+        return {
+            "outcome": "conflict",
+            "error_type": type(exc).__name__,
+            "conflict_fields": sorted(exc.differing_fields),
+        }
+    return {"outcome": "error", **_classify_error(exc)}
+
+
+def _execute_shadow(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    request = _build_request(step.params["request"])
+    dry_run = step.params.get("dry_run", False)
+    try:
+        service = context.make_shadow_service(
+            initialize=not dry_run,
+            clock=context.step_clock(step),
+            owner_id=step.params.get("owner_id"),
+            claim_lease_seconds=step.params.get("claim_lease_seconds"),
+        )
+        run = service.dry_run_cycle if dry_run else service.run_cycle
+        outcome = run(
+            request,
+            market=context.market,
+            account=context.account,
+            client_order_id=step.params["client_order_id"],
+            provenance=context.provenance,
+            timeframe=step.params.get("timeframe"),
+        )
+    except Exception as exc:
+        return _classify_shadow_error(exc)
+    return _shadow_step_payload(outcome)
+
+
+def _execute_shadow_production(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    """Drive the PRODUCTION composition root over the scenario's seeded
+    signal store and validated production configuration -- the runner only
+    provisions inputs and observes."""
+    config = parse_shadow_execution_config(
+        context.definition.production_config,
+        source=f"scenario:{context.definition.scenario_id}",
+    )
+    clock = context.step_clock(step)
+    try:
+        outcome = run_production_shadow_cycle(
+            step.params["signal_id"],
+            signal_provider=PaperSignalDbSignalProvider(context.signal_db),
+            config=config,
+            market_provider=StaticMarketSnapshotProvider(
+                context.market, f"scenario:{context.definition.scenario_id}"
+            ),
+            account_provider=StaticAccountSnapshotProvider(
+                context.account, f"scenario:{context.definition.scenario_id}"
+            ),
+            shadow_db_path=context.shadow_db,
+            decision_db_path=context.decisions_db,
+            clock=clock,
+            owner_id=step.params.get("owner_id"),
+            dry_run=step.params.get("dry_run", False),
+        )
+    except Exception as exc:
+        return _classify_shadow_error(exc)
+    return _shadow_step_payload(outcome)
+
+
+def _execute_shadow_concurrent(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    request = _build_request(step.params["request"])
+    worker_count = step.params["workers"]
+    # Stores are initialized once, sequentially, before the race: the
+    # contested boundary is the shadow store's claim, not init.
+    services = [
+        context.make_shadow_service(initialize=True, owner_id=f"scenario-worker-{index}")
+        for index in range(worker_count)
+    ]
+
+    def work(index: int, barrier: threading.Barrier) -> dict:
+        barrier.wait(timeout=60)
+        try:
+            outcome = services[index].run_cycle(
+                request,
+                market=context.market,
+                account=context.account,
+                client_order_id=step.params["client_order_id"],
+                provenance=context.provenance,
+                timeframe=step.params.get("timeframe"),
+            )
+        except Exception as exc:
+            # A locked-DB / store failure is an ``error`` -- it must never be
+            # counted as a recorded result or as duplicate suppression.
+            return _classify_shadow_error(exc)
+        return _shadow_step_payload(outcome)
+
+    worker_results = _run_workers(worker_count, work)
+    codes = sorted(
+        {code for entry in worker_results for code in entry.get("rejection_codes", [])}
+    )
+    return {
+        "recorded": sum(1 for entry in worker_results if entry["outcome"] == "recorded"),
+        "duplicates": sum(1 for entry in worker_results if entry["outcome"] == "duplicate"),
+        "errors": sum(1 for entry in worker_results if entry["outcome"] == "error"),
+        "rejection_codes": codes,
+        "workers": worker_results,
+    }
+
+
 def _execute_register_concurrent(context: _ScenarioContext, step: ScenarioStep) -> dict:
     registrations = step.params["registrations"]
     requests = [_build_request(entry["request"]) for entry in registrations]
@@ -509,6 +777,9 @@ _STEP_EXECUTORS = {
     "mark_submitting": _execute_mark_submitting,
     "submit_concurrent": _execute_submit_concurrent,
     "register_concurrent": _execute_register_concurrent,
+    "shadow": _execute_shadow,
+    "shadow_concurrent": _execute_shadow_concurrent,
+    "shadow_production": _execute_shadow_production,
 }
 
 
@@ -532,6 +803,24 @@ def _row_counts(db_path: Path) -> tuple[int, int]:
     finally:
         connection.close()
     return orders, history
+
+
+def _shadow_row_counts(db_path: Path) -> tuple[int, int]:
+    """(completed, claimed) row counts straight from the scenario's temporary
+    DB, read-only; a missing file counts as zero rows and is never created."""
+    if not db_path.exists():
+        return 0, 0
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        completed = connection.execute(
+            f"SELECT COUNT(*) FROM {shadow_store.RESULTS_TABLE} WHERE phase = 'completed'"
+        ).fetchone()[0]
+        claimed = connection.execute(
+            f"SELECT COUNT(*) FROM {shadow_store.RESULTS_TABLE} WHERE phase = 'claimed'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    return completed, claimed
 
 
 def _collect_actual(context: _ScenarioContext) -> dict:
@@ -608,6 +897,56 @@ def _collect_actual(context: _ScenarioContext) -> dict:
         "listed_unknown": primary_id in unknown_ids,
         "listed_unresolved": primary_id in unresolved_ids,
     }
+
+    # --- shadow-store observations (Issue #78) ---------------------------
+    shadow_result = None
+    shadow_claim = None
+    if primary_id is not None and context.shadow_db.exists():
+        shadow_result = shadow_store.get_shadow_result(primary_id, db_path=context.shadow_db)
+        shadow_claim = shadow_store.get_shadow_claim(primary_id, db_path=context.shadow_db)
+    intended = None if shadow_result is None else shadow_result.intended_order
+    completed_rows, claimed_rows = _shadow_row_counts(context.shadow_db)
+    if shadow_result is not None:
+        phase = "completed"
+    elif shadow_claim is not None:
+        phase = "claimed"
+    else:
+        phase = None
+    origin = (
+        shadow_result.provenance.input_origin
+        if shadow_result is not None
+        else (shadow_claim.input_origin if shadow_claim is not None else None)
+    )
+    actual.update(
+        {
+            "shadow_rows": completed_rows,
+            "shadow_claim_rows": claimed_rows,
+            "shadow_db_created": context.shadow_db.exists(),
+            "decision_db_created": context.decisions_db.exists(),
+            "shadow_allowed": None if shadow_result is None else shadow_result.allowed,
+            "shadow_codes": None
+            if shadow_result is None
+            else sorted(shadow_result.rejection_codes),
+            "shadow_origin": origin,
+            "shadow_phase": phase,
+            "shadow_account_id": None
+            if shadow_result is None
+            else shadow_result.account.account.account_id,
+            "shadow_safety_decision_id": None
+            if shadow_result is None
+            else shadow_result.safety_decision_id,
+            "shadow_intended_order": None
+            if intended is None
+            else {
+                "client_order_id": intended.client_order_id,
+                "symbol": intended.symbol,
+                "side": intended.side.value,
+                "order_type": intended.order_type.value,
+                "quantity": intended.quantity,
+                "limit_price": intended.limit_price,
+            },
+        }
+    )
     return actual
 
 
@@ -621,9 +960,9 @@ def _values_match(key: str, expected, actual) -> bool:
         return expected is None or Decimal(expected) == actual
     if key == "fill_prices":
         return actual is not None and [Decimal(price) for price in expected] == list(actual)
-    if key == "last_decision_codes":
+    if key in ("last_decision_codes", "shadow_codes"):
         return actual is not None and sorted(expected) == actual
-    if key == "submitted_request":
+    if key in ("submitted_request", "shadow_intended_order"):
         if actual is None:
             return False
         for sub_key, sub_expected in expected.items():
@@ -705,7 +1044,7 @@ def _compare_step(index: int, step: ScenarioStep, actual: dict) -> list[Mismatch
     mismatches = []
     for key, expected_value in step.expect.items():
         actual_value = actual.get(key)
-        if key == "rejection_codes":
+        if key in ("rejection_codes", "conflict_fields"):
             matched = actual_value is not None and sorted(expected_value) == sorted(actual_value)
         else:
             matched = expected_value == actual_value
@@ -843,42 +1182,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-@contextlib.contextmanager
-def _encoding_safe_streams():
-    """Never let the console encoding turn an all-PASS run into exit 1 --
-    and never LEAK the changed stream configuration past ``main()``.
-
-    The Windows-ja default console is cp932 and GitHub's Windows runners pipe
-    stdout through the ANSI codepage; scenario descriptions are free text, so
-    a strict-encoding stream would raise ``UnicodeEncodeError`` mid-report.
-    Separators are ASCII and ``--json`` is pure ASCII already; inside this
-    context the remaining free text degrades to escape sequences instead of
-    crashing. The previous ``errors`` policy of each stream is restored in
-    ``finally`` on EVERY exit path -- normal return, usage error
-    (``SystemExit`` from argparse), schema error and unexpected exceptions --
-    so embedding callers (pytest, other CLIs) never observe a leftover
-    configuration. Streams that cannot be reconfigured are left alone.
-    This runs only inside ``main()``; importing the module changes nothing.
-    """
-    restores: list[tuple] = []
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        original_errors = getattr(stream, "errors", None)
-        if not callable(reconfigure) or original_errors is None:
-            continue
-        try:
-            reconfigure(errors="backslashreplace")
-        except (ValueError, OSError):
-            continue
-        restores.append((reconfigure, original_errors))
-    try:
-        yield
-    finally:
-        for reconfigure, original_errors in reversed(restores):
-            try:
-                reconfigure(errors=original_errors)
-            except (ValueError, OSError):
-                pass
+# Console-encoding safety (PR #96 review r1) lives in execution.cli_streams
+# since Issue #78 -- the same contract now covers the shadow CLIs too.
+_encoding_safe_streams = encoding_safe_streams
 
 
 def main(argv: list[str] | None = None) -> int:

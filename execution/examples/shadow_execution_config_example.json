@@ -1,0 +1,18 @@
+{
+  "config_id": "shadow-production-config-example-1",
+  "policy": {
+    "policy_id": "shadow-production-policy-example-1",
+    "allowed_symbols": ["USD_JPY"],
+    "allowed_sides": ["buy", "sell"],
+    "max_order_quantity": "10",
+    "max_positions_per_symbol": 2,
+    "max_positions_account": 5,
+    "max_reference_age_seconds": 30,
+    "max_spread_by_symbol": {"USD_JPY": "0.05"},
+    "allowed_shadow_targets": ["shadow"],
+    "require_stop_loss": false
+  },
+  "order_quantities": {"USD_JPY": "1"},
+  "kill_switch": false,
+  "connection_target": "shadow"
+}

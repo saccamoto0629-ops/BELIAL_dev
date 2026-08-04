@@ -45,6 +45,7 @@ from pathlib import Path
 
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
 from execution.safety_gate import SafetyDecision, SafetyRejection, SafetyRejectionCode
+from execution.sqlite_ro import connect_read_only
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "safety_gate_decisions.sqlite3"
@@ -236,9 +237,11 @@ def _verified_txn(db_path: Path):
 
 @contextmanager
 def _verified_read(db_path: Path):
-    """Read flow: open -> BEGIN (consistent view) -> verify schema -> restore.
-    Always rolled back (reads write nothing)."""
-    with closing(_connect(db_path)) as connection:
+    """Read flow: open a TRUE read-only connection (``mode=ro`` +
+    ``PRAGMA query_only``, PR #100 review: a read can never create the file,
+    journals or WAL/SHM side files, and any write attempt fails) -> BEGIN
+    (consistent view) -> verify schema -> restore. Always rolled back."""
+    with closing(connect_read_only(db_path)) as connection:
         connection.execute("BEGIN")
         try:
             _verify_schema(connection, db_path)
@@ -317,8 +320,10 @@ class SQLiteSafetyDecisionStore:
                 connection.execute("ROLLBACK")
                 raise
 
-    def record(self, decision: SafetyDecision) -> None:
+    def record(self, decision: SafetyDecision) -> int:
         """Persist one decision; raises on ANY failure (fail closed).
+        Returns the assigned ``decision_id`` (Issue #78: shadow results
+        reference the decision row they were built from).
 
         A missing DB file is a failure, not a trigger for implicit creation:
         the audit store must be initialized deliberately, and a submission
@@ -342,11 +347,12 @@ class SQLiteSafetyDecisionStore:
             decision.position_count,
         )
         with _verified_txn(self._path) as connection:
-            connection.execute(
+            cursor = connection.execute(
                 f"INSERT INTO {DECISIONS_TABLE} ({', '.join(_DECISION_COLUMNS)}) "
                 f"VALUES ({', '.join('?' for _ in _DECISION_COLUMNS)})",
                 record,
             )
+            return int(cursor.lastrowid)
 
     def list_for_request(self, execution_request_id: str) -> tuple[SafetyDecision, ...]:
         """All decisions for one request, in recording order.
@@ -355,6 +361,16 @@ class SQLiteSafetyDecisionStore:
         safe). Every row is strictly re-validated; an out-of-band edited DB
         raises :class:`SafetyIntegrityError` instead of being trusted.
         """
+        return tuple(decision for _, decision in self.list_for_request_with_ids(execution_request_id))
+
+    def list_for_request_with_ids(
+        self, execution_request_id: str
+    ) -> tuple[tuple[int, SafetyDecision], ...]:
+        """Like :meth:`list_for_request`, additionally exposing each row's
+        ``decision_id`` (Issue #78 / PR #100 review: shadow results reference
+        their decision row, and the report CLI needs the ids to find ORPHAN
+        decisions -- audit rows left by a shadow completion that later failed
+        and was retried). Purely additive read API."""
         if not isinstance(execution_request_id, str) or not execution_request_id.strip():
             raise SafetyStoreError(
                 f"execution_request_id must be a non-empty string, got {execution_request_id!r}"
@@ -363,7 +379,7 @@ class SQLiteSafetyDecisionStore:
             return ()
         with _verified_read(self._path) as connection:
             rows = connection.execute(
-                f"SELECT {', '.join(_DECISION_COLUMNS)} FROM {DECISIONS_TABLE} "
+                f"SELECT decision_id, {', '.join(_DECISION_COLUMNS)} FROM {DECISIONS_TABLE} "
                 "WHERE execution_request_id = ? ORDER BY decision_id ASC",
                 (execution_request_id,),
             ).fetchall()
@@ -377,16 +393,19 @@ class SQLiteSafetyDecisionStore:
                 ):
                     raise ValueError(f"position_count is invalid: {row['position_count']!r}")
                 decisions.append(
-                    SafetyDecision(
-                        execution_request_id=row["execution_request_id"],
-                        allowed=bool(row["allowed"]),
-                        checked_at_utc=_parse_utc(row["checked_at_utc"]),
-                        policy_id=row["policy_id"],
-                        rejections=_rejections_from_json(row["rejections_json"]),
-                        execution_mode=row["execution_mode"],
-                        connection_target=row["connection_target"],
-                        account_id=row["account_id"],
-                        position_count=row["position_count"],
+                    (
+                        int(row["decision_id"]),
+                        SafetyDecision(
+                            execution_request_id=row["execution_request_id"],
+                            allowed=bool(row["allowed"]),
+                            checked_at_utc=_parse_utc(row["checked_at_utc"]),
+                            policy_id=row["policy_id"],
+                            rejections=_rejections_from_json(row["rejections_json"]),
+                            execution_mode=row["execution_mode"],
+                            connection_target=row["connection_target"],
+                            account_id=row["account_id"],
+                            position_count=row["position_count"],
+                        ),
                     )
                 )
             except (ValueError, TypeError) as exc:

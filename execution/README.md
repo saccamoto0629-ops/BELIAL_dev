@@ -1,6 +1,6 @@
 # execution/
 
-将来の **Live Execution** に向けた ExecutionRequest モデル、注文状態・状態履歴の SQLite 永続化基盤(Issue #74)、および Broker 送信直前の fail-closed **Safety Gate**(Issue #75)。**実発注は行わない。外部通信も行わない。OANDA Adapter・Live 接続・Live Execution runner は未実装。**
+将来の **Live Execution** に向けた ExecutionRequest モデル、注文状態・状態履歴の SQLite 永続化基盤(Issue #74)、Broker 送信直前の fail-closed **Safety Gate**(Issue #75)、および Broker へ送信せずに実判定経路を検証記録する **Shadow Mode**(Issue #78)。**実発注は行わない。外部通信も行わない。OANDA Adapter・Live 接続・Live Execution runner は未実装。**
 
 明示的な Python package。リポジトリルートから import する:
 
@@ -10,6 +10,8 @@ from execution import execution_store
 from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy
 from execution.safety_store import SQLiteSafetyDecisionStore
 from execution.live_submission import LiveOrderSubmissionService
+from execution.shadow_execution import ShadowExecutionService
+from execution import shadow_store
 ```
 
 | ファイル | 内容 |
@@ -19,9 +21,21 @@ from execution.live_submission import LiveOrderSubmissionService
 | `safety_gate.py` | 発注前 Safety Gate(Issue #75): 許可銘柄・方向・数量上限・銘柄別 / 口座全体ポジション上限(件数ベース)・SL 必須 / SL・TP 妥当性・参照価格の鮮度(未来時刻含む)・spread 上限・market open / tradable・kill switch・**Broker 実体から導出する型付き接続 identity**(`BrokerConnection` — mode / target は `connection_identity()` から導出され caller は申告不能。評価のたびに再導出しドリフトを拒否)× 許可接続先の整合を独立検査し、**全違反を機械可読コードで収集・順序保持 dedup** する。Broker 照会(positions / account)の失敗・型不正・stale / 未来 snapshot、bool 以外の kill switch 応答はすべて fail-closed で拒否。`SafetyPolicy` は deep immutable(防御的コピー + read-only view) |
 | `safety_store.py` | Safety Gate 判定の SQLite 監査保存(`safety_gate_decisions.sqlite3`。`execution_orders.sqlite3` とは別ファイル): allow / reject・機械可読な拒否コード・詳細・判定時刻・`policy_id`・mode / 接続先・account / position 情報。execution_store と同方針の closed-world schema 検証・pristine 判定・厳格復元。**保存失敗は例外 = 送信されない** |
 | `live_submission.py` | **唯一の公認送信経路** `LiveOrderSubmissionService`(Issue #75): `register()` が意図と固定 `client_order_id` を execution store へ 1:1 で永続化し、`submit()` が「意図復元 → Gate 評価 → 判定の耐久保存 + read-back 検証 → created→submitting 遷移の獲得(一度きり)→ 送信 → 結果記録」を実施。二重送信・UNKNOWN 後の再送は `duplicate_submission` で拒否(抑止時は execution_request_id / signal_id / 現在の phase・state / 理由を WARN ログへ出力。Issue #76)。**監査 store はサービス内部に封印**(コンストラクタは `decision_db_path` パスのみ受理。recorder オブジェクトの注入点なし)。受領済み結果の保存失敗は UNKNOWN へフォールバック記録し、停止・二重失敗で残る submitting/pending も `execution_store.list_unresolved_submissions()` で照会可能 |
-| `scenario_models.py` | 固定シナリオ試験(Issue #77)のシナリオ定義ロード + closed-world schema validation(未知キー・未知 behavior/状態/拒否コード・型不一致・重複 scenario id を明示的に拒否。all-or-nothing ロード) |
+| `shadow_models.py` | Shadow Mode(Issue #78)のモデル: `ShadowIntendedOrder`(送信予定だった注文内容の監査投影)+ `ShadowProvenance`(**input provenance**: `production_signal` / `cli_fixture` / `scenario_fixture` と signal / config / snapshot の各 source・config version)+ `ShadowClaim` + `ShadowResult`(request 全体・Gate 判定・**account snapshot 全体**・market / policy snapshot。**Broker 応答語彙を持たない**)+ **canonical payload**(duplicate と conflict を分ける正準 payload。Decimal は数値正準化・キー順序非依存) |
+| `shadow_store.py` | Shadow 検証記録の SQLite 保存(`shadow_results.sqlite3`。別ファイル・**別 idempotency namespace**): **claim-first**(`claim_shadow_cycle` が Gate 評価前に identity を UNIQUE + `BEGIN IMMEDIATE` で claim、payload 同値なら明示 duplicate、差異は `ShadowIdentityConflictError`、lease 切れ stale claim は takeover 回収 — claim は attempt id + **fencing generation** で所有され、有効 lease 中は誰も再取得不可、`complete_shadow_cycle` は attempt + generation を再検証した guarded UPDATE で完了列を確定)。closed-world schema 検証・pristine 判定・厳格復元(canonical payload・account snapshot / policy snapshot の再構築・round-trip・投影列整合含む)。読み取りは **true read-only 接続** |
+| `shadow_execution.py` | **Shadow Mode の唯一の Production サービス境界** `ShadowExecutionService`(Issue #78): claim → `SafetyGate.evaluate_shadow()`(live と同一の共有チェック)→ 判定の耐久保存 + read-back → complete。**loser は Gate を評価せず decision も書かない = completed 1 件 : Safety Decision 1 件**。**Broker / BrokerConnection を受け取る引数が存在しない**。`dry_run_cycle()` は同じ評価で完全無副作用(read-only probe のみ) |
+| `shadow_providers.py` | **Production 入力 provider 境界**(PR #100): `StoredSignalProvider` / `MarketSnapshotProvider` / `AccountSnapshotProvider`(Protocol)+ Production adapter(`PaperSignalDbSignalProvider` = Paper Signal DB の read-only adapter、snapshot ファイル provider)。**実行可能 status は closed set `{"paper_only"}` の完全一致のみ**(case-fold / trim なし。NULL・空・archived・未知 status は Signal id 付きで fail-closed)。**permissive default なし**: 欠損は明示 `ShadowInputError` |
+| `shadow_config.py` | Production 実行設定(`config_id` = configuration version・完全明示 policy・銘柄別数量・kill switch・接続先)。**全フィールド必須・未知キー拒否**(fixture 契約とは別) |
+| `shadow_composition.py` | **Production Signal 経路の composition root** `run_production_shadow_cycle()`: 保存済み Signal 解決 → 設定数量 → `build_execution_request_from_signal()`(Signal → ExecutionRequest の正式サービス。identity は Signal id から決定的に導出)→ Shadow service(market / account snapshot は supplier として渡され、**claim を獲得した winner だけが provider を呼ぶ** — duplicate loser は snapshot provider I/O を実行しない)。記録は `input_origin=production_signal` |
+| `shadow_runner.py` | Shadow Mode 1 cycle 実行 CLI。**`--signal-id`(Production 経路: `--signal-db` / `--execution-config` / `--market-snapshot` / `--account-snapshot` 必須・default なし)と `--cycle`(fixture 経路: `cli_fixture` として記録)を明確に分離**。mode dispatch(`shadow` / `dry-run` のみ実行可、`fake` / `demo` / `live` / 未知は明示拒否)。conflict は exit 1 + reason code |
+| `shadow_report.py` | Shadow 記録の確認 CLI(**read-only**・新しい順): 一覧 / `--limit`(1..1000)/ `--execution-request-id` / `--source-signal-id` / **`--safety-decision-id`** / `--decision` filter / **`--claims`**(進行中・stale claim)/ **`--orphan-decisions`**(decision 監査整合)/ `--json`。provenance・claim 状態(attempt / generation 含む)を表示。表示前に各記録の参照 Safety Decision row と埋め込み判定のフィールド一致を検証し(**`--orphan-decisions` 経路も同じ検証を通る**)、**不整合記録は text / JSON とも黙って表示せず exit 1**(decision id を参照する記録がある限り Decision store ファイルの欠落自体も fail-closed。`safety_decision_id IS NULL` ⇔ `decision_persist_failed` を双方向検証)。Decision store の読み取り失敗(空 / 非 SQLite / schema 欠損 / version 不一致 / 物理破損 / row 復元不能)は `ShadowReportIntegrityError` へ正規化され、traceback を出さず安定 exit 1 |
+| `sqlite_ro.py` | **true read-only SQLite 接続**(`mode=ro` + `PRAGMA query_only` + **authorizer**): missing DB / parent / WAL / SHM を作らず、mtime 不変、write は必ず失敗。`set_authorizer` が **`ATTACH` / `DETACH`**・DDL・状態変更 PRAGMA の値設定を対象ファイルを開く前に `SQLITE_DENY` で拒否するため、ATTACH による 0 バイトファイル生成も起きない(ファイルシステム完全不変)。全読み取り経路(safety store 含む)が使用 |
+| `strict_json.py` | JSON 入力の strict loader: **重複キー拒否(ネスト含む)**・不正 UTF-8 / BOM・サイズ / 深さ / 文字列 / 配列 / object キー数上限・NaN / Infinity 拒否を安定エラーへ変換 |
+| `cli_streams.py` | CLI 共通の encoding-safe stream 処理(Issue #77 / PR #96 の cp932 対策を scenario runner と Shadow CLI で共有) |
+| `scenario_models.py` | 固定シナリオ試験(Issue #77)のシナリオ定義ロード + closed-world schema validation(未知キー・未知 behavior/状態/拒否コード・型不一致・重複 scenario id を明示的に拒否。all-or-nothing ロード)。Issue #78 で `shadow` / `shadow_concurrent` ステップと Shadow 用 expected キーを追加 |
 | `scenario_runner.py` | 固定シナリオ実行器 + CLI(`python -m execution.scenario_runner`)。シナリオデータを**本番の Execution 経路そのまま**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / FakeBroker)へ流し、actual を収集して expected と比較する。判定ロジックの再実装なし(AST 検査で固定) |
-| `scenarios/` | 固定シナリオ定義(1ファイル = 1 シナリオの JSON)。正常約定・重複・Broker拒否・部分約定・timeout(UNKNOWN)・DB保存失敗・Safety Gate拒否・多重起動競合など([下記](#固定シナリオ試験issue-77)。キャンセルは Production ユースケース未実装のため対象外) |
+| `scenarios/` | 固定シナリオ定義(1ファイル = 1 シナリオの JSON)。正常約定・重複・Broker拒否・部分約定・timeout(UNKNOWN)・DB保存失敗・Safety Gate拒否・多重起動競合・Shadow Mode 系(Issue #78)など([下記](#固定シナリオ試験issue-77)。キャンセルは Production ユースケース未実装のため対象外) |
+| `examples/` | Shadow runner の cycle 入力サンプル(`shadow_cycle_example.json`) |
 | `tests/` | `python -m pytest execution/tests -q`(`tmp_path` 配下の SQLite と FakeBroker のみ。外部通信・Discord・S3・sleep・実注文なし) |
 
 ## Safety Gate / 送信サービスの境界
@@ -33,9 +47,41 @@ from execution.live_submission import LiveOrderSubmissionService
 - 迂回は「呼び出し側の注意」ではなく **AST 走査テスト**(`tests/test_submission_boundary.py`)で構造的に禁止する: `submit_order` / `to_order_request` の呼び出し箇所は公認箇所以外に存在できない。この境界は**誤用防止**であり、reflection 等による**故意回避の in-process 防止は言語的に不可能**(実 Adapter 導入時の運用境界で扱う。[設計書の該当節](../docs/architecture/safety_gate.md)参照)。
 - FakeBroker の `submitted_requests` により、全拒否経路で Broker 送信がゼロ件であることをテストする。
 
+## execution mode(dry-run / shadow / fake / demo / live)
+
+mode の唯一の正は `execution.safety_gate.ExecutionMode`。設定文字列は `resolve_execution_mode()` がロード時に解決し、**未知の mode は起動時に明示拒否**する。
+
+- `dry-run`: 副作用ゼロ(Broker 呼び出し・DB 作成・migration・INSERT/UPDATE・state 更新・Discord いずれもなし。既存 DB は read-only probe のみ)。
+- `shadow`: 実 Signal・実設定・Safety Gate を通常経路で実行し、**Broker へは送信せず**検証記録を保存する(下記)。仮想約定・仮想 Position・仮想 PnL は計算しない(それは Paper Execution の責務)。
+- `fake`: FakeBroker へ送信(`LiveOrderSubmissionService` 経由。既存の注文状態機械・保存を使用)。
+- `demo` / `live`: **mode 定義と validation のみ。未実装**。`BROKER_TYPE_BY_MODE` に Adapter 型が登録されるまで `BrokerConnection` を構築できず、runner は明示的に拒否する。
+
+## Shadow Mode(Issue #78 / PR #100)
+
+Demo / Live 接続前に実際の判定経路を検証するための監査記録機能。**「実 Signal を利用する」経路は保存済み Signal を読む Production 経路**(`--signal-id` / `run_production_shadow_cycle`)であり、CLI JSON は `cli_fixture` として明確に区別される。`ShadowExecutionService` は「**claim(Gate 評価前の identity 確保)** → `SafetyGate.evaluate_shadow()` → 判定の耐久保存 + read-back → complete」を実施する。**Broker API は一度も呼ばれない**(サービスに Broker を渡す引数が存在しない。全 Broker API を毒化した pytest と `broker_submit_calls: 0` の固定シナリオで回帰固定)。Gate 拒否でも Shadow 記録は保存される。
+
+- 保存先は専用 DB `data/shadow_results.sqlite3`(`SHADOW_RESULT_DB_PATH`)。**通常注文状態とは別 namespace**: Shadow は `execution_orders` に登録せず、**将来の fake / demo / live 送信をブロックしない**。
+- **claim-first idempotency**: loser は Gate を評価せず decision も書かないため **completed 1 件 : Safety Decision 1 件**。同一 payload の再実行・並行実行は明示 duplicate、**payload が 1 項目でも異なれば `ShadowIdentityConflictError`**(既存結果を黙って返さない)。claim の所有単位は run_cycle 1 回ごとの attempt(`claim_attempt_id` + fencing token `claim_generation`)で、**有効期限内の claim は同一 service / 同一 owner でも再取得できない** — crash や完了失敗で残った claim は lease 切れ後の takeover(generation +1)でのみ回収され、旧 attempt の complete は fencing 不一致で明示失敗する(orphan decision は `shadow_report --orphan-decisions` で追跡)。DB lock エラーは duplicate に化けない。
+- Gate のポジション / 口座上限は注入 snapshot(`AccountSafetySnapshot`)から評価され(live と同一の鮮度・型検証)、**snapshot 全体が監査保存される**(拒否の事後再現が可能)。
+
+```bash
+# Production Signal 経路(保存済み Signal + Production 設定。default なし)
+python -m execution.shadow_runner --mode shadow --signal-id <signal_id> \
+  --signal-db paper-signal/data/paper_signals.sqlite3 \
+  --execution-config <config.json> --market-snapshot <market.json> --account-snapshot <account.json>
+# CLI fixture 経路(input_origin=cli_fixture として記録)
+python -m execution.shadow_runner --mode shadow --cycle execution/examples/shadow_cycle_example.json --data-dir /tmp/shadow
+python -m execution.shadow_runner --mode dry-run --cycle ...        # 完全無副作用(true read-only probe)
+python -m execution.shadow_report --shadow-db /tmp/shadow/shadow_results.sqlite3 [--limit 20]
+python -m execution.shadow_report --shadow-db ... --execution-request-id <id> | --safety-decision-id <n>
+python -m execution.shadow_report --shadow-db ... --claims | --orphan-decisions | --decision rejected --json
+```
+
+設計の詳細(provenance / claim / lease / duplicate と conflict / decision 1:1 / account snapshot / true read-only / JSON 入力制限)は [docs/architecture/shadow_execution.md](../docs/architecture/shadow_execution.md) を参照。
+
 ## 固定シナリオ試験(Issue #77)
 
-実発注処理は実相場や Broker 障害を待って検証できないため、正常約定だけでなく拒否・部分約定・timeout(結果不明)・DB保存失敗・多重起動競合などを**固定データから決定的に再現**する試験基盤(固定シナリオは現在 **21 件**)。通常の pytest がモジュール単位の観点を固定するのに対し、固定シナリオは「入力 → Safety Gate → Broker → 永続化」の分岐 1 本を 1 シナリオとしてデータで表現する。**試験対象の判定はすべて本番コード**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / broker の状態機械)であり、runner は wiring・actual 収集・比較のみを行う(`tests/test_scenario_runner.py` の AST 検査が遷移表・validator の import を禁止)。`mark_submitting` / `record_unknown` ステップは store の公開 API による前提状態・観測の注入であり、ユースケースの合成ではない。
+実発注処理は実相場や Broker 障害を待って検証できないため、正常約定だけでなく拒否・部分約定・timeout(結果不明)・DB保存失敗・多重起動競合などを**固定データから決定的に再現**する試験基盤(固定シナリオは Issue #78 / PR #100 の Shadow Mode 系 13 件を含め現在 **34 件**)。Shadow シナリオ(`shadow` / `shadow_concurrent` / `shadow_production` ステップ)も同じ runner が Production API(`ShadowExecutionService` / `run_production_shadow_cycle`)を呼ぶだけであり、runner が Shadow 記録を直接構築・保存しないことは AST 検査で固定される。通常の pytest がモジュール単位の観点を固定するのに対し、固定シナリオは「入力 → Safety Gate → Broker → 永続化」の分岐 1 本を 1 シナリオとしてデータで表現する。**試験対象の判定はすべて本番コード**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / broker の状態機械)であり、runner は wiring・actual 収集・比較のみを行う(`tests/test_scenario_runner.py` の AST 検査が遷移表・validator の import を禁止)。`mark_submitting` / `record_unknown` ステップは store の公開 API による前提状態・観測の注入であり、ユースケースの合成ではない。
 
 **キャンセルは固定シナリオの対象外**(Issue #77 / PR #96 レビュー): Production のキャンセル Execution ユースケース(サービス境界経由のキャンセル)は未実装であり、runner がキャンセル処理を合成すると「本番経路の再現」にならないため。FakeBroker のキャンセル振る舞い(成功・失敗・terminal 拒否・呼び出し記録)は `broker/tests/test_fake_broker.py`、Execution Store の CANCELLED 遷移は `tests/test_execution_store.py` の通常 pytest が検証する。Production キャンセル Execution ユースケースは [Issue #99](https://github.com/saccamoto0629-ops/BELIAL_dev/issues/99) で扱い、その実装後に公開 API を呼ぶ形でキャンセル固定シナリオを復帰させる。
 
@@ -62,12 +108,13 @@ python -m execution.scenario_runner --json                # machine-readable JSO
 | キー | 内容 |
 |---|---|
 | `scenario_id` / `description` | `^[a-z0-9_]+$` の一意 id と説明 |
-| `gate` | Safety Gate 側の状態: `kill_switch`、policy 上書き(`max_order_quantity` / `allowed_symbols` / `allowed_fake_targets` / `max_reference_age_seconds` など。既定: USD_JPY・数量上限10・鮮度30s・接続先 `fake`) |
+| `gate` | Safety Gate 側の状態: `kill_switch`、policy 上書き(`max_order_quantity` / `allowed_symbols` / `allowed_fake_targets` / `allowed_shadow_targets` / `max_reference_age_seconds` など。既定: USD_JPY・数量上限10・鮮度30s・接続先 `fake` / `shadow`) |
 | `market` | 市場 snapshot: `reference_price` / `bid` / `ask` / `age_seconds`(固定 clock からの経過秒。stale 再現用)/ `market_open` / `tradable` |
 | `broker` | FakeBroker 設定: `default_fill_price` / `connection_target` / `scripts`(client_order_id → behavior: `fill_immediately`(`price`・`broker_order_id` 指定可)/ `stay_pending` / `partially_fill` / `reject` / `timeout` / `fail_communication`) |
-| `faults` | fault injection: `boundary` = `initial_save` / `mark_submitting` / `record_order_result` / `record_order_state` / `state_history` + `after_calls`(最初の N 回は成功させる) |
-| `steps` | 宣言的ステップ列。`register` / `submit` / `record_unknown` / `mark_submitting`(別 worker が遷移を獲得済みの状態を作る)/ `submit_concurrent`(`workers` 本の thread を barrier 同期で同時 submit)/ `register_concurrent`。各ステップは `expect`(outcome・状態・拒否コード・エラー分類)を持つ |
-| `expected` | 最終結果の比較: `final_phase` / `final_state` / `state_history`(履歴エントリのオブジェクト列。件数・順序は常に厳密比較。各エントリは `previous_state` / `new_state` 必須 + `reason` / `broker_order_id` の部分比較 — **キー省略 = 比較しない、明示 `null` = NULL であること**の区別あり。`changed_at_utc` の存在と単調性は宣言に関係なく常に検証、動的 timestamp の完全一致比較はしない)/ `broker_submit_calls` / `submitted_request`(Broker へ渡った request の部分一致)/ `order_rows` / `history_rows` / `safety_decisions` / `last_decision_allowed` / `last_decision_codes` / `broker_order_id` / `filled_quantity` / `average_fill_price` / `fill_prices` / `requested_price` / `reject_reason` / `listed_unknown` / `listed_unresolved` |
+| `faults` | fault injection: `boundary` = `initial_save` / `mark_submitting` / `record_order_result` / `record_order_state` / `state_history` / `shadow_claim` / `shadow_result_save`(completion)/ `safety_decision_record` + `after_calls`(最初の N 回は成功)または `fail_calls`(最初の N 回だけ失敗。stale claim 回収用) |
+| `signals` / `production_config` | `shadow_production` ステップ用: 保存済み Signal fixture(runner が一時 paper-signal DB へ seed し、**Production の `PaperSignalDbSignalProvider` が読む**)と、Production parser が検証する完全明示の実行設定 |
+| `steps` | 宣言的ステップ列。`register` / `submit` / `record_unknown` / `mark_submitting` / `submit_concurrent` / `register_concurrent` / `shadow`(`dry_run` / `owner_id` / `at_offset_seconds` / `claim_lease_seconds` 可)/ `shadow_concurrent` / `shadow_production`(`signal_id`)。shadow 系の `expect` は `outcome` = recorded / duplicate / dry_run / **conflict** / error + `allowed` + `conflict_fields` |
+| `expected` | 最終結果の比較: `final_phase` / `final_state` / `state_history`(履歴エントリのオブジェクト列。件数・順序は常に厳密比較。各エントリは `previous_state` / `new_state` 必須 + `reason` / `broker_order_id` の部分比較 — **キー省略 = 比較しない、明示 `null` = NULL であること**の区別あり。`changed_at_utc` の存在と単調性は宣言に関係なく常に検証、動的 timestamp の完全一致比較はしない)/ `broker_submit_calls` / `submitted_request`(Broker へ渡った request の部分一致)/ `order_rows` / `history_rows` / `safety_decisions` / `last_decision_allowed` / `last_decision_codes` / `broker_order_id` / `filled_quantity` / `average_fill_price` / `fill_prices` / `requested_price` / `reject_reason` / `listed_unknown` / `listed_unresolved` / **Shadow 系(Issue #78)**: `shadow_rows`(completed)/ `shadow_claim_rows` / `shadow_db_created` / `decision_db_created` / `shadow_allowed` / `shadow_codes` / `shadow_intended_order` / `shadow_origin` / `shadow_phase` / `shadow_account_id` / `shadow_safety_decision_id` |
 
 実行ごとに変動する値は比較しない設計: runner は固定 clock(`NOW` = FakeBroker の決定的 clock base)を注入し、`broker_order_id` は比較したいシナリオが script で固定値を指定する。DB 採番値(history_id)は比較対象外。
 

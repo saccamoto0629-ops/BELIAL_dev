@@ -1,0 +1,26 @@
+{
+  "request": {
+    "execution_request_id": "shadow-example-exec-1",
+    "signal_id": "shadow-example-signal-1",
+    "strategy_id": "example-strategy",
+    "symbol": "USD_JPY",
+    "side": "buy",
+    "order_type": "market",
+    "quantity": "1",
+    "stop_loss_price": "149.50",
+    "take_profit_price": "151.50"
+  },
+  "client_order_id": "shadow-example-client-1",
+  "timeframe": "H1",
+  "market": {
+    "reference_price": "150.00",
+    "bid": "149.99",
+    "ask": "150.01"
+  },
+  "account": {
+    "account_id": "example-account"
+  },
+  "policy": {
+    "policy_id": "shadow-example-policy"
+  }
+}
