@@ -345,13 +345,16 @@ def _parse_decimal(value, field_name: str) -> Decimal:
     )
 
 
-def _short_reason(payload: Mapping, *keys: str) -> str | None:
-    """Extract a short, human-readable broker reason (``rejectReason`` /
-    ``errorMessage`` style) without ever echoing the full payload."""
+def _extract_reason(payload: Mapping, *keys: str) -> str | None:
+    """Extract the FULL broker reason string (``rejectReason`` /
+    ``errorMessage`` style). No truncation here: redaction must see the
+    whole text first (PR #101 4th review — truncating before redaction can
+    split a secret across the cut and leave a fragment behind). Callers go
+    through ``OandaDemoAdapter._safe_reason`` which redacts THEN truncates."""
     for key in keys:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()[:200]
+            return value.strip()
     return None
 
 
@@ -434,12 +437,12 @@ class OandaDemoAdapter:
         if status in (400, 404):
             reject = payload.get("orderRejectTransaction")
             if isinstance(reject, Mapping):
+                # redact-then-truncate order (PR #101 4th review)
                 reason = (
-                    _short_reason(reject, "rejectReason")
-                    or _short_reason(payload, "errorMessage")
+                    self._safe_reason(reject, "rejectReason")
+                    or self._safe_reason(payload, "errorMessage")
                     or "rejected by broker"
                 )
-                reason = self._redact(reason)
                 # A duplicate client_order_id is a boundary-contract error
                 # (Issue #73 / FakeBroker parity), not an ordinary broker
                 # rejection (PR #101 review).
@@ -474,15 +477,19 @@ class OandaDemoAdapter:
 
         # Order Reissue after a partial fill is DELIBERATELY unsupported here
         # (Issue #102 owns reissue across the state machine / audit / query /
-        # cancel paths). A response carrying a reissue transaction is not
-        # interpreted at all — fail closed toward UNKNOWN so the recorded
-        # state can never misrepresent a reissued order, and a later query
-        # (never a resend) resolves it.
-        if isinstance(payload.get("orderReissueTransaction"), Mapping) or isinstance(
-            payload.get("orderReissueRejectTransaction"), Mapping
+        # cancel paths). KEY PRESENCE alone triggers the refusal (PR #101
+        # 4th review): a reissue field whose value is a string, an array, a
+        # malformed mapping or anything else must not be silently skipped as
+        # "absent" — well-formed or not, the response is not interpreted at
+        # all. Fail closed toward UNKNOWN so the recorded state can never
+        # misrepresent a reissued order; a later query (never a resend)
+        # resolves it.
+        if (
+            "orderReissueTransaction" in payload
+            or "orderReissueRejectTransaction" in payload
         ):
             raise BrokerTimeoutError(
-                "broker response carries an order reissue transaction after a "
+                "broker response carries an order reissue field after a "
                 "partial fill; reissue handling is deliberately unsupported by "
                 "this adapter (Issue #102) — the outcome is treated as unknown "
                 "and is resolved by a later query, never by resending",
@@ -490,7 +497,10 @@ class OandaDemoAdapter:
             )
 
         fill_tx = payload.get("orderFillTransaction")
-        cancel_tx = payload.get("orderCancelTransaction")
+        # cancel transaction: verified as OURS before it may drive ANY
+        # terminal CANCELLED decision (PR #101 4th review) — present but
+        # malformed / uncorrelated fails closed.
+        cancel_tx = self._verified_cancel_tx(payload, request.client_order_id)
         create_tx = payload.get("orderCreateTransaction")
         if isinstance(fill_tx, Mapping):
             # The fill transaction must be correlated to OUR order before it
@@ -501,7 +511,9 @@ class OandaDemoAdapter:
                 required=True,
                 context="orderFillTransaction",
             )
-            broker_order_id = self._tx_order_id(fill_tx, create_tx)
+            broker_order_id = self._tx_order_id(
+                fill_tx, create_tx, request.client_order_id
+            )
             filled_quantity = abs(
                 _parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")
             )
@@ -515,8 +527,10 @@ class OandaDemoAdapter:
             if filled_quantity == request.quantity:
                 state = OrderState.FILLED
             elif 0 < filled_quantity < request.quantity:
-                remainder_done = isinstance(cancel_tx, Mapping)
-                state = OrderState.CANCELLED if remainder_done else OrderState.PARTIALLY_FILLED
+                # cancel_tx is non-None only after full verification (our
+                # clientOrderID, valid id) — a foreign or malformed cancel
+                # transaction can never produce a terminal CANCELLED here.
+                state = OrderState.CANCELLED if cancel_tx is not None else OrderState.PARTIALLY_FILLED
             else:
                 raise BrokerCommunicationError(
                     "broker fill quantity is inconsistent with the requested quantity",
@@ -544,18 +558,15 @@ class OandaDemoAdapter:
                 broker_order_id=broker_order_id,
                 fills=(fill,),
             )
-        if isinstance(cancel_tx, Mapping):
+        if cancel_tx is not None:
             # e.g. a FOK market order the demo book could not fill in full.
-            self._verify_client_correlation(
-                cancel_tx.get("clientOrderID"),
-                request.client_order_id,
-                required=True,
-                context="orderCancelTransaction",
-            )
+            # (cancel_tx already passed _verified_cancel_tx.)
             return self._result_from_request(
                 request,
                 state=OrderState.CANCELLED,
-                broker_order_id=self._tx_order_id(cancel_tx, create_tx),
+                broker_order_id=self._tx_order_id(
+                    cancel_tx, create_tx, request.client_order_id
+                ),
             )
         if isinstance(create_tx, Mapping):
             self._verify_client_correlation(
@@ -598,11 +609,8 @@ class OandaDemoAdapter:
                     f"no order under client_order_id {client_order_id!r}",
                     client_order_id=client_order_id,
                 ) from None
-            reason = _short_reason(payload, "errorMessage")
-            reason = (
-                self._redact(reason)
-                if reason
-                else f"order is not cancellable (state {current.state.value!r})"
+            reason = self._safe_reason(payload, "errorMessage") or (
+                f"order is not cancellable (state {current.state.value!r})"
             )
             raise BrokerCancellationError(reason, client_order_id=client_order_id)
         if status != 200:
@@ -613,20 +621,16 @@ class OandaDemoAdapter:
         # The cancel transaction itself must exist and be correlated to OUR
         # order before the cancel may be treated as confirmed (PR #101
         # re-review) — a later GET returning the right order does not repair
-        # a response that failed to identify what it cancelled.
-        cancel_tx = payload.get("orderCancelTransaction")
-        if not isinstance(cancel_tx, Mapping):
+        # a response that failed to identify what it cancelled. Present but
+        # unverifiable (empty object, missing id, missing/mismatched
+        # clientOrderID) fails closed inside _verified_cancel_tx.
+        cancel_tx = self._verified_cancel_tx(payload, client_order_id)
+        if cancel_tx is None:
             raise BrokerCommunicationError(
                 "broker response after cancel carried no orderCancelTransaction; "
                 "refusing to treat the cancellation as confirmed",
                 client_order_id=client_order_id,
             )
-        self._verify_client_correlation(
-            cancel_tx.get("clientOrderID"),
-            client_order_id,
-            required=True,
-            context="orderCancelTransaction",
-        )
         snapshot = self.get_order(client_order_id)
         if snapshot.state is not OrderState.CANCELLED:
             raise BrokerCommunicationError(
@@ -991,19 +995,39 @@ class OandaDemoAdapter:
         reach an exception message or a returned reject_reason (PR #101
         review: the broker may reflect request values back). The configured
         endpoint is environment-managed like the credentials and is scrubbed
-        too (PR #101 re-review)."""
-        for secret in (
-            self._config.api_token,
-            self._config.account_id,
-            self._config.endpoint,
-        ):
-            if secret:
-                text = text.replace(secret, "***")
+        too (PR #101 re-review). Secrets are replaced LONGEST FIRST so one
+        secret containing another (or overlapping it) can never leave a
+        recognisable fragment behind (PR #101 4th review)."""
+        secrets = sorted(
+            (
+                value
+                for value in (
+                    self._config.api_token,
+                    self._config.account_id,
+                    self._config.endpoint,
+                )
+                if value
+            ),
+            key=len,
+            reverse=True,
+        )
+        for secret in secrets:
+            text = text.replace(secret, "***")
         return text
 
+    def _safe_reason(self, payload: Mapping, *keys: str) -> str | None:
+        """Broker free text made safe for exceptions / reject_reason:
+        extract the FULL string, redact it, THEN truncate — in that order,
+        so a secret straddling the truncation boundary never survives as a
+        fragment (PR #101 4th review)."""
+        reason = _extract_reason(payload, *keys)
+        if reason is None:
+            return None
+        return self._redact(reason)[:200]
+
     def _message(self, prefix: str, payload: Mapping) -> str:
-        reason = _short_reason(payload, "errorMessage", "rejectReason")
-        return f"{prefix}: {self._redact(reason)}" if reason else prefix
+        reason = self._safe_reason(payload, "errorMessage", "rejectReason")
+        return f"{prefix}: {reason}" if reason else prefix
 
     @staticmethod
     def _client_extension_id(tx: Mapping):
@@ -1041,16 +1065,51 @@ class OandaDemoAdapter:
             raise BrokerCommunicationError(f"broker response field {field_name} is missing")
         return value
 
-    @staticmethod
-    def _tx_order_id(tx: Mapping, create_tx) -> str:
+    def _tx_order_id(self, tx: Mapping, create_tx, client_order_id: str) -> str:
+        """Resolve the broker order id from ``tx.orderID``, falling back to
+        ``orderCreateTransaction.id`` ONLY when the create transaction is
+        proven to be OURS (PR #101 4th review): a broker_order_id must never
+        be adopted from another order's create transaction, so the fallback
+        requires a well-formed create transaction whose client extension id
+        matches the request."""
         value = tx.get("orderID")
         if isinstance(value, str) and value.strip():
             return value
-        if isinstance(create_tx, Mapping):
-            value = create_tx.get("id")
-            if isinstance(value, str) and value.strip():
-                return value
-        raise BrokerCommunicationError("broker response carried no order id")
+        if not isinstance(create_tx, Mapping):
+            raise BrokerCommunicationError(
+                "broker response carried no order id",
+                client_order_id=client_order_id,
+            )
+        self._verify_client_correlation(
+            self._client_extension_id(create_tx),
+            client_order_id,
+            required=True,
+            context="orderCreateTransaction (broker order id fallback)",
+        )
+        return self._tx_id(create_tx, "orderCreateTransaction.id")
+
+    def _verified_cancel_tx(self, payload: Mapping, client_order_id: str):
+        """Return ``orderCancelTransaction`` verified as OURS, or None when
+        the key is absent. Present-but-unverifiable — a non-Mapping value, a
+        missing transaction id, a missing or mismatched ``clientOrderID`` —
+        fails closed (PR #101 4th review): an unverified cancel transaction
+        must never drive a terminal CANCELLED."""
+        if "orderCancelTransaction" not in payload:
+            return None
+        raw = payload.get("orderCancelTransaction")
+        if not isinstance(raw, Mapping):
+            raise BrokerCommunicationError(
+                "broker orderCancelTransaction is malformed (not an object)",
+                client_order_id=client_order_id,
+            )
+        self._tx_id(raw, "orderCancelTransaction.id")
+        self._verify_client_correlation(
+            raw.get("clientOrderID"),
+            client_order_id,
+            required=True,
+            context="orderCancelTransaction",
+        )
+        return raw
 
     def _result_from_request(
         self,
@@ -1081,10 +1140,11 @@ class OandaDemoAdapter:
                 fills=fills,
                 reject_reason=reject_reason,
             )
-        except ValueError as exc:
+        except (ValueError, BrokerInvalidRequestError) as exc:
             # A broker answer inconsistent with the common-model invariants
-            # must cross the boundary as a common BrokerError, never as a
-            # naked ValueError (PR #101 review).
+            # must cross the boundary as a common BrokerError — never a naked
+            # ValueError, and never a caller-blaming BrokerInvalidRequestError
+            # for response-derived data (PR #101 review / 4th review).
             raise BrokerCommunicationError(
                 self._redact(f"broker response violated common-model invariants: {exc}"),
                 client_order_id=request.client_order_id,
@@ -1168,7 +1228,10 @@ class OandaDemoAdapter:
                 updated_at_utc=self._now(),
                 fills=fills,
             )
-        except ValueError as exc:
+        except (ValueError, BrokerInvalidRequestError) as exc:
+            # units=0, zero/negative LIMIT price and every other invalid
+            # BROKER payload must not be classified as a caller mistake
+            # (PR #101 4th review).
             raise BrokerCommunicationError(
                 self._redact(f"broker response violated common-model invariants: {exc}"),
                 client_order_id=client_order_id,

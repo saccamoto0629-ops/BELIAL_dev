@@ -49,6 +49,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+from broker.broker_models import safe_account_reference
 from execution import shadow_store
 from execution.cli_streams import encoding_safe_streams
 from execution.safety_gate import SafetyRejectionCode
@@ -155,7 +156,10 @@ def result_payload(result: ShadowResult) -> dict:
             "tradable": market.tradable,
         },
         "account_snapshot": {
-            "account_id": account.account_id,
+            # display boundary (PR #101 4th review): the stored snapshot and
+            # every integrity comparison keep the REAL id; the report renders
+            # the shared safe reference only.
+            "account_id": safe_account_reference(account.account_id),
             "currency": account.currency,
             "balance": str(account.balance),
             "equity": str(account.equity),
@@ -172,7 +176,7 @@ def result_payload(result: ShadowResult) -> dict:
                 for position in result.account.positions
             ],
         },
-        "account_id": decision.account_id,
+        "account_id": safe_account_reference(decision.account_id),
         "position_count": decision.position_count,
         "safety_decision_id": result.safety_decision_id,
         "policy_snapshot": result.policy_snapshot,

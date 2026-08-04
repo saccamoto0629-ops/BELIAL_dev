@@ -198,6 +198,9 @@ def test_allowed_decision_carries_audit_fields(tmp_path):
     assert decision.execution_mode == "fake"
     assert decision.connection_target == "fake"
     assert decision.account_id == "fake-account"
+    # display boundary (PR #101): the identifier survives internally, but
+    # repr() never renders the raw account id
+    assert "fake-account" not in repr(decision)
     assert decision.position_count == 0
     assert decision.checked_at_utc == NOW
 

@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 
+from broker.broker_models import safe_account_reference
 from execution import shadow_store
 from execution.shadow_report import EXIT_FAILURE, EXIT_OK, EXIT_USAGE_ERROR, main
 from shadow_helpers import (
@@ -72,7 +73,10 @@ def test_detail_by_execution_request_id_shows_provenance_and_snapshot(tmp_path, 
     assert "REJECTED" in out and "market_closed" in out
     assert "intended order (NOT submitted)" in out
     assert "provenance: origin=scenario_fixture" in out
-    assert "account snapshot: account_id=acct-1" in out
+    # display boundary (PR #101): the text report renders the safe account
+    # reference, never the raw account id
+    assert f"account snapshot: account_id={safe_account_reference('acct-1')}" in out
+    assert "acct-1" not in out
     assert "claim: owner=owner-1" in out
 
 
@@ -557,13 +561,19 @@ def test_json_report_is_machine_readable_with_provenance(tmp_path, capsys):
     db, decisions = seed(tmp_path)
     assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
                  "--json", "--decision", "rejected"]) == EXIT_OK
-    payload = json.loads(capsys.readouterr().out)
+    raw_out = capsys.readouterr().out
+    payload = json.loads(raw_out)
     assert payload["count"] == 1
     entry = payload["results"][0]
     assert entry["execution_request_id"] == "exec-2"
     assert entry["allowed"] is False and "market_closed" in entry["rejection_codes"]
     assert entry["provenance"]["input_origin"] == "scenario_fixture"
-    assert entry["account_snapshot"]["account_id"] == "acct-1"
+    # display boundary (PR #101): JSON renders safe account references only;
+    # the store itself keeps the real id (pinned by the store round-trip
+    # tests) and the integrity cross-checks still compare real values.
+    assert entry["account_snapshot"]["account_id"] == safe_account_reference("acct-1")
+    assert entry["account_id"] in (None, safe_account_reference("acct-1"))
+    assert "acct-1" not in raw_out
     assert entry["safety_decision_id"] == 2
 
 

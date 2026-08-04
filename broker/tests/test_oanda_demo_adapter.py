@@ -1015,6 +1015,176 @@ def test_get_order_with_missing_or_mismatched_client_extension_is_refused():
             adapter.get_order("c-7")
 
 
+# --- PR #101 4th review: redaction order & overlapping secrets ---------------------
+
+def test_account_id_straddling_the_truncation_boundary_leaves_no_fragment():
+    # 195 filler chars put ACCOUNT across the 200-char cut: redaction must
+    # run BEFORE truncation, so neither the full id nor a fragment survives.
+    reason = "x" * 195 + ACCOUNT
+    adapter, _ = make_adapter(
+        (400, {"orderRejectTransaction": {"id": "5001", "rejectReason": reason}})
+    )
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert ACCOUNT not in result.reject_reason
+    assert ACCOUNT[:5] not in result.reject_reason
+    assert "***" in result.reject_reason
+
+
+def test_token_straddling_the_truncation_boundary_leaves_no_fragment():
+    message = "y" * 190 + TOKEN
+    adapter, _ = make_adapter((400, {"errorMessage": message}))
+    with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
+        adapter.submit_order(make_request())
+    text = str(exc_info.value)
+    assert TOKEN not in text
+    assert TOKEN[:10] not in text
+
+
+def test_endpoint_straddling_the_truncation_boundary_leaves_no_fragment():
+    message = "z" * 195 + oa.OANDA_DEMO_API_URL
+    adapter, _ = make_adapter((400, {"errorMessage": message}))
+    with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
+        adapter.submit_order(make_request())
+    text = str(exc_info.value)
+    assert oa.OANDA_DEMO_API_URL not in text
+    assert "api-fxpractice" not in text
+
+
+def test_overlapping_secrets_are_scrubbed_longest_first():
+    # The token CONTAINS the account id: replacing the shorter secret first
+    # would break the longer one into surviving fragments. Longest-first
+    # replacement scrubs both completely.
+    overlap_token = f"tok-{ACCOUNT}-suffix"
+    config = oa.OandaDemoConfig(api_token=overlap_token, account_id=ACCOUNT)
+    transport = FakeTransport(
+        (400, {"errorMessage": f"reflected {overlap_token} and {ACCOUNT} back"})
+    )
+    adapter = oa.OandaDemoAdapter(config, transport=transport, clock=lambda: NOW)
+    with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
+        adapter.submit_order(make_request())
+    text = str(exc_info.value)
+    assert overlap_token not in text
+    assert ACCOUNT not in text
+    assert "tok-***" not in text  # no partial survivor of the longer secret
+
+
+# --- PR #101 4th review: submit-side cancel/create correlation ---------------------
+
+def test_partial_fill_with_foreign_cancel_transaction_fails_closed():
+    # A cancel transaction belonging to another order must never turn OUR
+    # partial fill into a terminal CANCELLED.
+    response = fill_response(units="2", price="155.000")
+    response[1]["orderCancelTransaction"] = {
+        "id": "1004", "orderID": "9999", "clientOrderID": "c-SOMEONE-ELSE",
+    }
+    adapter, _ = make_adapter(response)
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+
+
+def test_partial_fill_with_empty_or_malformed_cancel_transaction_fails_closed():
+    for bad_cancel in ({}, {"id": "1004"}, "CANCELLED", ["x"]):
+        response = fill_response(units="2", price="155.000")
+        response[1]["orderCancelTransaction"] = bad_cancel
+        adapter, _ = make_adapter(response)
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+
+
+def test_fill_order_id_fallback_requires_a_correlated_create_transaction():
+    # fill tx without orderID: the create-transaction fallback may only
+    # donate a broker_order_id when the create tx is proven to be OURS.
+    def response(create_tx):
+        return (
+            201,
+            {
+                "orderCreateTransaction": create_tx,
+                "orderFillTransaction": {
+                    "id": "1002",
+                    "clientOrderID": "c-1",
+                    "units": "1",
+                    "price": "155.000",
+                    "time": "2026-01-02T03:04:05Z",
+                },
+            },
+        )
+
+    # correlation missing on the create tx
+    adapter, _ = make_adapter(response({"id": "1001"}))
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.submit_order(make_request())
+    # correlation mismatch on the create tx
+    adapter, _ = make_adapter(
+        response({"id": "1001", "clientExtensions": {"id": "c-OTHER"}})
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.submit_order(make_request())
+    # correlated create tx works as the fallback source
+    adapter, _ = make_adapter(
+        response({"id": "1001", "clientExtensions": {"id": "c-1"}})
+    )
+    assert adapter.submit_order(make_request()).broker_order_id == "1001"
+
+
+# --- PR #101 4th review: malformed reissue fields fail closed ----------------------
+
+def test_malformed_reissue_values_fail_closed_like_wellformed_ones():
+    # Key PRESENCE triggers the Issue #102 refusal: a string, an array, an
+    # empty object or a null must not be skipped as "absent".
+    for bad_value in ("REISSUED", ["tx"], {}, None):
+        response = fill_response(units="2", price="155.000")
+        response[1]["orderReissueTransaction"] = bad_value
+        adapter, transport = make_adapter(response)
+        with pytest.raises(m.BrokerTimeoutError):
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert len(transport.calls) == 1  # no resend
+
+
+# --- PR #101 4th review: GET-order taxonomy for invalid broker payloads ------------
+
+def test_get_order_with_zero_units_is_a_communication_error():
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "6001",
+                    "type": "MARKET",
+                    "instrument": "USD_JPY",
+                    "units": "0",
+                    "state": "PENDING",
+                    "clientExtensions": {"id": "c-7"},
+                }
+            },
+        )
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.get_order("c-7")
+
+
+def test_get_order_with_zero_or_negative_limit_price_is_a_communication_error():
+    for bad_price in ("0", "-1.5"):
+        adapter, _ = make_adapter(
+            (
+                200,
+                {
+                    "order": {
+                        "id": "6001",
+                        "type": "LIMIT",
+                        "instrument": "USD_JPY",
+                        "units": "1",
+                        "price": bad_price,
+                        "state": "PENDING",
+                        "clientExtensions": {"id": "c-7"},
+                    }
+                },
+            )
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-7")
+
+
 # --- PR #101 review: client_order_id URL safety -------------------------------------
 
 def test_url_unsafe_or_oversized_client_order_ids_are_rejected():

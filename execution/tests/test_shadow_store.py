@@ -445,8 +445,12 @@ def test_tampered_account_snapshot_json_is_detected(tmp_path):
 def test_account_id_column_tamper_is_detected(tmp_path):
     recorded(tmp_path)
     _update_row(tmp_path, f"UPDATE {shadow_store.RESULTS_TABLE} SET account_id = 'acct-forged'")
-    with pytest.raises(shadow_store.ShadowIntegrityError, match="account_id"):
+    with pytest.raises(shadow_store.ShadowIntegrityError, match="account_id") as exc_info:
         shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
+    # display boundary (PR #101): the integrity error names the field but
+    # renders safe references, never the raw account ids
+    assert "acct-forged" not in str(exc_info.value)
+    assert "acct-1" not in str(exc_info.value)
 
 
 def test_account_snapshot_account_id_tamper_is_detected(tmp_path):
@@ -463,8 +467,10 @@ def test_account_snapshot_account_id_tamper_is_detected(tmp_path):
         f"UPDATE {shadow_store.RESULTS_TABLE} SET account_snapshot_json = ?",
         (tampered,),
     )
-    with pytest.raises(shadow_store.ShadowIntegrityError, match="account_id"):
+    with pytest.raises(shadow_store.ShadowIntegrityError, match="account_id") as exc_info:
         shadow_store.get_shadow_result("exec-1", db_path=db(tmp_path))
+    assert "acct-forged" not in str(exc_info.value)
+    assert "acct-1" not in str(exc_info.value)
 
 
 def _tamper_policy(tmp_path, mutate):

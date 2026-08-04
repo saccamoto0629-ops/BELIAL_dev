@@ -698,6 +698,25 @@ class TradeInfo:
         _require_utc(self.retrieved_at_utc, "retrieved_at_utc")
 
 
+def safe_account_reference(account_id: str | None) -> str | None:
+    """Display-safe reference for a broker account id (Issue #79 / PR #101).
+
+    The COMMON display helper for every boundary that stringifies an account
+    id (repr, logs, reports, integrity exceptions): a truncated SHA-256
+    digest — non-reversible, stable per account (same account -> same
+    reference) and collision-resistant across accounts (unlike prefix/suffix
+    masking, where real broker ids sharing common prefixes would collide).
+    ``None`` passes through so optional fields keep their absence semantics.
+    Identifier semantics stay untouched: stores / comparisons keep the REAL
+    id and call this only when rendering.
+    """
+    if account_id is None:
+        return None
+    text = account_id if isinstance(account_id, str) else str(account_id)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"account-{digest}"
+
+
 @dataclass(frozen=True)
 class AccountState:
     """Broker account snapshot (broker-agnostic, minimal).
@@ -720,15 +739,10 @@ class AccountState:
 
     @property
     def display_account_id(self) -> str:
-        """Display-safe form of ``account_id``: a truncated SHA-256 digest.
-
-        Non-reversible (the real id cannot be recovered) and
-        collision-resistant (distinct real accounts practically never share
-        a digest — unlike prefix/suffix masking, where real broker ids with
-        common prefixes would collide).
-        """
-        digest = hashlib.sha256(self.account_id.encode("utf-8")).hexdigest()[:12]
-        return f"account-{digest}"
+        """Display-safe form of ``account_id`` (see
+        :func:`safe_account_reference` — the shared helper every display
+        boundary uses)."""
+        return safe_account_reference(self.account_id)
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.account_id, "account_id")
