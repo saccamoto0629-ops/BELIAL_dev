@@ -14,6 +14,7 @@ allow-list.
 
 import ast
 import pathlib
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -21,8 +22,11 @@ import pytest
 
 from broker.broker_models import (
     BrokerCommunicationError,
+    BrokerAuthenticationError,
     BrokerInvalidRequestError,
     BrokerOrderNotFoundError,
+    BrokerRateLimitError,
+    Fill,
     BrokerTimeoutError,
     OrderRequest,
     OrderResult,
@@ -30,7 +34,14 @@ from broker.broker_models import (
     OrderState,
     OrderType,
 )
-from broker.fake_broker import FakeBroker, RejectOrder, StayPending
+from broker.fake_broker import (
+    FakeBroker,
+    FillImmediately,
+    PartiallyFill,
+    RejectOrder,
+    StayPending,
+    TimeoutOrder,
+)
 from execution import execution_store, reconciliation_store
 from execution.broker_reconciliation import BrokerOrderReconciliationService
 from execution.execution_models import ExecutionRequest
@@ -114,6 +125,17 @@ class NonListingBroker:
 
     def get_account_state(self):
         return self._inner.get_account_state()
+
+
+class SnapshotBroker(QueryOnlyBroker):
+    """Return selected external snapshots without mutating listing fixtures."""
+
+    def __init__(self, inner: FakeBroker, snapshots: dict[str, OrderResult]):
+        super().__init__(inner)
+        self._snapshots = snapshots
+
+    def get_order(self, client_order_id):
+        return self._snapshots.get(client_order_id, self._inner.get_order(client_order_id))
 
 
 @pytest.fixture
@@ -261,6 +283,37 @@ def test_internal_accepted_but_broker_cancelled_is_an_auto_repair_candidate(path
     assert entry.broker_order_id == "B-2"
 
 
+def test_internal_accepted_but_broker_filled_is_an_auto_repair_candidate(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(client_id("exec-accepted-fill"), StayPending(broker_order_id="B-AF"))
+    accepted = broker.submit_order(broker_request("exec-accepted-fill"))
+    seed_internal_accepted(execution_db, "exec-accepted-fill", accepted)
+    fill_entry = Fill(
+        fill_id="F-AF",
+        price=FILL_PRICE,
+        quantity=QUANTITY,
+        filled_at_utc=accepted.updated_at_utc + timedelta(seconds=1),
+    )
+    filled = replace(
+        accepted,
+        state=OrderState.FILLED,
+        filled_quantity=QUANTITY,
+        remaining_quantity=Decimal("0"),
+        average_fill_price=FILL_PRICE,
+        fills=(fill_entry,),
+        updated_at_utc=accepted.updated_at_utc + timedelta(seconds=1),
+    )
+
+    run = service(
+        SnapshotBroker(broker, {client_id("exec-accepted-fill"): filled}), paths
+    ).detect(run_id="run-accepted-fill")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.IN_FLIGHT_BROKER_FILLED
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
+
+
 def test_internal_accepted_but_broker_rejected_needs_manual_review(paths):
     """The broker's REJECTED snapshot carries no broker_order_id, so
     reflecting it would drop the id we already know -- not something the
@@ -321,21 +374,188 @@ def test_matching_states_are_not_discrepancies(paths):
     assert run.broker_orders_enumerated is True
 
 
-def test_settled_internal_orders_are_not_reconciled(paths):
-    """A terminal internal outcome can never change, so it is not compared
-    (and its broker order is not reported as broker-only either)."""
+def test_same_state_with_a_different_broker_order_id_is_detected(paths):
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
-    result = broker.submit_order(broker_request("exec-5"))
-    seed_internal_pending(execution_db, "exec-5")
-    execution_store.record_order_result(
-        "exec-5", result, reason="filled", db_path=execution_db
+    broker.script_order(client_id("exec-id-mismatch"), StayPending(broker_order_id="B-ORIGINAL"))
+    accepted = broker.submit_order(broker_request("exec-id-mismatch"))
+    seed_internal_accepted(execution_db, "exec-id-mismatch", accepted)
+    conflicting = replace(
+        accepted,
+        broker_order_id="B-FOREIGN",
+        updated_at_utc=accepted.updated_at_utc + timedelta(seconds=1),
     )
 
-    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-5")
+    run = service(
+        SnapshotBroker(broker, {client_id("exec-id-mismatch"): conflicting}), paths
+    ).detect(run_id="run-id-mismatch")
 
-    assert run.checked_order_count == 0
-    assert run.discrepancies == ()
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.STATE_MISMATCH
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+    assert "broker_order_id" in entry.detail
+
+
+def test_same_state_with_a_different_order_identity_is_detected(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(client_id("exec-shape-mismatch"), StayPending(broker_order_id="B-SHAPE"))
+    accepted = broker.submit_order(broker_request("exec-shape-mismatch"))
+    seed_internal_accepted(execution_db, "exec-shape-mismatch", accepted)
+    conflicting = replace(
+        accepted,
+        requested_quantity=Decimal("5"),
+        remaining_quantity=Decimal("5"),
+        updated_at_utc=accepted.updated_at_utc + timedelta(seconds=1),
+    )
+
+    run = service(
+        SnapshotBroker(broker, {client_id("exec-shape-mismatch"): conflicting}), paths
+    ).detect(run_id="run-shape-mismatch")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.STATE_MISMATCH
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+    assert "quantity" in entry.detail
+
+
+def test_conflicting_terminal_states_are_reconciled_for_manual_review(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(client_id("exec-5"), StayPending(broker_order_id="B-5"))
+    accepted = broker.submit_order(broker_request("exec-5"))
+    seed_internal_accepted(execution_db, "exec-5", accepted)
+    cancelled = broker.cancel_order(client_id("exec-5"))
+    execution_store.record_order_result("exec-5", cancelled, reason="cancelled", db_path=execution_db)
+    rejected = replace(
+        cancelled,
+        state=OrderState.REJECTED,
+        reject_reason="broker now reports rejection",
+        updated_at_utc=cancelled.updated_at_utc + timedelta(seconds=1),
+    )
+
+    run = service(SnapshotBroker(broker, {client_id("exec-5"): rejected}), paths).detect(
+        run_id="run-5"
+    )
+
+    entry = only(run.discrepancies)
+    assert run.checked_order_count == 1
+    assert entry.discrepancy_type is DiscrepancyType.STATE_MISMATCH
+    assert entry.internal_state is OrderState.CANCELLED
+    assert entry.broker_state is OrderState.REJECTED
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+
+
+def test_partially_filled_then_broker_cancelled_is_auto_repair_candidate(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(
+        client_id("exec-part-cancel"),
+        PartiallyFill(fills=((FILL_PRICE, Decimal("3")),), broker_order_id="B-PC"),
+    )
+    partial = broker.submit_order(broker_request("exec-part-cancel"))
+    seed_internal_pending(execution_db, "exec-part-cancel")
+    execution_store.record_order_result(
+        "exec-part-cancel", partial, reason="partial", db_path=execution_db
+    )
+    broker.cancel_order(client_id("exec-part-cancel"))
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-part-cancel")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.IN_FLIGHT_BROKER_CANCELLED
+    assert entry.internal_state is OrderState.PARTIALLY_FILLED
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
+
+
+def test_unknown_on_both_sides_remains_visible_as_undetermined(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-unknown-still")
+    try:
+        broker.script_order(client_id("exec-unknown-still"), TimeoutOrder())
+        broker.submit_order(broker_request("exec-unknown-still"))
+    except BrokerTimeoutError:
+        pass
+
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-unknown-still")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.STATE_MISMATCH
+    assert entry.internal_state is OrderState.UNKNOWN
+    assert entry.broker_state is OrderState.UNKNOWN
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+    assert "still report UNKNOWN" in entry.detail
+
+
+def test_partially_filled_then_broker_filled_without_fill_prefix_needs_manual_review(paths):
+    execution_db, _ = paths
+    internal_broker = FakeBroker(default_fill_price=FILL_PRICE)
+    internal_broker.script_order(
+        client_id("exec-part-fill"),
+        PartiallyFill(fills=((FILL_PRICE, Decimal("3")),), broker_order_id="B-PF"),
+    )
+    partial = internal_broker.submit_order(broker_request("exec-part-fill"))
+    seed_internal_pending(execution_db, "exec-part-fill")
+    execution_store.record_order_result(
+        "exec-part-fill", partial, reason="partial", db_path=execution_db
+    )
+
+    external_broker = FakeBroker(default_fill_price=FILL_PRICE)
+    external_broker.script_order(
+        client_id("exec-part-fill"),
+        FillImmediately(price=FILL_PRICE, broker_order_id="B-PF"),
+    )
+    filled = external_broker.submit_order(broker_request("exec-part-fill"))
+
+    run = service(
+        SnapshotBroker(external_broker, {client_id("exec-part-fill"): filled}), paths
+    ).detect(run_id="run-part-fill")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.IN_FLIGHT_BROKER_FILLED
+    assert entry.internal_state is OrderState.PARTIALLY_FILLED
+    assert entry.broker_state is OrderState.FILLED
+    # FakeBroker's independently built full-fill snapshot does not preserve
+    # the internally anchored partial fill prefix, so it is correctly manual.
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+
+
+def test_partially_filled_then_broker_filled_with_fill_prefix_is_auto_candidate(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(
+        client_id("exec-part-fill-prefix"),
+        PartiallyFill(fills=((FILL_PRICE, Decimal("3")),), broker_order_id="B-PFP"),
+    )
+    partial = broker.submit_order(broker_request("exec-part-fill-prefix"))
+    seed_internal_pending(execution_db, "exec-part-fill-prefix")
+    execution_store.record_order_result(
+        "exec-part-fill-prefix", partial, reason="partial", db_path=execution_db
+    )
+    remaining_fill = Fill(
+        fill_id="F-PFP-2",
+        price=FILL_PRICE,
+        quantity=Decimal("7"),
+        filled_at_utc=partial.updated_at_utc + timedelta(seconds=1),
+    )
+    filled = replace(
+        partial,
+        state=OrderState.FILLED,
+        filled_quantity=QUANTITY,
+        remaining_quantity=Decimal("0"),
+        average_fill_price=FILL_PRICE,
+        fills=partial.fills + (remaining_fill,),
+        updated_at_utc=partial.updated_at_utc + timedelta(seconds=1),
+    )
+
+    run = service(
+        SnapshotBroker(broker, {client_id("exec-part-fill-prefix"): filled}), paths
+    ).detect(run_id="run-part-fill-prefix")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.IN_FLIGHT_BROKER_FILLED
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
 
 
 def test_a_broker_snapshot_for_another_order_is_never_adopted(paths):
@@ -438,6 +658,21 @@ def test_a_failing_enumeration_is_recorded_on_the_run(paths):
     assert only(run.discrepancies).discrepancy_type is DiscrepancyType.IN_FLIGHT_BROKER_FILLED
 
 
+def test_duplicate_broker_listing_is_ambiguous_not_two_discrepancies(paths):
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    observed = broker.submit_order(broker_request("duplicate-listing"))
+
+    class DuplicateListingBroker(QueryOnlyBroker):
+        def list_orders(self):
+            return (observed, observed)
+
+    run = service(DuplicateListingBroker(broker), paths).detect(run_id="run-duplicate-listing")
+
+    assert run.broker_orders_enumerated is False
+    assert "duplicate client_order_id" in run.broker_listing_error
+    assert run.discrepancies == ()
+
+
 # --- query failures -----------------------------------------------------------
 
 
@@ -446,6 +681,8 @@ def test_a_failing_enumeration_is_recorded_on_the_run(paths):
     [
         (BrokerTimeoutError("timed out waiting for the broker"), "timeout"),
         (BrokerCommunicationError("connection refused"), "communication_failure"),
+        (BrokerAuthenticationError("credentials rejected"), "authentication_failure"),
+        (BrokerRateLimitError("slow down"), "rate_limited"),
     ],
 )
 def test_a_failed_broker_query_is_recorded_without_inferring_a_state(paths, error, expected_code):
@@ -465,6 +702,7 @@ def test_a_failed_broker_query_is_recorded_without_inferring_a_state(paths, erro
     assert entry.broker_error_code.value == expected_code
     assert entry.broker_state is None  # nothing was observed, nothing is inferred
     assert entry.internal_state is OrderState.UNKNOWN
+    assert run.has_partial_failures is True
     assert execution_store.get_execution_order("exec-12", db_path=execution_db) == before
 
 
@@ -486,6 +724,50 @@ def test_one_failing_query_does_not_hide_the_other_observations(paths):
         "exec-14": DiscrepancyType.IN_FLIGHT_BROKER_FILLED,
     }
     assert run.checked_order_count == 2
+
+
+def test_unexpected_adapter_exception_is_recorded_and_other_orders_continue(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    for request_id in ("exec-runtime-error", "exec-still-checked"):
+        seed_internal_pending(execution_db, request_id)
+        broker.submit_order(broker_request(request_id))
+    facade = QueryOnlyBroker(
+        broker,
+        query_failures={client_id("exec-runtime-error"): RuntimeError("adapter bug")},
+    )
+
+    run = service(facade, paths).run(run_id="run-runtime-error")
+
+    by_target = {entry.target_id: entry for entry in run.discrepancies}
+    failed = by_target["exec-runtime-error"]
+    assert failed.discrepancy_type is DiscrepancyType.QUERY_FAILURE
+    assert failed.broker_error_code.value == "communication_failure"
+    assert "RuntimeError" in failed.detail
+    assert by_target["exec-still-checked"].broker_state is OrderState.FILLED
+    assert run.has_partial_failures is True
+    assert (
+        reconciliation_store.get_reconciliation_run("run-runtime-error", db_path=paths[1])
+        == run
+    )
+
+
+def test_malformed_adapter_return_is_recorded_as_a_query_failure(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_pending(execution_db, "exec-malformed")
+    broker.submit_order(broker_request("exec-malformed"))
+
+    class MalformedQueryBroker(QueryOnlyBroker):
+        def get_order(self, client_order_id):
+            return {"state": "filled"}
+
+    run = service(MalformedQueryBroker(broker), paths).detect(run_id="run-malformed")
+
+    entry = only(run.discrepancies)
+    assert entry.discrepancy_type is DiscrepancyType.QUERY_FAILURE
+    assert entry.broker_error_code.value == "communication_failure"
+    assert "TypeError" in entry.detail
 
 
 # --- read-only / no-side-effect guarantees ------------------------------------

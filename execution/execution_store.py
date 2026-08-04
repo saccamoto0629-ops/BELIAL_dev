@@ -1902,8 +1902,42 @@ def list_in_flight_orders(*, db_path: Path | None = None) -> list[dict]:
             row["execution_request_id"]
             for row in connection.execute(
                 f"SELECT execution_request_id FROM {ORDERS_TABLE} "
-                f"WHERE order_state IN ({placeholders}) ORDER BY updated_at_utc ASC",
+                f"WHERE order_state IN ({placeholders}) "
+                "ORDER BY updated_at_utc ASC, execution_request_id ASC",
                 tuple(in_flight),
+            ).fetchall()
+        ]
+        for request_id in ids:
+            bundle = _fetch_and_validate(connection, request_id)
+            if bundle is not None:
+                rows.append(bundle[0])
+    return rows
+
+
+def list_reconciliation_orders(*, db_path: Path | None = None) -> list[dict]:
+    """Every execution order for which a broker state exists (Issue #103).
+
+    This is the complete comparison set for reconciliation: all in-flight
+    rows plus terminal rows.  A terminal state is immutable *inside BELIAL*,
+    but a later broker query can still contradict the stored terminal fact;
+    that contradiction must be detected for audit/manual review rather than
+    silently skipped.  ``created`` intents are excluded because no submit
+    attempt has occurred and therefore ``order_state`` is NULL.
+
+    Read-only, never creates or migrates a missing DB, and validates every
+    returned order/history bundle.  Ordering is total and deterministic.
+    """
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    rows = []
+    with _verified_read(db_path) as connection:
+        ids = [
+            row["execution_request_id"]
+            for row in connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+                "WHERE order_state IS NOT NULL "
+                "ORDER BY updated_at_utc ASC, execution_request_id ASC"
             ).fetchall()
         ]
         for request_id in ids:

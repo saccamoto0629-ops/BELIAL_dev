@@ -540,6 +540,46 @@ def test_list_unknown_orders_returns_exactly_the_query_targets(db_path):
     assert store.list_unknown_orders(db_path=db_path)[0]["order_state"] == "unknown"
 
 
+def test_reconciliation_listings_separate_in_flight_from_all_submitted_orders(db_path):
+    create_order(db_path, "exec-created")
+    submit(db_path, "exec-pending")
+    submit_and_accept(db_path, "exec-terminal", broker_order_id="B-terminal")
+    store.record_order_result(
+        "exec-terminal",
+        make_result(
+            OrderState.FILLED,
+            "exec-terminal",
+            broker_order_id="B-terminal",
+            filled="10",
+            fills=(fill("f-terminal", "10", 3),),
+            updated_at=at(3),
+        ),
+        reason="filled",
+        db_path=db_path,
+    )
+
+    assert [
+        row["execution_request_id"] for row in store.list_in_flight_orders(db_path=db_path)
+    ] == ["exec-pending"]
+    assert [
+        row["execution_request_id"]
+        for row in store.list_reconciliation_orders(db_path=db_path)
+    ] == ["exec-pending", "exec-terminal"]
+    assert store.list_client_order_ids(db_path=db_path) == [
+        "client-exec-created",
+        "client-exec-pending",
+        "client-exec-terminal",
+    ]
+
+
+def test_reconciliation_listings_never_create_a_missing_db(tmp_path):
+    missing = tmp_path / "missing-reconciliation-source.sqlite3"
+    assert store.list_in_flight_orders(db_path=missing) == []
+    assert store.list_reconciliation_orders(db_path=missing) == []
+    assert store.list_client_order_ids(db_path=missing) == []
+    assert not missing.exists()
+
+
 def test_list_unresolved_submissions_includes_unknown_and_stuck_pending(db_path):
     # exec-1: UNKNOWN (query target); exec-2: confirmed ACCEPTED (excluded);
     # exec-3: still created, no submit attempt (excluded); exec-4: submitting/

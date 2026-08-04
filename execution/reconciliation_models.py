@@ -307,6 +307,12 @@ class ReconciliationRun:
                 raise ValueError(
                     f"every discrepancies entry must be an OrderDiscrepancy, got {entry!r}"
                 )
+        targets = [(entry.target_type, entry.target_id) for entry in self.discrepancies]
+        if len(set(targets)) != len(targets):
+            raise ValueError(
+                "a reconciliation run may record at most one discrepancy per "
+                "(target_type, target_id)"
+            )
         if self.broker_listing_error is not None:
             _require_non_empty_str(self.broker_listing_error, "broker_listing_error")
 
@@ -315,6 +321,19 @@ class ReconciliationRun:
         """True when the broker-side order listing actually happened -- i.e.
         when "no ``BROKER_ONLY_ORDER`` records" may be read as "none exist"."""
         return self.broker_listing_error is None
+
+    @property
+    def has_partial_failures(self) -> bool:
+        """Whether any portion of this run could not be checked reliably.
+
+        Per-order query failures and a failed/unsupported broker enumeration
+        are both partial failures: successful observations remain valid, but
+        callers must not present the run as a complete clean reconciliation.
+        """
+        return self.broker_listing_error is not None or any(
+            discrepancy.discrepancy_type is DiscrepancyType.QUERY_FAILURE
+            for discrepancy in self.discrepancies
+        )
 
     def by_resolution(self, category: ResolutionCategory) -> tuple[OrderDiscrepancy, ...]:
         """The discrepancies in one resolution category, in observation order."""

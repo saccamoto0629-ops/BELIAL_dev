@@ -5,6 +5,7 @@ sleep, no real orders anywhere in this suite.
 """
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
@@ -100,6 +101,13 @@ def test_init_creates_the_schema_and_is_idempotent(tmp_path):
     assert version == store.SCHEMA_VERSION
 
 
+def test_init_treats_a_zero_byte_sqlite_file_as_pristine(tmp_path):
+    path = db(tmp_path)
+    path.touch()
+    store.init_reconciliation_db(path)
+    assert store.list_reconciliation_runs(db_path=path) == ()
+
+
 def test_re_initializing_keeps_every_stored_row(tmp_path):
     path = db(tmp_path)
     store.init_reconciliation_db(path)
@@ -128,6 +136,38 @@ def test_an_empty_db_carrying_a_version_is_not_pristine(tmp_path):
         connection.commit()
     with pytest.raises(store.ReconciliationSchemaError, match="not a pristine DB"):
         store.init_reconciliation_db(path)
+
+
+@pytest.mark.parametrize("operation", ["init", "get", "list", "record"])
+def test_a_non_sqlite_file_is_rejected_through_the_store_error_contract(tmp_path, operation):
+    path = db(tmp_path)
+    path.write_bytes(b"this is not a sqlite database")
+    before = path.read_bytes()
+
+    with pytest.raises(store.ReconciliationStoreError) as captured:
+        if operation == "init":
+            store.init_reconciliation_db(path)
+        elif operation == "get":
+            store.get_reconciliation_run("run-1", db_path=path)
+        elif operation == "list":
+            store.list_reconciliation_runs(db_path=path)
+        else:
+            store.record_reconciliation_run(sample_run(), db_path=path)
+
+    assert isinstance(captured.value, store.ReconciliationSchemaError)
+    assert path.read_bytes() == before
+
+
+def test_a_truncated_sqlite_database_is_rejected_without_further_modification(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    path.write_bytes(path.read_bytes()[:100])
+    before = path.read_bytes()
+
+    with pytest.raises(store.ReconciliationSchemaError):
+        store.get_reconciliation_run("run-1", db_path=path)
+
+    assert path.read_bytes() == before
 
 
 def test_a_constraint_stripped_lookalike_fails_verification(tmp_path):
@@ -203,6 +243,36 @@ def test_a_run_without_discrepancies_is_recorded_too(tmp_path):
     assert store.get_reconciliation_run("run-empty", db_path=path) == empty
 
 
+def test_a_failure_after_partial_discrepancy_inserts_rolls_back_the_whole_run(
+    tmp_path, monkeypatch
+):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    original_iso = store._iso
+    calls = 0
+
+    def fail_on_second_discrepancy(value):
+        nonlocal calls
+        calls += 1
+        # started + finished + first discrepancy are valid; the second
+        # discrepancy violates the UTC CHECK after the run/first child INSERT.
+        if calls == 4:
+            return "not-a-utc-timestamp"
+        return original_iso(value)
+
+    monkeypatch.setattr(store, "_iso", fail_on_second_discrepancy)
+    with pytest.raises(store.ReconciliationStoreError):
+        store.record_reconciliation_run(sample_run(), db_path=path)
+
+    assert store.get_reconciliation_run("run-1", db_path=path) is None
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(f"SELECT COUNT(*) FROM {store.RUNS_TABLE}").fetchone()[0] == 0
+        assert (
+            connection.execute(f"SELECT COUNT(*) FROM {store.DISCREPANCIES_TABLE}").fetchone()[0]
+            == 0
+        )
+
+
 def test_the_broker_listing_error_is_persisted(tmp_path):
     path = db(tmp_path)
     store.init_reconciliation_db(path)
@@ -225,6 +295,26 @@ def test_repeating_a_reconciliation_appends_a_new_run(tmp_path):
     assert [r.run_id for r in runs] == ["run-2", "run-1"]  # newest first
     assert runs[0].discrepancies == runs[1].discrepancies
     assert store.get_reconciliation_run("run-1", db_path=path) == sample_run("run-1")
+
+
+def test_concurrent_distinct_runs_are_serialized_without_loss(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    runs = [
+        sample_run(
+            f"run-{index}",
+            started_at_utc=at(index * 10),
+            finished_at_utc=at(index * 10 + 5),
+        )
+        for index in range(8)
+    ]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda run: store.record_reconciliation_run(run, db_path=path), runs))
+
+    restored = store.list_reconciliation_runs(limit=20, db_path=path)
+    assert {run.run_id for run in restored} == {run.run_id for run in runs}
+    assert all(len(run.discrepancies) == len(sample_discrepancies()) for run in restored)
 
 
 def test_recording_the_same_run_id_twice_is_refused_and_changes_nothing(tmp_path):
@@ -363,6 +453,24 @@ def test_db_check_constraint_pins_query_failed_to_query_failure(tmp_path):
             connection.execute(
                 f"UPDATE {store.DISCREPANCIES_TABLE} SET broker_error_code = 'timeout' "
                 "WHERE target_id = 'exec-1'"
+            )
+
+
+def test_db_unique_constraint_rejects_a_duplicate_target_within_one_run(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    store.record_reconciliation_run(sample_run(), db_path=path)
+    with closing(sqlite3.connect(path)) as connection:
+        row = connection.execute(
+            f"SELECT {', '.join(store._DISCREPANCY_COLUMNS)} "
+            f"FROM {store.DISCREPANCIES_TABLE} WHERE target_id = 'exec-1'"
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO {store.DISCREPANCIES_TABLE} "
+                f"({', '.join(store._DISCREPANCY_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in store._DISCREPANCY_COLUMNS)})",
+                tuple(row),
             )
 
 

@@ -10,12 +10,13 @@ trades / SL / TP are Issue #105. ***
 What a run compares
 -------------------
 
-1. Every internal order whose broker-side outcome is not settled
-   (``execution_store.list_in_flight_orders``: pending / accepted /
-   partially filled / unknown) is queried on the broker by its
-   ``client_order_id``:
+1. Every internal order for which a submit attempt established a broker state
+   (``execution_store.list_reconciliation_orders``: pending / accepted /
+   partially filled / unknown AND terminal states) is queried on the broker
+   by its ``client_order_id``. Created-only intents are excluded:
 
-   - identical states -> NOT a discrepancy (nothing is recorded),
+   - identical states with matching identity and snapshot contract -> NOT a
+     discrepancy (nothing is recorded),
    - still working internally but FILLED / CANCELLED / REJECTED at the
      broker -> the matching ``IN_FLIGHT_BROKER_*`` kind,
    - internally UNKNOWN but settled at the broker ->
@@ -60,7 +61,9 @@ continues with the other orders. NO state is inferred from a failed query:
 an unreachable broker never turns an order into FILLED / CANCELLED /
 REJECTED, and it never marks one "not placed". Only the broker-side
 ENUMERATION, which belongs to no single target, is recorded on the run
-itself.
+itself. An adapter that leaks an unexpected exception or malformed return
+across the Broker boundary is recorded fail-closed as a scoped communication
+failure; the remaining orders are still checked.
 
 Repeatability
 -------------
@@ -74,6 +77,7 @@ state or history -- an invariant the tests pin explicitly.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -82,6 +86,7 @@ from typing import Callable
 from broker.broker_interface import Broker, OrderListingBroker
 from broker.broker_models import (
     BrokerError,
+    BrokerErrorCode,
     BrokerInvalidRequestError,
     BrokerOrderNotFoundError,
     OrderResult,
@@ -170,7 +175,7 @@ class BrokerOrderReconciliationService:
         started_at = self._now()
         discrepancies: list[OrderDiscrepancy] = []
 
-        rows = execution_store.list_in_flight_orders(db_path=self._execution_db_path)
+        rows = execution_store.list_reconciliation_orders(db_path=self._execution_db_path)
         for row in rows:
             discrepancies.extend(self._reconcile_internal_order(row))
 
@@ -236,6 +241,11 @@ class BrokerOrderReconciliationService:
 
         try:
             observed = self._broker.get_order(client_order_id)
+            if not isinstance(observed, OrderResult):
+                raise TypeError(
+                    "Broker.get_order() must return an OrderResult, got "
+                    f"{type(observed).__name__}"
+                )
         except BrokerOrderNotFoundError as exc:
             return (
                 self._discrepancy(
@@ -269,6 +279,28 @@ class BrokerOrderReconciliationService:
                     ),
                 ),
             )
+        except Exception as exc:
+            # A Broker implementation is required to translate transport and
+            # malformed-response failures into BrokerError.  If an adapter
+            # violates that boundary, reconciliation still records a scoped
+            # query failure and continues; it must never lose the whole run or
+            # infer an order state from the leaked exception.
+            return (
+                self._discrepancy(
+                    row,
+                    discrepancy_type=DiscrepancyType.QUERY_FAILURE,
+                    resolution_category=ResolutionCategory.QUERY_FAILED,
+                    internal_state=internal_state,
+                    broker_state=None,
+                    broker_order_id=row["broker_order_id"],
+                    broker_error_code=BrokerErrorCode.COMMUNICATION_FAILURE,
+                    detail=(
+                        "broker query violated the Broker error/return contract "
+                        f"({type(exc).__name__}); recorded fail-closed as a "
+                        "communication failure and left the internal state unchanged"
+                    ),
+                ),
+            )
 
         if observed.client_order_id != client_order_id:
             # An adapter answering about a different order would attach a
@@ -289,11 +321,27 @@ class BrokerOrderReconciliationService:
                 ),
             )
 
-        if observed.state is internal_state:
-            return ()  # both sides agree -- not a discrepancy
+        if internal_state is OrderState.UNKNOWN and observed.state is OrderState.UNKNOWN:
+            return (
+                self._discrepancy(
+                    row,
+                    discrepancy_type=DiscrepancyType.STATE_MISMATCH,
+                    resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                    internal_state=internal_state,
+                    broker_state=observed.state,
+                    broker_order_id=observed.broker_order_id or row["broker_order_id"],
+                    detail=(
+                        "both BELIAL and the broker still report UNKNOWN; the query did not "
+                        "settle the outcome, so this remains visible for manual review"
+                    ),
+                ),
+            )
+
+        category, detail = self._classify_resolution(row, internal_state, observed)
+        if observed.state is internal_state and category is ResolutionCategory.AUTO_REPAIR_CANDIDATE:
+            return ()  # state and the complete stored identity/snapshot contract agree
 
         discrepancy_type = self._classify_type(internal_state, observed.state)
-        category, detail = self._classify_resolution(row, internal_state, observed)
         return (
             self._discrepancy(
                 row,
@@ -414,13 +462,47 @@ class BrokerOrderReconciliationService:
             )
         try:
             orders = self._broker.list_orders()
+            if not isinstance(orders, tuple):
+                raise TypeError(
+                    "OrderListingBroker.list_orders() must return a tuple, got "
+                    f"{type(orders).__name__}"
+                )
+            for order in orders:
+                if not isinstance(order, OrderResult):
+                    raise TypeError(
+                        "OrderListingBroker.list_orders() entries must be OrderResult, got "
+                        f"{type(order).__name__}"
+                    )
+            client_ids = [order.client_order_id for order in orders]
+            duplicate_client_ids = sorted(
+                client_id for client_id, count in Counter(client_ids).items() if count > 1
+            )
+            broker_ids = [order.broker_order_id for order in orders if order.broker_order_id is not None]
+            duplicate_broker_ids = sorted(
+                broker_id for broker_id, count in Counter(broker_ids).items() if count > 1
+            )
+            if duplicate_client_ids or duplicate_broker_ids:
+                return (
+                    (),
+                    "broker order enumeration is ambiguous: duplicate client_order_id="
+                    f"{duplicate_client_ids!r}, duplicate broker_order_id="
+                    f"{duplicate_broker_ids!r}; orders existing only on the broker side "
+                    "were NOT checked",
+                )
         except BrokerError as exc:
             return (
                 (),
                 f"listing broker orders failed ({type(exc).__name__}: {exc}); orders "
                 "existing only on the broker side were NOT checked",
             )
-        return tuple(orders), None
+        except Exception as exc:
+            return (
+                (),
+                "listing broker orders violated the Broker error/return contract "
+                f"({type(exc).__name__}); orders existing only on the broker "
+                "side were NOT checked",
+            )
+        return orders, None
 
     # --- helpers -------------------------------------------------------------
 

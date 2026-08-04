@@ -207,6 +207,8 @@ def test_a_run_reports_its_mode_counts_and_categories():
     manual = discrepancy(
         discrepancy_type=DiscrepancyType.STATE_MISMATCH,
         resolution_category=ResolutionCategory.MANUAL_REVIEW,
+        target_id="exec-2",
+        client_order_id="client-2",
     )
     result = run(checked_order_count=3, discrepancies=(discrepancy(), manual))
     assert result.mode is ReconciliationMode.DETECTION_ONLY
@@ -222,6 +224,24 @@ def test_a_run_reports_its_mode_counts_and_categories():
 def test_broker_orders_enumerated_distinguishes_none_found_from_not_checked():
     assert run().broker_orders_enumerated is True
     assert run(broker_listing_error="broker cannot enumerate").broker_orders_enumerated is False
+
+
+def test_partial_failure_is_machine_readable_for_query_or_listing_gaps():
+    query_failure = discrepancy(
+        discrepancy_type=DiscrepancyType.QUERY_FAILURE,
+        resolution_category=ResolutionCategory.QUERY_FAILED,
+        broker_state=None,
+        broker_error_code=BrokerErrorCode.TIMEOUT,
+    )
+    assert run().has_partial_failures is False
+    assert run(discrepancies=(query_failure,)).has_partial_failures is True
+    assert run(broker_listing_error="broker cannot enumerate").has_partial_failures is True
+
+
+def test_a_run_rejects_duplicate_discrepancies_for_the_same_target():
+    duplicate = discrepancy()
+    with pytest.raises(ValueError, match="at most one discrepancy"):
+        run(discrepancies=(duplicate, duplicate))
 
 
 @pytest.mark.parametrize(

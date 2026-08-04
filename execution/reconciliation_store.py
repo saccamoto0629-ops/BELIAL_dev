@@ -187,6 +187,7 @@ def _create_discrepancies_table_sql() -> str:
                 CHECK (broker_error_code IS NULL OR broker_error_code IN ('{codes}')),
             detail TEXT NOT NULL CHECK (trim(detail) <> ''),
             observed_at_utc TEXT NOT NULL CHECK (observed_at_utc LIKE '%+00:00'),
+            UNIQUE (run_id, target_type, target_id),
             CHECK ((discrepancy_type = '{query_failure}') = (resolution_category = '{query_failed}')),
             CHECK ((discrepancy_type = '{query_failure}') = (broker_error_code IS NOT NULL))
         )
@@ -301,20 +302,45 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _translate_sqlite_error(db_path: Path, operation: str, exc: sqlite3.DatabaseError):
+    """Map raw sqlite failures onto the store's public error contract.
+
+    Corrupt/non-SQLite files are schema failures; transient operational
+    failures (lock/read-only/open errors) are store availability failures.
+    Callers must not need sqlite implementation exceptions to distinguish an
+    invalid audit DB from a temporarily unavailable one.
+    """
+    message = str(exc).lower()
+    transient = isinstance(exc, sqlite3.OperationalError) and any(
+        marker in message
+        for marker in ("locked", "busy", "readonly", "read-only", "unable to open")
+    )
+    error_type = ReconciliationStoreError if transient else ReconciliationSchemaError
+    return error_type(
+        f"broker reconciliation DB at {db_path} failed during {operation}: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
 @contextmanager
 def _verified_txn(db_path: Path):
     """Write flow: open -> BEGIN IMMEDIATE -> verify schema -> row work ->
     COMMIT (ROLLBACK on any error, so a failed write leaves the DB
     untouched). Connection always explicitly closed."""
-    with closing(_connect(db_path)) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            _verify_schema(connection, db_path)
-            yield connection
-            connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
+    try:
+        with closing(_connect(db_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                _verify_schema(connection, db_path)
+                yield connection
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+    except ReconciliationStoreError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise _translate_sqlite_error(db_path, "verified write", exc) from exc
 
 
 @contextmanager
@@ -322,13 +348,18 @@ def _verified_read(db_path: Path):
     """Read flow: TRUE read-only connection (``mode=ro`` + ``query_only`` +
     authorizer: never creates the file, journals or WAL/SHM side files) ->
     BEGIN -> verify schema -> restore. Always rolled back."""
-    with closing(connect_read_only(db_path)) as connection:
-        connection.execute("BEGIN")
-        try:
-            _verify_schema(connection, db_path)
-            yield connection
-        finally:
-            connection.execute("ROLLBACK")
+    try:
+        with closing(connect_read_only(db_path)) as connection:
+            connection.execute("BEGIN")
+            try:
+                _verify_schema(connection, db_path)
+                yield connection
+            finally:
+                connection.execute("ROLLBACK")
+    except ReconciliationStoreError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise _translate_sqlite_error(db_path, "verified read", exc) from exc
 
 
 def init_reconciliation_db(db_path: Path | None = None) -> None:
@@ -347,23 +378,28 @@ def init_reconciliation_db(db_path: Path | None = None) -> None:
     """
     db_path = Path(db_path) if db_path is not None else reconciliation_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(_connect(db_path)) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            objects = connection.execute("SELECT name FROM sqlite_master").fetchall()
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if not objects:
-                if version != 0:
-                    raise ReconciliationSchemaError(
-                        f"DB at {db_path} is empty but carries user_version {version}; "
-                        "not a pristine DB -- refusing to initialize it"
-                    )
-                _create_schema(connection)
-            _verify_schema(connection, db_path)
-            connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
+    try:
+        with closing(_connect(db_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                objects = connection.execute("SELECT name FROM sqlite_master").fetchall()
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if not objects:
+                    if version != 0:
+                        raise ReconciliationSchemaError(
+                            f"DB at {db_path} is empty but carries user_version {version}; "
+                            "not a pristine DB -- refusing to initialize it"
+                        )
+                    _create_schema(connection)
+                _verify_schema(connection, db_path)
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+    except ReconciliationStoreError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise _translate_sqlite_error(db_path, "initialization", exc) from exc
 
 
 def record_reconciliation_run(run: ReconciliationRun, *, db_path: Path | None = None) -> None:
