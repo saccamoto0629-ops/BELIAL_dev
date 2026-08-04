@@ -483,6 +483,12 @@ def _tamper_policy(tmp_path, mutate):
         (lambda data: data.update(max_order_quantity=10), "decimal"),
         (lambda data: data.update(max_positions_account="5"), "integer"),
         (lambda data: data.update(policy_id="policy-forged"), "policy_id"),
+        # PR #100 3rd-review Major 3: plain json.loads accepts Infinity/NaN
+        # constants; they must surface as a stable integrity error, never as
+        # an OverflowError escaping timedelta().
+        (lambda data: data.update(max_reference_age_seconds=float("inf")), "finite"),
+        (lambda data: data.update(max_reference_age_seconds=float("nan")), "finite"),
+        (lambda data: data.update(max_reference_age_seconds=float("-inf")), "finite"),
     ],
 )
 def test_policy_snapshot_tamper_is_detected(tmp_path, mutate, match):

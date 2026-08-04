@@ -66,6 +66,7 @@ payload consistency); an out-of-band edited DB raises
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from contextlib import closing, contextmanager
@@ -1136,9 +1137,18 @@ def _policy_from_snapshot(data) -> SafetyPolicy:
         if not isinstance(data[name], int) or isinstance(data[name], bool):
             raise ValueError(f"policy snapshot {name} must be an integer, got {data[name]!r}")
     age = data["max_reference_age_seconds"]
-    if isinstance(age, bool) or not isinstance(age, (int, float)) or not age > 0:
+    # math.isfinite: plain json.loads accepts the Infinity/NaN constants, and
+    # timedelta(seconds=inf) would raise OverflowError instead of a stable
+    # integrity error (PR #100 3rd-review Major 3).
+    if (
+        isinstance(age, bool)
+        or not isinstance(age, (int, float))
+        or not math.isfinite(age)
+        or not age > 0
+    ):
         raise ValueError(
-            f"policy snapshot max_reference_age_seconds must be a positive number, got {age!r}"
+            f"policy snapshot max_reference_age_seconds must be a positive finite "
+            f"number, got {age!r}"
         )
     spreads_raw = data["max_spread_by_symbol"]
     if not isinstance(spreads_raw, dict):
@@ -1294,7 +1304,10 @@ def _restore_result(row: sqlite3.Row) -> ShadowResult:
             completed_at_utc=_parse_utc(row["completed_at_utc"]),
             shadow_result_id=row["shadow_result_id"],
         )
-    except (ValueError, TypeError, KeyError) as exc:
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        # OverflowError: a tampered numeric (e.g. a huge or non-finite value
+        # reaching a datetime/timedelta conversion) is integrity evidence, not
+        # a crash (PR #100 3rd-review Major 3).
         raise ShadowIntegrityError(
             f"shadow result row {row['shadow_result_id']!r} failed restore-time "
             f"validation: {exc}"

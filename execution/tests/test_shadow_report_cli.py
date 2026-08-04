@@ -46,8 +46,8 @@ def seed(tmp_path):
 
 
 def test_list_shows_every_result_newest_first_with_provenance(tmp_path, capsys):
-    db, _ = seed(tmp_path)
-    assert main(["--shadow-db", str(db)]) == EXIT_OK
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions)]) == EXIT_OK
     out = capsys.readouterr().out
     assert "ALLOWED" in out and "REJECTED" in out and "total 2" in out
     assert out.index("exec-2") < out.index("exec-1")  # newest first
@@ -55,8 +55,9 @@ def test_list_shows_every_result_newest_first_with_provenance(tmp_path, capsys):
 
 
 def test_limit_bounds_the_listing(tmp_path, capsys):
-    db, _ = seed(tmp_path)
-    assert main(["--shadow-db", str(db), "--limit", "1"]) == EXIT_OK
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--limit", "1"]) == EXIT_OK
     out = capsys.readouterr().out
     assert "exec-2" in out and "exec-1" not in out
     assert main(["--shadow-db", str(db), "--limit", "0"]) == EXIT_USAGE_ERROR
@@ -64,8 +65,9 @@ def test_limit_bounds_the_listing(tmp_path, capsys):
 
 
 def test_detail_by_execution_request_id_shows_provenance_and_snapshot(tmp_path, capsys):
-    db, _ = seed(tmp_path)
-    assert main(["--shadow-db", str(db), "--execution-request-id", "exec-2"]) == EXIT_OK
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--execution-request-id", "exec-2"]) == EXIT_OK
     out = capsys.readouterr().out
     assert "REJECTED" in out and "market_closed" in out
     assert "intended order (NOT submitted)" in out
@@ -75,18 +77,21 @@ def test_detail_by_execution_request_id_shows_provenance_and_snapshot(tmp_path, 
 
 
 def test_detail_by_source_signal_and_decision_id(tmp_path, capsys):
-    db, _ = seed(tmp_path)
-    assert main(["--shadow-db", str(db), "--source-signal-id", "signal-1"]) == EXIT_OK
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--source-signal-id", "signal-1"]) == EXIT_OK
     assert "exec-1" in capsys.readouterr().out
-    assert main(["--shadow-db", str(db), "--safety-decision-id", "2"]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--safety-decision-id", "2"]) == EXIT_OK
     assert "exec-2" in capsys.readouterr().out
     assert main(["--shadow-db", str(db), "--safety-decision-id", "99"]) == EXIT_FAILURE
     assert "no shadow result references" in capsys.readouterr().err
 
 
 def test_rejected_filter(tmp_path, capsys):
-    db, _ = seed(tmp_path)
-    assert main(["--shadow-db", str(db), "--decision", "rejected"]) == EXIT_OK
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--decision", "rejected"]) == EXIT_OK
     out = capsys.readouterr().out
     assert "exec-2" in out and "exec-1" not in out
 
@@ -208,16 +213,75 @@ def test_detail_view_also_cross_checks_the_referenced_decision(tmp_path, capsys)
     assert "shadow report failed" in captured.err and captured.out == ""
 
 
-def test_report_without_a_decision_db_skips_the_cross_check(tmp_path, capsys):
-    db, decisions = seed(tmp_path)
-    tamper_decision(
-        decisions,
-        "UPDATE safety_gate_decisions SET account_id = 'tampered-acct' WHERE decision_id = 1",
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+def test_missing_decision_db_fails_closed_for_referencing_records(
+    tmp_path, capsys, extra_args
+):
+    # PR #100 3rd-review Major 2: records referencing safety decision ids must
+    # not render when the decision store file itself is absent.
+    db, _ = seed(tmp_path)
+    assert (
+        main(["--shadow-db", str(db), "--decision-db",
+              str(tmp_path / "absent.sqlite3"), *extra_args])
+        == EXIT_FAILURE
     )
-    # standalone shadow DB copy (decision store file absent): still inspectable
-    assert main(["--shadow-db", str(db), "--decision-db",
+    captured = capsys.readouterr()
+    assert "shadow report failed" in captured.err and "does not exist" in captured.err
+    assert captured.out == ""
+
+
+def test_missing_decision_db_is_fine_when_no_record_references_a_decision(
+    tmp_path, capsys, monkeypatch
+):
+    # A record whose decision persistence failed carries safety_decision_id
+    # NULL -- with no references at all, a standalone shadow DB copy stays
+    # inspectable without the decision store.
+    from execution.safety_store import SQLiteSafetyDecisionStore
+
+    service = make_service(tmp_path, owner_id="owner-1")
+
+    def explode(self, decision):
+        raise RuntimeError("injected decision store failure")
+
+    monkeypatch.setattr(SQLiteSafetyDecisionStore, "record", explode)
+    service.run_cycle(
+        make_request(), market=make_market(), account=make_account(),
+        client_order_id="client-1", provenance=make_provenance(),
+    )
+    monkeypatch.undo()
+    assert main(["--shadow-db", str(service.shadow_db_path), "--decision-db",
                  str(tmp_path / "absent.sqlite3")]) == EXIT_OK
-    assert "total 2" in capsys.readouterr().out
+    assert "total 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+def test_infinity_tampered_policy_fails_the_report_stably(tmp_path, capsys, extra_args):
+    # PR #100 3rd-review Major 3: an Infinity injected into policy_json must
+    # surface as the stable "shadow report failed" error (exit 1), never as
+    # an OverflowError traceback.
+    db, decisions = seed(tmp_path)
+    connection = sqlite3.connect(db)
+    policy_json = connection.execute(
+        f"SELECT policy_json FROM {shadow_store.RESULTS_TABLE} "
+        "WHERE execution_request_id = 'exec-1'"
+    ).fetchone()[0]
+    tampered = json.loads(policy_json)
+    tampered["max_reference_age_seconds"] = float("inf")
+    connection.execute(
+        f"UPDATE {shadow_store.RESULTS_TABLE} SET policy_json = ? "
+        "WHERE execution_request_id = 'exec-1'",
+        (json.dumps(tampered, sort_keys=True, separators=(",", ":")),),
+    )
+    connection.commit()
+    connection.close()
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions), *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert "shadow report failed" in captured.err and "finite" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
 
 
 def test_no_orphans_for_clean_records(tmp_path, capsys):
@@ -248,8 +312,9 @@ def test_empty_store_is_a_valid_empty_report(tmp_path, capsys):
 
 
 def test_json_report_is_machine_readable_with_provenance(tmp_path, capsys):
-    db, _ = seed(tmp_path)
-    assert main(["--shadow-db", str(db), "--json", "--decision", "rejected"]) == EXIT_OK
+    db, decisions = seed(tmp_path)
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--json", "--decision", "rejected"]) == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1
     entry = payload["results"][0]
@@ -265,8 +330,9 @@ def test_report_is_truly_read_only(tmp_path):
     before = db.read_bytes()
     stat_before = (db.stat().st_mtime_ns, db.stat().st_size)
     files_before = sorted(entry.name for entry in tmp_path.iterdir())
-    assert main(["--shadow-db", str(db)]) == EXIT_OK
-    assert main(["--shadow-db", str(db), "--json"]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions)]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--json"]) == EXIT_OK
     assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
                  "--orphan-decisions"]) == EXIT_OK
     assert db.read_bytes() == before
@@ -298,18 +364,19 @@ def _cp932_stdout(monkeypatch):
 
 
 def test_report_survives_a_cp932_console(tmp_path, monkeypatch):
-    db, _ = seed(tmp_path)
+    db, decisions = seed(tmp_path)
     buffer, stream = _cp932_stdout(monkeypatch)
-    assert main(["--shadow-db", str(db)]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions)]) == EXIT_OK
     assert sys.stdout.errors == "strict"
     stream.flush()
     assert "total 2" in buffer.getvalue().decode("cp932")
 
 
 def test_json_survives_a_cp932_console(tmp_path, monkeypatch):
-    db, _ = seed(tmp_path)
+    db, decisions = seed(tmp_path)
     buffer, stream = _cp932_stdout(monkeypatch)
-    assert main(["--shadow-db", str(db), "--json"]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions),
+                 "--json"]) == EXIT_OK
     stream.flush()
     payload = json.loads(buffer.getvalue().decode("ascii"))
     assert payload["count"] == 2
@@ -323,9 +390,9 @@ def _stream_settings():
 
 
 def test_streams_are_restored_on_every_exit_path(tmp_path):
-    db, _ = seed(tmp_path)
+    db, decisions = seed(tmp_path)
     before = _stream_settings()
-    assert main(["--shadow-db", str(db)]) == EXIT_OK
+    assert main(["--shadow-db", str(db), "--decision-db", str(decisions)]) == EXIT_OK
     assert _stream_settings() == before
     assert main(["--shadow-db", str(tmp_path / 'missing.sqlite3')]) == EXIT_FAILURE
     assert _stream_settings() == before

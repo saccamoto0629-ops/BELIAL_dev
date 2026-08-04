@@ -21,9 +21,10 @@ signal_id
   -> StoredSignalProvider.get_signal()            … 保存済み Signal の解決(欠損は明示エラー)
   -> ShadowExecutionConfig.order_quantity_for()   … Production 設定の銘柄別数量(未設定銘柄は明示エラー)
   -> build_execution_request_from_signal()        … Signal → ExecutionRequest の正式サービス(決定的 identity)
-  -> MarketSnapshotProvider / AccountSnapshotProvider … snapshot 解決(欠損は明示エラー)
-  -> ShadowExecutionService.run_cycle()           … claim → Gate → 記録
+  -> ShadowExecutionService.run_cycle()           … claim → snapshot 解決 → Gate → 記録
 ```
+
+market / account snapshot の provider 呼び出しは **claim を獲得した winner だけが行う**(run_cycle へ supplier として渡され、claim 獲得後に初めて解決される): duplicate の loser・conflict は snapshot provider I/O を一切実行しない。claim 後の provider 失敗は claim を保持したまま伝播し、通常の lease 切れ回収契約に接続する(snapshot 欠損は明示エラー)。
 
 - **provider 境界**(`execution/shadow_providers.py`): `StoredSignalProvider` / `MarketSnapshotProvider` / `AccountSnapshotProvider` は Protocol。Production adapter は
   - `PaperSignalDbSignalProvider` — Paper Signal SQLite store(`paper-signal/` が所有・書き込み)を **true read-only**(`execution/sqlite_ro.py`)で読む。`paper-signal` ディレクトリは import 可能な package 名ではないため、adapter は DB ファイル境界で接続する(Paper Execution が Chart DB を読むのと同じ cross-component read-only パターン)。必要列の欠損・DB 欠損・Signal 欠損はすべて明示 `ShadowInputError`。
@@ -93,7 +94,7 @@ Safety Decision store 自体への schema 変更はない(additive の read API 
 
 **account / position snapshot の監査保存**: Gate が判定に使った注入 `AccountSafetySnapshot` **全体**を `account_snapshot_json` に保存する(account_id / currency / balance / equity / margin_available / retrieved_at + 各 position の symbol / side / quantity / average_entry_price / retrieved_at)。Decimal は文字列・時刻は UTC tz-aware・復元は closed-world(未知フィールド拒否・投影列 `position_count` との整合検証・改ざんは `ShadowIntegrityError`)。ポジション上限・口座上限の拒否は保存 snapshot から**事後再現可能**(pytest で固定)。モデルに secret(API token / password / credential)は存在せず、保存もされない。なお `AccountState` に used margin / position opened_at のフィールドは存在しないため保存対象外(モデル追加は Broker 境界 Issue の範囲)。
 
-**復元時の整合検証(3-way)**: strict restore は投影列と snapshot JSON を突き合わせる — `account_id` 列 ⇔ `account_snapshot_json` 内の account_id、`position_count` 列 ⇔ snapshot 内 position 件数、canonical payload 列の再計算一致、`policy_id` 列 ⇔ `policy_snapshot_json` 内の policy_id。`policy_snapshot_json` は closed-world で `SafetyPolicy` へ**再構築**し、`to_snapshot()` round-trip が保存値と一致することまで検証する(未知キー・欠損キー・型違い・forged policy_id はすべて `ShadowIntegrityError`)。さらに report は各 completed 記録の `safety_decision_id` が参照する Safety Decision row を実際に読み、**埋め込み decision とフィールド一致**(account_id / position_count / codes / policy / mode / 時刻)することを検証する — 不一致・参照先欠損の記録は text / `--json` どちらの出力でも**黙って表示されず**、レポート全体が exit 1 で明示失敗する(`--decision-db` のファイルが存在しない standalone copy の閲覧のみ cross-check を skip)。
+**復元時の整合検証(3-way)**: strict restore は投影列と snapshot JSON を突き合わせる — `account_id` 列 ⇔ `account_snapshot_json` 内の account_id、`position_count` 列 ⇔ snapshot 内 position 件数、canonical payload 列の再計算一致、`policy_id` 列 ⇔ `policy_snapshot_json` 内の policy_id。`policy_snapshot_json` は closed-world で `SafetyPolicy` へ**再構築**し、`to_snapshot()` round-trip が保存値と一致することまで検証する(未知キー・欠損キー・型違い・forged policy_id はすべて `ShadowIntegrityError`)。さらに report は各 completed 記録の `safety_decision_id` が参照する Safety Decision row を実際に読み、**埋め込み decision とフィールド一致**(account_id / position_count / codes / policy / mode / 時刻)することを検証する — 不一致・参照先欠損の記録は text / `--json` どちらの出力でも**黙って表示されず**、レポート全体が exit 1 で明示失敗する。**Decision store ファイル自体の欠落も、decision id を参照する記録が 1 件でもあれば同じ integrity failure**(fail-closed)であり、store なしで閲覧できるのは参照を一切持たない記録(decision 保存失敗の `safety_decision_id = NULL`)だけである。policy snapshot の数値は有限値のみ受理し(`Infinity` / `NaN` の注入は `OverflowError` にならず安定した integrity error)、復元境界は `OverflowError` も integrity error へ正規化する。
 
 schema 方針は従来どおり(pristine 初期化・closed-world 検証・strict restore)。
 

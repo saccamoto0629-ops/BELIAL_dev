@@ -10,8 +10,10 @@ cycle through the production services:
       -> StoredSignalProvider.get_signal()          (missing -> explicit error)
       -> ShadowExecutionConfig.order_quantity_for() (unconfigured -> error)
       -> build_execution_request_from_signal()      (deterministic identity)
-      -> MarketSnapshotProvider / AccountSnapshotProvider (missing -> error)
-      -> ShadowExecutionService.run_cycle()         (claim -> gate -> record)
+      -> ShadowExecutionService.run_cycle()         (claim -> snapshots -> gate -> record)
+           where the MarketSnapshotProvider / AccountSnapshotProvider lookups
+           run only AFTER the claim is won (missing -> error): a duplicate
+           loser performs no snapshot-provider I/O at all.
 
 No permissive defaults exist anywhere on this path: every input either
 resolves explicitly or fails with :class:`ShadowInputError` /
@@ -140,8 +142,6 @@ def run_production_shadow_cycle(
     signal = signal_provider.get_signal(signal_id)
     quantity = config.order_quantity_for(signal.symbol)
     request, client_order_id = build_execution_request_from_signal(signal, quantity=quantity)
-    market = market_provider.get_market_snapshot(signal.symbol)
-    account = account_provider.get_account_snapshot()
 
     provenance = ShadowProvenance(
         input_origin=INPUT_ORIGIN_PRODUCTION_SIGNAL,
@@ -166,19 +166,25 @@ def run_production_shadow_cycle(
         owner_id=owner_id,
     )
     if dry_run:
+        # Dry run never claims (zero side effects), so the snapshots are
+        # simply resolved for this one evaluation.
         return service.dry_run_cycle(
             request,
-            market=market,
-            account=account,
+            market=market_provider.get_market_snapshot(signal.symbol),
+            account=account_provider.get_account_snapshot(),
             client_order_id=client_order_id,
             provenance=provenance,
             timeframe=signal.timeframe,
         )
     service.initialize_stores()
+    # Suppliers, not values (PR #100 3rd-review Major 1): only the claim
+    # WINNER performs the market/account provider I/O -- a duplicate loser
+    # returns before either provider is contacted. A provider failure after
+    # the claim leaves the claim held for ordinary lease-expiry recovery.
     return service.run_cycle(
         request,
-        market=market,
-        account=account,
+        market_supplier=lambda: market_provider.get_market_snapshot(signal.symbol),
+        account_supplier=account_provider.get_account_snapshot,
         client_order_id=client_order_id,
         provenance=provenance,
         timeframe=signal.timeframe,

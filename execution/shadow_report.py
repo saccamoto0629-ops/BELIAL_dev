@@ -264,10 +264,23 @@ def _verify_decision_consistency(results, decision_db: Path) -> str | None:
     codes, timestamps). Any mismatch means a corrupted / inconsistent record
     and the report fails EXPLICITLY -- never silently displaying it, in text
     or JSON output alike. Records whose decision persistence failed
-    (``safety_decision_id`` NULL) carry no reference to check; when the
-    decision store file itself is absent the cross-check cannot run and is
-    skipped (a standalone shadow DB copy stays inspectable)."""
+    (``safety_decision_id`` NULL) carry no reference to check. A MISSING
+    decision store file is itself an integrity failure whenever any displayed
+    record references a decision id (PR #100 3rd-review Major 2): the report
+    fails closed instead of silently showing unverifiable records. Only
+    records with no references at all render without the store."""
     if not decision_db.exists():
+        referencing = [
+            result.request.execution_request_id
+            for result in results
+            if result.safety_decision_id is not None
+        ]
+        if referencing:
+            return (
+                f"the decision store at {decision_db} does not exist, but "
+                f"{len(referencing)} shadow record(s) (e.g. {referencing[0]!r}) "
+                "reference safety decision ids that cannot be verified"
+            )
         return None
     store = SQLiteSafetyDecisionStore(decision_db)
     for result in results:

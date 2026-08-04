@@ -351,6 +351,49 @@ def test_production_retry_is_a_duplicate_not_a_conflict(tmp_path):
     assert again.result == first.result
 
 
+class _CountingProvider:
+    """Wraps a snapshot provider and counts its lookups."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    @property
+    def source_id(self):
+        return self._inner.source_id
+
+    def get_market_snapshot(self, symbol):
+        self.calls += 1
+        return self._inner.get_market_snapshot(symbol)
+
+    def get_account_snapshot(self):
+        self.calls += 1
+        return self._inner.get_account_snapshot()
+
+
+def test_duplicate_production_cycle_performs_no_snapshot_provider_io(tmp_path):
+    # PR #100 3rd-review Major 1: the market/account providers are contacted
+    # only by the claim WINNER -- a duplicate retry resolves the signal (its
+    # identity is needed to classify the retry) but fetches no snapshots.
+    market = _CountingProvider(StaticMarketSnapshotProvider(make_market(), "test-market"))
+    account = _CountingProvider(StaticAccountSnapshotProvider(make_account(), "test-account"))
+    kwargs = dict(
+        signal_provider=PaperSignalDbSignalProvider(seed_signal_db(tmp_path)),
+        config=make_config(),
+        market_provider=market,
+        account_provider=account,
+        shadow_db_path=tmp_path / "shadow.sqlite3",
+        decision_db_path=tmp_path / "safety.sqlite3",
+        clock=lambda: NOW,
+    )
+    first = run_production_shadow_cycle("sig-1", **kwargs)
+    assert first.status is ShadowCycleStatus.RECORDED
+    assert market.calls == 1 and account.calls == 1
+    again = run_production_shadow_cycle("sig-1", owner_id="another-owner", **kwargs)
+    assert again.status is ShadowCycleStatus.DUPLICATE
+    assert market.calls == 1 and account.calls == 1  # the loser fetched nothing
+
+
 def test_production_dry_run_creates_nothing(tmp_path):
     outcome = run_production(tmp_path, dry_run=True)
     assert outcome.status is ShadowCycleStatus.DRY_RUN

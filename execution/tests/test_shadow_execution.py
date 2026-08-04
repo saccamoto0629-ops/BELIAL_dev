@@ -654,3 +654,109 @@ def test_stale_account_snapshot_fails_closed(tmp_path):
         service, account=make_account(retrieved_at_utc=NOW - timedelta(seconds=120))
     )
     assert outcome.result.rejection_codes == ("broker_query_failed",)
+
+
+# --- snapshot suppliers: winner-only provider I/O (PR #100 3rd review) ----------
+
+
+def test_snapshot_suppliers_run_only_for_the_claim_winner(tmp_path):
+    service = make_service(tmp_path, owner_id="owner-1", claim_lease_seconds=60)
+    calls = {"market": 0, "account": 0}
+
+    def market_supplier():
+        calls["market"] += 1
+        return make_market()
+
+    def account_supplier():
+        calls["account"] += 1
+        return make_account()
+
+    outcome = service.run_cycle(
+        make_request(),
+        market_supplier=market_supplier,
+        account_supplier=account_supplier,
+        client_order_id="client-1",
+        provenance=make_provenance(),
+    )
+    assert outcome.status is ShadowCycleStatus.RECORDED
+    assert calls == {"market": 1, "account": 1}
+
+    def poisoned():
+        raise AssertionError("a duplicate loser must not resolve snapshots")
+
+    blocked = service.run_cycle(
+        make_request(),
+        market_supplier=poisoned,
+        account_supplier=poisoned,
+        client_order_id="client-1",
+        provenance=make_provenance(),
+    )
+    assert blocked.status is ShadowCycleStatus.DUPLICATE
+    assert calls == {"market": 1, "account": 1}
+    assert len(decisions(service)) == 1
+
+
+def test_supplier_failure_leaves_the_claim_for_lease_recovery(tmp_path):
+    service = make_service(tmp_path, owner_id="owner-1", claim_lease_seconds=60)
+
+    def failing_market():
+        raise RuntimeError("injected provider outage")
+
+    with pytest.raises(RuntimeError, match="injected provider outage"):
+        service.run_cycle(
+            make_request(),
+            market_supplier=failing_market,
+            account_supplier=make_account,
+            client_order_id="client-1",
+            provenance=make_provenance(),
+            timeframe="H1",
+        )
+    # the claim stays held (gate never evaluated, no decision written) ...
+    assert shadow_store.get_shadow_claim("exec-1", db_path=service.shadow_db_path) is not None
+    assert len(decisions(service)) == 0
+
+    def poisoned():
+        raise AssertionError("an in-progress duplicate must not resolve snapshots")
+
+    blocked = service.run_cycle(
+        make_request(),
+        market_supplier=poisoned,
+        account_supplier=poisoned,
+        client_order_id="client-1",
+        provenance=make_provenance(),
+        timeframe="H1",
+    )
+    assert blocked.status is ShadowCycleStatus.DUPLICATE and blocked.claim is not None
+    # ... and the ordinary lease-expiry recovery completes the cycle.
+    LATER = NOW + timedelta(seconds=61)
+    recovery = make_service(
+        tmp_path, owner_id="owner-1", claim_lease_seconds=60, clock=lambda: LATER
+    )
+    retry = run_cycle(
+        recovery,
+        market=make_market(observed_at_utc=LATER),
+        account=make_account(retrieved_at_utc=LATER),
+    )
+    assert retry.status is ShadowCycleStatus.RECORDED
+
+
+def test_exactly_one_snapshot_source_is_required(tmp_path):
+    service = make_service(tmp_path)
+    with pytest.raises(ValueError, match="exactly one of market"):
+        service.run_cycle(
+            make_request(),
+            account=make_account(),
+            client_order_id="client-1",
+            provenance=make_provenance(),
+        )
+    with pytest.raises(ValueError, match="exactly one of market"):
+        service.run_cycle(
+            make_request(),
+            market=make_market(),
+            market_supplier=lambda: make_market(),
+            account=make_account(),
+            client_order_id="client-1",
+            provenance=make_provenance(),
+        )
+    # nothing was claimed by the rejected calls
+    assert shadow_store.list_shadow_claims(db_path=service.shadow_db_path) == ()

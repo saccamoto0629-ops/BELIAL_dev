@@ -29,11 +29,15 @@ recorded but BEFORE completion leaves a reclaimable claim whose retry writes
 a fresh decision -- the earlier row becomes an ORPHAN, searchable via
 ``shadow_report --orphan-decisions`` and bounded by the number of retries.
 
-Claim recovery contract (see ``shadow_store`` for the mechanics): the same
-owner re-acquires its claim immediately; other owners take over only after
-the lease expires; every crash point (before evaluation, after decision,
-before completion) therefore converges back to a completed record on retry,
-and no claim can stay unprocessable forever.
+Claim recovery contract (see ``shadow_store`` for the mechanics): each
+``run_cycle()`` call owns its claim through a unique attempt id plus a
+fencing generation token; an ACTIVE lease is never re-acquired -- not even
+by the same owner or service instance -- and every retry inside the lease is
+an in-progress duplicate. Recovery is lease-expiry takeover only (the
+generation increments, and the stale attempt's completion is refused), so
+every crash point (before evaluation, after decision, before completion)
+converges back to a completed record once the lease expires, and no claim
+can stay unprocessable forever.
 
 Mode dispatch (Issue #78): ``shadow`` runs through THIS service; ``fake``
 submission stays exclusively ``LiveOrderSubmissionService``; ``demo`` /
@@ -214,18 +218,33 @@ class ShadowExecutionService:
         self,
         request: ExecutionRequest,
         *,
-        market: MarketSafetySnapshot,
-        account: AccountSafetySnapshot,
+        market: MarketSafetySnapshot | None = None,
+        account: AccountSafetySnapshot | None = None,
+        market_supplier: Callable[[], MarketSafetySnapshot] | None = None,
+        account_supplier: Callable[[], AccountSafetySnapshot] | None = None,
         client_order_id: str,
         provenance: ShadowProvenance,
         timeframe: str | None = None,
     ) -> ShadowCycleOutcome:
         """Claim, evaluate, persist -- in that order (module docstring).
 
+        Market / account snapshots are given EITHER as values (fixture paths)
+        OR as zero-argument suppliers (the production path): a supplier is
+        invoked only AFTER this call wins the claim, so duplicate losers and
+        conflicts never perform the provider I/O behind it (PR #100
+        3rd-review Major 1). A supplier failure propagates and leaves the
+        claim held; the ordinary lease-expiry recovery contract applies.
+
         Returns RECORDED or an explicit DUPLICATE; a payload mismatch raises
         ``ShadowIdentityConflictError`` and store failures raise
         ``ShadowStoreError`` (the claim, if held, stays reclaimable)."""
-        self._validate_cycle_args(request, market, account, client_order_id, provenance, timeframe)
+        self._validate_identity_args(request, client_order_id, provenance, timeframe)
+        resolve_market = self._snapshot_source(
+            market, market_supplier, MarketSafetySnapshot, "market"
+        )
+        resolve_account = self._snapshot_source(
+            account, account_supplier, AccountSafetySnapshot, "account"
+        )
 
         status, record = shadow_store.claim_shadow_cycle(
             request,
@@ -250,7 +269,9 @@ class ShadowExecutionService:
             )
             return ShadowCycleOutcome(status=ShadowCycleStatus.DUPLICATE, claim=record)
 
-        # --- claim acquired: this caller alone evaluates ---------------------
+        # --- claim acquired: this caller alone resolves snapshots + evaluates
+        market = resolve_market()
+        account = resolve_account()
         decision = self._gate.evaluate_shadow(
             request,
             market=market,
@@ -342,18 +363,48 @@ class ShadowExecutionService:
 
     @staticmethod
     def _validate_cycle_args(request, market, account, client_order_id, provenance, timeframe) -> None:
-        if not isinstance(request, ExecutionRequest):
-            raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
+        ShadowExecutionService._validate_identity_args(
+            request, client_order_id, provenance, timeframe
+        )
         if not isinstance(market, MarketSafetySnapshot):
             raise ValueError(f"market must be a MarketSafetySnapshot, got {market!r}")
         if not isinstance(account, AccountSafetySnapshot):
             raise ValueError(f"account must be an AccountSafetySnapshot, got {account!r}")
+
+    @staticmethod
+    def _validate_identity_args(request, client_order_id, provenance, timeframe) -> None:
+        if not isinstance(request, ExecutionRequest):
+            raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
         if not isinstance(client_order_id, str) or not client_order_id.strip():
             raise ValueError(f"client_order_id must be a non-empty string, got {client_order_id!r}")
         if not isinstance(provenance, ShadowProvenance):
             raise ValueError(f"provenance must be a ShadowProvenance, got {provenance!r}")
         if timeframe is not None and (not isinstance(timeframe, str) or not timeframe.strip()):
             raise ValueError(f"timeframe must be a non-empty string or None, got {timeframe!r}")
+
+    @staticmethod
+    def _snapshot_source(value, supplier, expected_type, name):
+        """Exactly one of ``value`` / ``supplier``; returns a zero-argument
+        resolver that is only invoked once the claim is WON (so a duplicate
+        loser performs none of the I/O behind a supplier)."""
+        if (value is None) == (supplier is None):
+            raise ValueError(f"exactly one of {name} or {name}_supplier must be provided")
+        if value is not None:
+            if not isinstance(value, expected_type):
+                raise ValueError(f"{name} must be a {expected_type.__name__}, got {value!r}")
+            return lambda: value
+        if not callable(supplier):
+            raise ValueError(f"{name}_supplier must be callable, got {supplier!r}")
+
+        def resolve():
+            resolved = supplier()
+            if not isinstance(resolved, expected_type):
+                raise ValueError(
+                    f"{name}_supplier must return a {expected_type.__name__}, got {resolved!r}"
+                )
+            return resolved
+
+        return resolve
 
     def _next_attempt_id(self) -> str:
         """A unique id per ``run_cycle()`` call: claim ownership and the

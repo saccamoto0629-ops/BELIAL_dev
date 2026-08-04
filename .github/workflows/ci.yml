@@ -104,9 +104,9 @@ jobs:
           python -m execution.shadow_runner --mode dry-run --cycle execution/examples/shadow_cycle_example.json --data-dir "$RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00
           find "$RUNNER_TEMP/shadow-ci" -type f | sort > files-after.txt
           diff files-before.txt files-after.txt
-          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" | tee report.out
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" | tee report.out
           grep -q "origin=production_signal" report.out
-          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --json > shadow-report.json
+          python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --json > shadow-report.json
           python -c "import json; data=json.load(open('shadow-report.json', encoding='ascii')); assert data['count'] == 2, data"
           python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --orphan-decisions
 
@@ -197,9 +197,9 @@ jobs:
           python -m execution.shadow_runner --mode shadow --signal-id ci-signal-1 --signal-db "$env:RUNNER_TEMP/shadow-ci-signals/paper_signals.sqlite3" --execution-config execution/examples/shadow_execution_config_example.json --market-snapshot execution/examples/market_snapshot_example.json --account-snapshot execution/examples/account_snapshot_example.json --data-dir "$env:RUNNER_TEMP/shadow-ci" --now 2026-01-01T00:00:00+00:00 | Tee-Object production-cycle.out
           if ($LASTEXITCODE -ne 0) { throw "production cycle failed" }
           if (-not (Select-String -Path production-cycle.out -Pattern "origin=production_signal" -Quiet)) { throw "production provenance missing" }
-          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3"
+          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$env:RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3"
           if ($LASTEXITCODE -ne 0) { throw "report failed" }
-          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --json > shadow-report.json
+          python -m execution.shadow_report --shadow-db "$env:RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$env:RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --json > shadow-report.json
           if ($LASTEXITCODE -ne 0) { throw "json report failed" }
           python -c "import json; data=json.load(open('shadow-report.json', encoding='ascii')); assert data['count'] == 2, data"
           if ($LASTEXITCODE -ne 0) { throw "json parse failed" }
