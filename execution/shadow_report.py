@@ -416,11 +416,19 @@ def _decision_store_boundary(decision_db: Path):
 def _find_orphan_decisions(shadow_db: Path, decision_db: Path) -> list[dict]:
     """Decision rows for shadow requests that are NOT referenced by the
     completed record (module docstring). Read-only on both stores; decision
-    store failures are normalized like every other read (Major 1)."""
+    store failures are normalized like every other read (Major 1).
+
+    The orphan search reports on the SAME completed records as the listing,
+    so it holds them to the SAME integrity contract first (PR #100 5th-review
+    Major): a record whose REFERENCED decision row is missing or disagrees
+    field-by-field must never be summarized as "no orphan decisions" -- an
+    unverifiable record fails the whole command before anything is printed."""
+    results = shadow_store.list_shadow_results(db_path=shadow_db)
+    _verify_decision_consistency(results, decision_db)
     orphans: list[dict] = []
     records: list[tuple[str, int | None]] = [
         (result.request.execution_request_id, result.safety_decision_id)
-        for result in shadow_store.list_shadow_results(db_path=shadow_db)
+        for result in results
     ]
     records.extend(
         (claim.execution_request_id, None)

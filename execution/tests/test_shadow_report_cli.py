@@ -298,6 +298,53 @@ def test_unusable_decision_store_fails_stably_without_a_traceback(
 
 
 @pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DELETE FROM safety_gate_decisions WHERE decision_id = 1",
+        "UPDATE safety_gate_decisions SET account_id = 'tampered-acct' WHERE decision_id = 1",
+        "UPDATE safety_gate_decisions SET position_count = 42 WHERE decision_id = 1",
+        "UPDATE safety_gate_decisions SET execution_request_id = 'exec-other' "
+        "WHERE decision_id = 1",
+    ],
+    ids=["missing_row", "account_id", "position_count", "request_id"],
+)
+def test_orphan_search_refuses_a_broken_decision_reference(tmp_path, capsys, sql, extra_args):
+    """PR #100 5th-review Major: --orphan-decisions reports on the same
+    records as the listing, so a missing or disagreeing referenced decision
+    row must fail it too -- never a reassuring 'no orphan decisions'."""
+    db, decisions = seed(tmp_path)
+    tamper_decision(decisions, sql)
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions),
+              "--orphan-decisions", *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert captured.err.startswith("shadow report failed: ")
+    assert "exec-1" in captured.err  # names the unverifiable record
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
+def test_orphan_search_refuses_a_broken_null_reference(tmp_path, capsys, extra_args):
+    db, decisions = seed(tmp_path)
+    tamper_decision(
+        db, f"UPDATE {shadow_store.RESULTS_TABLE} SET safety_decision_id = NULL "
+            "WHERE execution_request_id = 'exec-1'"
+    )
+    assert (
+        main(["--shadow-db", str(db), "--decision-db", str(decisions),
+              "--orphan-decisions", *extra_args])
+        == EXIT_FAILURE
+    )
+    captured = capsys.readouterr()
+    assert captured.err.startswith("shadow report failed: ")
+    assert "Traceback" not in captured.err and captured.out == ""
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--json"]], ids=["text", "json"])
 def test_unusable_decision_store_also_fails_the_orphan_search(tmp_path, capsys, extra_args):
     db, decisions = seed(tmp_path)
     break_non_sqlite(decisions)
