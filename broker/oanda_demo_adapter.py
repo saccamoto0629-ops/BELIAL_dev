@@ -37,11 +37,13 @@ Secrets (Issue #79 / PR #101 review):
   ``from None`` so URL/header-bearing library errors never leak into
   tracebacks. ``OandaDemoConfig`` excludes token, account id AND endpoint
   from ``repr()``, and the endpoint-rejection errors are FIXED TEXT that
-  never echoes the configured value. Nothing secret crosses the boundary
-  either: ``connection_identity().target`` is the constant label
-  ``"oanda-demo"`` (never the URL) and ``AccountState.account_id`` carries
-  a MASKED account identifier (the response id is verified against the
-  configured one, then masked before it leaves the adapter).
+  never echoes the configured value. ``connection_identity().target`` is
+  the constant label ``"oanda-demo"`` (never the URL).
+  ``AccountState.account_id`` keeps the REAL account id (verified against
+  the configured one) because downstream layers use it as an identifier;
+  its concealment lives on the common model's display boundary (the field
+  is excluded from ``repr()``; ``display_account_id`` is a non-reversible
+  digest).
 - Redirects are never followed (``allow_redirects=False``): a 3xx answer
   cannot pull the connection off the demo endpoint and is converted to a
   common error instead (fail-closed).
@@ -255,14 +257,6 @@ class OandaDemoConfig:
                 f"timeout_seconds must be a positive finite number, got {self.timeout_seconds!r}"
             )
 
-    def masked_account_id(self) -> str:
-        """A display-safe account identifier: the real id never crosses the
-        adapter boundary (PR #101 review). Long ids keep a short prefix and
-        suffix for recognisability; short ids are fully masked."""
-        value = self.account_id
-        if len(value) <= 8:
-            return "***"
-        return f"{value[:3]}***{value[-3:]}"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "OandaDemoConfig":
@@ -528,12 +522,22 @@ class OandaDemoAdapter:
                     "broker fill quantity is inconsistent with the requested quantity",
                     client_order_id=request.client_order_id,
                 )
-            fill = Fill(
-                fill_id=self._tx_id(fill_tx, "orderFillTransaction.id"),
-                price=_parse_decimal(fill_tx.get("price"), "orderFillTransaction.price"),
-                quantity=filled_quantity,
-                filled_at_utc=_parse_utc_time(fill_tx.get("time"), "orderFillTransaction.time"),
-            )
+            try:
+                fill = Fill(
+                    fill_id=self._tx_id(fill_tx, "orderFillTransaction.id"),
+                    price=_parse_decimal(fill_tx.get("price"), "orderFillTransaction.price"),
+                    quantity=filled_quantity,
+                    filled_at_utc=_parse_utc_time(
+                        fill_tx.get("time"), "orderFillTransaction.time"
+                    ),
+                )
+            except BrokerInvalidRequestError as exc:
+                # e.g. a zero/negative fill price: a malformed RESPONSE, not
+                # a caller mistake (PR #101 re-review).
+                raise BrokerCommunicationError(
+                    self._redact(f"broker fill transaction is malformed: {exc}"),
+                    client_order_id=request.client_order_id,
+                ) from None
             return self._result_from_request(
                 request,
                 state=state,
@@ -606,7 +610,31 @@ class OandaDemoAdapter:
                 self._message(f"cancellation failed with HTTP status {status}", payload),
                 client_order_id=client_order_id,
             )
-        return self.get_order(client_order_id)
+        # The cancel transaction itself must exist and be correlated to OUR
+        # order before the cancel may be treated as confirmed (PR #101
+        # re-review) — a later GET returning the right order does not repair
+        # a response that failed to identify what it cancelled.
+        cancel_tx = payload.get("orderCancelTransaction")
+        if not isinstance(cancel_tx, Mapping):
+            raise BrokerCommunicationError(
+                "broker response after cancel carried no orderCancelTransaction; "
+                "refusing to treat the cancellation as confirmed",
+                client_order_id=client_order_id,
+            )
+        self._verify_client_correlation(
+            cancel_tx.get("clientOrderID"),
+            client_order_id,
+            required=True,
+            context="orderCancelTransaction",
+        )
+        snapshot = self.get_order(client_order_id)
+        if snapshot.state is not OrderState.CANCELLED:
+            raise BrokerCommunicationError(
+                "post-cancel snapshot does not report the order as cancelled; "
+                "the broker responses are inconsistent",
+                client_order_id=client_order_id,
+            )
+        return snapshot
 
     def get_order(self, client_order_id: str) -> OrderResult:
         """Return the latest broker-side snapshot of the order registered
@@ -665,17 +693,25 @@ class OandaDemoAdapter:
                 )
                 if units == 0:
                     continue
-                positions.append(
-                    PositionInfo(
-                        symbol=instrument,
-                        side=side,
-                        quantity=abs(units),
-                        average_entry_price=_parse_decimal(
-                            side_entry.get("averagePrice"), f"position.{side_key}.averagePrice"
-                        ),
-                        retrieved_at_utc=retrieved_at,
+                try:
+                    positions.append(
+                        PositionInfo(
+                            symbol=instrument,
+                            side=side,
+                            quantity=abs(units),
+                            average_entry_price=_parse_decimal(
+                                side_entry.get("averagePrice"),
+                                f"position.{side_key}.averagePrice",
+                            ),
+                            retrieved_at_utc=retrieved_at,
+                        )
                     )
-                )
+                except (ValueError, BrokerInvalidRequestError) as exc:
+                    raise BrokerCommunicationError(
+                        self._redact(
+                            f"broker position violated common-model invariants: {exc}"
+                        )
+                    ) from None
         return tuple(positions)
 
     def get_account_state(self) -> AccountState:
@@ -702,9 +738,12 @@ class OandaDemoAdapter:
         if not isinstance(currency, str) or not currency.strip():
             raise BrokerCommunicationError("broker account object carries no currency")
         return AccountState(
-            # The REAL account id never leaves the adapter (PR #101 review):
-            # AccountState reprs plainly, so it carries the masked form.
-            account_id=self._config.masked_account_id(),
+            # The REAL account id is kept: downstream layers use it as an
+            # identifier (Safety Decision / audit / shadow report). Display
+            # concealment lives on the common model itself — repr() excludes
+            # the field and display_account_id provides a non-reversible
+            # digest (PR #101 re-review).
+            account_id=account_id,
             currency=currency,
             balance=_parse_decimal(account.get("balance"), "account.balance"),
             equity=_parse_decimal(account.get("NAV"), "account.NAV"),
@@ -718,7 +757,8 @@ class OandaDemoAdapter:
 
     def connection_identity(self) -> BrokerConnectionIdentity:
         """The immutable identity derived from the construction-time config
-        (Issue #75): always mode ``"demo"`` with the demo endpoint as target."""
+        (Issue #75): always mode ``"demo"`` with the constant, non-secret
+        target label ``"oanda-demo"`` (never the endpoint URL — PR #101)."""
         return self._connection_identity
 
     def get_open_trades(self) -> tuple[TradeInfo, ...]:
@@ -761,7 +801,9 @@ class OandaDemoAdapter:
                         retrieved_at_utc=retrieved_at,
                     )
                 )
-            except ValueError as exc:
+            except (ValueError, BrokerInvalidRequestError) as exc:
+                # zero/negative open price and similar response-derived
+                # violations are malformed RESPONSES (PR #101 re-review).
                 raise BrokerCommunicationError(
                     self._redact(f"broker trade violated common-model invariants: {exc}")
                 ) from None
@@ -1158,9 +1200,17 @@ class OandaDemoAdapter:
                 "broker response carried no transaction object",
                 client_order_id=client_order_id,
             )
-        return Fill(
-            fill_id=self._tx_id(tx, "transaction.id"),
-            price=_parse_decimal(tx.get("price"), "transaction.price"),
-            quantity=abs(_parse_decimal(tx.get("units"), "transaction.units")),
-            filled_at_utc=_parse_utc_time(tx.get("time"), "transaction.time"),
-        )
+        try:
+            return Fill(
+                fill_id=self._tx_id(tx, "transaction.id"),
+                price=_parse_decimal(tx.get("price"), "transaction.price"),
+                quantity=abs(_parse_decimal(tx.get("units"), "transaction.units")),
+                filled_at_utc=_parse_utc_time(tx.get("time"), "transaction.time"),
+            )
+        except BrokerInvalidRequestError as exc:
+            # response-derived Fill invariants (zero/negative price etc.):
+            # a malformed RESPONSE, never a caller mistake (PR #101 re-review)
+            raise BrokerCommunicationError(
+                self._redact(f"broker fill transaction is malformed: {exc}"),
+                client_order_id=client_order_id,
+            ) from None

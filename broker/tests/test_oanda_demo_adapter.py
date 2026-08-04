@@ -203,13 +203,14 @@ def test_config_repr_hides_token_account_id_and_endpoint():
     assert oa.OANDA_DEMO_API_URL not in text
 
 
-def test_masked_account_id_never_contains_the_full_account_id():
-    config = make_config()
-    masked = config.masked_account_id()
-    assert ACCOUNT not in masked
-    assert masked != ACCOUNT
-    # short ids collapse entirely
-    assert make_config(account_id="short").masked_account_id() == "***"
+def test_transport_mapped_errors_carry_no_cause_chain():
+    # `raise ... from None`: no library exception (which may embed the URL /
+    # headers) may survive into the traceback chain.
+    adapter, _ = make_adapter(oa.TransportTimeoutError("t"))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request())
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
 
 
 # --- protocol conformance / connection identity --------------------------------
@@ -580,7 +581,8 @@ def test_get_order_rejects_a_blank_client_order_id():
 
 def test_cancel_order_returns_the_post_cancel_snapshot():
     adapter, transport = make_adapter(
-        (200, {"orderCancelTransaction": {"id": "9002", "orderID": "9001"}}),
+        (200, {"orderCancelTransaction": {"id": "9002", "orderID": "9001",
+                                          "clientOrderID": "c-10"}}),
         (
             200,
             {
@@ -635,6 +637,67 @@ def test_cancel_of_a_terminal_order_is_a_cancellation_failure():
     with pytest.raises(m.BrokerCancellationError) as exc_info:
         adapter.cancel_order("c-11")
     assert exc_info.value.code is m.BrokerErrorCode.CANCELLATION_FAILURE
+
+
+def test_cancel_without_a_cancel_transaction_is_refused():
+    # PR #101 re-review: a 200 PUT answer without orderCancelTransaction is
+    # never treated as a confirmed cancel — no follow-up GET can repair it.
+    adapter, transport = make_adapter((200, {}))
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.cancel_order("c-10")
+    assert "orderCancelTransaction" in str(exc_info.value)
+    assert len(transport.calls) == 1  # the GET is never reached
+
+
+def test_cancel_with_missing_client_order_id_echo_is_refused():
+    adapter, transport = make_adapter(
+        (200, {"orderCancelTransaction": {"id": "9002", "orderID": "9001"}})
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.cancel_order("c-10")
+    assert len(transport.calls) == 1
+
+
+def test_cancel_with_mismatched_client_order_id_echo_is_refused():
+    adapter, transport = make_adapter(
+        (200, {"orderCancelTransaction": {"id": "9002", "orderID": "9001",
+                                          "clientOrderID": "c-SOMEONE-ELSE"}})
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.cancel_order("c-10")
+    assert len(transport.calls) == 1
+
+
+def test_cancel_with_malformed_response_body_is_refused():
+    adapter, _ = make_adapter((200, "this is not json"))
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.cancel_order("c-10")
+
+
+def test_cancel_whose_post_cancel_snapshot_is_not_cancelled_is_refused():
+    # The cancel transaction correlates, but the follow-up GET reports a
+    # non-cancelled state: inconsistent broker responses fail closed.
+    adapter, _ = make_adapter(
+        (200, {"orderCancelTransaction": {"id": "9002", "orderID": "9001",
+                                          "clientOrderID": "c-10"}}),
+        (
+            200,
+            {
+                "order": {
+                    "id": "9001",
+                    "type": "LIMIT",
+                    "instrument": "USD_JPY",
+                    "units": "1",
+                    "price": "50.000",
+                    "state": "PENDING",
+                    "clientExtensions": {"id": "c-10"},
+                }
+            },
+        ),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.cancel_order("c-10")
+    assert "post-cancel" in str(exc_info.value)
 
 
 def test_cancel_of_an_unknown_order_raises_not_found():
@@ -701,9 +764,9 @@ def test_get_account_state_translates_the_summary():
         )
     )
     state = adapter.get_account_state()
-    # the account id crosses the boundary masked (PR #101 review)
-    assert state.account_id == make_config().masked_account_id()
-    assert ACCOUNT not in state.account_id
+    # identifier semantics preserved; concealment is repr-level only
+    assert state.account_id == ACCOUNT
+    assert ACCOUNT not in repr(state)
     assert state.currency == "JPY"
     assert state.balance == Decimal("3000000.0000")
     assert state.equity == Decimal("3000123.4567")
@@ -793,7 +856,9 @@ def test_broker_echoed_reject_reason_is_redacted_in_the_result():
             {
                 "orderRejectTransaction": {
                     "id": "5001",
-                    "rejectReason": f"MARGIN for {ACCOUNT}",
+                    "rejectReason": (
+                        f"MARGIN for {ACCOUNT} via {oa.OANDA_DEMO_API_URL} token {TOKEN}"
+                    ),
                 }
             },
         )
@@ -801,9 +866,75 @@ def test_broker_echoed_reject_reason_is_redacted_in_the_result():
     result = adapter.submit_order(make_request())
     assert result.state is m.OrderState.REJECTED
     assert ACCOUNT not in result.reject_reason
+    assert TOKEN not in result.reject_reason
+    assert oa.OANDA_DEMO_API_URL not in result.reject_reason
 
 
-def test_account_state_carries_a_masked_account_id():
+def test_zero_or_negative_fill_price_is_a_communication_error():
+    # A malformed RESPONSE, never a caller-side BrokerInvalidRequestError
+    # (PR #101 re-review) — via submit...
+    for bad_price in ("0", "-1.5"):
+        adapter, _ = make_adapter(fill_response(price=bad_price))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.submit_order(make_request())
+    # ...and via the filled-order query's filling transaction.
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "7001",
+                    "type": "MARKET",
+                    "instrument": "USD_JPY",
+                    "units": "1",
+                    "state": "FILLED",
+                    "fillingTransactionID": "7002",
+                    "clientExtensions": {"id": "c-8"},
+                }
+            },
+        ),
+        (
+            200,
+            {
+                "transaction": {
+                    "id": "7002",
+                    "units": "1",
+                    "price": "0",
+                    "time": "2026-01-02T03:04:07Z",
+                }
+            },
+        ),
+    )
+    with pytest.raises(m.BrokerCommunicationError):
+        adapter.get_order("c-8")
+
+
+def test_zero_or_negative_open_trade_price_is_a_communication_error():
+    for bad_price in ("0", "-155.0"):
+        adapter, _ = make_adapter(
+            (
+                200,
+                {
+                    "trades": [
+                        {
+                            "id": "T-1",
+                            "instrument": "USD_JPY",
+                            "currentUnits": "1",
+                            "price": bad_price,
+                            "openTime": "2026-01-02T03:00:00Z",
+                        }
+                    ]
+                },
+            )
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_open_trades()
+
+
+def test_account_state_keeps_the_real_id_but_conceals_it_at_display_boundaries():
+    # PR #101 re-review: the REAL id is the identifier downstream layers
+    # (Safety Decision / audit / shadow report) rely on — only repr and the
+    # display digest conceal it.
     adapter, _ = make_adapter(
         (
             200,
@@ -819,8 +950,9 @@ def test_account_state_carries_a_masked_account_id():
         )
     )
     state = adapter.get_account_state()
-    assert ACCOUNT not in state.account_id
+    assert state.account_id == ACCOUNT
     assert ACCOUNT not in repr(state)
+    assert ACCOUNT not in state.display_account_id
 
 
 def test_account_state_for_a_different_account_id_fails_closed():

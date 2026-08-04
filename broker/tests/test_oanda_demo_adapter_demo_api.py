@@ -83,8 +83,11 @@ def test_demo_account_state_can_be_fetched(adapter):
     assert isinstance(state, m.AccountState)
     assert state.currency
     assert state.retrieved_at_utc.tzinfo is not None
-    # the real account id never crosses the boundary (PR #101 review)
-    assert os.environ[oa.ENV_ACCOUNT_ID] not in state.account_id
+    # the model keeps the REAL id (identifier semantics) while repr and the
+    # display digest conceal it (PR #101 re-review)
+    assert state.account_id == os.environ[oa.ENV_ACCOUNT_ID].strip()
+    assert state.account_id not in repr(state)
+    assert state.account_id not in state.display_account_id
 
 
 def test_demo_tradable_instruments_include_the_test_instrument(adapter):
@@ -92,16 +95,30 @@ def test_demo_tradable_instruments_include_the_test_instrument(adapter):
     assert INSTRUMENT in instruments
 
 
+def _net_units(adapter):
+    """Signed net exposure in INSTRUMENT (long positive), via the broker."""
+    net = Decimal("0")
+    for position in adapter.get_positions():
+        if position.symbol == INSTRUMENT:
+            if position.side is m.PositionSide.LONG:
+                net += position.quantity
+            else:
+                net -= position.quantity
+    return net
+
+
 def test_demo_market_order_lifecycle_submit_query_positions_flatten(adapter):
     client_order_id = _new_client_order_id()
-    result = adapter.submit_order(make_request(client_order_id))
-    # A 1-unit FOK market order on a major pair fills immediately on demo.
-    # Whatever got filled is flattened again in the finally block, even when
-    # an assertion in between fails (PR #101 review). NOTE: the opposite
-    # MARKET order nets the exposure on a NETTING demo account; on a hedging
-    # demo account it opens an opposing trade instead — use a netting
-    # (default) demo account for this suite.
+    # Cleanup is RECONCILIATION-based (PR #101 re-review): the net exposure
+    # is measured before the test and re-measured in the finally block, so
+    # even a submit that raises AFTER broker acceptance (e.g. a response
+    # correlation failure) still gets flattened. NOTE: the opposite MARKET
+    # order nets the exposure on a NETTING demo account; hedging demo
+    # accounts are out of scope for this suite (documented limitation).
+    net_before = _net_units(adapter)
     try:
+        result = adapter.submit_order(make_request(client_order_id))
+        # A 1-unit FOK market order on a major pair fills immediately on demo.
         assert result.state is m.OrderState.FILLED
         assert result.client_order_id == client_order_id
         assert result.broker_order_id
@@ -123,13 +140,16 @@ def test_demo_market_order_lifecycle_submit_query_positions_flatten(adapter):
         with pytest.raises(m.BrokerCancellationError):
             adapter.cancel_order(client_order_id)
     finally:
-        if result.filled_quantity > 0:
+        delta = _net_units(adapter) - net_before
+        if delta != 0:
             flatten = adapter.submit_order(
-                make_request(
-                    _new_client_order_id(),
-                    side=m.OrderSide.SELL
-                    if result.side is m.OrderSide.BUY
-                    else m.OrderSide.BUY,
+                m.OrderRequest(
+                    client_order_id=_new_client_order_id(),
+                    symbol=INSTRUMENT,
+                    side=m.OrderSide.SELL if delta > 0 else m.OrderSide.BUY,
+                    order_type=m.OrderType.MARKET,
+                    quantity=abs(delta),
+                    created_at_utc=_now(),
                 )
             )
             assert flatten.state is m.OrderState.FILLED

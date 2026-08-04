@@ -45,6 +45,7 @@ Design decisions (Issue #73):
 from __future__ import annotations
 
 import enum
+import hashlib
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
@@ -699,14 +700,35 @@ class TradeInfo:
 
 @dataclass(frozen=True)
 class AccountState:
-    """Broker account snapshot (broker-agnostic, minimal)."""
+    """Broker account snapshot (broker-agnostic, minimal).
 
-    account_id: str
+    ``account_id`` holds the REAL broker account identifier — downstream
+    layers (Safety Decision, audit store, shadow report, connection
+    consistency checks) use it as an identifier, so its meaning must never
+    be replaced by a display mask (Issue #79 / PR #101 re-review).
+    Concealment happens at the DISPLAY boundary instead: the field is
+    excluded from ``repr()``, and ``display_account_id`` provides a
+    non-reversible, collision-resistant digest for logs / reports.
+    """
+
+    account_id: str = field(repr=False)
     currency: str
     balance: Decimal
     equity: Decimal
     margin_available: Decimal
     retrieved_at_utc: datetime
+
+    @property
+    def display_account_id(self) -> str:
+        """Display-safe form of ``account_id``: a truncated SHA-256 digest.
+
+        Non-reversible (the real id cannot be recovered) and
+        collision-resistant (distinct real accounts practically never share
+        a digest — unlike prefix/suffix masking, where real broker ids with
+        common prefixes would collide).
+        """
+        digest = hashlib.sha256(self.account_id.encode("utf-8")).hexdigest()[:12]
+        return f"account-{digest}"
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.account_id, "account_id")
