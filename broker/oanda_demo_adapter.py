@@ -32,15 +32,16 @@ Secrets (Issue #79 / PR #101 review):
 - API token / account id / endpoint come from environment variables only
   (``OandaDemoConfig.from_env``). The adapter performs NO logging, its
   exception messages are built from static text plus short broker-supplied
-  reason strings — with the token / account id values SCRUBBED out of any
-  broker-echoed text — and transport-level exceptions are re-raised
+  reason strings — with the token / account id / endpoint values SCRUBBED
+  out of any broker-echoed text — and transport-level exceptions are re-raised
   ``from None`` so URL/header-bearing library errors never leak into
   tracebacks. ``OandaDemoConfig`` excludes token, account id AND endpoint
-  from ``repr()``. Nothing secret crosses the boundary either:
-  ``connection_identity().target`` is the constant label ``"oanda-demo"``
-  (never the URL) and ``AccountState.account_id`` carries a MASKED account
-  identifier (the response id is verified against the configured one, then
-  masked before it leaves the adapter).
+  from ``repr()``, and the endpoint-rejection errors are FIXED TEXT that
+  never echoes the configured value. Nothing secret crosses the boundary
+  either: ``connection_identity().target`` is the constant label
+  ``"oanda-demo"`` (never the URL) and ``AccountState.account_id`` carries
+  a MASKED account identifier (the response id is verified against the
+  configured one, then masked before it leaves the adapter).
 - Redirects are never followed (``allow_redirects=False``): a 3xx answer
   cannot pull the connection off the demo endpoint and is converted to a
   common error instead (fail-closed).
@@ -60,6 +61,9 @@ Error translation (everything crossing the boundary is a common type):
 - malformed / unsupported call -> ``BrokerInvalidRequestError``
 - unknown order specifier      -> ``BrokerOrderNotFoundError``
 - refused cancellation         -> ``BrokerCancellationError``
+- order reissue after partial fill -> ``BrokerTimeoutError`` (deliberately
+  UNSUPPORTED pending Issue #102; the response is not interpreted at all —
+  fail-closed toward UNKNOWN, resolved by a later query)
 """
 
 from __future__ import annotations
@@ -225,16 +229,20 @@ class OandaDemoConfig:
             raise ValueError(f"account_id must be a non-empty string (set {ENV_ACCOUNT_ID})")
         if not isinstance(self.endpoint, str) or not self.endpoint.strip():
             raise ValueError(f"endpoint must be a non-empty string (set {ENV_API_URL})")
+        # Rejection messages are FIXED TEXT (PR #101 re-review): neither the
+        # configured value nor any endpoint URL is ever echoed into the
+        # exception, so a mistyped live URL or credentials-in-URL mistake
+        # cannot leak through the startup failure.
         normalized = self.endpoint.strip().rstrip("/")
         if _OANDA_LIVE_HOST_MARKER in normalized.lower():
             raise ValueError(
-                "the configured OANDA endpoint is a LIVE endpoint; this adapter is "
-                f"demo-only and refuses to start (allowed: {OANDA_DEMO_API_URL})"
+                "OANDA Demo endpoint configuration is invalid: a live endpoint "
+                "was configured; this adapter is demo-only and refuses to start"
             )
         if normalized != OANDA_DEMO_API_URL:
             raise ValueError(
-                "the configured OANDA endpoint is not the demo (fxpractice) endpoint; "
-                f"this adapter is demo-only and refuses to start (allowed: {OANDA_DEMO_API_URL})"
+                "OANDA Demo endpoint configuration is invalid: only the demo "
+                "endpoint is allowed; this adapter refuses to start"
             )
         object.__setattr__(self, "endpoint", normalized)
         if (
@@ -470,10 +478,26 @@ class OandaDemoAdapter:
                 client_order_id=request.client_order_id,
             )
 
+        # Order Reissue after a partial fill is DELIBERATELY unsupported here
+        # (Issue #102 owns reissue across the state machine / audit / query /
+        # cancel paths). A response carrying a reissue transaction is not
+        # interpreted at all — fail closed toward UNKNOWN so the recorded
+        # state can never misrepresent a reissued order, and a later query
+        # (never a resend) resolves it.
+        if isinstance(payload.get("orderReissueTransaction"), Mapping) or isinstance(
+            payload.get("orderReissueRejectTransaction"), Mapping
+        ):
+            raise BrokerTimeoutError(
+                "broker response carries an order reissue transaction after a "
+                "partial fill; reissue handling is deliberately unsupported by "
+                "this adapter (Issue #102) — the outcome is treated as unknown "
+                "and is resolved by a later query, never by resending",
+                client_order_id=request.client_order_id,
+            )
+
         fill_tx = payload.get("orderFillTransaction")
         cancel_tx = payload.get("orderCancelTransaction")
         create_tx = payload.get("orderCreateTransaction")
-        reissue_reject_tx = payload.get("orderReissueRejectTransaction")
         if isinstance(fill_tx, Mapping):
             # The fill transaction must be correlated to OUR order before it
             # may be bound to this client_order_id (PR #101 review).
@@ -488,19 +512,16 @@ class OandaDemoAdapter:
                 _parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")
             )
             # Partial fills (PR #101 review): the response may fill less
-            # than the requested quantity. If the remainder was cancelled or
-            # its reissue was rejected the order is done (CANCELLED with the
-            # partial fills kept); otherwise it is still working
-            # (PARTIALLY_FILLED). An orderReissueTransaction alone means the
-            # remainder keeps working, which is also PARTIALLY_FILLED. A
-            # zero or over-requested fill quantity is a malformed response,
-            # detected BEFORE any model construction.
+            # than the requested quantity. If the remainder was cancelled the
+            # order is done (CANCELLED with the partial fills kept);
+            # otherwise it is still working (PARTIALLY_FILLED). Reissue
+            # responses never reach this point (fail-closed above,
+            # Issue #102). A zero or over-requested fill quantity is a
+            # malformed response, detected BEFORE any model construction.
             if filled_quantity == request.quantity:
                 state = OrderState.FILLED
             elif 0 < filled_quantity < request.quantity:
-                remainder_done = isinstance(cancel_tx, Mapping) or isinstance(
-                    reissue_reject_tx, Mapping
-                )
+                remainder_done = isinstance(cancel_tx, Mapping)
                 state = OrderState.CANCELLED if remainder_done else OrderState.PARTIALLY_FILLED
             else:
                 raise BrokerCommunicationError(
@@ -926,8 +947,14 @@ class OandaDemoAdapter:
     def _redact(self, text: str) -> str:
         """Scrub the secret values out of broker-echoed text before it can
         reach an exception message or a returned reject_reason (PR #101
-        review: the broker may reflect request values back)."""
-        for secret in (self._config.api_token, self._config.account_id):
+        review: the broker may reflect request values back). The configured
+        endpoint is environment-managed like the credentials and is scrubbed
+        too (PR #101 re-review)."""
+        for secret in (
+            self._config.api_token,
+            self._config.account_id,
+            self._config.endpoint,
+        ):
             if secret:
                 text = text.replace(secret, "***")
         return text

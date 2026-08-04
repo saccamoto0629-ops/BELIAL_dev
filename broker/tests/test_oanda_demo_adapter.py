@@ -90,8 +90,20 @@ def test_config_normalizes_a_trailing_slash():
 def test_config_refuses_the_live_endpoint_fail_closed():
     with pytest.raises(ValueError) as exc_info:
         make_config(endpoint="https://api-fxtrade.oanda.com")
-    assert "LIVE" in str(exc_info.value)
+    assert "live endpoint" in str(exc_info.value)
     assert "demo-only" in str(exc_info.value)
+
+
+def test_endpoint_rejection_messages_are_fixed_text_without_any_url():
+    # PR #101 re-review: neither the configured value nor any endpoint URL
+    # (allowed one included) may be echoed by the rejection.
+    for bad in ("https://api-fxtrade.oanda.com", "https://evil.example/path?x=1"):
+        with pytest.raises(ValueError) as exc_info:
+            make_config(endpoint=bad)
+        text = str(exc_info.value)
+        assert bad not in text
+        assert "https://" not in text
+        assert "oanda.com" not in text
 
 
 def test_config_refuses_the_live_stream_endpoint_and_case_variants():
@@ -752,16 +764,25 @@ def test_default_transport_disables_redirect_following():
 # --- PR #101 review: secret redaction / correlation --------------------------------
 
 def test_broker_echoed_error_messages_are_redacted():
-    # The broker may reflect request values (account id, token) back in
-    # errorMessage / rejectReason; both must be scrubbed.
+    # The broker may reflect request values (account id, token, endpoint)
+    # back in errorMessage / rejectReason; all must be scrubbed.
     adapter, _ = make_adapter(
-        (400, {"errorMessage": f"account {ACCOUNT} rejected token {TOKEN}"})
+        (
+            400,
+            {
+                "errorMessage": (
+                    f"account {ACCOUNT} rejected token {TOKEN} "
+                    f"at {oa.OANDA_DEMO_API_URL}/v3"
+                )
+            },
+        )
     )
     with pytest.raises(m.BrokerInvalidRequestError) as exc_info:
         adapter.submit_order(make_request())
     text = str(exc_info.value)
     assert ACCOUNT not in text
     assert TOKEN not in text
+    assert oa.OANDA_DEMO_API_URL not in text
     assert "***" in text
 
 
@@ -928,13 +949,22 @@ def test_partial_fill_with_working_remainder_is_partially_filled():
     assert result.broker_order_id == "1001"
 
 
-def test_partial_fill_with_reissue_rejection_is_cancelled():
-    response = fill_response(units="2", price="155.000")
-    response[1]["orderReissueRejectTransaction"] = {"id": "1003"}
-    adapter, _ = make_adapter(response)
-    result = adapter.submit_order(make_request(quantity=Decimal("5")))
-    assert result.state is m.OrderState.CANCELLED
-    assert result.filled_quantity == Decimal("2")
+def test_reissue_transactions_are_deliberately_unsupported_and_fail_closed():
+    # Issue #102 owns reissue handling across the state machine / audit /
+    # query / cancel paths. Until then a reissue-carrying response is NOT
+    # interpreted: the submit fails toward UNKNOWN (no resend), so the
+    # recorded state can never misrepresent a reissued order.
+    for extra_key in ("orderReissueTransaction", "orderReissueRejectTransaction"):
+        response = fill_response(units="2", price="155.000")
+        response[1][extra_key] = {"id": "1003"}
+        adapter, transport = make_adapter(response)
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert exc_info.value.code is m.BrokerErrorCode.TIMEOUT
+        assert "reissue" in str(exc_info.value)
+        assert "unsupported" in str(exc_info.value)
+        # one attempt, no automatic resend
+        assert len(transport.calls) == 1
 
 
 def test_partial_fill_with_cancelled_remainder_is_cancelled():
