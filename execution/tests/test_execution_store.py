@@ -540,6 +540,46 @@ def test_list_unknown_orders_returns_exactly_the_query_targets(db_path):
     assert store.list_unknown_orders(db_path=db_path)[0]["order_state"] == "unknown"
 
 
+def test_reconciliation_listings_separate_in_flight_from_all_submitted_orders(db_path):
+    create_order(db_path, "exec-created")
+    submit(db_path, "exec-pending")
+    submit_and_accept(db_path, "exec-terminal", broker_order_id="B-terminal")
+    store.record_order_result(
+        "exec-terminal",
+        make_result(
+            OrderState.FILLED,
+            "exec-terminal",
+            broker_order_id="B-terminal",
+            filled="10",
+            fills=(fill("f-terminal", "10", 3),),
+            updated_at=at(3),
+        ),
+        reason="filled",
+        db_path=db_path,
+    )
+
+    assert [
+        row["execution_request_id"] for row in store.list_in_flight_orders(db_path=db_path)
+    ] == ["exec-pending"]
+    assert [
+        row["execution_request_id"]
+        for row in store.list_reconciliation_orders(db_path=db_path)
+    ] == ["exec-pending", "exec-terminal"]
+    assert store.list_client_order_ids(db_path=db_path) == [
+        "client-exec-created",
+        "client-exec-pending",
+        "client-exec-terminal",
+    ]
+
+
+def test_reconciliation_listings_never_create_a_missing_db(tmp_path):
+    missing = tmp_path / "missing-reconciliation-source.sqlite3"
+    assert store.list_in_flight_orders(db_path=missing) == []
+    assert store.list_reconciliation_orders(db_path=missing) == []
+    assert store.list_client_order_ids(db_path=missing) == []
+    assert not missing.exists()
+
+
 def test_list_unresolved_submissions_includes_unknown_and_stuck_pending(db_path):
     # exec-1: UNKNOWN (query target); exec-2: confirmed ACCEPTED (excluded);
     # exec-3: still created, no submit attempt (excluded); exec-4: submitting/
@@ -1604,6 +1644,66 @@ def test_get_execution_order_by_signal_id_round_trips(db_path):
 def test_get_execution_order_by_signal_id_never_creates_a_missing_db(db_path):
     assert store.get_execution_order_by_signal_id("sig-1", db_path=db_path) is None
     assert not db_path.exists()
+
+
+# --- broker_order_id ownership lookup (Issue #103 review) --------------------
+
+
+def test_get_execution_order_by_broker_order_id_finds_the_owning_request(db_path):
+    submit_and_accept(db_path, broker_order_id="B-1")
+    create_order(db_path, request_id="exec-2")  # no broker id of its own
+
+    row = store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
+
+    assert row["execution_request_id"] == "exec-1"
+    assert row["broker_order_id"] == "B-1"
+
+
+def test_an_unassigned_broker_order_id_has_no_owner(db_path):
+    submit_and_accept(db_path, broker_order_id="B-1")
+    assert store.get_execution_order_by_broker_order_id("B-2", db_path=db_path) is None
+
+
+def test_the_broker_order_id_lookup_never_creates_a_missing_db(db_path):
+    assert store.get_execution_order_by_broker_order_id("B-1", db_path=db_path) is None
+    assert not db_path.exists()
+
+
+def test_the_broker_order_id_lookup_requires_a_non_empty_id(db_path):
+    submit_and_accept(db_path)
+    for bad in ("", "   ", None):
+        with pytest.raises(ValueError):
+            store.get_execution_order_by_broker_order_id(bad, db_path=db_path)
+
+
+def test_the_broker_order_id_lookup_changes_neither_rows_nor_history(db_path):
+    submit_and_accept(db_path, broker_order_id="B-1")
+    before = full_db_state(db_path)
+    stat_before = (db_path.read_bytes(), db_path.stat().st_mtime_ns)
+
+    store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
+    store.get_execution_order_by_broker_order_id("unassigned", db_path=db_path)
+
+    assert full_db_state(db_path) == before
+    assert (db_path.read_bytes(), db_path.stat().st_mtime_ns) == stat_before
+
+
+def test_the_broker_order_id_lookup_survives_a_process_restart(db_path):
+    submit_and_accept(db_path, broker_order_id="B-1")
+    # a fresh connection on the same file = a new process reading it back
+    row = store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
+    again = store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
+    assert row == again
+    assert row["execution_request_id"] == "exec-1"
+
+
+def test_the_broker_order_id_lookup_refuses_a_broken_schema(db_path):
+    submit_and_accept(db_path, broker_order_id="B-1")
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("PRAGMA user_version = 99")
+        connection.commit()
+    with pytest.raises(store.ExecutionSchemaError):
+        store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
 
 
 def test_init_db_migrates_a_v2_db_in_place_and_keeps_rows_readable(db_path):

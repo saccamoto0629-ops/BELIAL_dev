@@ -486,6 +486,20 @@ class FakeBroker:
             )
         return result
 
+    def list_orders(self) -> tuple[OrderResult, ...]:
+        """Every order this broker currently holds, ordered by
+        ``client_order_id`` (Issue #103, ``OrderListingBroker``).
+
+        Read-only enumeration of the orders ALREADY recorded by
+        ``submit_order`` / ``cancel_order`` -- it places nothing, changes
+        nothing, and adds no new scripting surface. Reconciliation uses it to
+        observe orders that exist only on the broker side; the deterministic
+        ordering keeps assertions stable. Orders whose submit raised
+        ``FailCommunication`` were never recorded and therefore never appear.
+        """
+        with self._lock:
+            return tuple(self._orders[key] for key in sorted(self._orders))
+
     def get_positions(self) -> tuple[PositionInfo, ...]:
         return self._positions
 

@@ -47,6 +47,8 @@ OANDA Demo Adapter              ← broker/oanda_demo_adapter.py(Issue #79。Dem
 | ポジション照会 | `get_positions()` | `tuple[PositionInfo, ...]` |
 | 口座状態照会 | `get_account_state()` | `AccountState` |
 
+**追加の optional Protocol `OrderListingBroker`(Issue #103)**: `list_orders() -> tuple[OrderResult, ...]`(Broker 側が保持する注文の列挙。読み取り専用)。上記 5 操作の `Broker` Protocol は**変更していない** — 列挙は「実装しても良い追加能力」として**別 Protocol** に分離してあるため、既存実装(FakeBroker / OANDA Demo Adapter / 将来の Adapter)は無変更で `Broker` を満たし続ける(後方互換)。Broker 側にのみ存在する注文は照会だけでは観測できない(存在を知らない ID は照会できない)ため、reconciliation([Broker Reconciliation](broker_reconciliation.md))がこの能力を使う。**未実装の Broker では reconciliation が「未確認」として記録**し、「Broker 側のみの注文は存在しない」とは判定しない。
+
 境界のキーは**呼び出し側が生成する `client_order_id`**。Broker が採番する `broker_order_id` は結果側にのみ現れる(意味の異なる ID を同一フィールドに混在させない)。Adapter は内部で自 Broker の注文 ID へマッピングする。
 
 ## 共通モデル(`broker_models.py`)
@@ -106,6 +108,7 @@ broker.set_positions([...]); broker.set_account_state(...)              # 照会
 - 未スクリプト注文は `default_script`(既定: 指値価格で即時全量約定)。約定価格の選択は truthiness ではなく明示的な `is not None` 判定(`script.price` → `request.limit_price` → `default_fill_price` の順)。
 - **設定ミスは即時に失敗する(PR #87)**: Scenario dataclass は構築時に値を検証し(価格は正の有限 Decimal、reason は非空文字列、`PartiallyFill.fills` は非空 tuple の (Decimal, Decimal) ペア)、設定 API(`script_order` / `script_cancel` / `set_positions` / `set_account_state`)も引数の型を検証する。いずれも `BrokerInvalidRequestError` を送出し、submit / cancel 実行まで設定ミスを遅延させない(注文数量との比較のみ submit 時)。
 - タイムアウトは `BrokerTimeoutError` を**即時に**送出し、注文を `unknown` として記録する(後続の `get_order` で「拒否ではない」ことを検証できる)。sleep・実時間待機・乱数・ネットワークは使わない。時刻は決定的な内部クロック(固定基準時刻 + 連番秒)または注入 `clock` から得る。
+- **注文の列挙(Issue #103)**: `list_orders()` は既に保持している注文レコードを `client_order_id` 昇順(決定的)で返す読み取り専用操作。新しい scripting API は増やしていない(FakeBroker の責務を広げない)。通信失敗(`FailCommunication`)で記録されなかった注文は現れず、timeout で `unknown` として記録された注文は現れる。
 - 単体テストは一時ファイルすら不要のインメモリ動作(`broker/tests/` 参照。socket を無効化した検証あり)。
 
 ## Paper Execution との境界
@@ -128,4 +131,4 @@ broker.set_positions([...]); broker.set_account_state(...)              # 照会
 
 ## 非スコープ(Issue #79 時点で未実装)
 
-Live 口座接続・Live 用認証情報、`BROKER_TYPE_BY_MODE` への `demo` 登録(Execution 統合)、Live Execution runner、ロット計算、レバレッジ計算、資金管理、Broker との定期照合、再接続ループ、pricing/stream API、Discord 通知。(Safety Gate は Issue #75 で `execution/` に実装済み。)
+Live 口座接続・Live 用認証情報、`BROKER_TYPE_BY_MODE` への `demo` 登録(Execution 統合)、Live Execution runner、ロット計算、レバレッジ計算、資金管理、Broker との**定期**照合(scheduler 組み込み)、再接続ループ、pricing/stream API、Discord 通知。(Safety Gate は Issue #75 で `execution/` に実装済み。Broker 注文照合の**差分検出基盤**は Issue #103 で `execution/` に実装済みだが、検出専用であり定期実行・自動修復は含まない。)

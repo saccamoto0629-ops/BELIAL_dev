@@ -14,11 +14,27 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # The only files that may CALL <something>.submit_order(...):
 # - broker/tests exercise the broker boundary itself (Issue #73);
-# - execution/live_submission.py holds THE single gated call.
+# - execution/live_submission.py holds THE single gated call;
+# - execution/tests/test_broker_reconciliation.py seeds the FakeBroker test
+#   double with the broker-side state a reconciliation run is supposed to
+#   observe (Issue #103). It is a fixture, not a production path: the
+#   reconciliation module itself is separately pinned to ZERO submit/cancel
+#   calls (test_the_reconciliation_module_never_calls_a_broker_write_operation
+#   plus a poisoned broker facade used by every test there).
 # (broker/fake_broker.py only DEFINES submit_order; a def is not a call.)
 SUBMIT_ORDER_ALLOWED = {
     "broker/tests",
     "execution/live_submission.py",
+    "execution/tests/test_broker_reconciliation.py",
+}
+
+# Broker CANCELLATION has no production caller at all: the cancel Execution
+# use case is not implemented (Issue #99), and reconciliation (Issue #103) is
+# detection-only. Pinning it repository-wide means a future module cannot
+# quietly start cancelling broker orders.
+CANCEL_ORDER_ALLOWED = {
+    "broker/tests",
+    "execution/tests/test_broker_reconciliation.py",
 }
 
 # The only files that may CALL <something>.to_order_request(...):
@@ -64,6 +80,10 @@ def _offenders(method_name: str, allowed: set[str]) -> list[str]:
 
 def test_submit_order_is_called_only_by_the_safety_gate_and_broker_tests():
     assert _offenders("submit_order", SUBMIT_ORDER_ALLOWED) == []
+
+
+def test_cancel_order_is_called_only_by_broker_and_reconciliation_fixture_tests():
+    assert _offenders("cancel_order", CANCEL_ORDER_ALLOWED) == []
 
 
 def test_to_order_request_is_called_only_by_the_safety_gate_and_model_tests():

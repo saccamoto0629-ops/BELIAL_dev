@@ -86,3 +86,34 @@ class Broker(Protocol):
     def get_account_state(self) -> AccountState:
         """Return the broker account snapshot."""
         ...
+
+
+@runtime_checkable
+class OrderListingBroker(Protocol):
+    """OPTIONAL capability: enumerate the orders the BROKER itself holds.
+
+    Deliberately NOT a sixth method on ``Broker`` (Issue #103): the five
+    Issue #73 operations stay the boundary every implementation must
+    provide, so existing implementations -- FakeBroker, the OANDA Demo
+    Adapter (Issue #79) and any future adapter -- keep satisfying ``Broker``
+    unchanged. Enumeration is a separate structural Protocol an
+    implementation may additionally satisfy.
+
+    Reconciliation (Issue #103) needs it to notice orders that exist ONLY on
+    the broker side: without an enumeration there is no way to observe an
+    order BELIAL never recorded. An implementation that cannot enumerate
+    simply does not satisfy this Protocol, and reconciliation then REPORTS
+    that the broker-only check could not run -- it never concludes "no such
+    orders exist".
+
+    Read-only by contract: like ``get_order``, listing observes and must
+    never place, modify or cancel anything.
+    """
+
+    def list_orders(self) -> tuple[OrderResult, ...]:
+        """Return a snapshot of every order the broker currently knows about.
+
+        Raises the same typed ``BrokerError`` subclasses as the other query
+        operations when the enumeration itself fails.
+        """
+        ...
