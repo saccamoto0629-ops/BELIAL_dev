@@ -5,6 +5,7 @@ sleep, no real orders anywhere in this suite.
 """
 
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -503,6 +504,7 @@ def test_the_default_db_path_is_execution_owned_and_env_overridable(tmp_path, mo
 from execution.reconciliation_repair_models import (  # noqa: E402
     OrderRepairAttempt,
     RepairAttemptReservation,
+    RepairFailureCode,
     RepairMode,
     RepairOutcome,
 )
@@ -516,6 +518,11 @@ def sample_reservation(attempt_id="attempt-1", run_id="run-1", **overrides):
         target_id="exec-1",
         reserved_at_utc=at(10),
         detail="reserved: repair evaluation started",
+        owner_id="worker-1",
+        claim_execution_id="claim-1",
+        generation=1,
+        lease_expires_at_utc=at(700),
+        last_claimed_at_utc=at(10),
         execution_request_id="exec-1",
         client_order_id="client-1",
         reconciliation_internal_state=OrderState.PENDING,
@@ -537,6 +544,9 @@ def sample_attempt(attempt_id="attempt-1", run_id="run-1", **overrides) -> Order
         outcome=RepairOutcome.APPLIED,
         detail="the broker confirmed state 'filled'",
         reserved_at_utc=at(10),
+        owner_id="worker-1",
+        claim_execution_id="claim-1",
+        generation=1,
         execution_request_id="exec-1",
         client_order_id="client-1",
         reconciliation_internal_state=OrderState.PENDING,
@@ -546,7 +556,8 @@ def sample_attempt(attempt_id="attempt-1", run_id="run-1", **overrides) -> Order
         internal_state_after=OrderState.FILLED,
         broker_order_id="B-1",
         observed_at_utc=at(1),
-        applied_at_utc=at(11),
+        broker_state_updated_at_utc=at(11),
+        finalized_at_utc=at(12),
     )
     kwargs.update(overrides)
     return OrderRepairAttempt(**kwargs)
@@ -591,7 +602,7 @@ def test_a_skipped_attempt_for_a_broker_only_target_round_trips(tmp_path):
         target_id="client-9",
         outcome=RepairOutcome.SKIPPED,
         detail="broker-only orders are never adopted automatically",
-        failure_code="not_eligible_broker_only",
+        failure_code=RepairFailureCode.NOT_ELIGIBLE_BROKER_ONLY,
         execution_request_id=None,
         client_order_id="client-9",
         reconciliation_internal_state=None,
@@ -599,7 +610,7 @@ def test_a_skipped_attempt_for_a_broker_only_target_round_trips(tmp_path):
         internal_state_before=None,
         internal_state_after=None,
         broker_order_id=None,
-        applied_at_utc=None,
+        broker_state_updated_at_utc=None,
     )
     store.finalize_repair_attempt(finalized, db_path=path)
     assert store.get_repair_attempt("attempt-skip", db_path=path) == finalized
@@ -659,7 +670,11 @@ def test_a_dry_run_attempt_is_never_persisted(tmp_path):
     dry = sample_attempt(
         mode=RepairMode.DRY_RUN,
         outcome=RepairOutcome.WOULD_APPLY,
-        applied_at_utc=None,
+        owner_id=None,
+        claim_execution_id=None,
+        generation=None,
+        broker_state_updated_at_utc=None,
+        finalized_at_utc=None,
     )
     with pytest.raises(store.ReconciliationStoreError, match="dry-run"):
         store.finalize_repair_attempt(dry, db_path=path)
@@ -744,6 +759,165 @@ def test_internal_revision_round_trips_on_discrepancies(tmp_path):
     store.record_reconciliation_run(with_revision, db_path=path)
     restored = store.get_reconciliation_run("run-rev", db_path=path)
     assert restored.discrepancies[0].internal_revision == 3
+
+
+# --- claim takeover / finalize fencing (Issue #104 re-review) ------------------
+
+
+def test_claim_takeover_increments_the_generation_and_replaces_the_claim(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+
+    taken = store.claim_repair_attempt(
+        "attempt-1",
+        expected_generation=1,
+        new_owner_id="worker-2",
+        new_claim_execution_id="claim-2",
+        new_lease_expires_at_utc=at(2000),
+        claimed_at_utc=at(1300),
+        db_path=path,
+    )
+
+    assert taken.generation == 2
+    assert taken.owner_id == "worker-2"
+    assert taken.claim_execution_id == "claim-2"
+    assert taken.lease_expires_at_utc == at(2000)
+    assert taken.last_claimed_at_utc == at(1300)
+    # everything else is the original reservation, untouched
+    assert taken.attempt_id == "attempt-1"
+    assert taken.reserved_at_utc == at(10)
+    assert store.list_pending_repair_attempts(db_path=path) == (taken,)
+
+
+def test_claim_takeover_with_a_stale_generation_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    current = store.claim_repair_attempt(
+        "attempt-1",
+        expected_generation=1,
+        new_owner_id="worker-2",
+        new_claim_execution_id="claim-2",
+        new_lease_expires_at_utc=at(2000),
+        claimed_at_utc=at(1300),
+        db_path=path,
+    )
+
+    with pytest.raises(store.RepairClaimLostError, match="another worker won"):
+        store.claim_repair_attempt(
+            "attempt-1",
+            expected_generation=1,  # stale: the row moved on to generation 2
+            new_owner_id="worker-3",
+            new_claim_execution_id="claim-3",
+            new_lease_expires_at_utc=at(2600),
+            claimed_at_utc=at(1301),
+            db_path=path,
+        )
+    # the losing takeover changed nothing
+    assert store.list_pending_repair_attempts(db_path=path) == (current,)
+
+
+def test_claim_takeover_of_a_finalized_attempt_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.finalize_repair_attempt(sample_attempt(), db_path=path)
+
+    with pytest.raises(store.RepairAttemptConflictError, match="no claim to take over"):
+        store.claim_repair_attempt(
+            "attempt-1",
+            expected_generation=1,
+            new_owner_id="worker-2",
+            new_claim_execution_id="claim-2",
+            new_lease_expires_at_utc=at(2000),
+            claimed_at_utc=at(1300),
+            db_path=path,
+        )
+    assert store.get_repair_attempt("attempt-1", db_path=path) == sample_attempt()
+
+
+def test_claim_takeover_of_an_unknown_attempt_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    with pytest.raises(store.ReconciliationStoreError, match="no reservation"):
+        store.claim_repair_attempt(
+            "attempt-ghost",
+            expected_generation=1,
+            new_owner_id="worker-2",
+            new_claim_execution_id="claim-2",
+            new_lease_expires_at_utc=at(2000),
+            claimed_at_utc=at(1300),
+            db_path=path,
+        )
+
+
+def test_exactly_one_of_concurrent_takeover_workers_wins(tmp_path):
+    """Genuinely concurrent CAS: N barrier-aligned threads race the takeover
+    of the same generation; exactly one wins, every loser observes the typed
+    RepairClaimLostError and the row ends at generation 2 (not N+1)."""
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    workers = 4
+    barrier = threading.Barrier(workers)
+
+    def takeover(index):
+        barrier.wait()  # all workers issue the CAS as close together as possible
+        try:
+            return store.claim_repair_attempt(
+                "attempt-1",
+                expected_generation=1,
+                new_owner_id=f"recovery-{index}",
+                new_claim_execution_id=f"claim-r{index}",
+                new_lease_expires_at_utc=at(2000),
+                claimed_at_utc=at(1300),
+                db_path=path,
+            )
+        except store.RepairClaimLostError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(takeover, range(workers)))
+
+    winners = [taken for taken in results if taken is not None]
+    assert len(winners) == 1
+    assert winners[0].generation == 2  # exactly one increment happened
+    stored = store.list_pending_repair_attempts(db_path=path)
+    assert stored == (winners[0],)
+
+
+def test_finalize_under_a_lost_claim_is_refused_and_the_new_claim_completes(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.claim_repair_attempt(
+        "attempt-1",
+        expected_generation=1,
+        new_owner_id="worker-2",
+        new_claim_execution_id="claim-2",
+        new_lease_expires_at_utc=at(2000),
+        claimed_at_utc=at(1300),
+        db_path=path,
+    )
+
+    # the original (generation 1) worker resurrects and tries to finalize
+    with pytest.raises(store.RepairClaimLostError, match="generation 2"):
+        store.finalize_repair_attempt(sample_attempt(), db_path=path)
+    assert len(store.list_pending_repair_attempts(db_path=path)) == 1  # still pending
+
+    # only the current claim (generation 2) can complete the row
+    completed = sample_attempt(
+        owner_id="worker-2",
+        claim_execution_id="claim-2",
+        generation=2,
+        finalized_at_utc=at(1400),
+    )
+    store.finalize_repair_attempt(completed, db_path=path)
+    assert store.get_repair_attempt("attempt-1", db_path=path) == completed
+    assert store.list_pending_repair_attempts(db_path=path) == ()
+
+
+def test_finalize_requires_the_finalized_timestamp(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    with pytest.raises(store.ReconciliationStoreError, match="finalized_at_utc"):
+        store.finalize_repair_attempt(sample_attempt(finalized_at_utc=None), db_path=path)
+    assert len(store.list_pending_repair_attempts(db_path=path)) == 1
 
 
 # --- v1 -> v2 migration (Issue #104) ------------------------------------------

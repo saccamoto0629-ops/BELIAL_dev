@@ -107,6 +107,7 @@ from execution.reconciliation_models import (
 from execution.reconciliation_repair_models import (
     OrderRepairAttempt,
     RepairAttemptReservation,
+    RepairFailureCode,
     RepairMode,
     RepairOutcome,
 )
@@ -177,10 +178,17 @@ _RESERVATION_COLUMNS: tuple[str, ...] = (
     "detail",
     "observed_at_utc",
     "reserved_at_utc",
+    "owner_id",
+    "claim_execution_id",
+    "generation",
+    "lease_expires_at_utc",
+    "last_claimed_at_utc",
 )
 # Identity/anchor columns that must be IDENTICAL between the stored pending
 # reservation and the finalizing attempt (a finalize may only complete the
-# reservation it belongs to).
+# reservation it belongs to). The CLAIM columns (owner / claim execution /
+# generation) are deliberately NOT here: they are compare-and-set fencing
+# conditions -- a mismatch there is a LOST CLAIM, not corruption.
 _ATTEMPT_IDENTITY_COLUMNS: tuple[str, ...] = (
     "run_id",
     "mode",
@@ -216,6 +224,16 @@ class ReconciliationRunConflictError(ReconciliationStoreError):
 class RepairAttemptConflictError(ReconciliationStoreError):
     """A repair attempt with this ``attempt_id`` is already recorded
     (attempts are appended, never overwritten -- Issue #104)."""
+
+
+class RepairClaimLostError(ReconciliationStoreError):
+    """The caller no longer holds the attempt's claim (Issue #104 fencing).
+
+    Raised when a takeover or finalize compare-and-set finds the pending row
+    claimed by a different owner / claim execution / generation -- e.g. the
+    lease expired and a recovery worker took over, or another recovery
+    worker won the takeover race. The caller's work must be classified as a
+    typed lost-claim result, never recorded as a competing outcome."""
 
 
 def reconciliation_db_path() -> Path:
@@ -323,6 +341,7 @@ def _create_repairs_table_sql() -> str:
     targets = _enum_values_sql(ReconciliationTargetType)
     states = _enum_values_sql(OrderState)
     codes = _enum_values_sql(BrokerErrorCode)
+    failure_codes = _enum_values_sql(RepairFailureCode)  # closed set, generated
     storable_outcomes = "', '".join(
         sorted(o.value for o in RepairOutcome if o is not RepairOutcome.WOULD_APPLY)
     )
@@ -354,6 +373,11 @@ def _create_repairs_table_sql() -> str:
                        OR reconciliation_broker_state IN ('{states}')),
             internal_revision INTEGER
                 CHECK (internal_revision IS NULL OR internal_revision >= 0),
+            owner_id TEXT NOT NULL CHECK (trim(owner_id) <> ''),
+            claim_execution_id TEXT NOT NULL CHECK (trim(claim_execution_id) <> ''),
+            generation INTEGER NOT NULL CHECK (generation >= 1),
+            lease_expires_at_utc TEXT NOT NULL CHECK (lease_expires_at_utc LIKE '%+00:00'),
+            last_claimed_at_utc TEXT NOT NULL CHECK (last_claimed_at_utc LIKE '%+00:00'),
             internal_state_before TEXT
                 CHECK (internal_state_before IS NULL OR internal_state_before IN ('{states}')),
             internal_state_after TEXT
@@ -362,20 +386,26 @@ def _create_repairs_table_sql() -> str:
             broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
             broker_error_code TEXT
                 CHECK (broker_error_code IS NULL OR broker_error_code IN ('{codes}')),
-            failure_code TEXT CHECK (failure_code IS NULL OR trim(failure_code) <> ''),
+            failure_code TEXT CHECK (failure_code IS NULL OR failure_code IN ('{failure_codes}')),
             detail TEXT NOT NULL CHECK (trim(detail) <> ''),
             observed_at_utc TEXT CHECK (observed_at_utc IS NULL OR observed_at_utc LIKE '%+00:00'),
             reserved_at_utc TEXT NOT NULL CHECK (reserved_at_utc LIKE '%+00:00'),
-            applied_at_utc TEXT CHECK (applied_at_utc IS NULL OR applied_at_utc LIKE '%+00:00'),
+            broker_state_updated_at_utc TEXT
+                CHECK (broker_state_updated_at_utc IS NULL
+                       OR broker_state_updated_at_utc LIKE '%+00:00'),
+            finalized_at_utc TEXT
+                CHECK (finalized_at_utc IS NULL OR finalized_at_utc LIKE '%+00:00'),
             FOREIGN KEY (run_id, target_type, target_id)
                 REFERENCES {DISCREPANCIES_TABLE} (run_id, target_type, target_id),
             CHECK ((target_type = '{execution_target}') = (execution_request_id IS NOT NULL)),
             CHECK ((status = '{pending}') = (outcome IS NULL)),
+            CHECK ((status = '{finalized}') = (finalized_at_utc IS NOT NULL)),
             CHECK (status <> '{pending}'
                    OR (internal_state_before IS NULL AND internal_state_after IS NULL
                        AND broker_order_id IS NULL AND broker_error_code IS NULL
-                       AND failure_code IS NULL AND applied_at_utc IS NULL)),
-            CHECK (status = '{pending}' OR (outcome = '{applied}') = (applied_at_utc IS NOT NULL)),
+                       AND failure_code IS NULL AND broker_state_updated_at_utc IS NULL)),
+            CHECK (status = '{pending}'
+                   OR (outcome = '{applied}') = (broker_state_updated_at_utc IS NOT NULL)),
             CHECK (status = '{pending}'
                    OR (outcome IN ('{applied}', '{already}')) = (internal_state_after IS NOT NULL)),
             CHECK (status = '{pending}'
@@ -886,6 +916,11 @@ def reserve_repair_attempt(
         reservation.detail,
         None if reservation.observed_at_utc is None else _iso(reservation.observed_at_utc),
         _iso(reservation.reserved_at_utc),
+        reservation.owner_id,
+        reservation.claim_execution_id,
+        reservation.generation,
+        _iso(reservation.lease_expires_at_utc),
+        _iso(reservation.last_claimed_at_utc),
     )
     with _verified_txn(db_path) as connection:
         existing = connection.execute(
@@ -922,15 +957,90 @@ def reserve_repair_attempt(
             ) from exc
 
 
+def claim_repair_attempt(
+    attempt_id: str,
+    *,
+    expected_generation: int,
+    new_owner_id: str,
+    new_claim_execution_id: str,
+    new_lease_expires_at_utc: datetime,
+    claimed_at_utc: datetime,
+    db_path: Path | None = None,
+) -> RepairAttemptReservation:
+    """Take over an expired pending claim -- atomic fenced compare-and-set.
+
+    The takeover succeeds only while the row is still ``pending`` AND still
+    at ``expected_generation``; it increments the generation, replaces the
+    owner / claim execution id and extends the lease. Of any number of
+    concurrent takeover attempts exactly one wins; the losers observe
+    :class:`RepairClaimLostError` (still pending, someone else claimed it)
+    or :class:`RepairAttemptConflictError` (already finalized). Lease
+    EXPIRY is the CALLER's contract (checked against its clock before
+    calling); this CAS enforces atomicity, not the clock. Returns the
+    reservation as stored after the takeover.
+    """
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise ReconciliationStoreError(f"attempt_id must be a non-empty string, got {attempt_id!r}")
+    if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) \
+            or expected_generation < 1:
+        raise ReconciliationStoreError(
+            f"expected_generation must be an int >= 1, got {expected_generation!r}"
+        )
+    db_path = _require_existing_db(db_path)
+    with _verified_txn(db_path) as connection:
+        row = connection.execute(
+            f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise ReconciliationStoreError(
+                f"repair attempt {attempt_id!r} has no reservation; nothing to take over"
+            )
+        if row["status"] != ATTEMPT_STATUS_PENDING:
+            raise RepairAttemptConflictError(
+                f"repair attempt {attempt_id!r} is already finalized "
+                f"(outcome {row['outcome']!r}); there is no claim to take over"
+            )
+        try:
+            updated = connection.execute(
+                f"UPDATE {REPAIRS_TABLE} SET owner_id = ?, claim_execution_id = ?, "
+                "generation = generation + 1, lease_expires_at_utc = ?, "
+                "last_claimed_at_utc = ? "
+                "WHERE attempt_id = ? AND status = ? AND generation = ?",
+                (
+                    new_owner_id,
+                    new_claim_execution_id,
+                    _iso(new_lease_expires_at_utc),
+                    _iso(claimed_at_utc),
+                    attempt_id,
+                    ATTEMPT_STATUS_PENDING,
+                    expected_generation,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:  # CHECK violation
+            raise ReconciliationStoreError(
+                f"taking over repair attempt {attempt_id!r} violates a DB constraint: {exc}"
+            ) from exc
+        if updated.rowcount != 1:
+            raise RepairClaimLostError(
+                f"repair attempt {attempt_id!r} is no longer at generation "
+                f"{expected_generation}; another worker won the takeover"
+            )
+        stored = connection.execute(
+            f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        return _restore_reservation(stored)
+
+
 def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None = None) -> None:
     """Complete the reserved audit row with the attempt's outcome.
 
-    Compare-and-set protected: only a row that is still ``pending`` can be
-    finalized, and only by an attempt whose identity/anchor columns
-    (:data:`_ATTEMPT_IDENTITY_COLUMNS`) exactly equal the stored
-    reservation. Finalizing an already-finalized attempt raises
-    :class:`RepairAttemptConflictError` (a concurrent recovery may
-    legitimately have completed it first); an identity mismatch is
+    FENCED compare-and-set: only a row that is still ``pending`` AND still
+    claimed by THIS attempt's (owner_id, claim_execution_id, generation) can
+    be finalized. A worker whose claim was taken over observes
+    :class:`RepairClaimLostError` -- its outcome is never stored over the
+    new owner's, and an APPLIED fact can never be overwritten by a
+    contradicting result. Finalizing an already-finalized attempt raises
+    :class:`RepairAttemptConflictError`; an identity/anchor mismatch is
     corruption and raises :class:`ReconciliationIntegrityError`. Only
     APPLY-mode attempts exist in this DB; a ``would_apply`` outcome is
     unrepresentable (dry-run persists nothing). ``attempt.audit_error`` is
@@ -942,6 +1052,10 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
         raise ReconciliationStoreError(
             f"only apply-mode repair attempts are audited; got mode {attempt.mode.value!r} "
             "(dry-run is a no-side-effect contract)"
+        )
+    if attempt.finalized_at_utc is None:
+        raise ReconciliationStoreError(
+            f"finalizing repair attempt {attempt.attempt_id!r} requires finalized_at_utc"
         )
     db_path = _require_existing_db(db_path)
     expected_identity = {
@@ -988,12 +1102,24 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
                 f"stored reservation (differing: {', '.join(mismatched)}); refusing to "
                 "complete a foreign reservation"
             )
+        if (
+            row["owner_id"] != attempt.owner_id
+            or row["claim_execution_id"] != attempt.claim_execution_id
+            or row["generation"] != attempt.generation
+        ):
+            raise RepairClaimLostError(
+                f"repair attempt {attempt.attempt_id!r} is claimed by generation "
+                f"{row['generation']} (owner {row['owner_id']!r}), not by this worker's "
+                f"generation {attempt.generation}; the lost claim's outcome is not stored"
+            )
         try:
             updated = connection.execute(
                 f"UPDATE {REPAIRS_TABLE} SET status = ?, outcome = ?, detail = ?, "
                 "internal_state_before = ?, internal_state_after = ?, broker_order_id = ?, "
-                "broker_error_code = ?, failure_code = ?, applied_at_utc = ? "
-                "WHERE attempt_id = ? AND status = ?",
+                "broker_error_code = ?, failure_code = ?, broker_state_updated_at_utc = ?, "
+                "finalized_at_utc = ? "
+                "WHERE attempt_id = ? AND status = ? AND owner_id = ? "
+                "AND claim_execution_id = ? AND generation = ?",
                 (
                     ATTEMPT_STATUS_FINALIZED,
                     attempt.outcome.value,
@@ -1006,10 +1132,16 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
                     else attempt.internal_state_after.value,
                     attempt.broker_order_id,
                     None if attempt.broker_error_code is None else attempt.broker_error_code.value,
-                    attempt.failure_code,
-                    None if attempt.applied_at_utc is None else _iso(attempt.applied_at_utc),
+                    None if attempt.failure_code is None else attempt.failure_code.value,
+                    None
+                    if attempt.broker_state_updated_at_utc is None
+                    else _iso(attempt.broker_state_updated_at_utc),
+                    _iso(attempt.finalized_at_utc),
                     attempt.attempt_id,
                     ATTEMPT_STATUS_PENDING,
+                    attempt.owner_id,
+                    attempt.claim_execution_id,
+                    attempt.generation,
                 ),
             )
         except sqlite3.IntegrityError as exc:  # CHECK violation
@@ -1018,9 +1150,9 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
                 f"constraint: {exc}"
             ) from exc
         if updated.rowcount != 1:  # defence in depth under BEGIN IMMEDIATE
-            raise RepairAttemptConflictError(
-                f"repair attempt {attempt.attempt_id!r} was finalized concurrently; an "
-                "attempt is finalized exactly once"
+            raise RepairClaimLostError(
+                f"repair attempt {attempt.attempt_id!r} was claimed or finalized "
+                "concurrently; the lost claim's outcome is not stored"
             )
 
 
@@ -1043,6 +1175,9 @@ def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
             outcome=RepairOutcome(row["outcome"]),
             detail=row["detail"],
             reserved_at_utc=_parse_utc(row["reserved_at_utc"]),
+            owner_id=row["owner_id"],
+            claim_execution_id=row["claim_execution_id"],
+            generation=row["generation"],
             execution_request_id=row["execution_request_id"],
             client_order_id=row["client_order_id"],
             reconciliation_internal_state=state("reconciliation_internal_state"),
@@ -1054,13 +1189,18 @@ def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
             broker_error_code=None
             if row["broker_error_code"] is None
             else BrokerErrorCode(row["broker_error_code"]),
-            failure_code=row["failure_code"],
+            failure_code=None
+            if row["failure_code"] is None
+            else RepairFailureCode(row["failure_code"]),
             observed_at_utc=None
             if row["observed_at_utc"] is None
             else _parse_utc(row["observed_at_utc"]),
-            applied_at_utc=None
-            if row["applied_at_utc"] is None
-            else _parse_utc(row["applied_at_utc"]),
+            broker_state_updated_at_utc=None
+            if row["broker_state_updated_at_utc"] is None
+            else _parse_utc(row["broker_state_updated_at_utc"]),
+            finalized_at_utc=None
+            if row["finalized_at_utc"] is None
+            else _parse_utc(row["finalized_at_utc"]),
         )
     except (ValueError, TypeError) as exc:
         raise ReconciliationIntegrityError(
@@ -1069,7 +1209,7 @@ def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
 
 
 def _restore_reservation(row: sqlite3.Row) -> RepairAttemptReservation:
-    """Rebuild one PENDING reservation; strict, fail-closed."""
+    """Rebuild one PENDING reservation (claim included); strict, fail-closed."""
 
     def state(name):
         return None if row[name] is None else OrderState(row[name])
@@ -1086,6 +1226,11 @@ def _restore_reservation(row: sqlite3.Row) -> RepairAttemptReservation:
             target_id=row["target_id"],
             reserved_at_utc=_parse_utc(row["reserved_at_utc"]),
             detail=row["detail"],
+            owner_id=row["owner_id"],
+            claim_execution_id=row["claim_execution_id"],
+            generation=row["generation"],
+            lease_expires_at_utc=_parse_utc(row["lease_expires_at_utc"]),
+            last_claimed_at_utc=_parse_utc(row["last_claimed_at_utc"]),
             execution_request_id=row["execution_request_id"],
             client_order_id=row["client_order_id"],
             reconciliation_internal_state=state("reconciliation_internal_state"),

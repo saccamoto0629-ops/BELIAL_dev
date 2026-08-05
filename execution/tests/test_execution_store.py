@@ -1378,6 +1378,7 @@ def _write_schema(db_path, orders_sql, history_sql=None, index_sqls=None):
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(orders_sql)
         connection.execute(history_sql if history_sql is not None else store._create_history_table_sql())
+        connection.execute(store._create_fences_table_sql())
         for sql in index_sqls if index_sqls is not None else store._create_index_sql().values():
             connection.execute(sql)
         connection.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
@@ -1516,7 +1517,9 @@ def _downgrade_to_v3(db_path):
     Rows persist. Asserted faithful against the pristine v3 reference."""
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(f"DROP INDEX {store._HISTORY_REPAIR_INDEX}")
+        connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} DROP COLUMN repair_generation")
         connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} DROP COLUMN repair_attempt_id")
+        connection.execute(f"DROP TABLE {store.FENCES_TABLE}")
         connection.execute("PRAGMA user_version = 3")
         connection.commit()
     with closing(sqlite3.connect(db_path)) as connection:
@@ -2001,8 +2004,21 @@ def test_expected_revision_must_be_a_non_negative_int(db_path):
             )
 
 
+def _fence(db_path, request_id, attempt_id, generation=1, claim="claim-1"):
+    store.register_repair_fence(
+        request_id,
+        repair_attempt_id=attempt_id,
+        generation=generation,
+        owner_id="worker-1",
+        claim_execution_id=claim,
+        registered_at_utc=at(9),
+        db_path=db_path,
+    )
+
+
 def test_repair_provenance_is_recorded_structurally_on_the_history_row(db_path):
     submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-xyz")
     store.record_order_result(
         "exec-1",
         _filled_result(),
@@ -2010,10 +2026,12 @@ def test_repair_provenance_is_recorded_structurally_on_the_history_row(db_path):
         expected_current_state=OrderState.ACCEPTED,
         expected_revision=2,
         repair_attempt_id="attempt-xyz",
+        repair_generation=1,
         db_path=db_path,
     )
     history = store.get_state_history("exec-1", db_path=db_path)
     assert history[-1]["repair_attempt_id"] == "attempt-xyz"
+    assert history[-1]["repair_generation"] == 1
     assert [h["repair_attempt_id"] for h in history[:-1]] == [None, None]
 
 
@@ -2021,14 +2039,17 @@ def test_one_repair_attempt_id_commits_at_most_one_history_row(db_path):
     """The partial UNIQUE index: reusing an attempt id -- even on another
     order -- is refused and rolls the whole update back."""
     submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-once")
     store.record_order_result(
         "exec-1",
         _filled_result(),
         reason="repair applied",
         repair_attempt_id="attempt-once",
+        repair_generation=1,
         db_path=db_path,
     )
     submit_and_accept(db_path, request_id="exec-2", broker_order_id="B-2")
+    _fence(db_path, "exec-2", "attempt-once")
     before = store.get_state_history("exec-2", db_path=db_path)
 
     with pytest.raises(store.ExecutionOrderConflictError, match="attempt-once"):
@@ -2044,6 +2065,7 @@ def test_one_repair_attempt_id_commits_at_most_one_history_row(db_path):
             ),
             reason="repair reusing an attempt id",
             repair_attempt_id="attempt-once",
+            repair_generation=1,
             db_path=db_path,
         )
 
@@ -2060,6 +2082,176 @@ def test_a_history_row_with_provenance_but_no_snapshot_is_rejected_on_restore(db
         connection.commit()
     with pytest.raises(store.ExecutionIntegrityError, match="repair provenance"):
         store.get_execution_order("exec-1", db_path=db_path)
+
+
+# --- repair fences (Issue #104 re-review: generation fencing) ------------------
+
+
+def test_register_repair_fence_inserts_then_takes_over_by_generation(db_path):
+    submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-f", generation=1, claim="claim-1")
+    fence = store.get_repair_fence("exec-1", db_path=db_path)
+    assert (fence["repair_attempt_id"], fence["generation"]) == ("attempt-f", 1)
+    assert fence["claim_execution_id"] == "claim-1"
+
+    # recovery takes over the SAME attempt with a HIGHER generation
+    _fence(db_path, "exec-1", "attempt-f", generation=2, claim="claim-2")
+    fence = store.get_repair_fence("exec-1", db_path=db_path)
+    assert (fence["generation"], fence["claim_execution_id"]) == (2, "claim-2")
+
+
+def test_a_stale_generation_cannot_rearm_the_fence(db_path):
+    submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-f", generation=2, claim="claim-2")
+
+    with pytest.raises(store.ExecutionRepairFenceConflictError, match="lost the claim"):
+        _fence(db_path, "exec-1", "attempt-f", generation=1, claim="claim-1")
+    with pytest.raises(store.ExecutionRepairFenceConflictError, match="lost the claim"):
+        # same generation held by a DIFFERENT claim execution is a conflict too
+        _fence(db_path, "exec-1", "attempt-f", generation=2, claim="claim-other")
+    fence = store.get_repair_fence("exec-1", db_path=db_path)
+    assert (fence["generation"], fence["claim_execution_id"]) == (2, "claim-2")
+
+
+def test_re_registration_by_the_holding_claim_is_idempotent(db_path):
+    submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-f", generation=1, claim="claim-1")
+    before = store.get_repair_fence("exec-1", db_path=db_path)
+    _fence(db_path, "exec-1", "attempt-f", generation=1, claim="claim-1")
+    assert store.get_repair_fence("exec-1", db_path=db_path) == before
+
+
+def test_a_commit_by_the_fenced_out_generation_is_rejected_and_rolls_back(db_path):
+    """The review's core sequence: generation 1 registers, generation 2 takes
+    the fence over; the resurrected generation-1 worker's commit is refused
+    IN the transaction; only generation 2 applies, and the history row
+    carries generation 2."""
+    submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-f", generation=1, claim="claim-1")
+    _fence(db_path, "exec-1", "attempt-f", generation=2, claim="claim-2")
+    history_before = store.get_state_history("exec-1", db_path=db_path)
+
+    with pytest.raises(store.ExecutionRepairFenceConflictError, match="generation 2"):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(),
+            reason="resurrected generation-1 worker",
+            expected_current_state=OrderState.ACCEPTED,
+            expected_revision=2,
+            repair_attempt_id="attempt-f",
+            repair_generation=1,
+            db_path=db_path,
+        )
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
+    assert store.get_state_history("exec-1", db_path=db_path) == history_before
+
+    store.record_order_result(
+        "exec-1",
+        _filled_result(),
+        reason="the fence holder commits",
+        expected_current_state=OrderState.ACCEPTED,
+        expected_revision=2,
+        repair_attempt_id="attempt-f",
+        repair_generation=2,
+        db_path=db_path,
+    )
+    history = store.get_state_history("exec-1", db_path=db_path)
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "filled"
+    assert (history[-1]["repair_attempt_id"], history[-1]["repair_generation"]) == (
+        "attempt-f",
+        2,
+    )
+    assert len(history) == len(history_before) + 1  # the current row moved exactly once
+
+
+def test_a_repair_commit_without_a_registered_fence_is_rejected(db_path):
+    submit_and_accept(db_path)
+    with pytest.raises(store.ExecutionRepairFenceConflictError, match="fence is absent"):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(),
+            reason="repair without fence registration",
+            repair_attempt_id="attempt-f",
+            repair_generation=1,
+            db_path=db_path,
+        )
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
+
+
+def test_a_different_attempt_replaces_the_fence_and_locks_the_old_one_out(db_path):
+    submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-old", generation=1, claim="claim-old")
+    _fence(db_path, "exec-1", "attempt-new", generation=1, claim="claim-new")
+
+    fence = store.get_repair_fence("exec-1", db_path=db_path)
+    assert fence["repair_attempt_id"] == "attempt-new"
+    with pytest.raises(store.ExecutionRepairFenceConflictError):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(),
+            reason="the replaced attempt tries to commit",
+            repair_attempt_id="attempt-old",
+            repair_generation=1,
+            db_path=db_path,
+        )
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
+
+
+def test_registering_a_fence_for_an_unknown_order_is_refused(db_path):
+    store.init_db(db_path)
+    with pytest.raises(store.ExecutionOrderNotFoundError):
+        _fence(db_path, "exec-ghost", "attempt-f")
+
+
+def test_get_repair_fence_read_contract(db_path, tmp_path):
+    missing = tmp_path / "never-created.sqlite3"
+    assert store.get_repair_fence("exec-1", db_path=missing) is None
+    assert not missing.exists()  # reads never create the file
+    submit_and_accept(db_path)
+    assert store.get_repair_fence("exec-1", db_path=db_path) is None  # no fence yet
+
+
+def test_exactly_one_of_concurrent_fence_takeovers_wins(db_path):
+    """Genuinely concurrent takeover: barrier-aligned threads race to bump
+    the SAME attempt's fence from generation 1 to 2; exactly one wins and
+    the losers observe the typed conflict without changing the row."""
+    submit_and_accept(db_path)
+    _fence(db_path, "exec-1", "attempt-f", generation=1, claim="claim-live")
+    workers = 4
+    barrier = threading.Barrier(workers)
+
+    def takeover(index):
+        barrier.wait()
+        try:
+            store.register_repair_fence(
+                "exec-1",
+                repair_attempt_id="attempt-f",
+                generation=2,
+                owner_id=f"recovery-{index}",
+                claim_execution_id=f"claim-r{index}",
+                registered_at_utc=at(700),
+                db_path=db_path,
+            )
+            return index
+        except store.ExecutionRepairFenceConflictError:
+            return None
+
+    threads = []
+    results = [None] * workers
+    for index in range(workers):
+        thread = threading.Thread(
+            target=lambda i=index: results.__setitem__(i, takeover(i))
+        )
+        threads.append(thread)
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    winners = [index for index in results if index is not None]
+    assert len(winners) == 1
+    fence = store.get_repair_fence("exec-1", db_path=db_path)
+    assert fence["generation"] == 2
+    assert fence["claim_execution_id"] == f"claim-r{winners[0]}"
 
 
 def test_init_db_migrates_a_v3_db_in_place_and_keeps_rows_readable(db_path):

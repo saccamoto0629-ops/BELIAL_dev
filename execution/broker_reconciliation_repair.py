@@ -9,127 +9,107 @@ store: the single write path is ``execution_store.record_order_result``,
 which enforces the Issue #74 transition validator, the snapshot update
 contract and the pre-commit write-back validation. ***
 
-Attempt lifecycle (reservation -> evaluation -> finalize)
----------------------------------------------------------
+Claimed attempt lifecycle (owner + lease + generation fencing)
+--------------------------------------------------------------
 
 Input is a RECORDED reconciliation run (Issue #103): :meth:`repair` loads
-the run by ``run_id`` from the reconciliation audit DB -- an in-memory,
-unrecorded run is refused, so every repair is traceable to a stored
-observation. ALL attempt ids are generated and uniqueness-checked BEFORE
-any side effect. Then, per discrepancy in observation order (APPLY mode):
+the run by ``run_id`` from the reconciliation audit DB. ALL attempt ids are
+generated and uniqueness-checked BEFORE any side effect. Then, per
+discrepancy in observation order (APPLY mode):
 
-1. RESERVE: a ``pending`` audit row (attempt id + run / discrepancy
-   identity + observation anchors) is committed BEFORE anything else. A
-   duplicate attempt id is refused HERE -- before any state update.
-2. EVALUATE (the stored result is NOT trusted blindly):
-   - eligibility: only ``EXECUTION_ORDER`` targets classified
-     ``AUTO_REPAIR_CANDIDATE`` proceed; ``MANUAL_REVIEW`` / ``QUERY_FAILED``
-     and broker-only targets finalize as ``skipped``.
-   - the current internal row is re-read; the ``client_order_id`` binding
-     must be intact.
-   - the broker is RE-QUERIED (``get_order``) -- ALWAYS, including before
-     an ``already_applied`` verdict. A ``BrokerError``, not-found, or a
-     boundary contract violation finalizes as ``query_failed`` (typed
-     ``BrokerErrorCode``; nothing is inferred from a failed query).
-   - REVISION gate: the discrepancy carries the order's revision at
-     observation time (the execution store's history row count -- it
-     increments on EVERY write, same-state re-observations and snapshot
-     refreshes included). If the revision moved, the observation is
-     outdated: either the order already holds the observed outcome and the
-     fresh broker snapshot agrees with the anchored one in full (the
-     THREE-WAY check: stored discrepancy x current row/anchored snapshot x
-     fresh snapshot) -> ``already_applied``, or -> ``stale`` / ``conflict``.
-     Nothing is ever overwritten from an outdated observation.
-   - broker reference IDs are never lost or replaced; an id owned by
-     another execution request is a ``conflict`` (fail-closed on a lookup
-     that cannot answer).
-   - the existing validators (transition table, intent identity, anchored
-     snapshot update contract, no backwards timestamp) must pass ->
-     otherwise ``rejected``. The transition table is reused as-is, never
-     widened.
-3. APPLY: the full APPLIED attempt record -- ``applied_at_utc`` (= the
-   broker snapshot's ``updated_at_utc``, which is exactly what the store
-   stamps on the history row), the effective broker id, the sanitized
-   detail -- is CONSTRUCTED AND VALIDATED BEFORE the store call. The store
-   call is a compare-and-set (``expected_current_state`` +
-   ``expected_revision``) and records the STRUCTURED provenance
-   (``history.repair_attempt_id``). After a successful commit NOTHING is
-   computed any more -- the pre-built attempt is returned as-is, so no
-   post-commit exception can ever mislabel a committed repair as FAILED.
-4. FINALIZE: the pending audit row is completed (CAS on the pending
-   status). If THIS store call fails after a committed update, the attempt
-   is returned with ``audit_error`` set and the reservation stays pending:
-   the repair is durable, attributable (structured provenance, never
-   reason-string parsing) and recoverable.
+1. CLAIM / RESERVE: a ``pending`` audit row -- attempt id, run /
+   discrepancy identity, observation anchors AND the claim (``owner_id``,
+   a fresh ``claim_execution_id``, ``generation = 1``,
+   ``lease_expires_at_utc = reserved_at + lease_duration``) -- is committed
+   BEFORE anything else. While the lease is valid, nobody else (recovery
+   included) may touch the attempt; a duplicate attempt id is refused HERE,
+   before any state update.
+2. EVALUATE (the stored result is NOT trusted blindly): the current
+   internal row is re-read (``client_order_id`` binding intact), the broker
+   is RE-QUERIED -- always, including before an ``already_applied`` verdict
+   -- and the REVISION gate compares the discrepancy's observed revision
+   against the current one, so ANY change since the observation (same-state
+   writes included) is detected. Broker reference IDs are never lost,
+   replaced or stolen from another execution request; the existing
+   validators (transition table, intent identity, anchored snapshot update
+   contract, no backwards timestamp) must all pass.
+3. FENCE + COMMIT: right before the commit the claim's fencing token is
+   registered in the EXECUTION DB (``execution_repair_fences``:
+   ``register_repair_fence``), and ``record_order_result`` verifies that
+   token INSIDE its transaction on top of the state/revision compare-and-
+   set. A worker whose claim was taken over (lease expiry -> generation
+   increment) therefore CANNOT commit -- fence registration and commit both
+   fail typed (``ExecutionRepairFenceConflictError`` -> outcome
+   ``conflict`` / ``claim_lost``), even while state and revision still
+   match. The APPLIED attempt record is fully constructed and validated
+   BEFORE the store call; after a successful commit nothing is computed any
+   more, so no post-commit exception can mislabel a committed repair.
+4. FINALIZE: the pending audit row is completed by a compare-and-set on
+   (pending status, owner, claim execution id, generation). A lost claim
+   (``RepairClaimLostError``) attaches ``audit_error`` to the returned
+   attempt and NEVER stores an outcome over the new owner's -- an APPLIED
+   fact in the execution DB can never be contradicted by a stale worker's
+   audit row.
 
-Crash recovery (:meth:`recover_pending_attempts`): pending reservations are
-enumerated from the audit DB; each is finalized under its ORIGINAL attempt
-id -- ``applied`` when the execution order state history holds a row whose
-``repair_attempt_id`` equals the reservation's id (with that row's
-committed timestamp), ``failed`` (``reservation_not_applied``) when no such
-row exists, i.e. the crash happened before the state update committed.
-Recovery reads the execution DB only; it never grows history. A recovery
-whose source run / discrepancy has vanished or no longer matches is refused
-(fail-closed integrity error).
+Lease contract: there is NO heartbeat by design (minimal Issue #104 scope);
+instead the lease must comfortably exceed one attempt's work, and the
+constructor VALIDATES ``broker timeout < lease duration`` (against the
+explicit ``broker_timeout_seconds`` argument and/or a broker exposing
+``timeout_seconds``, e.g. the OANDA adapter config). Adapters must keep
+their query timeout below the lease duration -- see the docs.
 
-Cross-DB consistency (state update vs audit row)
-------------------------------------------------
+Crash / takeover recovery (:meth:`recover_pending_attempts`)
+------------------------------------------------------------
 
-The order-state update (execution orders DB) and the repair audit rows
-(reconciliation DB) live in different SQLite files and CANNOT share one
-transaction. No distributed-transaction machinery is imitated; the design
-is reservation (audit) -> commit (orders) -> finalize (audit), an explicit
-outbox-style sequence in which every crash window is recoverable:
+Pending reservations are enumerated from the audit DB:
 
-- crash before the reservation commits: no trace anywhere, nothing changed;
-- crash after the reservation, before the state update: a pending row
-  remains; recovery finalizes it as ``failed`` (nothing was changed);
-- crash after the state update, before finalize: the pending row remains
-  AND the history row carries the attempt id; recovery finalizes it as
-  ``applied`` under the original id -- the original outcome, attempt id and
-  applied timestamp are never lost.
+- LEASE STILL VALID -> untouched. No takeover, no finalize, no broker
+  query, no execution-DB change: a live worker owns it.
+- LEASE EXPIRED -> fenced takeover: (a) the EXECUTION-DB fence is bumped to
+  ``generation + 1`` first (this is the takeover mutex -- of any number of
+  concurrent recovery workers exactly one wins; losers change neither
+  fence nor claim), then (b) the reconciliation-DB claim is taken over by
+  atomic CAS (owner / claim execution id replaced, generation incremented,
+  lease extended). The new generation is now the only token the execution
+  DB accepts; a resurrected old worker can neither commit nor finalize.
+  Then, under the new claim:
+  - the execution history's STRUCTURED provenance (``repair_attempt_id``)
+    already names this attempt -> the state update committed before the
+    crash; finalize ``applied`` under the ORIGINAL attempt id.
+  - no provenance -> the update never committed; the recovery worker
+    CONTINUES the attempt as its legitimate new owner: fresh broker
+    re-query plus the full eligibility evaluation, then commit/finalize
+    under the new generation. Recovery never invents a ``failed`` verdict
+    without that re-evaluation.
 
-Failure classification (Issue #104 review)
-------------------------------------------
+Cross-DB consistency: reservation (audit) -> fence + commit (orders) ->
+finalize (audit) is an explicit outbox-style sequence; every crash window
+is recoverable and the fence closes the "old worker resurrects after
+takeover" window inside the execution DB transaction itself.
 
-Only OPERATIONALLY EXPECTED, typed failures become attempt outcomes:
-``BrokerError`` (plus the documented Issue #103 broker-boundary contract
-violation), ``ExecutionStoreError``, ``ReconciliationStoreError``, the
-store's documented refusal channel (``ValueError`` /
-``BrokerInvalidRequestError`` from ``record_order_result``) and the CAS
-conflict. Everything else -- ``AssertionError``, ``KeyError``, model
-invariant violations, clock contract failures, programmer errors -- is a
-RUN-LEVEL INTEGRITY FAILURE: the pass stops with
-:class:`ReconciliationRepairRunError`, which carries the attempts completed
-so far (also independently durable in the audit DB), and any half-evaluated
-attempt stays pending for recovery. Audit details are SANITIZED: stable
-``failure_code`` values plus self-authored descriptions naming at most our
-own typed exception classes -- never raw exception text, paths, SQL or
-adapter free text (full exceptions go to the log, not the audit DB).
+Failure classification and logging (Issue #104 re-review)
+---------------------------------------------------------
 
-Logging is an AID, never a dependency: every log call is isolated so a
-broken handler / formatter cannot change a repair outcome, lose a committed
-attempt or stop the pass (the audit DB is the authority).
+Only OPERATIONALLY EXPECTED, typed failures become attempt outcomes
+(``BrokerError``, the documented broker-boundary contract violation,
+``ExecutionStoreError``, ``ReconciliationStoreError``, the store's
+refusal channel, CAS / fence / claim conflicts). Everything else stops the
+pass with :class:`ReconciliationRepairRunError` carrying the completed
+attempts. Audit details AND LOGS are sanitized: stable
+:class:`RepairFailureCode` members plus our own typed exception class
+names -- never raw exception text, ``repr``, tracebacks, secrets, paths or
+SQL (an unexpected exception is logged as its class name only). Logging is
+an AID, never a dependency: every log call is isolated so a broken
+handler / formatter cannot change a repair outcome or stop the pass.
 
 Dry-run (``RepairMode.DRY_RUN``)
 --------------------------------
 
 The full evaluation runs -- reads and broker queries only -- but NOTHING is
-written: no order update, no history row, no reservation, no audit row, no
-DB creation or migration (a v1 reconciliation DB is refused with a pointer
-to ``init_reconciliation_db``; reads never migrate), no state file, no
-filesystem side effect. Eligible targets report ``would_apply``.
-
-Idempotency
------------
-
-Re-running the same repair any number of times: the terminal state stays
-what the broker confirmed, the order state history gains NO new rows
-(``already_applied`` short-circuits before the store; the revision CAS
-closes the race window completely -- same-state writes included), and each
-pass appends only its own audit attempts. A target that meanwhile changed
-in ANY way is never overwritten (``stale`` / ``conflict`` / the
-terminal-state transition rules).
+written: no order update, no history row, no claim / reservation, no
+fence, no audit row, no DB creation or migration (a v1 reconciliation DB is
+refused; reads never migrate), no state file, no filesystem side effect.
+Eligible targets report ``would_apply``.
 """
 
 from __future__ import annotations
@@ -137,7 +117,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable
@@ -158,6 +138,7 @@ from execution.execution_models import _require_non_empty_str, _require_utc
 from execution.execution_store import (
     ExecutionOrderConflictError,
     ExecutionOrderStateConflictError,
+    ExecutionRepairFenceConflictError,
     ExecutionStoreError,
 )
 from execution.reconciliation_models import (
@@ -170,11 +151,15 @@ from execution.reconciliation_repair_models import (
     OrderRepairAttempt,
     ReconciliationRepairResult,
     RepairAttemptReservation,
+    RepairFailureCode,
     RepairMode,
     RepairOutcome,
 )
 from execution.reconciliation_store import (
     ReconciliationStoreError,
+    RepairAttemptConflictError,
+    RepairClaimLostError,
+    claim_repair_attempt,
     finalize_repair_attempt,
     get_reconciliation_run,
     init_reconciliation_db,
@@ -190,44 +175,15 @@ _INFO_OUTCOMES: frozenset[RepairOutcome] = frozenset(
     {RepairOutcome.APPLIED, RepairOutcome.WOULD_APPLY, RepairOutcome.ALREADY_APPLIED}
 )
 
-# Stable failure codes (Issue #104 review): the machine-readable vocabulary
-# persisted on every non-success attempt. Audit details never embed raw
-# exception text -- at most these codes plus our own typed class names.
-FAILURE_NOT_ELIGIBLE_BROKER_ONLY = "not_eligible_broker_only"
-FAILURE_NOT_ELIGIBLE_QUERY_FAILED = "not_eligible_query_failed"
-FAILURE_NOT_ELIGIBLE_MANUAL_REVIEW = "not_eligible_manual_review"
-FAILURE_CANDIDATE_CONTRACT_VIOLATION = "candidate_contract_violation"
-FAILURE_ORDER_MISSING = "order_missing"
-FAILURE_ORDER_WITHOUT_BROKER_STATE = "order_without_broker_state"
-FAILURE_BINDING_MISMATCH = "client_order_id_binding_mismatch"
-FAILURE_STORE_READ_FAILED = "execution_store_read_failed"
-FAILURE_OWNER_LOOKUP_FAILED = "broker_id_owner_lookup_failed"
-FAILURE_MISSING_OBSERVED_REVISION = "missing_observed_revision"
-FAILURE_INTERNAL_CHANGED = "internal_order_changed"
-FAILURE_BROKER_ANSWERED_FOREIGN_ORDER = "broker_answered_foreign_order"
-FAILURE_REQUERY_DISAGREES = "requery_disagrees_with_observation"
-FAILURE_BROKER_REFERENCE_CHANGED = "broker_reference_changed"
-FAILURE_BROKER_REFERENCE_OWNED_ELSEWHERE = "broker_reference_owned_elsewhere"
-FAILURE_ALREADY_APPLIED_MISMATCH = "already_applied_content_mismatch"
-FAILURE_IDENTITY_MISMATCH = "snapshot_identity_mismatch"
-FAILURE_FORBIDDEN_TRANSITION = "forbidden_transition"
-FAILURE_SNAPSHOT_CONTRACT = "snapshot_contract_violation"
-FAILURE_SNAPSHOT_OLDER = "snapshot_older_than_stored_state"
-FAILURE_BROKER_QUERY_FAILED = "broker_query_failed"
-FAILURE_BROKER_NOT_FOUND = "broker_order_not_found"
-FAILURE_BROKER_CONTRACT_VIOLATION = "broker_contract_violation"
-FAILURE_UNIQUENESS_CONFLICT = "uniqueness_conflict"
-FAILURE_STORE_REFUSED_UPDATE = "store_refused_update"
-FAILURE_STORE_UPDATE_FAILED = "store_update_failed"
-FAILURE_CAS_UNRESOLVABLE = "cas_conflict_unresolvable"
-FAILURE_RESERVATION_NOT_APPLIED = "reservation_not_applied"
+DEFAULT_LEASE_DURATION_SECONDS = 600
 
 
 class ReconciliationRepairError(RuntimeError):
     """A repair pass could not run at all (bad input, unrecorded run,
-    missing audit DB, duplicate attempt ids from the factory). Raised BEFORE
-    any state change. Per-target problems never raise this -- they become
-    typed :class:`RepairOutcome` values on the attempt."""
+    missing audit DB, duplicate attempt ids from the factory, a broker
+    timeout that does not fit under the lease). Raised BEFORE any state
+    change. Per-target problems never raise this -- they become typed
+    :class:`RepairOutcome` values on the attempt."""
 
 
 class ReconciliationRepairRunError(ReconciliationRepairError):
@@ -238,7 +194,8 @@ class ReconciliationRepairRunError(ReconciliationRepairError):
     caller never loses committed partial results -- and the same attempts
     are independently durable in the audit DB
     (``reconciliation_store.list_repair_attempts``); a half-processed
-    target stays pending there for :meth:`recover_pending_attempts`.
+    target stays pending there (its lease eventually expires) for
+    :meth:`recover_pending_attempts`.
     """
 
     def __init__(self, message: str, *, attempts: tuple[OrderRepairAttempt, ...]):
@@ -250,21 +207,39 @@ def _default_attempt_id() -> str:
     return f"repair-{os.urandom(16).hex()}"
 
 
+def _new_claim_execution_id() -> str:
+    return f"claim-{os.urandom(8).hex()}"
+
+
+class _Claim:
+    """The claim under which one attempt is being executed (in-memory)."""
+
+    __slots__ = ("owner_id", "claim_execution_id", "generation")
+
+    def __init__(self, owner_id: str, claim_execution_id: str, generation: int):
+        self.owner_id = owner_id
+        self.claim_execution_id = claim_execution_id
+        self.generation = generation
+
+
 class BrokerOrderReconciliationRepairService:
     """Reflect AUTO_REPAIR_CANDIDATE observations into the order store --
     idempotently, through the existing state machine only (Issue #104).
 
     ``execution_db_path`` is the execution ORDER store (written exclusively
-    through ``record_order_result``). ``reconciliation_db_path`` is the
-    Issue #103 audit DB the run is loaded from and (in APPLY mode) the
-    attempt reservations / finalizations are written to. ``clock`` supplies
-    the repair-side timestamps (injected in tests; defaults to
-    ``datetime.now(timezone.utc)``) and must return timezone-aware UTC
-    datetimes -- a clock that violates the contract stops the pass BEFORE
-    the next attempt reserves, never after a commit (post-commit code calls
-    no clock). ``attempt_id_factory`` supplies the per-attempt audit ids
-    (defaults to a random hex id; injected in tests for determinism); all
-    ids for a pass are generated and uniqueness-checked up front.
+    through ``record_order_result``; the fencing table is maintained via
+    ``register_repair_fence``). ``reconciliation_db_path`` is the Issue #103
+    audit DB the run is loaded from and (in APPLY mode) the claims are
+    written to. ``owner_id`` names this worker in claims (defaults to a
+    random per-instance id). ``lease_duration_seconds`` is the claim lease;
+    ``broker_timeout_seconds`` (explicit, and/or a broker exposing
+    ``timeout_seconds``) must stay BELOW it -- validated at construction.
+    ``clock`` supplies the repair-side timestamps (injected in tests) and
+    must return timezone-aware UTC datetimes; it is called at pass
+    start/finish, at claim/reservation time and at finalize time -- never
+    between a state commit and the return of the attempt.
+    ``attempt_id_factory`` supplies the per-attempt audit ids; all ids for a
+    pass are generated and uniqueness-checked up front.
     """
 
     def __init__(
@@ -273,6 +248,9 @@ class BrokerOrderReconciliationRepairService:
         broker: Broker,
         execution_db_path: Path | str,
         reconciliation_db_path: Path | str,
+        owner_id: str | None = None,
+        lease_duration_seconds: int = DEFAULT_LEASE_DURATION_SECONDS,
+        broker_timeout_seconds: float | None = None,
         clock: Callable[[], datetime] | None = None,
         attempt_id_factory: Callable[[], str] | None = None,
     ):
@@ -287,9 +265,43 @@ class BrokerOrderReconciliationRepairService:
                 f"attempt_id_factory must be a callable returning a string, got "
                 f"{attempt_id_factory!r}"
             )
+        if owner_id is not None:
+            _require_non_empty_str(owner_id, "owner_id")
+        if (
+            isinstance(lease_duration_seconds, bool)
+            or not isinstance(lease_duration_seconds, int)
+            or lease_duration_seconds < 1
+        ):
+            raise ValueError(
+                f"lease_duration_seconds must be an int >= 1, got {lease_duration_seconds!r}"
+            )
+        # Lease contract (Issue #104 re-review): no heartbeat by design, so
+        # every broker query must fit comfortably under the lease. Validated
+        # against the explicit argument AND a broker that exposes its
+        # timeout (e.g. an adapter's ``timeout_seconds``).
+        for source, timeout in (
+            ("broker_timeout_seconds", broker_timeout_seconds),
+            ("broker.timeout_seconds", getattr(broker, "timeout_seconds", None)),
+        ):
+            if timeout is None:
+                continue
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not timeout > 0
+            ):
+                raise ValueError(f"{source} must be a positive number, got {timeout!r}")
+            if timeout >= lease_duration_seconds:
+                raise ValueError(
+                    f"{source} ({timeout}) must be strictly below "
+                    f"lease_duration_seconds ({lease_duration_seconds}); a broker query "
+                    "must never outlive the claim lease"
+                )
         self._broker = broker
         self._execution_db_path = Path(execution_db_path)
         self._reconciliation_db_path = Path(reconciliation_db_path)
+        self._owner_id = owner_id or f"repair-worker-{os.urandom(4).hex()}"
+        self._lease_duration = timedelta(seconds=lease_duration_seconds)
         self._clock = clock
         self._attempt_id_factory = attempt_id_factory or _default_attempt_id
 
@@ -330,15 +342,14 @@ class BrokerOrderReconciliationRepairService:
             )
 
         # ALL attempt ids up front: a broken factory (exception, empty value,
-        # duplicate) fails the pass HERE, before any reservation or state
-        # change anywhere.
+        # duplicate) fails the pass HERE, before any claim or state change.
         attempt_ids = tuple(self._attempt_id_factory() for _ in run.discrepancies)
         for attempt_id in attempt_ids:
             _require_non_empty_str(attempt_id, "attempt_id")
         if len(set(attempt_ids)) != len(attempt_ids):
             raise ReconciliationRepairError(
                 "attempt_id_factory produced duplicate ids within one repair pass; "
-                "refusing to start (no reservation and no state update was made)"
+                "refusing to start (no claim and no state update was made)"
             )
 
         attempts: list[OrderRepairAttempt] = []
@@ -349,10 +360,10 @@ class BrokerOrderReconciliationRepairService:
                 self._safe_log_attempt(attempt)
         except Exception as exc:
             # Run-level integrity failure (unexpected exception, clock
-            # contract, store unavailability at reserve time, ...): stop, but
+            # contract, store unavailability at claim time, ...): stop, but
             # never lose what already committed -- the finalized attempts are
             # in the audit DB and returned on the error; a half-processed
-            # target stays pending there for recover_pending_attempts().
+            # target stays pending there (lease expiry hands it to recovery).
             raise ReconciliationRepairRunError(
                 f"repair pass over run {run_id!r} stopped after "
                 f"{len(attempts)}/{len(run.discrepancies)} attempts "
@@ -387,57 +398,141 @@ class BrokerOrderReconciliationRepairService:
     def recover_pending_attempts(
         self, *, run_id: str | None = None
     ) -> tuple[OrderRepairAttempt, ...]:
-        """Finalize reservations a crashed pass left ``pending``.
+        """Take over and complete pending attempts whose lease EXPIRED.
 
-        For each pending reservation (optionally restricted to one run), the
-        execution order state history is checked for a row whose STRUCTURED
-        ``repair_attempt_id`` column equals the reservation's attempt id:
+        For each pending reservation (optionally restricted to one run):
 
-        - found   -> the state update COMMITTED before the crash; the
-          attempt is finalized ``applied`` under its ORIGINAL id, with the
-          committed history row's state / broker id / timestamp.
-        - missing -> nothing ever committed for this attempt; finalized
-          ``failed`` (``reservation_not_applied``).
+        - lease still valid -> UNTOUCHED (no takeover, no finalize, no
+          broker query, no execution-DB change): a live worker owns it.
+        - lease expired -> fenced takeover (execution-DB fence bumped to
+          ``generation + 1`` FIRST -- the takeover mutex; exactly one of any
+          number of concurrent recovery workers wins, losers change
+          nothing), then the reconciliation-DB claim CAS. Under the new
+          claim: a history row whose STRUCTURED ``repair_attempt_id``
+          equals the reservation's id proves the state update committed ->
+          finalize ``applied`` under the ORIGINAL attempt id; otherwise the
+          attempt is RE-EVALUATED in full (fresh broker query, eligibility,
+          fenced commit) as the new legitimate owner -- recovery never
+          invents a ``failed`` verdict without that re-evaluation.
 
-        Recovery reads the execution DB only (never grows history) and is
-        fail-closed: a reservation whose source run / discrepancy has been
-        deleted or tampered with is refused with
+        Recovery is fail-closed: a reservation whose source run /
+        discrepancy has been deleted or tampered with is refused with
         :class:`ReconciliationRepairError` instead of being guessed about.
-        Concurrent recoveries are safe -- finalize is compare-and-set, the
-        loser observes ``RepairAttemptConflictError``.
         """
         db_path = self._reconciliation_db_path
         pending = list_pending_repair_attempts(run_id=run_id, db_path=db_path)
         recovered: list[OrderRepairAttempt] = []
         for reservation in pending:
-            source_run = get_reconciliation_run(reservation.run_id, db_path=db_path)
-            discrepancy = None
-            if source_run is not None:
-                for entry in source_run.discrepancies:
-                    if (
-                        entry.target_type is reservation.target_type
-                        and entry.target_id == reservation.target_id
-                    ):
-                        discrepancy = entry
-                        break
-            if (
-                discrepancy is None
-                or discrepancy.internal_state is not reservation.reconciliation_internal_state
-                or discrepancy.broker_state is not reservation.reconciliation_broker_state
-                or discrepancy.internal_revision != reservation.internal_revision
-            ):
-                raise ReconciliationRepairError(
-                    f"pending repair attempt {reservation.attempt_id!r} refers to "
-                    f"reconciliation run {reservation.run_id!r} / target "
-                    f"{reservation.target_id!r}, whose stored observation is missing or "
-                    "no longer matches the reservation; refusing to recover from a "
-                    "tampered audit trail"
+            now = self._now()
+            if reservation.lease_expires_at_utc > now:
+                continue  # the lease protects a (possibly live) worker
+            run, discrepancy = self._verified_source(reservation)
+            new_claim = _Claim(
+                self._owner_id, _new_claim_execution_id(), reservation.generation + 1
+            )
+            if reservation.execution_request_id is not None:
+                # Fence FIRST (the takeover mutex): after this, the old
+                # generation can no longer commit -- and of concurrent
+                # recovery workers only the fence winner proceeds.
+                try:
+                    execution_store.register_repair_fence(
+                        reservation.execution_request_id,
+                        repair_attempt_id=reservation.attempt_id,
+                        generation=new_claim.generation,
+                        owner_id=new_claim.owner_id,
+                        claim_execution_id=new_claim.claim_execution_id,
+                        registered_at_utc=now,
+                        db_path=self._execution_db_path,
+                    )
+                except ExecutionRepairFenceConflictError:
+                    continue  # another worker holds a newer fence; not ours
+                except execution_store.ExecutionOrderNotFoundError:
+                    pass  # no order -> nothing to fence; the claim CAS decides
+            try:
+                claimed = claim_repair_attempt(
+                    reservation.attempt_id,
+                    expected_generation=reservation.generation,
+                    new_owner_id=new_claim.owner_id,
+                    new_claim_execution_id=new_claim.claim_execution_id,
+                    new_lease_expires_at_utc=now + self._lease_duration,
+                    claimed_at_utc=now,
+                    db_path=db_path,
                 )
-            attempt = self._recovered_attempt(reservation)
-            finalize_repair_attempt(attempt, db_path=db_path)
+            except (RepairClaimLostError, RepairAttemptConflictError):
+                continue  # someone else took it over or finalized it first
+            attempt = self._resume_claimed_attempt(run, discrepancy, claimed, new_claim)
+            attempt = self._finalize(attempt)
             self._safe_log_attempt(attempt)
             recovered.append(attempt)
         return tuple(recovered)
+
+    # --- recovery helpers ---------------------------------------------------
+
+    def _verified_source(
+        self, reservation: RepairAttemptReservation
+    ) -> tuple[ReconciliationRun, OrderDiscrepancy]:
+        run = get_reconciliation_run(reservation.run_id, db_path=self._reconciliation_db_path)
+        discrepancy = None
+        if run is not None:
+            for entry in run.discrepancies:
+                if (
+                    entry.target_type is reservation.target_type
+                    and entry.target_id == reservation.target_id
+                ):
+                    discrepancy = entry
+                    break
+        if (
+            discrepancy is None
+            or discrepancy.internal_state is not reservation.reconciliation_internal_state
+            or discrepancy.broker_state is not reservation.reconciliation_broker_state
+            or discrepancy.internal_revision != reservation.internal_revision
+        ):
+            raise ReconciliationRepairError(
+                f"pending repair attempt {reservation.attempt_id!r} refers to "
+                f"reconciliation run {reservation.run_id!r} / target "
+                f"{reservation.target_id!r}, whose stored observation is missing or "
+                "no longer matches the reservation; refusing to recover from a "
+                "tampered audit trail"
+            )
+        return run, discrepancy
+
+    def _resume_claimed_attempt(
+        self,
+        run: ReconciliationRun,
+        discrepancy: OrderDiscrepancy,
+        reservation: RepairAttemptReservation,
+        claim: _Claim,
+    ) -> OrderRepairAttempt:
+        """Complete a taken-over attempt: confirm from provenance, or
+        re-evaluate in full as the new owner."""
+        make = self._attempt_builder(
+            run, discrepancy, reservation.attempt_id, RepairMode.APPLY,
+            reservation.reserved_at_utc, claim,
+        )
+        committed = None
+        if reservation.execution_request_id is not None:
+            history = execution_store.get_state_history(
+                reservation.execution_request_id, db_path=self._execution_db_path
+            )
+            for entry in history:
+                if entry["repair_attempt_id"] == reservation.attempt_id:
+                    committed = entry
+                    break
+        if committed is not None:
+            return make(
+                outcome=RepairOutcome.APPLIED,
+                before=reservation.reconciliation_internal_state,
+                after=OrderState(committed["new_state"]),
+                broker_order_id=committed["broker_order_id"],
+                broker_state_updated_at=datetime.fromisoformat(committed["changed_at_utc"]),
+                detail=(
+                    "recovered pending claim: the state history carries this attempt id "
+                    f"(state {committed['new_state']!r} committed before the takeover); "
+                    "finalized under the original attempt id"
+                ),
+            )
+        # nothing committed: continue the attempt as its legitimate new owner
+        return self._evaluate(run, discrepancy, reservation.attempt_id, RepairMode.APPLY, make, claim)
 
     # --- one discrepancy ----------------------------------------------------
 
@@ -449,17 +544,45 @@ class BrokerOrderReconciliationRepairService:
         mode: RepairMode,
     ) -> OrderRepairAttempt:
         reserved_at = self._now()
+        claim = (
+            _Claim(self._owner_id, _new_claim_execution_id(), 1)
+            if mode is RepairMode.APPLY
+            else None
+        )
+        make = self._attempt_builder(run, discrepancy, attempt_id, mode, reserved_at, claim)
 
+        if mode is RepairMode.APPLY:
+            # Claim FIRST: the attempt id and its lease are durable (and a
+            # duplicate refused) before anything is evaluated or written. A
+            # failure here propagates -- nothing was changed yet.
+            reserve_repair_attempt(
+                self._reservation(run, discrepancy, attempt_id, reserved_at, claim),
+                db_path=self._reconciliation_db_path,
+            )
+        attempt = self._evaluate(run, discrepancy, attempt_id, mode, make, claim)
+        if mode is RepairMode.APPLY:
+            attempt = self._finalize(attempt)
+        return attempt
+
+    def _attempt_builder(
+        self,
+        run: ReconciliationRun,
+        discrepancy: OrderDiscrepancy,
+        attempt_id: str,
+        mode: RepairMode,
+        reserved_at: datetime,
+        claim: _Claim | None,
+    ):
         def make(
             *,
             outcome: RepairOutcome,
             detail: str,
-            failure_code: str | None = None,
+            failure_code: RepairFailureCode | None = None,
             before: OrderState | None = None,
             after: OrderState | None = None,
             broker_order_id: str | None = None,
             broker_error_code: BrokerErrorCode | None = None,
-            applied_at: datetime | None = None,
+            broker_state_updated_at: datetime | None = None,
         ) -> OrderRepairAttempt:
             is_execution = discrepancy.target_type is ReconciliationTargetType.EXECUTION_ORDER
             return OrderRepairAttempt(
@@ -471,6 +594,9 @@ class BrokerOrderReconciliationRepairService:
                 outcome=outcome,
                 detail=detail,
                 reserved_at_utc=reserved_at,
+                owner_id=None if claim is None else claim.owner_id,
+                claim_execution_id=None if claim is None else claim.claim_execution_id,
+                generation=None if claim is None else claim.generation,
                 execution_request_id=discrepancy.target_id if is_execution else None,
                 client_order_id=discrepancy.client_order_id,
                 reconciliation_internal_state=discrepancy.internal_state,
@@ -484,28 +610,18 @@ class BrokerOrderReconciliationRepairService:
                 broker_error_code=broker_error_code,
                 failure_code=failure_code,
                 observed_at_utc=discrepancy.observed_at_utc,
-                applied_at_utc=applied_at,
+                broker_state_updated_at_utc=broker_state_updated_at,
             )
 
-        if mode is RepairMode.APPLY:
-            # Reservation FIRST: the attempt id is durable (and a duplicate
-            # refused) before anything is evaluated or written. A failure
-            # here propagates -- nothing was changed yet.
-            reserve_repair_attempt(
-                self._reservation(run, discrepancy, attempt_id, reserved_at),
-                db_path=self._reconciliation_db_path,
-            )
-        attempt = self._evaluate(run, discrepancy, attempt_id, mode, make)
-        if mode is RepairMode.APPLY:
-            attempt = self._finalize(attempt)
-        return attempt
+        return make
 
-    @staticmethod
     def _reservation(
+        self,
         run: ReconciliationRun,
         discrepancy: OrderDiscrepancy,
         attempt_id: str,
         reserved_at: datetime,
+        claim: _Claim,
     ) -> RepairAttemptReservation:
         is_execution = discrepancy.target_type is ReconciliationTargetType.EXECUTION_ORDER
         return RepairAttemptReservation(
@@ -515,6 +631,11 @@ class BrokerOrderReconciliationRepairService:
             target_id=discrepancy.target_id,
             reserved_at_utc=reserved_at,
             detail="reserved: repair evaluation started",
+            owner_id=claim.owner_id,
+            claim_execution_id=claim.claim_execution_id,
+            generation=claim.generation,
+            lease_expires_at_utc=reserved_at + self._lease_duration,
+            last_claimed_at_utc=reserved_at,
             execution_request_id=discrepancy.target_id if is_execution else None,
             client_order_id=discrepancy.client_order_id,
             reconciliation_internal_state=discrepancy.internal_state,
@@ -530,12 +651,13 @@ class BrokerOrderReconciliationRepairService:
         attempt_id: str,
         mode: RepairMode,
         make,
+        claim: _Claim | None,
     ) -> OrderRepairAttempt:
         skipped = RepairOutcome.SKIPPED
         if discrepancy.target_type is not ReconciliationTargetType.EXECUTION_ORDER:
             return make(
                 outcome=skipped,
-                failure_code=FAILURE_NOT_ELIGIBLE_BROKER_ONLY,
+                failure_code=RepairFailureCode.NOT_ELIGIBLE_BROKER_ONLY,
                 detail=(
                     "broker-only orders are never adopted automatically "
                     f"(resolution {discrepancy.resolution_category.value!r})"
@@ -544,7 +666,7 @@ class BrokerOrderReconciliationRepairService:
         if discrepancy.resolution_category is ResolutionCategory.QUERY_FAILED:
             return make(
                 outcome=skipped,
-                failure_code=FAILURE_NOT_ELIGIBLE_QUERY_FAILED,
+                failure_code=RepairFailureCode.NOT_ELIGIBLE_QUERY_FAILED,
                 detail=(
                     "the reconciliation query itself failed -- nothing was observed, so "
                     "there is nothing to reflect"
@@ -553,7 +675,7 @@ class BrokerOrderReconciliationRepairService:
         if discrepancy.resolution_category is not ResolutionCategory.AUTO_REPAIR_CANDIDATE:
             return make(
                 outcome=skipped,
-                failure_code=FAILURE_NOT_ELIGIBLE_MANUAL_REVIEW,
+                failure_code=RepairFailureCode.NOT_ELIGIBLE_MANUAL_REVIEW,
                 detail=(
                     f"resolution category {discrepancy.resolution_category.value!r} is never "
                     "auto-repaired; a human decides"
@@ -564,7 +686,7 @@ class BrokerOrderReconciliationRepairService:
             # the Issue #103 classification contract -- fail closed.
             return make(
                 outcome=RepairOutcome.REJECTED,
-                failure_code=FAILURE_CANDIDATE_CONTRACT_VIOLATION,
+                failure_code=RepairFailureCode.CANDIDATE_CONTRACT_VIOLATION,
                 detail=(
                     "the stored auto-repair candidate carries no confirmable broker "
                     "state; refusing to trust it"
@@ -581,7 +703,7 @@ class BrokerOrderReconciliationRepairService:
         except ExecutionStoreError as exc:
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_STORE_READ_FAILED,
+                failure_code=RepairFailureCode.EXECUTION_STORE_READ_FAILED,
                 detail=(
                     f"reading the execution order store failed ({type(exc).__name__}); "
                     "nothing was changed"
@@ -590,7 +712,7 @@ class BrokerOrderReconciliationRepairService:
         if row is None:
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_ORDER_MISSING,
+                failure_code=RepairFailureCode.ORDER_MISSING,
                 detail=(
                     f"no execution order {request_id!r} exists in the order store; the "
                     "stored discrepancy cannot be re-validated and nothing was changed"
@@ -599,7 +721,7 @@ class BrokerOrderReconciliationRepairService:
         if discrepancy.client_order_id is None or row["client_order_id"] != discrepancy.client_order_id:
             return make(
                 outcome=RepairOutcome.REJECTED,
-                failure_code=FAILURE_BINDING_MISMATCH,
+                failure_code=RepairFailureCode.CLIENT_ORDER_ID_BINDING_MISMATCH,
                 detail=(
                     f"the client_order_id binding is broken: the discrepancy observed "
                     f"{discrepancy.client_order_id!r} but the order store binds "
@@ -610,7 +732,7 @@ class BrokerOrderReconciliationRepairService:
         if row["order_state"] is None:
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_ORDER_WITHOUT_BROKER_STATE,
+                failure_code=RepairFailureCode.ORDER_WITHOUT_BROKER_STATE,
                 detail=(
                     "the execution order has no broker state (phase 'created'); the stored "
                     "discrepancy cannot describe this row and nothing was changed"
@@ -631,7 +753,7 @@ class BrokerOrderReconciliationRepairService:
             return make(
                 outcome=RepairOutcome.QUERY_FAILED,
                 broker_error_code=BrokerErrorCode.NOT_FOUND,
-                failure_code=FAILURE_BROKER_NOT_FOUND,
+                failure_code=RepairFailureCode.BROKER_ORDER_NOT_FOUND,
                 before=current,
                 detail=(
                     "the broker no longer answers about this client_order_id; this "
@@ -643,7 +765,7 @@ class BrokerOrderReconciliationRepairService:
             return make(
                 outcome=RepairOutcome.QUERY_FAILED,
                 broker_error_code=exc.code,
-                failure_code=FAILURE_BROKER_QUERY_FAILED,
+                failure_code=RepairFailureCode.BROKER_QUERY_FAILED,
                 before=current,
                 detail=(
                     f"repair-time broker query failed ({type(exc).__name__}); a failed "
@@ -655,14 +777,21 @@ class BrokerOrderReconciliationRepairService:
             # transport/malformed-response failures into BrokerError. A leak
             # across that DOCUMENTED boundary is recorded fail-closed as a
             # scoped contract violation (same stance as detection) -- this is
-            # a defined boundary conversion, not a general catch-all.
-            self._safe_log_exception(
-                "broker.get_order violated the Broker error/return contract", exc
+            # a defined boundary conversion, not a general catch-all. The
+            # leaked exception is logged as its CLASS NAME only: adapter free
+            # text can carry secrets and never reaches logs or audit rows.
+            self._safe_log_sanitized_exception(
+                "broker.get_order violated the Broker error/return contract",
+                exc,
+                failure_code=RepairFailureCode.BROKER_CONTRACT_VIOLATION,
+                attempt_id=attempt_id,
+                run_id=run.run_id,
+                target_id=discrepancy.target_id,
             )
             return make(
                 outcome=RepairOutcome.QUERY_FAILED,
                 broker_error_code=BrokerErrorCode.COMMUNICATION_FAILURE,
-                failure_code=FAILURE_BROKER_CONTRACT_VIOLATION,
+                failure_code=RepairFailureCode.BROKER_CONTRACT_VIOLATION,
                 before=current,
                 detail=(
                     "repair-time broker query violated the Broker error/return contract; "
@@ -673,7 +802,7 @@ class BrokerOrderReconciliationRepairService:
         if fresh.client_order_id != row["client_order_id"]:
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_BROKER_ANSWERED_FOREIGN_ORDER,
+                failure_code=RepairFailureCode.BROKER_ANSWERED_FOREIGN_ORDER,
                 before=current,
                 detail=(
                     f"the broker answered about client_order_id {fresh.client_order_id!r} "
@@ -686,7 +815,7 @@ class BrokerOrderReconciliationRepairService:
         if discrepancy.internal_revision is None:
             return make(
                 outcome=RepairOutcome.STALE,
-                failure_code=FAILURE_MISSING_OBSERVED_REVISION,
+                failure_code=RepairFailureCode.MISSING_OBSERVED_REVISION,
                 before=current,
                 broker_order_id=row["broker_order_id"],
                 detail=(
@@ -701,7 +830,7 @@ class BrokerOrderReconciliationRepairService:
             # bookkeeping is broken -- fail closed, repair nothing
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_CANDIDATE_CONTRACT_VIOLATION,
+                failure_code=RepairFailureCode.CANDIDATE_CONTRACT_VIOLATION,
                 before=current,
                 detail=(
                     f"the order is at the observed revision {row['revision']} but in state "
@@ -714,7 +843,7 @@ class BrokerOrderReconciliationRepairService:
         if fresh.state is not discrepancy.broker_state:
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_REQUERY_DISAGREES,
+                failure_code=RepairFailureCode.REQUERY_DISAGREES_WITH_OBSERVATION,
                 before=current,
                 detail=(
                     f"the repair-time re-query reports {fresh.state.value!r} but the "
@@ -727,7 +856,7 @@ class BrokerOrderReconciliationRepairService:
         if reference_conflict is not None:
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_BROKER_REFERENCE_CHANGED,
+                failure_code=RepairFailureCode.BROKER_REFERENCE_CHANGED,
                 before=current,
                 detail=reference_conflict,
             )
@@ -735,14 +864,14 @@ class BrokerOrderReconciliationRepairService:
         if owner_failure is not None:
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_OWNER_LOOKUP_FAILED,
+                failure_code=RepairFailureCode.BROKER_ID_OWNER_LOOKUP_FAILED,
                 before=current,
                 detail=owner_failure,
             )
         if owner_conflict is not None:
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_BROKER_REFERENCE_OWNED_ELSEWHERE,
+                failure_code=RepairFailureCode.BROKER_REFERENCE_OWNED_ELSEWHERE,
                 before=current,
                 detail=owner_conflict,
             )
@@ -753,7 +882,7 @@ class BrokerOrderReconciliationRepairService:
             # repairability
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_STORE_READ_FAILED,
+                failure_code=RepairFailureCode.EXECUTION_STORE_READ_FAILED,
                 before=current,
                 detail=(
                     f"reading the execution order store failed while proving "
@@ -784,27 +913,36 @@ class BrokerOrderReconciliationRepairService:
                 ),
             )
 
-        # --- apply. EVERYTHING the APPLIED attempt needs is computed and
-        # validated BEFORE the store call: applied_at is the broker
-        # snapshot's updated_at (exactly the timestamp the store stamps on
-        # the committed history row), the broker id is the same effective id
+        # --- fence + apply. EVERYTHING the APPLIED attempt needs is computed
+        # and validated BEFORE the store call: broker_state_updated_at is the
+        # broker snapshot's updated_at (exactly the timestamp the store
+        # stamps on the history row), the broker id is the same effective id
         # the store derives, the attempt object itself is constructed now.
         # After a successful commit nothing is computed any more, so no
         # post-commit failure can mislabel a committed repair.
         reason = (
-            f"broker reconciliation repair (run_id={run.run_id}, attempt_id={attempt_id}): "
-            f"the broker confirmed state {fresh.state.value!r} for client_order_id "
-            f"{row['client_order_id']!r}"
+            f"broker reconciliation repair (run_id={run.run_id}, attempt_id={attempt_id}, "
+            f"generation={claim.generation}): the broker confirmed state "
+            f"{fresh.state.value!r} for client_order_id {row['client_order_id']!r}"
         )
         applied_attempt = make(
             outcome=RepairOutcome.APPLIED,
             before=current,
             after=fresh.state,
             broker_order_id=effective_broker_id,
-            applied_at=fresh.updated_at_utc,
+            broker_state_updated_at=fresh.updated_at_utc,
             detail=reason,
         )
         try:
+            execution_store.register_repair_fence(
+                request_id,
+                repair_attempt_id=attempt_id,
+                generation=claim.generation,
+                owner_id=claim.owner_id,
+                claim_execution_id=claim.claim_execution_id,
+                registered_at_utc=applied_attempt.reserved_at_utc,
+                db_path=self._execution_db_path,
+            )
             execution_store.record_order_result(
                 request_id,
                 fresh,
@@ -812,15 +950,37 @@ class BrokerOrderReconciliationRepairService:
                 expected_current_state=current,
                 expected_revision=discrepancy.internal_revision,
                 repair_attempt_id=attempt_id,
+                repair_generation=claim.generation,
                 db_path=self._execution_db_path,
+            )
+        except ExecutionRepairFenceConflictError:
+            # the claim was fenced out (a takeover after lease expiry, or a
+            # newer attempt now owns the order): typed lost claim, nothing
+            # was changed by this worker
+            return make(
+                outcome=RepairOutcome.CONFLICT,
+                failure_code=RepairFailureCode.CLAIM_LOST,
+                before=current,
+                detail=(
+                    "the repair fencing token was superseded before the commit "
+                    "(the claim was taken over or a newer attempt owns the order); "
+                    "nothing was changed by this worker"
+                ),
             )
         except ExecutionOrderStateConflictError:
             return self._concurrent_loss(discrepancy, current, fresh, make)
         except ExecutionOrderConflictError as exc:
-            self._safe_log_exception("conditional repair update hit a uniqueness conflict", exc)
+            self._safe_log_sanitized_exception(
+                "conditional repair update hit a uniqueness conflict",
+                exc,
+                failure_code=RepairFailureCode.UNIQUENESS_CONFLICT,
+                attempt_id=attempt_id,
+                run_id=run.run_id,
+                target_id=discrepancy.target_id,
+            )
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_UNIQUENESS_CONFLICT,
+                failure_code=RepairFailureCode.UNIQUENESS_CONFLICT,
                 before=current,
                 detail=(
                     "the update collided with a uniqueness constraint "
@@ -828,10 +988,17 @@ class BrokerOrderReconciliationRepairService:
                 ),
             )
         except (ValueError, BrokerInvalidRequestError) as exc:
-            self._safe_log_exception("the execution store refused the repair update", exc)
+            self._safe_log_sanitized_exception(
+                "the execution store refused the repair update",
+                exc,
+                failure_code=RepairFailureCode.STORE_REFUSED_UPDATE,
+                attempt_id=attempt_id,
+                run_id=run.run_id,
+                target_id=discrepancy.target_id,
+            )
             return make(
                 outcome=RepairOutcome.REJECTED,
-                failure_code=FAILURE_STORE_REFUSED_UPDATE,
+                failure_code=RepairFailureCode.STORE_REFUSED_UPDATE,
                 before=current,
                 detail=(
                     f"the execution store refused the update ({type(exc).__name__}); the "
@@ -839,10 +1006,17 @@ class BrokerOrderReconciliationRepairService:
                 ),
             )
         except ExecutionStoreError as exc:
-            self._safe_log_exception("the execution store failed during the repair update", exc)
+            self._safe_log_sanitized_exception(
+                "the execution store failed during the repair update",
+                exc,
+                failure_code=RepairFailureCode.STORE_UPDATE_FAILED,
+                attempt_id=attempt_id,
+                run_id=run.run_id,
+                target_id=discrepancy.target_id,
+            )
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_STORE_UPDATE_FAILED,
+                failure_code=RepairFailureCode.STORE_UPDATE_FAILED,
                 before=current,
                 detail=(
                     f"the execution store failed during the update ({type(exc).__name__}); "
@@ -869,7 +1043,7 @@ class BrokerOrderReconciliationRepairService:
         if current is not discrepancy.broker_state:
             return make(
                 outcome=RepairOutcome.STALE,
-                failure_code=FAILURE_INTERNAL_CHANGED,
+                failure_code=RepairFailureCode.INTERNAL_ORDER_CHANGED,
                 before=current,
                 broker_order_id=row["broker_order_id"],
                 detail=(
@@ -884,7 +1058,7 @@ class BrokerOrderReconciliationRepairService:
         if mismatch is not None:
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=FAILURE_ALREADY_APPLIED_MISMATCH,
+                failure_code=RepairFailureCode.ALREADY_APPLIED_CONTENT_MISMATCH,
                 before=current,
                 broker_order_id=row["broker_order_id"],
                 detail=(
@@ -978,7 +1152,7 @@ class BrokerOrderReconciliationRepairService:
         fresh: OrderResult,
         make,
     ) -> OrderRepairAttempt:
-        """The compare-and-set lost: re-read and classify what happened."""
+        """The state/revision compare-and-set lost: re-read and classify."""
         try:
             row = execution_store.get_execution_order(
                 discrepancy.target_id, db_path=self._execution_db_path
@@ -986,7 +1160,7 @@ class BrokerOrderReconciliationRepairService:
         except ExecutionStoreError as exc:
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_CAS_UNRESOLVABLE,
+                failure_code=RepairFailureCode.CAS_CONFLICT_UNRESOLVABLE,
                 before=expected,
                 detail=(
                     "the conditional update was refused (the order changed concurrently) "
@@ -997,7 +1171,7 @@ class BrokerOrderReconciliationRepairService:
         if row is None or row["order_state"] is None:
             return make(
                 outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_CAS_UNRESOLVABLE,
+                failure_code=RepairFailureCode.CAS_CONFLICT_UNRESOLVABLE,
                 before=expected,
                 detail=(
                     "the conditional update was refused (the order changed concurrently) "
@@ -1063,7 +1237,7 @@ class BrokerOrderReconciliationRepairService:
 
     def _contract_rejection(
         self, request_id: str, row: dict, current: OrderState, fresh: OrderResult
-    ) -> tuple[str, str] | None:
+    ) -> tuple[RepairFailureCode, str] | None:
         """``(failure_code, detail)`` when the existing state machine / store
         contract refuses the update -- the same checks
         ``record_order_result`` enforces, run first so the refusal is
@@ -1084,7 +1258,7 @@ class BrokerOrderReconciliationRepairService:
         ]
         if mismatches:
             return (
-                FAILURE_IDENTITY_MISMATCH,
+                RepairFailureCode.SNAPSHOT_IDENTITY_MISMATCH,
                 "the broker snapshot does not describe the stored execution request "
                 f"(differing: {', '.join(mismatches)})",
             )
@@ -1092,7 +1266,7 @@ class BrokerOrderReconciliationRepairService:
             validate_order_state_transition(current, fresh.state)
         except (ValueError, BrokerInvalidRequestError):
             return (
-                FAILURE_FORBIDDEN_TRANSITION,
+                RepairFailureCode.FORBIDDEN_TRANSITION,
                 f"the order state machine forbids the transition {current.value!r} -> "
                 f"{fresh.state.value!r}",
             )
@@ -1102,79 +1276,45 @@ class BrokerOrderReconciliationRepairService:
                 validate_order_result_update(anchored, fresh)
             except (ValueError, BrokerInvalidRequestError) as exc:
                 return (
-                    FAILURE_SNAPSHOT_CONTRACT,
+                    RepairFailureCode.SNAPSHOT_CONTRACT_VIOLATION,
                     "the snapshot update contract refuses this observation "
                     f"({type(exc).__name__})",
                 )
         stored_updated_at = datetime.fromisoformat(row["updated_at_utc"])
         if fresh.updated_at_utc < stored_updated_at:
             return (
-                FAILURE_SNAPSHOT_OLDER,
+                RepairFailureCode.SNAPSHOT_OLDER_THAN_STORED_STATE,
                 f"the broker snapshot is older than the stored state "
                 f"({fresh.updated_at_utc.isoformat()} < {row['updated_at_utc']})",
             )
         return None
 
-    def _recovered_attempt(self, reservation: RepairAttemptReservation) -> OrderRepairAttempt:
-        """The finalized view of a crashed pending attempt, decided by the
-        STRUCTURED history provenance (``repair_attempt_id``)."""
-        base = dict(
-            attempt_id=reservation.attempt_id,
-            run_id=reservation.run_id,
-            mode=RepairMode.APPLY,
-            target_type=reservation.target_type,
-            target_id=reservation.target_id,
-            reserved_at_utc=reservation.reserved_at_utc,
-            execution_request_id=reservation.execution_request_id,
-            client_order_id=reservation.client_order_id,
-            reconciliation_internal_state=reservation.reconciliation_internal_state,
-            reconciliation_broker_state=reservation.reconciliation_broker_state,
-            internal_revision=reservation.internal_revision,
-            observed_at_utc=reservation.observed_at_utc,
-        )
-        committed = None
-        if reservation.execution_request_id is not None:
-            history = execution_store.get_state_history(
-                reservation.execution_request_id, db_path=self._execution_db_path
-            )
-            for entry in history:
-                if entry["repair_attempt_id"] == reservation.attempt_id:
-                    committed = entry
-                    break
-        if committed is None:
-            return OrderRepairAttempt(
-                outcome=RepairOutcome.FAILED,
-                failure_code=FAILURE_RESERVATION_NOT_APPLIED,
-                detail=(
-                    "recovered pending reservation: no state-history row carries this "
-                    "attempt id, so the state update never committed; nothing was changed"
-                ),
-                **base,
-            )
-        applied_state = OrderState(committed["new_state"])
-        applied_at = datetime.fromisoformat(committed["changed_at_utc"])
-        return OrderRepairAttempt(
-            outcome=RepairOutcome.APPLIED,
-            detail=(
-                "recovered pending reservation: the state history carries this attempt id "
-                f"(state {applied_state.value!r} committed before the crash); finalized "
-                "under the original attempt id"
-            ),
-            internal_state_before=reservation.reconciliation_internal_state,
-            internal_state_after=applied_state,
-            broker_order_id=committed["broker_order_id"],
-            applied_at_utc=applied_at,
-            **base,
-        )
-
     def _finalize(self, attempt: OrderRepairAttempt) -> OrderRepairAttempt:
-        """Complete the reserved audit row; on failure attach ``audit_error``
-        instead of losing the attempt (the reservation stays pending and the
-        structured history provenance lets recovery finalize it under the
-        SAME attempt id -- see the module docstring)."""
+        """Complete the reserved audit row under this attempt's claim.
+
+        The finalize timestamp is taken HERE (immediately before the write);
+        any failure -- store, clock, or a LOST CLAIM (the reservation was
+        taken over after lease expiry) -- attaches ``audit_error`` instead
+        of changing the outcome: the state history's structured provenance
+        keeps an APPLIED fact attributable, and the pending row is completed
+        by its current owner (recovery), never overwritten by this worker.
+        """
         try:
-            finalize_repair_attempt(attempt, db_path=self._reconciliation_db_path)
-        except ReconciliationStoreError as exc:
+            finalized = replace(attempt, finalized_at_utc=self._now())
+            finalize_repair_attempt(finalized, db_path=self._reconciliation_db_path)
+            return finalized
+        except RepairClaimLostError as exc:
+            attempt = replace(
+                attempt,
+                audit_error=(
+                    f"{type(exc).__name__}: the claim was taken over before finalize; "
+                    "the new owner completes the audit row (this worker's outcome is "
+                    "not stored)"
+                ),
+            )
+            self._safe_log_lost_claim(attempt)
+            return attempt
+        except Exception as exc:  # store failure or clock contract failure
             attempt = replace(
                 attempt,
                 audit_error=(
@@ -1183,42 +1323,46 @@ class BrokerOrderReconciliationRepairService:
                     "it under the same attempt id"
                 ),
             )
-            self._safe_log_exception(
-                f"repair attempt {attempt.attempt_id} (run {attempt.run_id}, target "
-                f"{attempt.target_id}) had outcome {attempt.outcome.value} but its audit "
-                "row could not be finalized",
+            self._safe_log_sanitized_exception(
+                "finalizing a repair attempt failed",
                 exc,
+                failure_code=None,
+                attempt_id=attempt.attempt_id,
+                run_id=attempt.run_id,
+                target_id=attempt.target_id,
             )
-        return attempt
+            return attempt
 
     def _now(self) -> datetime:
         value = datetime.now(timezone.utc) if self._clock is None else self._clock()
         _require_utc(value, "clock()")
         return value
 
-    # --- logging (an aid, never a dependency) --------------------------------
+    # --- logging (an aid, never a dependency; sanitized) ----------------------
 
     def _safe_log_attempt(self, attempt: OrderRepairAttempt) -> None:
-        """One line per attempt. Only order identifiers and states are
-        logged -- no credentials, no tokens, no account ids. Wrapped: a
-        broken handler/formatter must never change a repair outcome or stop
-        the pass (the audit DB is the authority)."""
+        """One line per attempt. Only order identifiers, states, stable codes
+        and our own typed class names are logged -- no credentials, no
+        tokens, no account ids, no raw exception text. Wrapped: a broken
+        handler/formatter must never change a repair outcome or stop the
+        pass (the audit DB is the authority)."""
         try:
             level = logging.INFO if attempt.outcome in _INFO_OUTCOMES else logging.WARNING
             _LOGGER.log(
                 level,
                 "reconciliation repair attempt: run_id=%s attempt_id=%s mode=%s "
-                "target_type=%s target_id=%s client_order_id=%s outcome=%s "
+                "generation=%s target_type=%s target_id=%s client_order_id=%s outcome=%s "
                 "failure_code=%s state_before=%s state_after=%s broker_order_id=%s "
                 "broker_error_code=%s audit_error=%s detail=%s",
                 attempt.run_id,
                 attempt.attempt_id,
                 attempt.mode.value,
+                attempt.generation,
                 attempt.target_type.value,
                 attempt.target_id,
                 attempt.client_order_id,
                 attempt.outcome.value,
-                attempt.failure_code,
+                None if attempt.failure_code is None else attempt.failure_code.value,
                 None
                 if attempt.internal_state_before is None
                 else attempt.internal_state_before.value,
@@ -1257,8 +1401,45 @@ class BrokerOrderReconciliationRepairService:
         except Exception:  # deliberate: logging is best-effort only
             pass
 
-    def _safe_log_exception(self, message: str, exc: Exception) -> None:
+    def _safe_log_lost_claim(self, attempt: OrderRepairAttempt) -> None:
         try:
-            _LOGGER.error("%s: %s", message, exc, exc_info=exc)
+            _LOGGER.warning(
+                "repair attempt %s (run %s, target %s) lost its claim before finalize "
+                "(generation %s); the new owner completes the audit row",
+                attempt.attempt_id,
+                attempt.run_id,
+                attempt.target_id,
+                attempt.generation,
+            )
+        except Exception:  # deliberate: logging is best-effort only
+            pass
+
+    def _safe_log_sanitized_exception(
+        self,
+        context: str,
+        exc: Exception,
+        *,
+        failure_code: RepairFailureCode | None,
+        attempt_id: str | None = None,
+        run_id: str | None = None,
+        target_id: str | None = None,
+    ) -> None:
+        """SANITIZED failure logging (Issue #104 re-review): only the stable
+        failure code, the exception CLASS NAME and our own identifiers are
+        emitted. Never ``str(exc)``, ``repr(exc)`` or a traceback -- adapter
+        free text, tokens, credentials, URLs, SQL and paths must not reach
+        any log stream, and the deliberately traceback-free form keeps
+        ``__cause__`` / ``__context__`` chains out too."""
+        try:
+            _LOGGER.error(
+                "%s: exception_class=%s failure_code=%s attempt_id=%s run_id=%s "
+                "target_id=%s (details withheld from logs; see the typed audit record)",
+                context,
+                type(exc).__name__,
+                None if failure_code is None else failure_code.value,
+                attempt_id,
+                run_id,
+                target_id,
+            )
         except Exception:  # deliberate: logging is best-effort only
             pass

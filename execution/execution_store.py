@@ -271,6 +271,15 @@ _HISTORY_COLUMNS: tuple[str, ...] = (
     "order_result_json",
     "changed_at_utc",
     "repair_attempt_id",
+    "repair_generation",
+)
+_FENCE_COLUMNS: tuple[str, ...] = (
+    "execution_request_id",
+    "repair_attempt_id",
+    "generation",
+    "owner_id",
+    "claim_execution_id",
+    "updated_at_utc",
 )
 REQUIRED_ORDER_COLUMNS: frozenset[str] = frozenset(_ORDER_COLUMNS)
 REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
@@ -284,13 +293,21 @@ REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
 #     at most one execution request). Purely additive over v2; init_db
 #     migrates a verified v2 DB in place (see the module docstring).
 # v4 (Issue #104): STRUCTURED repair provenance on the history table --
-#     ``repair_attempt_id`` (nullable) plus a partial UNIQUE index, so a
-#     reconciliation-repair application is attributable machine-readably
-#     (never by parsing the reason string) and one attempt can commit at
-#     most one history row. Purely additive over v3 (ALTER ADD COLUMN +
-#     index); init_db migrates verified v2 / v3 DBs in place.
+#     ``repair_attempt_id`` + ``repair_generation`` (nullable) plus a
+#     partial UNIQUE index, so a reconciliation-repair application is
+#     attributable machine-readably (never by parsing the reason string) and
+#     one attempt can commit at most one history row -- and the FENCING
+#     table ``execution_repair_fences``: one row per order naming the
+#     currently authorized (repair_attempt_id, generation);
+#     ``record_order_result`` verifies it INSIDE the update transaction, so
+#     a worker whose claim was taken over (lease expiry -> generation
+#     increment) can never commit a stale repair. Purely additive over v3
+#     (ALTER ADD COLUMN x2 + table + indexes); init_db migrates verified
+#     v2 / v3 DBs in place.
 SCHEMA_VERSION = 4
 _MIGRATABLE_VERSIONS = (3, 2)  # newest first; v2 chains through v3
+
+FENCES_TABLE = "execution_repair_fences"
 
 # Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
 # match EXACTLY -- unknown fields are rejected, missing fields are rejected.
@@ -334,6 +351,20 @@ class ExecutionOrderNotFoundError(ExecutionStoreError):
 class ExecutionOrderConflictError(ExecutionStoreError):
     """An insert/update collided with a UNIQUE constraint
     (execution_request_id / signal_id / client_order_id / broker_order_id)."""
+
+
+class ExecutionRepairFenceConflictError(ExecutionStoreError):
+    """The caller's repair fencing token is not the currently authorized one
+    (Issue #104 re-review).
+
+    Raised inside the ``record_order_result`` transaction when the caller
+    supplies repair provenance whose (attempt_id, generation) does not match
+    the order's ``execution_repair_fences`` row -- i.e. its claim was taken
+    over (generation moved on) or a newer attempt now owns the order. Also
+    raised by :func:`register_repair_fence` when a stale registration cannot
+    take the fence. The transaction rolls back and the DB is untouched; the
+    caller classifies its work as a typed lost-claim result, never as
+    applied."""
 
 
 class ExecutionOrderStateConflictError(ExecutionStoreError):
@@ -413,17 +444,22 @@ def _create_orders_table_sql() -> str:
     """
 
 
-# Shared between the v4 reference CREATE and the v3 -> v4 ALTER so a migrated
+# Shared between the v4 reference CREATE and the v3 -> v4 ALTERs so a migrated
 # DB token-normalizes identically to a freshly created one (SQLite appends an
 # added column at the end of the column list).
-_HISTORY_REPAIR_COLUMN_DDL = (
-    "repair_attempt_id TEXT CHECK (repair_attempt_id IS NULL OR trim(repair_attempt_id) <> '')"
+_HISTORY_REPAIR_COLUMN_DDLS = (
+    "repair_attempt_id TEXT CHECK (repair_attempt_id IS NULL OR trim(repair_attempt_id) <> '')",
+    "repair_generation INTEGER CHECK (repair_generation IS NULL OR repair_generation >= 1)",
 )
 
 
 def _create_history_table_sql(*, version: int = SCHEMA_VERSION) -> str:
     states = _enum_values_sql(OrderState)
-    repair_column = f",\n            {_HISTORY_REPAIR_COLUMN_DDL}" if version >= 4 else ""
+    repair_columns = (
+        "".join(f",\n            {ddl}" for ddl in _HISTORY_REPAIR_COLUMN_DDLS)
+        if version >= 4
+        else ""
+    )
     return f"""
         CREATE TABLE {HISTORY_TABLE} (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -435,8 +471,32 @@ def _create_history_table_sql(*, version: int = SCHEMA_VERSION) -> str:
             reason TEXT NOT NULL CHECK (trim(reason) <> ''),
             broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
             order_result_json TEXT CHECK (order_result_json IS NULL OR trim(order_result_json) <> ''),
-            changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00'){repair_column}
+            changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00'){repair_columns}
         )
+    """
+
+
+def _create_fences_table_sql() -> str:
+    """The repair FENCING table (Issue #104 re-review, v4).
+
+    One row per order naming the currently authorized repair claim
+    (attempt id + fencing generation + claiming execution). Registered /
+    taken over by :func:`register_repair_fence`, verified INSIDE the
+    ``record_order_result`` transaction. Rows are retained after a repair
+    finishes (the last authorized claim is audit-relevant) and are simply
+    replaced when a different attempt claims the order -- a stale fence can
+    therefore never block future repairs and needs no cleanup."""
+    return f"""
+        CREATE TABLE {FENCES_TABLE} (
+            execution_request_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES {ORDERS_TABLE} (execution_request_id)
+                CHECK (trim(execution_request_id) <> ''),
+            repair_attempt_id TEXT NOT NULL CHECK (trim(repair_attempt_id) <> ''),
+            generation INTEGER NOT NULL CHECK (generation >= 1),
+            owner_id TEXT NOT NULL CHECK (trim(owner_id) <> ''),
+            claim_execution_id TEXT NOT NULL CHECK (trim(claim_execution_id) <> ''),
+            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00')
+        ) WITHOUT ROWID
     """
 
 
@@ -598,25 +658,34 @@ def _ddl_tokens(sql: str) -> tuple[str, ...]:
     return tuple(flat)
 
 
+def _tables_for(version: int) -> tuple[str, ...]:
+    tables = [ORDERS_TABLE, HISTORY_TABLE]
+    if version >= 4:
+        tables.append(FENCES_TABLE)
+    return tuple(tables)
+
+
 def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
     """Create the schema for ``version`` (v2 / v3 are used only as the
     in-memory migration references and by migration tests; real DBs are
     created at the current version)."""
     connection.execute(_create_orders_table_sql())
     connection.execute(_create_history_table_sql(version=version))
+    if version >= 4:
+        connection.execute(_create_fences_table_sql())
     for create_sql in _create_index_sql(version=version).values():
         connection.execute(create_sql)
     connection.execute(f"PRAGMA user_version = {version}")
 
 
-def _structure_signature(connection: sqlite3.Connection) -> dict:
+def _structure_signature(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> dict:
     """Structural signature from the live schema objects (PR #91 r2 Minor 2).
 
     Built from ``PRAGMA table_info`` / ``index_list`` / ``index_info`` /
     ``foreign_key_list`` -- so verification does not rest on the
     ``sqlite_master`` SQL text alone."""
     signature: dict = {}
-    for table in (ORDERS_TABLE, HISTORY_TABLE):
+    for table in _tables_for(version):
         signature[f"table_info:{table}"] = [
             tuple(row) for row in connection.execute(f"PRAGMA table_info({table})")
         ]
@@ -654,7 +723,10 @@ def _reference_schema(version: int = SCHEMA_VERSION) -> tuple[dict, dict]:
                 (row[0], row[1]): (row[2], None if row[3] is None else _ddl_tokens(row[3]))
                 for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
             }
-            _REFERENCE_SCHEMA_CACHE[version] = (objects, _structure_signature(connection))
+            _REFERENCE_SCHEMA_CACHE[version] = (
+                objects,
+                _structure_signature(connection, version=version),
+            )
     return _REFERENCE_SCHEMA_CACHE[version]
 
 
@@ -685,7 +757,7 @@ def _schema_problems(connection: sqlite3.Connection, *, version: int = SCHEMA_VE
                 "(constraints missing or altered)"
             )
 
-    if not problems and _structure_signature(connection) != expected_signature:
+    if not problems and _structure_signature(connection, version=version) != expected_signature:
         problems.append(
             "live PRAGMA structure (table_info/index_list/index_info/foreign_key_list) "
             "differs from the reference schema"
@@ -823,20 +895,24 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection, db_path: Path) -> None:
 
 def _migrate_v3_to_v4(connection: sqlite3.Connection, db_path: Path) -> None:
     """Migrate a fully verified v3 schema to v4 inside the caller's
-    transaction (Issue #104): additive ``ALTER TABLE ... ADD COLUMN
-    repair_attempt_id`` on the history table (SQLite appends the column at
-    the end of the column list, exactly where the v4 reference CREATE
-    declares it, so the migrated DDL token-normalizes identically) plus the
-    partial UNIQUE index and the version bump. Existing rows are untouched
-    and read back with ``repair_attempt_id = NULL``."""
-    connection.execute(f"ALTER TABLE {HISTORY_TABLE} ADD COLUMN {_HISTORY_REPAIR_COLUMN_DDL}")
+    transaction (Issue #104): additive ``ALTER TABLE ... ADD COLUMN`` for
+    the history provenance columns (SQLite appends each column at the end
+    of the column list, exactly where the v4 reference CREATE declares
+    them, so the migrated DDL token-normalizes identically), the fencing
+    table, the partial UNIQUE index and the version bump. Existing rows are
+    untouched and read back with NULL provenance; the fencing table starts
+    empty."""
+    for column_ddl in _HISTORY_REPAIR_COLUMN_DDLS:
+        connection.execute(f"ALTER TABLE {HISTORY_TABLE} ADD COLUMN {column_ddl}")
+    connection.execute(_create_fences_table_sql())
     connection.execute(_HISTORY_REPAIR_INDEX_SQL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     _LOGGER.info(
         "migrated execution DB %s from schema v3 to v%d (added history repair provenance "
-        "column and index %s)",
+        "columns, fencing table %s and index %s)",
         db_path,
         SCHEMA_VERSION,
+        FENCES_TABLE,
         _HISTORY_REPAIR_INDEX,
     )
 
@@ -1101,11 +1177,28 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
         if not isinstance(entry["reason"], str) or not entry["reason"].strip():
             raise _integrity(request_id, f"history row {entry['history_id']} has an empty reason")
         repair_attempt_id = entry["repair_attempt_id"]
+        repair_generation = entry["repair_generation"]
+        if (repair_attempt_id is None) != (repair_generation is None):
+            raise _integrity(
+                request_id,
+                f"history row {entry['history_id']} carries repair provenance with "
+                "attempt id and generation out of lockstep",
+            )
         if repair_attempt_id is not None:
             if not isinstance(repair_attempt_id, str) or not repair_attempt_id.strip():
                 raise _integrity(
                     request_id,
                     f"history row {entry['history_id']} carries an empty repair_attempt_id",
+                )
+            if (
+                isinstance(repair_generation, bool)
+                or not isinstance(repair_generation, int)
+                or repair_generation < 1
+            ):
+                raise _integrity(
+                    request_id,
+                    f"history row {entry['history_id']} carries an invalid "
+                    f"repair_generation {repair_generation!r}",
                 )
             if entry["order_result_json"] is None:
                 # a repair application is always a full-snapshot observation
@@ -1491,11 +1584,13 @@ def _append_history(
     order_result_json: str | None,
     changed_at_utc: datetime,
     repair_attempt_id: str | None = None,
+    repair_generation: int | None = None,
 ) -> None:
     connection.execute(
         f"INSERT INTO {HISTORY_TABLE} "
         "(execution_request_id, previous_state, new_state, reason, broker_order_id, "
-        "order_result_json, changed_at_utc, repair_attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "order_result_json, changed_at_utc, repair_attempt_id, repair_generation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             execution_request_id,
             None if previous_state is None else previous_state.value,
@@ -1505,6 +1600,7 @@ def _append_history(
             order_result_json,
             _iso(changed_at_utc),
             repair_attempt_id,
+            repair_generation,
         ),
     )
 
@@ -1583,6 +1679,7 @@ def mark_submitting(
                 "order_result_json": None,
                 "changed_at_utc": _iso(changed_at_utc),
                 "repair_attempt_id": None,
+                "repair_generation": None,
             },
         )
     return updated
@@ -1599,6 +1696,7 @@ def _apply_state_update(
     effective_broker_id: str | None,
     result_json: str | None,
     repair_attempt_id: str | None = None,
+    repair_generation: int | None = None,
 ) -> dict:
     """Shared tail of both update paths: phase derivation + current-row UPDATE
     + history INSERT (snapshot anchored on the history row too) + pre-commit
@@ -1639,6 +1737,7 @@ def _apply_state_update(
             order_result_json=result_json,
             changed_at_utc=changed_at_utc,
             repair_attempt_id=repair_attempt_id,
+            repair_generation=repair_generation,
         )
     except sqlite3.IntegrityError as exc:
         raise ExecutionOrderConflictError(
@@ -1671,6 +1770,7 @@ def _apply_state_update(
             "order_result_json": result_json,
             "changed_at_utc": _iso(changed_at_utc),
             "repair_attempt_id": repair_attempt_id,
+            "repair_generation": repair_generation,
         },
     )
 
@@ -1764,6 +1864,7 @@ def record_order_result(
     expected_current_state: OrderState | None = None,
     expected_revision: int | None = None,
     repair_attempt_id: str | None = None,
+    repair_generation: int | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Record a full broker ``OrderResult`` snapshot for this order.
@@ -1800,11 +1901,18 @@ def record_order_result(
       TOCTOU window COMPLETELY: a state-only comparison cannot see a
       concurrent same-state change (an UNKNOWN -> UNKNOWN record, a further
       partial fill, a snapshot refresh), the revision can.
-    - ``repair_attempt_id`` (Issue #104, optional) records STRUCTURED repair
-      provenance on the appended history row. The partial UNIQUE index lets
-      one attempt commit at most one history row DB-wide, and recovery
-      attributes an applied repair by this column -- never by parsing the
-      human-readable reason string.
+    - ``repair_attempt_id`` + ``repair_generation`` (Issue #104, always
+      together) record STRUCTURED repair provenance on the appended history
+      row AND make the update FENCED: inside this same transaction the
+      order's ``execution_repair_fences`` row must name exactly this
+      (attempt_id, generation) -- otherwise
+      :class:`ExecutionRepairFenceConflictError` rolls everything back. A
+      worker whose claim was taken over (its lease expired and a recovery
+      worker incremented the generation) therefore cannot commit, even
+      while the order's state and revision still match. The partial UNIQUE
+      index additionally lets one attempt commit at most one history row
+      DB-wide, and recovery attributes an applied repair by these columns
+      -- never by parsing the human-readable reason string.
     """
     if not isinstance(result, OrderResult):
         raise ValueError(f"result must be an OrderResult, got {result!r}")
@@ -1825,10 +1933,50 @@ def record_order_result(
         )
     if repair_attempt_id is not None:
         _require_non_empty_str(repair_attempt_id, "repair_attempt_id")
+    if (repair_attempt_id is None) != (repair_generation is None):
+        raise ValueError(
+            "repair_attempt_id and repair_generation must be supplied together "
+            "(the fencing token is the pair)"
+        )
+    if repair_generation is not None and (
+        isinstance(repair_generation, bool)
+        or not isinstance(repair_generation, int)
+        or repair_generation < 1
+    ):
+        raise ValueError(f"repair_generation must be an int >= 1, got {repair_generation!r}")
     _require_non_empty_str(reason, "reason")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
+
+        if repair_attempt_id is not None:
+            # FENCE check (Issue #104 re-review): the currently authorized
+            # repair claim for this order -- registered / taken over via
+            # register_repair_fence -- must be exactly this (attempt,
+            # generation). Verified INSIDE the update transaction, so a
+            # takeover between the caller's read and this commit is always
+            # detected, state/revision equality notwithstanding.
+            fence = connection.execute(
+                f"SELECT repair_attempt_id, generation FROM {FENCES_TABLE} "
+                "WHERE execution_request_id = ?",
+                (execution_request_id,),
+            ).fetchone()
+            if (
+                fence is None
+                or fence["repair_attempt_id"] != repair_attempt_id
+                or fence["generation"] != repair_generation
+            ):
+                raise ExecutionRepairFenceConflictError(
+                    f"repair update for execution order {execution_request_id!r} carries "
+                    f"fencing token ({repair_attempt_id!r}, generation {repair_generation}) "
+                    "but the order's authorized fence is "
+                    + (
+                        "absent"
+                        if fence is None
+                        else f"({fence['repair_attempt_id']!r}, generation {fence['generation']})"
+                    )
+                    + "; the claim was lost and nothing was changed"
+                )
 
         if expected_revision is not None and row["revision"] != expected_revision:
             raise ExecutionOrderStateConflictError(
@@ -1901,8 +2049,129 @@ def record_order_result(
             effective_broker_id=effective_broker_id,
             result_json=_result_to_json(result),
             repair_attempt_id=repair_attempt_id,
+            repair_generation=repair_generation,
         )
     return updated
+
+
+# --- repair fencing (Issue #104 re-review) ------------------------------------
+
+
+def register_repair_fence(
+    execution_request_id: str,
+    *,
+    repair_attempt_id: str,
+    generation: int,
+    owner_id: str,
+    claim_execution_id: str,
+    registered_at_utc: datetime,
+    db_path: Path | None = None,
+) -> None:
+    """Register or take over the order's repair fencing token -- atomically.
+
+    Rules, all inside one ``BEGIN IMMEDIATE`` transaction:
+
+    - no fence row for the order -> INSERT.
+    - existing fence for a DIFFERENT attempt -> REPLACE (a new attempt now
+      claims the order; the previous attempt's later commit/finalize fails
+      its fence/claim checks as a typed lost claim -- never a wrong write).
+    - existing fence for the SAME attempt:
+        - ``generation`` greater than stored -> takeover (recovery path);
+        - same generation AND same ``claim_execution_id`` -> idempotent
+          re-registration by the same claim;
+        - anything else (stale generation, or the same generation held by a
+          different claim execution) ->
+          :class:`ExecutionRepairFenceConflictError` -- of concurrent
+          takeover attempts exactly one wins, and a worker whose claim was
+          taken over cannot re-arm its old token.
+
+    The fence row is retained after the repair finishes (see
+    :func:`_create_fences_table_sql`).
+    """
+    _require_non_empty_str(execution_request_id, "execution_request_id")
+    _require_non_empty_str(repair_attempt_id, "repair_attempt_id")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError(f"generation must be an int >= 1, got {generation!r}")
+    _require_non_empty_str(owner_id, "owner_id")
+    _require_non_empty_str(claim_execution_id, "claim_execution_id")
+    _require_utc(registered_at_utc, "registered_at_utc")
+    db_path = _existing_db_path(db_path, execution_request_id)
+    with _verified_txn(db_path) as connection:
+        order = connection.execute(
+            f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE execution_request_id = ?",
+            (execution_request_id,),
+        ).fetchone()
+        if order is None:
+            raise ExecutionOrderNotFoundError(
+                f"no execution order with id {execution_request_id!r}"
+            )
+        fence = connection.execute(
+            f"SELECT * FROM {FENCES_TABLE} WHERE execution_request_id = ?",
+            (execution_request_id,),
+        ).fetchone()
+        record = (
+            execution_request_id,
+            repair_attempt_id,
+            generation,
+            owner_id,
+            claim_execution_id,
+            _iso(registered_at_utc),
+        )
+        if fence is None:
+            connection.execute(
+                f"INSERT INTO {FENCES_TABLE} ({', '.join(_FENCE_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _FENCE_COLUMNS)})",
+                record,
+            )
+            return
+        if fence["repair_attempt_id"] == repair_attempt_id:
+            same_claim = (
+                fence["generation"] == generation
+                and fence["claim_execution_id"] == claim_execution_id
+            )
+            if not same_claim and fence["generation"] >= generation:
+                raise ExecutionRepairFenceConflictError(
+                    f"repair fence for execution order {execution_request_id!r} is held at "
+                    f"generation {fence['generation']} (claim "
+                    f"{fence['claim_execution_id']!r}); registration with generation "
+                    f"{generation} lost the claim and changes nothing"
+                )
+            if same_claim:
+                return  # idempotent re-registration by the holding claim
+        # takeover (same attempt, greater generation) or a different attempt
+        updated = connection.execute(
+            f"UPDATE {FENCES_TABLE} SET repair_attempt_id = ?, generation = ?, "
+            "owner_id = ?, claim_execution_id = ?, updated_at_utc = ? "
+            "WHERE execution_request_id = ?",
+            (
+                repair_attempt_id,
+                generation,
+                owner_id,
+                claim_execution_id,
+                _iso(registered_at_utc),
+                execution_request_id,
+            ),
+        )
+        if updated.rowcount != 1:  # pragma: no cover - defence in depth
+            raise ExecutionRepairFenceConflictError(
+                f"repair fence for execution order {execution_request_id!r} could not be "
+                "updated; the claim was lost and nothing was changed"
+            )
+
+
+def get_repair_fence(execution_request_id: str, *, db_path: Path | None = None) -> dict | None:
+    """The order's current repair fencing row, or None. Missing DB -> None;
+    the file is never created (read-only contract)."""
+    _require_non_empty_str(execution_request_id, "execution_request_id")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return None
+    with _verified_read(db_path) as connection:
+        row = connection.execute(
+            f"SELECT * FROM {FENCES_TABLE} WHERE execution_request_id = ?",
+            (execution_request_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
 
 
 # --- read helpers -----------------------------------------------------------

@@ -1,6 +1,8 @@
 """Issue #104: broker reconciliation repair models -- validation only.
 
-No I/O anywhere in this suite: pure model construction and invariants.
+No I/O anywhere in this suite: pure model construction and invariants
+(claimed reservations, fenced attempts, the closed failure-code set and the
+timestamp contract included).
 """
 
 from dataclasses import replace
@@ -14,6 +16,7 @@ from execution.reconciliation_repair_models import (
     OrderRepairAttempt,
     ReconciliationRepairResult,
     RepairAttemptReservation,
+    RepairFailureCode,
     RepairMode,
     RepairOutcome,
 )
@@ -33,6 +36,11 @@ def reservation(**overrides) -> RepairAttemptReservation:
         target_id="exec-1",
         reserved_at_utc=at(1),
         detail="reserved: repair evaluation started",
+        owner_id="worker-1",
+        claim_execution_id="claim-1",
+        generation=1,
+        lease_expires_at_utc=at(601),
+        last_claimed_at_utc=at(1),
         execution_request_id="exec-1",
         client_order_id="client-1",
         reconciliation_internal_state=OrderState.UNKNOWN,
@@ -54,6 +62,9 @@ def attempt(**overrides) -> OrderRepairAttempt:
         outcome=RepairOutcome.APPLIED,
         detail="the broker confirmed state 'filled'",
         reserved_at_utc=at(1),
+        owner_id="worker-1",
+        claim_execution_id="claim-1",
+        generation=1,
         execution_request_id="exec-1",
         client_order_id="client-1",
         reconciliation_internal_state=OrderState.UNKNOWN,
@@ -63,7 +74,8 @@ def attempt(**overrides) -> OrderRepairAttempt:
         internal_state_after=OrderState.FILLED,
         broker_order_id="B-1",
         observed_at_utc=at(0),
-        applied_at_utc=at(2),
+        broker_state_updated_at_utc=at(2),
+        finalized_at_utc=at(3),
     )
     kwargs.update(overrides)
     return OrderRepairAttempt(**kwargs)
@@ -73,8 +85,8 @@ def skipped(**overrides) -> OrderRepairAttempt:
     kwargs = dict(
         outcome=RepairOutcome.SKIPPED,
         internal_state_after=None,
-        applied_at_utc=None,
-        failure_code="not_eligible_manual_review",
+        broker_state_updated_at_utc=None,
+        failure_code=RepairFailureCode.NOT_ELIGIBLE_MANUAL_REVIEW,
         detail="manual review targets are never auto-repaired",
     )
     kwargs.update(overrides)
@@ -86,8 +98,9 @@ def skipped(**overrides) -> OrderRepairAttempt:
 
 def test_a_valid_reservation_constructs():
     entry = reservation()
-    assert entry.internal_revision == 2
-    assert entry.reconciliation_internal_state is OrderState.UNKNOWN
+    assert entry.generation == 1
+    assert entry.owner_id == "worker-1"
+    assert entry.lease_expires_at_utc > entry.last_claimed_at_utc
 
 
 @pytest.mark.parametrize(
@@ -97,17 +110,31 @@ def test_a_valid_reservation_constructs():
         ("run_id", " "),
         ("target_id", ""),
         ("detail", ""),
+        ("owner_id", ""),
+        ("claim_execution_id", " "),
+        ("generation", 0),
+        ("generation", True),
+        ("generation", "1"),
         ("target_type", "execution_order"),
         ("reconciliation_internal_state", "unknown"),
         ("internal_revision", -1),
         ("internal_revision", True),
         ("reserved_at_utc", datetime(2026, 8, 1)),
+        ("lease_expires_at_utc", datetime(2026, 8, 1)),
+        ("last_claimed_at_utc", datetime(2026, 8, 1)),
         ("observed_at_utc", datetime(2026, 8, 1)),
     ],
 )
 def test_malformed_reservation_fields_are_rejected(field, value):
     with pytest.raises(ValueError):
         reservation(**{field: value})
+
+
+def test_a_lease_must_extend_beyond_the_claim_time():
+    with pytest.raises(ValueError, match="lease_expires_at_utc"):
+        reservation(lease_expires_at_utc=at(1))
+    with pytest.raises(ValueError, match="lease_expires_at_utc"):
+        reservation(lease_expires_at_utc=at(0))
 
 
 def test_a_reservation_pairs_execution_target_and_request_id():
@@ -136,8 +163,9 @@ def test_an_execution_reservation_requires_the_observed_internal_state():
 def test_a_valid_applied_attempt_constructs():
     entry = attempt()
     assert entry.outcome is RepairOutcome.APPLIED
-    assert entry.applied_at_utc == at(2)
+    assert entry.broker_state_updated_at_utc == at(2)
     assert entry.failure_code is None
+    assert entry.generation == 1
 
 
 @pytest.mark.parametrize(
@@ -153,8 +181,12 @@ def test_a_valid_applied_attempt_constructs():
         ("reconciliation_internal_state", "unknown"),
         ("internal_state_after", "filled"),
         ("broker_error_code", "timeout"),
+        ("failure_code", "claim_lost"),
         ("internal_revision", -3),
+        ("generation", 0),
+        ("owner_id", " "),
         ("reserved_at_utc", datetime(2026, 8, 1)),
+        ("finalized_at_utc", datetime(2026, 8, 1)),
     ],
 )
 def test_malformed_attempt_fields_are_rejected(field, value):
@@ -162,33 +194,52 @@ def test_malformed_attempt_fields_are_rejected(field, value):
         attempt(**{field: value})
 
 
+def test_apply_attempts_require_a_claim_and_dry_run_forbids_one():
+    for field in ("owner_id", "claim_execution_id", "generation"):
+        with pytest.raises(ValueError, match=field):
+            attempt(**{field: None})
+    with pytest.raises(ValueError, match="claim"):
+        attempt(
+            mode=RepairMode.DRY_RUN,
+            outcome=RepairOutcome.WOULD_APPLY,
+            broker_state_updated_at_utc=None,
+            finalized_at_utc=None,
+        )
+    dry = attempt(
+        mode=RepairMode.DRY_RUN,
+        outcome=RepairOutcome.WOULD_APPLY,
+        owner_id=None,
+        claim_execution_id=None,
+        generation=None,
+        broker_state_updated_at_utc=None,
+        finalized_at_utc=None,
+    )
+    assert dry.generation is None
+
+
 def test_applied_requires_apply_mode():
     with pytest.raises(ValueError, match="apply mode"):
-        attempt(mode=RepairMode.DRY_RUN)
+        attempt(
+            mode=RepairMode.DRY_RUN,
+            owner_id=None,
+            claim_execution_id=None,
+            generation=None,
+        )
 
 
-def test_would_apply_requires_dry_run_mode():
-    with pytest.raises(ValueError, match="dry_run mode"):
-        attempt(outcome=RepairOutcome.WOULD_APPLY, applied_at_utc=None)
-    entry = attempt(
-        mode=RepairMode.DRY_RUN, outcome=RepairOutcome.WOULD_APPLY, applied_at_utc=None
-    )
-    assert entry.internal_state_after is OrderState.FILLED
+def test_broker_state_updated_at_exists_exactly_for_applied():
+    with pytest.raises(ValueError, match="broker_state_updated_at_utc"):
+        attempt(broker_state_updated_at_utc=None)
+    with pytest.raises(ValueError, match="broker_state_updated_at_utc"):
+        skipped(broker_state_updated_at_utc=at(2))
 
 
-def test_applied_at_exists_exactly_for_applied():
-    with pytest.raises(ValueError, match="applied_at_utc"):
-        attempt(applied_at_utc=None)
-    with pytest.raises(ValueError, match="applied_at_utc"):
-        skipped(applied_at_utc=at(2))
-
-
-def test_applied_at_lives_in_the_broker_clock_domain():
-    """applied_at is the committed state-history timestamp (= the broker
-    snapshot's updated_at) and is deliberately NOT ordered against the
-    repair-side reservation clock."""
-    entry = attempt(applied_at_utc=at(1) - timedelta(days=30))
-    assert entry.applied_at_utc < entry.reserved_at_utc
+def test_broker_state_updated_at_lives_in_the_broker_clock_domain():
+    """It is the broker-reported snapshot timestamp on the committed history
+    row -- NOT an internal commit time -- and is deliberately not ordered
+    against the repair-side reservation clock."""
+    entry = attempt(broker_state_updated_at_utc=at(1) - timedelta(days=30))
+    assert entry.broker_state_updated_at_utc < entry.reserved_at_utc
 
 
 def test_the_after_state_exists_exactly_for_applied_like_outcomes():
@@ -198,7 +249,7 @@ def test_the_after_state_exists_exactly_for_applied_like_outcomes():
         skipped(internal_state_after=OrderState.FILLED)
     already = attempt(
         outcome=RepairOutcome.ALREADY_APPLIED,
-        applied_at_utc=None,
+        broker_state_updated_at_utc=None,
         internal_state_before=OrderState.FILLED,
         internal_state_after=OrderState.FILLED,
     )
@@ -209,24 +260,42 @@ def test_the_broker_error_code_exists_exactly_for_query_failed():
     with pytest.raises(ValueError, match="broker_error_code"):
         skipped(broker_error_code=BrokerErrorCode.TIMEOUT)
     with pytest.raises(ValueError, match="broker_error_code"):
-        skipped(outcome=RepairOutcome.QUERY_FAILED, failure_code="broker_query_failed")
+        skipped(
+            outcome=RepairOutcome.QUERY_FAILED,
+            failure_code=RepairFailureCode.BROKER_QUERY_FAILED,
+        )
     entry = skipped(
         outcome=RepairOutcome.QUERY_FAILED,
         broker_error_code=BrokerErrorCode.TIMEOUT,
-        failure_code="broker_query_failed",
+        failure_code=RepairFailureCode.BROKER_QUERY_FAILED,
     )
     assert entry.broker_error_code is BrokerErrorCode.TIMEOUT
 
 
-def test_the_failure_code_exists_exactly_for_non_success_outcomes():
+def test_the_failure_code_is_a_closed_set_bound_to_the_outcome():
+    # success outcomes carry no code
     with pytest.raises(ValueError, match="failure_code"):
-        attempt(failure_code="some_code")  # applied must not carry one
+        attempt(failure_code=RepairFailureCode.CLAIM_LOST)
+    # non-success outcomes require one
     with pytest.raises(ValueError, match="failure_code"):
-        skipped(failure_code=None)  # skipped must carry one
+        skipped(failure_code=None)
+    # raw strings are rejected (Enum only)
     with pytest.raises(ValueError):
-        skipped(failure_code="  ")
-    stale = skipped(outcome=RepairOutcome.STALE, failure_code="internal_order_changed")
-    assert stale.failure_code == "internal_order_changed"
+        skipped(failure_code="not_eligible_manual_review")
+    # and the code must belong to the outcome's permitted family
+    with pytest.raises(ValueError, match="not permitted"):
+        skipped(failure_code=RepairFailureCode.BROKER_QUERY_FAILED)
+    with pytest.raises(ValueError, match="not permitted"):
+        attempt(
+            outcome=RepairOutcome.STALE,
+            broker_state_updated_at_utc=None,
+            internal_state_after=None,
+            failure_code=RepairFailureCode.CLAIM_LOST,
+        )
+    conflict = skipped(
+        outcome=RepairOutcome.CONFLICT, failure_code=RepairFailureCode.CLAIM_LOST
+    )
+    assert conflict.failure_code is RepairFailureCode.CLAIM_LOST
 
 
 def test_execution_request_id_exists_exactly_for_execution_order_targets():
@@ -241,6 +310,7 @@ def test_execution_request_id_exists_exactly_for_execution_order_targets():
         reconciliation_internal_state=None,
         internal_revision=None,
         internal_state_before=None,
+        failure_code=RepairFailureCode.NOT_ELIGIBLE_BROKER_ONLY,
     )
     assert entry.execution_request_id is None
 
@@ -251,7 +321,7 @@ def test_an_execution_target_requires_the_observed_internal_state():
 
 
 def test_audit_error_is_optional_metadata():
-    entry = replace(attempt(), audit_error="finalize failed; reservation stays pending")
+    entry = replace(attempt(), audit_error="claim lost; reservation stays with its new owner")
     assert entry.audit_error is not None
     with pytest.raises(ValueError):
         attempt(audit_error="  ")
@@ -291,18 +361,17 @@ def test_has_audit_failures_reflects_attempt_metadata():
 def test_a_result_refuses_foreign_or_inconsistent_attempts():
     with pytest.raises(ValueError, match="belongs to run"):
         result(attempts=(attempt(run_id="run-other"),))
+    dry = attempt(
+        mode=RepairMode.DRY_RUN,
+        outcome=RepairOutcome.WOULD_APPLY,
+        owner_id=None,
+        claim_execution_id=None,
+        generation=None,
+        broker_state_updated_at_utc=None,
+        finalized_at_utc=None,
+    )
     with pytest.raises(ValueError, match="mode"):
-        result(
-            mode=RepairMode.DRY_RUN,
-            attempts=(
-                attempt(
-                    mode=RepairMode.DRY_RUN,
-                    outcome=RepairOutcome.WOULD_APPLY,
-                    applied_at_utc=None,
-                ),
-                skipped(attempt_id="attempt-2"),
-            ),
-        )
+        result(mode=RepairMode.DRY_RUN, attempts=(dry, skipped(attempt_id="attempt-2")))
     with pytest.raises(ValueError, match="unique"):
         result(attempts=(skipped(), skipped()))
     with pytest.raises(ValueError, match="finished_at_utc"):

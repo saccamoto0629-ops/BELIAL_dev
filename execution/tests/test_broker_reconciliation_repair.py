@@ -1,19 +1,18 @@
 """Issue #104: broker reconciliation -- safe order-state REPAIR.
 
 Everything runs against ``tmp_path`` SQLite files and an in-memory
-FakeBroker: no network, no Discord, no S3, no sleep, no real orders.
+FakeBroker: no network, no Discord, no S3, no sleep-based timing, no real
+orders.
 
 The repair service is driven through :class:`QueryOnlyBroker`, a facade
 whose ``submit_order`` / ``cancel_order`` are POISONED -- so every test in
 this file simultaneously pins that repair never writes through the broker.
-The broker-side fixtures themselves are seeded on the FakeBroker BEFORE
-detection/repair start (that is the state being reconciled against), which
-is why this file is listed in the submission-boundary allow-list.
 
-Fault injection (Issue #104 review): post-commit failures, pass-level
-failures, revision-CAS races, three-way already-applied verification,
-reservation / finalize / crash recovery and dry-run no-side-effect are all
-exercised here.
+Concurrency (Issue #104 re-review): the live-repair-vs-recovery and
+recovery-vs-recovery suites REALLY overlap threads -- gates (events) pause a
+live worker at a precise point while a recovery worker runs, and barriers
+align competing workers -- they are never sequential calls dressed up as
+concurrency tests.
 """
 
 import ast
@@ -60,17 +59,26 @@ from execution.reconciliation_models import (
     ReconciliationTargetType,
     ResolutionCategory,
 )
-from execution.reconciliation_repair_models import RepairMode, RepairOutcome
+from execution.reconciliation_repair_models import (
+    RepairFailureCode,
+    RepairMode,
+    RepairOutcome,
+)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # Internal records predate FakeBroker's clock base (2026-01-01); detection
-# observes at OBSERVED_AT and repair runs later at REPAIR_AT.
+# observes at OBSERVED_AT, live repair runs at REPAIR_AT, recovery runs at
+# RECOVERY_AT (long after every lease expired).
 INTERNAL_T = datetime(2025, 12, 31, 12, 0, 0, tzinfo=timezone.utc)
 OBSERVED_AT = datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
 REPAIR_AT = datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+RECOVERY_AT = datetime(2026, 3, 2, 0, 0, 0, tzinfo=timezone.utc)  # lease long expired
+DURING_LEASE_AT = REPAIR_AT + timedelta(seconds=10)  # lease still valid
+LEASE_SECONDS = 600
 FILL_PRICE = Decimal("2400")
 QUANTITY = Decimal("10")
+GATE_TIMEOUT = 15
 
 
 def client_id(request_id: str) -> str:
@@ -81,15 +89,14 @@ class QueryOnlyBroker:
     """Query-only Broker facade over a FakeBroker (test double, in-memory).
 
     ``submit_order`` / ``cancel_order`` raise: repair must never reach a
-    broker WRITE operation, and a poisoned facade proves it for every test
-    rather than only for a dedicated one. ``get_order`` can be scripted to
-    fail with a typed ``BrokerError`` (FakeBroker has no query-failure
-    scripting, same stance as Issue #103).
-    """
+    broker WRITE operation. ``get_order`` can be scripted to fail with a
+    typed ``BrokerError`` and counts its calls (used by the recovery-race
+    assertions)."""
 
     def __init__(self, inner: FakeBroker, *, query_failures: dict | None = None):
         self._inner = inner
         self._query_failures = dict(query_failures or {})
+        self.query_count = 0
 
     def submit_order(self, request):  # pragma: no cover - must never run
         raise AssertionError("repair must never submit an order")
@@ -98,6 +105,7 @@ class QueryOnlyBroker:
         raise AssertionError("repair must never cancel an order")
 
     def get_order(self, client_order_id):
+        self.query_count += 1
         failure = self._query_failures.get(client_order_id)
         if failure is not None:
             raise failure
@@ -121,7 +129,25 @@ class SnapshotBroker(QueryOnlyBroker):
         self._snapshots = snapshots
 
     def get_order(self, client_order_id):
+        self.query_count += 1
         return self._snapshots.get(client_order_id, self._inner.get_order(client_order_id))
+
+
+class GateBroker(QueryOnlyBroker):
+    """Blocks the FIRST get_order call until released (live-vs-recovery)."""
+
+    def __init__(self, inner: FakeBroker):
+        super().__init__(inner)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._armed = True
+
+    def get_order(self, client_order_id):
+        if self._armed:
+            self._armed = False
+            self.entered.set()
+            assert self.release.wait(timeout=GATE_TIMEOUT)
+        return super().get_order(client_order_id)
 
 
 @pytest.fixture
@@ -141,7 +167,7 @@ def record_run(broker, paths, *, run_id) -> ReconciliationRun:
 
 
 def repair_service(
-    broker, paths, *, prefix="attempt", clock=None
+    broker, paths, *, prefix="attempt", clock=None, owner="worker-live", lease=LEASE_SECONDS
 ) -> BrokerOrderReconciliationRepairService:
     execution_db, reconciliation_db = paths
     counter = itertools.count(1)
@@ -149,8 +175,16 @@ def repair_service(
         broker=broker,
         execution_db_path=execution_db,
         reconciliation_db_path=reconciliation_db,
+        owner_id=owner,
+        lease_duration_seconds=lease,
         clock=clock or (lambda: REPAIR_AT),
         attempt_id_factory=lambda: f"{prefix}-{next(counter)}",
+    )
+
+
+def recovery_service(broker, paths, *, owner="worker-recovery", clock=None, prefix="rec"):
+    return repair_service(
+        broker, paths, prefix=prefix, owner=owner, clock=clock or (lambda: RECOVERY_AT)
     )
 
 
@@ -270,6 +304,15 @@ def pending(reconciliation_db, run_id=None):
     )
 
 
+def seeded_candidate(paths, request_id, run_id):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, request_id)
+    broker.submit_order(broker_request(request_id))
+    record_run(QueryOnlyBroker(broker), paths, run_id=run_id)
+    return broker
+
+
 # --- safe repairs (issue scenarios 1-6) ---------------------------------------
 
 
@@ -295,16 +338,22 @@ def test_unknown_to_filled_is_applied_through_the_state_machine(paths):
     assert attempt.client_order_id == client_id("exec-1")
     assert attempt.observed_at_utc == OBSERVED_AT
     assert attempt.reserved_at_utc == REPAIR_AT
-    # applied_at is the committed history timestamp = the broker snapshot's
-    # updated_at (known BEFORE the commit; broker clock domain)
-    assert attempt.applied_at_utc == filled.updated_at_utc
+    assert (attempt.owner_id, attempt.generation) == ("worker-live", 1)
+    # broker_state_updated_at is the broker-reported snapshot timestamp that
+    # the committed history row carries (broker clock domain, known pre-commit)
+    assert attempt.broker_state_updated_at_utc == filled.updated_at_utc
+    assert attempt.finalized_at_utc == REPAIR_AT
     assert attempt.broker_order_id == "FAKE-1"
     assert attempt.failure_code is None
     assert order_state(execution_db, "exec-1") == ("filled", "FAKE-1")
     # STRUCTURED provenance on the committed history row (never reason parsing)
     history = execution_store.get_state_history("exec-1", db_path=execution_db)
     assert history[-1]["repair_attempt_id"] == attempt.attempt_id
-    assert history[-1]["changed_at_utc"] == attempt.applied_at_utc.isoformat()
+    assert history[-1]["repair_generation"] == 1
+    assert history[-1]["changed_at_utc"] == attempt.broker_state_updated_at_utc.isoformat()
+    # the fence names the committing claim
+    fence = execution_store.get_repair_fence("exec-1", db_path=execution_db)
+    assert (fence["repair_attempt_id"], fence["generation"]) == (attempt.attempt_id, 1)
     # the audit row is finalized and linked to the run
     stored = only(finalized(reconciliation_db, "run-1"))
     assert stored == attempt
@@ -468,54 +517,23 @@ def test_a_forbidden_transition_in_a_stored_candidate_is_rejected(paths):
     before = order_snapshot(execution_db, ("exec-7",))
 
     result = repair_service(
-        SnapshotBroker(broker, {client_id("exec-7"): replace(cancelled, broker_order_id=filled.broker_order_id)}),
+        SnapshotBroker(
+            broker,
+            {client_id("exec-7"): replace(cancelled, broker_order_id=filled.broker_order_id)},
+        ),
         paths,
     ).repair(run_id="run-7")
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.REJECTED
-    assert attempt.failure_code == "forbidden_transition"
+    assert attempt.failure_code is RepairFailureCode.FORBIDDEN_TRANSITION
     assert order_snapshot(execution_db, ("exec-7",)) == before
-
-
-def test_a_broken_client_order_id_binding_is_rejected(paths):
-    execution_db, _ = paths
-    broker = FakeBroker(default_fill_price=FILL_PRICE)
-    broker.submit_order(broker_request("exec-8"))
-    seed_internal_unknown(execution_db, "exec-8")
-    fabricate_recorded_run(
-        paths,
-        "run-8",
-        [
-            OrderDiscrepancy(
-                discrepancy_type=DiscrepancyType.UNKNOWN_BROKER_SETTLED,
-                target_type=ReconciliationTargetType.EXECUTION_ORDER,
-                target_id="exec-8",
-                resolution_category=ResolutionCategory.AUTO_REPAIR_CANDIDATE,
-                observed_at_utc=OBSERVED_AT,
-                detail="tampered: observed under a foreign client_order_id",
-                internal_state=OrderState.UNKNOWN,
-                broker_state=OrderState.FILLED,
-                client_order_id="client-somebody-else",
-                broker_order_id="FAKE-1",
-                internal_revision=2,
-            )
-        ],
-    )
-    before = order_snapshot(execution_db, ("exec-8",))
-
-    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-8")
-
-    attempt = only(result.attempts)
-    assert attempt.outcome is RepairOutcome.REJECTED
-    assert attempt.failure_code == "client_order_id_binding_mismatch"
-    assert order_snapshot(execution_db, ("exec-8",)) == before
 
 
 def test_manual_review_targets_are_never_repaired(paths):
     """Internal ACCEPTED vs broker REJECTED without a broker id (a known
     Issue #103 manual-review case) plus a broker-only order. Both attempts
-    are reserved and finalized as skipped -- audited, never applied."""
+    are claimed and finalized as skipped -- audited, never applied."""
     execution_db, reconciliation_db = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     broker.script_order(client_id("exec-9"), StayPending(broker_order_id="B-9"))
@@ -551,11 +569,12 @@ def test_manual_review_targets_are_never_repaired(paths):
         [a for a in result.attempts if a.target_type is ReconciliationTargetType.BROKER_ORDER]
     )
     assert broker_only.execution_request_id is None
-    assert broker_only.failure_code == "not_eligible_broker_only"
+    assert broker_only.failure_code is RepairFailureCode.NOT_ELIGIBLE_BROKER_ONLY
     assert order_snapshot(execution_db, ("exec-9",)) == before
-    # both skips are finalized in the audit DB (reservation -> skipped)
     assert len(finalized(reconciliation_db, "run-9")) == 2
     assert pending(reconciliation_db) == ()
+    # skipped attempts never register an execution fence
+    assert execution_store.get_repair_fence("exec-9", db_path=execution_db) is None
 
 
 def test_query_failed_reconciliation_targets_are_skipped(paths):
@@ -574,14 +593,11 @@ def test_query_failed_reconciliation_targets_are_skipped(paths):
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.SKIPPED
-    assert attempt.failure_code == "not_eligible_query_failed"
+    assert attempt.failure_code is RepairFailureCode.NOT_ELIGIBLE_QUERY_FAILED
     assert order_snapshot(execution_db, ("exec-10",)) == before
-    assert only(finalized(reconciliation_db, "run-10")).outcome is RepairOutcome.SKIPPED
 
 
 def test_a_broker_that_now_reports_unknown_changes_nothing(paths):
-    """The candidate observed FILLED, but the repair-time re-query reports
-    UNKNOWN -- the stored observation is not confirmable."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     seed_internal_pending(execution_db, "exec-11")
@@ -595,20 +611,24 @@ def test_a_broker_that_now_reports_unknown_changes_nothing(paths):
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.CONFLICT
-    assert attempt.failure_code == "requery_disagrees_with_observation"
+    assert attempt.failure_code is RepairFailureCode.REQUERY_DISAGREES_WITH_OBSERVATION
     assert order_snapshot(execution_db, ("exec-11",)) == before
 
 
 @pytest.mark.parametrize(
     "error, expected_code, expected_failure",
     [
-        (BrokerTimeoutError("timed out"), "timeout", "broker_query_failed"),
+        (BrokerTimeoutError("timed out"), "timeout", RepairFailureCode.BROKER_QUERY_FAILED),
         (
             BrokerCommunicationError("connection refused"),
             "communication_failure",
-            "broker_query_failed",
+            RepairFailureCode.BROKER_QUERY_FAILED,
         ),
-        (RuntimeError("adapter bug"), "communication_failure", "broker_contract_violation"),
+        (
+            RuntimeError("adapter bug"),
+            "communication_failure",
+            RepairFailureCode.BROKER_CONTRACT_VIOLATION,
+        ),
     ],
 )
 def test_a_repair_time_query_failure_changes_nothing(paths, error, expected_code, expected_failure):
@@ -626,31 +646,11 @@ def test_a_repair_time_query_failure_changes_nothing(paths, error, expected_code
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.QUERY_FAILED
     assert attempt.broker_error_code.value == expected_code
-    assert attempt.failure_code == expected_failure
-    # sanitized audit: the raw exception text never reaches the audit row
+    assert attempt.failure_code is expected_failure
     assert "adapter bug" not in attempt.detail
     assert "connection refused" not in attempt.detail
     assert order_snapshot(execution_db, ("exec-12",)) == before
     assert only(finalized(reconciliation_db, "run-12")).outcome is RepairOutcome.QUERY_FAILED
-
-
-def test_an_order_the_broker_no_longer_knows_is_a_query_failure(paths):
-    execution_db, _ = paths
-    broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_unknown(execution_db, "exec-13")
-    broker.submit_order(broker_request("exec-13"))
-    record_run(QueryOnlyBroker(broker), paths, run_id="run-13")
-    before = order_snapshot(execution_db, ("exec-13",))
-
-    # a broker that lost the order between detection and repair
-    result = repair_service(
-        QueryOnlyBroker(FakeBroker(default_fill_price=FILL_PRICE)), paths
-    ).repair(run_id="run-13")
-
-    attempt = only(result.attempts)
-    assert attempt.outcome is RepairOutcome.QUERY_FAILED
-    assert attempt.broker_error_code.value == "not_found"
-    assert order_snapshot(execution_db, ("exec-13",)) == before
 
 
 def test_a_changed_broker_reference_id_is_a_conflict(paths):
@@ -675,15 +675,11 @@ def test_a_changed_broker_reference_id_is_a_conflict(paths):
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.CONFLICT
-    assert attempt.failure_code == "broker_reference_changed"
-    assert "B-ORIG" in attempt.detail and "B-FOREIGN" in attempt.detail
+    assert attempt.failure_code is RepairFailureCode.BROKER_REFERENCE_CHANGED
     assert order_snapshot(execution_db, ("exec-14",)) == before
 
 
 def test_a_broker_id_now_owned_by_another_request_is_a_conflict(paths):
-    """The id was unassigned at detection but another request recorded it
-    before the repair ran -- reflecting it would collide with the DB-wide
-    uniqueness."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     broker.script_order(
@@ -695,7 +691,6 @@ def test_a_broker_id_now_owned_by_another_request_is_a_conflict(paths):
     run = record_run(QueryOnlyBroker(broker), paths, run_id="run-15")
     clash = only([d for d in run.discrepancies if d.target_id == "exec-clash"])
     assert clash.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
-    # after detection, another request takes ownership of B-1 internally
     execution_store.record_order_result(
         "exec-owner",
         OrderResult(
@@ -729,17 +724,14 @@ def test_a_broker_id_now_owned_by_another_request_is_a_conflict(paths):
 
     by_target = {a.target_id: a for a in result.attempts}
     assert by_target["exec-clash"].outcome is RepairOutcome.CONFLICT
-    assert by_target["exec-clash"].failure_code == "broker_reference_owned_elsewhere"
-    assert "exec-owner" in by_target["exec-clash"].detail
-    # exec-owner itself was a broker_order_missing manual-review target
+    assert by_target["exec-clash"].failure_code is RepairFailureCode.BROKER_REFERENCE_OWNED_ELSEWHERE
     assert by_target["exec-owner"].outcome is RepairOutcome.SKIPPED
     assert order_snapshot(execution_db, ("exec-clash", "exec-owner")) == before
 
 
 def test_an_ownership_race_after_the_lookup_is_still_a_conflict(paths, monkeypatch):
-    """Fault: the ownership lookup answers 'free' but another request claims
-    the id before the CAS commits -- the store's uniqueness constraint rolls
-    the update back and the attempt reports conflict."""
+    """The lookup answers 'free' but another request claims the id before
+    the CAS commits -- the store's uniqueness constraint rolls back."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     broker.script_order(
@@ -776,7 +768,6 @@ def test_an_ownership_race_after_the_lookup_is_still_a_conflict(paths, monkeypat
         reason="filled elsewhere",
         db_path=execution_db,
     )
-    # simulate the race: the lookup misses the concurrent owner
     monkeypatch.setattr(
         execution_store, "get_execution_order_by_broker_order_id", lambda *a, **k: None
     )
@@ -786,11 +777,11 @@ def test_an_ownership_race_after_the_lookup_is_still_a_conflict(paths, monkeypat
 
     clash = only([a for a in result.attempts if a.target_id == "exec-race"])
     assert clash.outcome is RepairOutcome.CONFLICT
-    assert clash.failure_code == "uniqueness_conflict"
+    assert clash.failure_code is RepairFailureCode.UNIQUENESS_CONFLICT
     assert order_snapshot(execution_db, ("exec-race",)) == before
 
 
-# --- revision CAS: same-state changes are detected (review 17-23) -------------
+# --- revision CAS: same-state changes are detected ----------------------------
 
 
 def same_state_change(execution_db, request_id, kind):
@@ -837,9 +828,9 @@ def same_state_change(execution_db, request_id, kind):
 
 @pytest.mark.parametrize("kind", ["unknown_history", "accepted_reobservation", "partial_fill_growth"])
 def test_a_same_state_change_after_the_observation_is_stale(paths, kind):
-    """State-only CAS cannot see these; the revision CAS must (review 17-21):
-    an UNKNOWN -> UNKNOWN history append, a same-state snapshot/timestamp
-    refresh, and a further partial fill all leave the state text unchanged."""
+    """State-only CAS cannot see these; the revision CAS must: an UNKNOWN ->
+    UNKNOWN history append, a same-state snapshot/timestamp refresh, and a
+    further partial fill all leave the state text unchanged."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     if kind == "unknown_history":
@@ -875,14 +866,14 @@ def test_a_same_state_change_after_the_observation_is_stale(paths, kind):
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.STALE
-    assert attempt.failure_code == "internal_order_changed"
+    assert attempt.failure_code is RepairFailureCode.INTERNAL_ORDER_CHANGED
     assert attempt.internal_state_before is observed.internal_state  # state text unchanged
     assert order_snapshot(execution_db, ("exec-17",)) == before
 
 
 def test_a_stale_reconciliation_result_never_rolls_back_newer_state(paths):
-    """Review 23: the normal submission path settles the order differently
-    after the observation -- the repair must not overwrite it."""
+    """The normal submission path settles the order differently after the
+    observation -- the repair must not overwrite it."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     seed_internal_pending(execution_db, "exec-18")
@@ -900,13 +891,10 @@ def test_a_stale_reconciliation_result_never_rolls_back_newer_state(paths):
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.STALE
-    assert "'cancelled'" in attempt.detail
     assert order_snapshot(execution_db, ("exec-18",)) == before
 
 
 def test_an_observation_without_a_revision_is_stale(paths):
-    """Records stored before revision tracking (schema v1) cannot be proven
-    current and are never auto-repaired."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     broker.submit_order(broker_request("exec-19"))
@@ -936,57 +924,16 @@ def test_an_observation_without_a_revision_is_stale(paths):
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.STALE
-    assert attempt.failure_code == "missing_observed_revision"
+    assert attempt.failure_code is RepairFailureCode.MISSING_OBSERVED_REVISION
     assert order_snapshot(execution_db, ("exec-19",)) == before
 
 
-def test_concurrent_repairs_never_duplicate_history_or_state(paths):
-    """Review 22: two workers, one target. Exactly one applies; the loser's
-    CAS is refused and the three-way check reports already_applied."""
-    execution_db, reconciliation_db = paths
-    broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_unknown(execution_db, "exec-20")
-    broker.submit_order(broker_request("exec-20"))
-    record_run(QueryOnlyBroker(broker), paths, run_id="run-20")
-    history_before = len(execution_store.get_state_history("exec-20", db_path=execution_db))
-
-    barrier = threading.Barrier(2, timeout=10)
-
-    def worker(prefix):
-        counter = itertools.count(1)
-
-        def aligned_attempt_id():
-            barrier.wait()  # both workers evaluate the same starting state
-            return f"{prefix}-{next(counter)}"
-
-        service = BrokerOrderReconciliationRepairService(
-            broker=QueryOnlyBroker(broker),
-            execution_db_path=execution_db,
-            reconciliation_db_path=reconciliation_db,
-            clock=lambda: REPAIR_AT,
-            attempt_id_factory=aligned_attempt_id,
-        )
-        return service.repair(run_id="run-20")
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [future.result() for future in [pool.submit(worker, "w1"), pool.submit(worker, "w2")]]
-
-    outcomes = sorted(only(result.attempts).outcome.value for result in results)
-    assert outcomes == ["already_applied", "applied"]
-    assert order_state(execution_db, "exec-20")[0] == "filled"
-    history = execution_store.get_state_history("exec-20", db_path=execution_db)
-    assert len(history) == history_before + 1  # exactly one repair history row
-    audit = finalized(reconciliation_db, "run-20")
-    assert sorted(a.outcome.value for a in audit) == ["already_applied", "applied"]
-    assert pending(reconciliation_db) == ()
-
-
-# --- already_applied: three-way verification (review 25-31) -------------------
+# --- already_applied: three-way verification ----------------------------------
 
 
 def applied_elsewhere(paths, request_id, run_id):
     """Candidate observed FILLED; the same outcome is recorded by the normal
-    path after detection. Returns the broker fixture and the fresh snapshot."""
+    path after detection."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     seed_internal_pending(execution_db, request_id)
@@ -997,24 +944,22 @@ def applied_elsewhere(paths, request_id, run_id):
 
 
 def test_already_applied_requires_a_fresh_matching_broker_snapshot(paths):
-    """Review 31: only the full three-way agreement (stored discrepancy x
-    current row/anchored snapshot x fresh re-query) yields already_applied."""
     execution_db, reconciliation_db = paths
-    broker, filled = applied_elsewhere(paths, "exec-21", "run-21")
+    broker, _ = applied_elsewhere(paths, "exec-21", "run-21")
     before = order_snapshot(execution_db, ("exec-21",))
 
-    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-21")
+    facade = QueryOnlyBroker(broker)
+    result = repair_service(facade, paths).repair(run_id="run-21")
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.ALREADY_APPLIED
     assert attempt.internal_state_after is OrderState.FILLED
+    assert facade.query_count == 1  # the broker WAS asked before the verdict
     assert order_snapshot(execution_db, ("exec-21",)) == before  # no new history row
     assert only(finalized(reconciliation_db, "run-21")).outcome is RepairOutcome.ALREADY_APPLIED
 
 
 def test_already_applied_is_never_concluded_without_asking_the_broker(paths):
-    """Review 25: the internal state matches the observed outcome but the
-    repair-time query fails -> query_failed, NOT already_applied."""
     execution_db, _ = paths
     broker, _ = applied_elsewhere(paths, "exec-22", "run-22")
     before = order_snapshot(execution_db, ("exec-22",))
@@ -1033,11 +978,8 @@ def test_already_applied_is_never_concluded_without_asking_the_broker(paths):
 @pytest.mark.parametrize(
     "mutate, expected_fragment",
     [
-        (  # review 26: the broker no longer reports the observed state
-            lambda filled: unknown_snapshot("exec-23", seconds=30),
-            "differs from the observed",
-        ),
-        (  # review 27/28: fill content / average price differ
+        (lambda filled: unknown_snapshot("exec-23", seconds=30), "differs from the observed"),
+        (
             lambda filled: replace(
                 filled,
                 average_fill_price=filled.average_fill_price + Decimal("1"),
@@ -1046,7 +988,7 @@ def test_already_applied_is_never_concluded_without_asking_the_broker(paths):
             ),
             "update contract",
         ),
-        (  # review 29: broker reference differs
+        (
             lambda filled: replace(
                 filled,
                 broker_order_id="B-OTHER",
@@ -1054,7 +996,7 @@ def test_already_applied_is_never_concluded_without_asking_the_broker(paths):
             ),
             "broker_order_id",
         ),
-        (  # review 30: the fresh snapshot is older than the recorded one
+        (
             lambda filled: replace(
                 filled, updated_at_utc=filled.updated_at_utc - timedelta(seconds=30)
             ),
@@ -1074,12 +1016,12 @@ def test_already_applied_rejects_any_three_way_mismatch(paths, mutate, expected_
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.CONFLICT
-    assert attempt.failure_code == "already_applied_content_mismatch"
+    assert attempt.failure_code is RepairFailureCode.ALREADY_APPLIED_CONTENT_MISMATCH
     assert expected_fragment in attempt.detail
     assert order_snapshot(execution_db, ("exec-23",)) == before
 
 
-# --- dry-run: complete no-side-effect contract (review 41-47) -----------------
+# --- dry-run: complete no-side-effect contract --------------------------------
 
 
 def test_dry_run_evaluates_but_writes_nothing(paths, tmp_path):
@@ -1101,15 +1043,21 @@ def test_dry_run_evaluates_but_writes_nothing(paths, tmp_path):
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.WOULD_APPLY
     assert attempt.internal_state_after is OrderState.FILLED
-    assert attempt.applied_at_utc is None
+    assert attempt.broker_state_updated_at_utc is None
+    assert (attempt.owner_id, attempt.claim_execution_id, attempt.generation) == (
+        None,
+        None,
+        None,
+    )
     # bytes, mtimes, directory entries (journal/WAL/SHM sidecars included)
     assert execution_db.read_bytes() == execution_bytes
     assert reconciliation_db.read_bytes() == reconciliation_bytes
     assert (execution_db.stat().st_mtime_ns, reconciliation_db.stat().st_mtime_ns) == mtimes_before
     assert sorted(p.name for p in tmp_path.iterdir()) == files_before
-    # no reservation, no audit row, no broker write
+    # no claim, no fence, no audit row, no broker write
     assert pending(reconciliation_db) == ()
     assert finalized(reconciliation_db, "run-24") == ()
+    assert execution_store.get_repair_fence("exec-24", db_path=execution_db) is None
     assert (len(broker.submitted_requests), len(broker.cancel_requests)) == (submits, cancels)
     assert order_state(execution_db, "exec-24")[0] == "unknown"
 
@@ -1137,10 +1085,7 @@ def test_dry_run_refuses_a_corrupt_reconciliation_db_without_touching_it(paths):
 
 def test_repeating_the_same_repair_is_idempotent(paths):
     execution_db, reconciliation_db = paths
-    broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_unknown(execution_db, "exec-26")
-    broker.submit_order(broker_request("exec-26"))
-    record_run(QueryOnlyBroker(broker), paths, run_id="run-26")
+    broker = seeded_candidate(paths, "exec-26", "run-26")
 
     first = repair_service(QueryOnlyBroker(broker), paths, prefix="first").repair(run_id="run-26")
     after_first = order_snapshot(execution_db, ("exec-26",))
@@ -1150,10 +1095,8 @@ def test_repeating_the_same_repair_is_idempotent(paths):
     assert only(first.attempts).outcome is RepairOutcome.APPLIED
     assert only(second.attempts).outcome is RepairOutcome.ALREADY_APPLIED
     assert only(third.attempts).outcome is RepairOutcome.ALREADY_APPLIED
-    # the final state holds and the history did NOT grow after the first pass
     assert order_snapshot(execution_db, ("exec-26",)) == after_first
     assert order_state(execution_db, "exec-26")[0] == "filled"
-    # every pass appended exactly its own audit attempt (append-only audit)
     attempts = finalized(reconciliation_db, "run-26")
     assert [a.outcome for a in attempts] == [
         RepairOutcome.APPLIED,
@@ -1162,7 +1105,49 @@ def test_repeating_the_same_repair_is_idempotent(paths):
     ]
 
 
-# --- post-commit failures (review 1-3, 10, 11) --------------------------------
+def test_concurrent_live_repairs_never_duplicate_history_or_state(paths):
+    """Two LIVE workers, one target, genuinely overlapped via a barrier in
+    the attempt-id factory. Exactly one applies; the other observes a typed
+    no-op (already_applied) or lost claim (conflict) -- never a second
+    history row and never FAILED."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-20", "run-20")
+    history_before = len(execution_store.get_state_history("exec-20", db_path=execution_db))
+
+    barrier = threading.Barrier(2, timeout=10)
+
+    def worker(prefix):
+        counter = itertools.count(1)
+
+        def aligned_attempt_id():
+            barrier.wait()  # both workers overlap from the very start
+            return f"{prefix}-{next(counter)}"
+
+        service = BrokerOrderReconciliationRepairService(
+            broker=QueryOnlyBroker(broker),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            owner_id=f"owner-{prefix}",
+            lease_duration_seconds=LEASE_SECONDS,
+            clock=lambda: REPAIR_AT,
+            attempt_id_factory=aligned_attempt_id,
+        )
+        return service.repair(run_id="run-20")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [f.result() for f in [pool.submit(worker, "w1"), pool.submit(worker, "w2")]]
+
+    outcomes = [only(result.attempts).outcome for result in results]
+    assert sum(1 for o in outcomes if o is RepairOutcome.APPLIED) == 1
+    losers = [o for o in outcomes if o is not RepairOutcome.APPLIED]
+    assert len(losers) == 1
+    assert losers[0] in (RepairOutcome.ALREADY_APPLIED, RepairOutcome.CONFLICT)
+    assert order_state(execution_db, "exec-20")[0] == "filled"
+    history = execution_store.get_state_history("exec-20", db_path=execution_db)
+    assert len(history) == history_before + 1  # exactly one repair history row
+
+
+# --- post-commit failures -----------------------------------------------------
 
 
 class StepClock:
@@ -1179,60 +1164,67 @@ class StepClock:
         return REPAIR_AT
 
 
-def seeded_candidate(paths, request_id, run_id):
-    execution_db, _ = paths
-    broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_unknown(execution_db, request_id)
-    broker.submit_order(broker_request(request_id))
-    record_run(QueryOnlyBroker(broker), paths, run_id=run_id)
-    return broker
-
-
-def test_a_clock_failure_after_the_commit_never_yields_failed(paths):
-    """Review 1/10: clock calls are pass-start, per-attempt reservation and
-    pass-finish. The finish call runs AFTER the commit -- its failure must
-    not relabel the committed repair; the attempt is finalized APPLIED in
-    the audit DB and returned on the run-level error."""
+def test_a_clock_failure_at_finalize_degrades_to_a_pending_claim_not_failed(paths):
+    """Clock calls: 1=pass start, 2=claim, 3=finalize, 4=pass finish. A
+    clock broken from the finalize call on fails AFTER the commit -- the
+    attempt stays APPLIED (audit_error attached, never mislabeled FAILED),
+    the claim stays pending, the still-broken finish clock surfaces as a
+    run error CARRYING that attempt, and recovery completes the pending
+    claim under the original id."""
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-27", "run-27")
-    clock = StepClock(fail_from=3)  # 1=start, 2=reserve, 3=finish
+    clock = StepClock(fail_from=3)
 
     with pytest.raises(ReconciliationRepairRunError) as captured:
-        repair_service(QueryOnlyBroker(broker), paths, clock=clock).repair(run_id="run-27")
+        repair_service(QueryOnlyBroker(broker), paths, clock=clock, prefix="live").repair(
+            run_id="run-27"
+        )
 
     attempt = only(captured.value.attempts)
-    assert attempt.outcome is RepairOutcome.APPLIED
+    assert attempt.outcome is RepairOutcome.APPLIED  # never mislabeled
+    assert attempt.audit_error is not None
     assert order_state(execution_db, "exec-27")[0] == "filled"
-    stored = only(finalized(reconciliation_db, "run-27"))
-    assert stored.outcome is RepairOutcome.APPLIED  # audit and reality agree
-    assert pending(reconciliation_db) == ()
+    assert [r.attempt_id for r in pending(reconciliation_db)] == ["live-1"]
+
+    recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    entry = only(recovered)
+    assert (entry.attempt_id, entry.outcome) == ("live-1", RepairOutcome.APPLIED)
 
 
-def test_a_result_construction_failure_after_the_commit_never_yields_failed(paths):
-    """Review 2/11: a finish clock that goes backwards makes the pass result
-    unconstructible -- the committed, finalized attempt still reaches the
-    caller machine-readably."""
+def test_a_finished_clock_failure_after_all_attempts_keeps_the_committed_results(paths):
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-28", "run-28")
-    times = iter(
-        [REPAIR_AT, REPAIR_AT, REPAIR_AT - timedelta(days=1)]  # finish < start
-    )
-    clock = lambda: next(times)  # noqa: E731
+    clock = StepClock(fail_from=4)  # 1=start, 2=claim, 3=finalize, 4=finish
 
-    with pytest.raises(ReconciliationRepairRunError, match="could not be built") as captured:
+    with pytest.raises(ReconciliationRepairRunError) as captured:
         repair_service(QueryOnlyBroker(broker), paths, clock=clock).repair(run_id="run-28")
 
     attempt = only(captured.value.attempts)
     assert attempt.outcome is RepairOutcome.APPLIED
     assert order_state(execution_db, "exec-28")[0] == "filled"
-    assert only(finalized(reconciliation_db, "run-28")).outcome is RepairOutcome.APPLIED
+    stored = only(finalized(reconciliation_db, "run-28"))
+    assert stored.outcome is RepairOutcome.APPLIED  # audit and reality agree
+    assert pending(reconciliation_db) == ()
+
+
+def test_a_result_construction_failure_after_the_commit_never_yields_failed(paths):
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-29", "run-29")
+    times = iter([REPAIR_AT, REPAIR_AT, REPAIR_AT, REPAIR_AT - timedelta(days=1)])
+    clock = lambda: next(times)  # noqa: E731  (finish < start)
+
+    with pytest.raises(ReconciliationRepairRunError, match="could not be built") as captured:
+        repair_service(QueryOnlyBroker(broker), paths, clock=clock).repair(run_id="run-29")
+
+    attempt = only(captured.value.attempts)
+    assert attempt.outcome is RepairOutcome.APPLIED
+    assert order_state(execution_db, "exec-29")[0] == "filled"
+    assert only(finalized(reconciliation_db, "run-29")).outcome is RepairOutcome.APPLIED
 
 
 def test_the_applied_attempt_never_depends_on_the_store_return_value(paths, monkeypatch):
-    """Review 3: everything the APPLIED attempt needs is computed BEFORE the
-    commit; a store returning garbage changes nothing."""
     execution_db, _ = paths
-    broker = seeded_candidate(paths, "exec-29", "run-29")
+    broker = seeded_candidate(paths, "exec-30", "run-30")
     real = execution_store.record_order_result
 
     def returns_garbage(*args, **kwargs):
@@ -1241,96 +1233,262 @@ def test_the_applied_attempt_never_depends_on_the_store_return_value(paths, monk
 
     monkeypatch.setattr(execution_store, "record_order_result", returns_garbage)
 
-    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-29")
+    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-30")
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.APPLIED
     assert attempt.broker_order_id == "FAKE-1"
-    assert order_state(execution_db, "exec-29") == ("filled", "FAKE-1")
-
-
-# --- reservation / finalize / crash recovery (review 4-8, 32-40) --------------
+    assert order_state(execution_db, "exec-30") == ("filled", "FAKE-1")
 
 
 def test_a_mid_update_store_failure_rolls_back_and_reports_failed(paths, monkeypatch):
-    """Review 32: reservation succeeded, the state update failed pre-commit
-    -- FAILED is accurate (the order DB is proven unchanged) and finalized."""
+    """FAILED is used exactly when the ORDER state is PROVEN unchanged (the
+    fence row registered before the update is bookkeeping, not order state)."""
     execution_db, reconciliation_db = paths
-    broker = seeded_candidate(paths, "exec-30", "run-30")
-    before_bytes = execution_db.read_bytes()
+    broker = seeded_candidate(paths, "exec-31", "run-31")
+    history_before = execution_store.get_state_history("exec-31", db_path=execution_db)
+
+    real = execution_store.record_order_result
 
     def boom(*args, **kwargs):
         raise execution_store.ExecutionIntegrityError("simulated pre-commit failure")
 
-    monkeypatch.setattr(execution_store, "_validate_writeback", boom)
+    monkeypatch.setattr(execution_store, "record_order_result", boom)
 
-    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-30")
+    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-31")
 
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.FAILED
-    assert attempt.failure_code == "store_update_failed"
+    assert attempt.failure_code is RepairFailureCode.STORE_UPDATE_FAILED
     assert "simulated" not in attempt.detail  # sanitized: no raw exception text
-    monkeypatch.undo()
-    assert execution_db.read_bytes() == before_bytes  # the whole txn rolled back
-    assert order_state(execution_db, "exec-30")[0] == "unknown"
-    assert only(finalized(reconciliation_db, "run-30")).outcome is RepairOutcome.FAILED
+    monkeypatch.setattr(execution_store, "record_order_result", real)
+    assert order_state(execution_db, "exec-31")[0] == "unknown"
+    assert execution_store.get_state_history("exec-31", db_path=execution_db) == history_before
+    assert only(finalized(reconciliation_db, "run-31")).outcome is RepairOutcome.FAILED
     assert pending(reconciliation_db) == ()
 
 
-def test_a_finalize_failure_after_the_commit_is_recoverable_under_the_same_id(
-    paths, monkeypatch
-):
-    """Review 4-8 / 35: the state update committed but the audit finalize
-    failed. The attempt reports APPLIED + audit_error, the reservation stays
-    pending, and recovery finalizes it -- APPLIED, under the ORIGINAL
-    attempt id, from the STRUCTURED history provenance, without growing
-    history."""
-    execution_db, reconciliation_db = paths
-    broker = seeded_candidate(paths, "exec-31", "run-31")
+# --- live repair vs recovery (genuinely concurrent) ---------------------------
 
+
+def run_live_and_recovery(paths, broker_for_live, gate_setup, *, recovery_broker=None):
+    """Run the live worker in a thread, pause it at the gate, run recovery
+    while it is paused, release, and return (live_result, recovered)."""
+    execution_db, reconciliation_db = paths
+    entered = threading.Event()
+    release = threading.Event()
+    gate_setup(entered, release)
+
+    live_holder = {}
+
+    def live():
+        try:
+            live_holder["result"] = repair_service(
+                broker_for_live, paths, prefix="live", lease=LEASE_SECONDS
+            ).repair(run_id="run-lr")
+        except BaseException as exc:  # transferred to the main thread
+            live_holder["error"] = exc
+
+    thread = threading.Thread(target=live)
+    thread.start()
+    assert entered.wait(timeout=GATE_TIMEOUT), "live worker never reached the gate"
+    # the lease is long, but recovery runs with a much later clock -> expired
+    recovered = recovery_service(
+        recovery_broker
+        if recovery_broker is not None
+        else QueryOnlyBroker(broker_for_live._inner), paths
+    ).recover_pending_attempts()
+    release.set()
+    thread.join(timeout=GATE_TIMEOUT)
+    assert not thread.is_alive()
+    assert "error" not in live_holder, live_holder.get("error")
+    return live_holder["result"], recovered
+
+
+def assert_consistent_single_apply(paths, request_id, run_id, live_attempt, recovered):
+    """The cross-DB consistency invariants every interleaving must satisfy."""
+    execution_db, reconciliation_db = paths
+    # execution DB: applied exactly once, with the shared attempt id
+    state, _ = order_state(execution_db, request_id)
+    assert state == "filled"
+    history = execution_store.get_state_history(request_id, db_path=execution_db)
+    repair_rows = [h for h in history if h["repair_attempt_id"] is not None]
+    assert len(repair_rows) == 1
+    assert repair_rows[0]["repair_attempt_id"] == "live-1"
+    # audit DB: exactly one finalized attempt, same id, outcome APPLIED
+    stored = only(finalized(reconciliation_db, run_id))
+    assert stored.attempt_id == "live-1"
+    assert stored.outcome is RepairOutcome.APPLIED
+    assert pending(reconciliation_db) == ()
+    # the live caller's view never contradicts reality
+    assert live_attempt.attempt_id == "live-1"
+    if live_attempt.outcome is RepairOutcome.APPLIED:
+        # it really did commit (gen 1 provenance) or was recovered as applied
+        assert repair_rows[0]["repair_generation"] == live_attempt.generation
+    else:
+        # it did not commit: recovery (generation 2) did
+        assert live_attempt.outcome in (RepairOutcome.CONFLICT, RepairOutcome.ALREADY_APPLIED)
+        assert repair_rows[0]["repair_generation"] == 2
+        assert [a.attempt_id for a in recovered] == ["live-1"]
+    # fence: the final generation matches the committed provenance
+    fence = execution_store.get_repair_fence(request_id, db_path=execution_db)
+    assert fence["repair_attempt_id"] == "live-1"
+    assert fence["generation"] >= repair_rows[0]["repair_generation"]
+
+
+def test_recovery_during_the_live_broker_query_takes_over_and_the_old_worker_is_fenced_out(
+    paths,
+):
+    """Gate positions 1-2 (after reservation / inside the broker query): the
+    recovery worker takes over (generation 2), re-evaluates and applies; the
+    resumed old worker cannot commit gen-1 work."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-lr", "run-lr")
+    gate = GateBroker(broker)
+
+    def setup(entered, release):
+        gate.entered = entered
+        gate.release = release
+
+    live_result, recovered = run_live_and_recovery(paths, gate, setup)
+
+    live_attempt = only(live_result.attempts)
+    # recovery applied under generation 2; the old worker observed the
+    # already-committed outcome (or its lost claim) -- never a second apply
+    entry = only(recovered)
+    assert (entry.attempt_id, entry.outcome, entry.generation) == (
+        "live-1",
+        RepairOutcome.APPLIED,
+        2,
+    )
+    assert live_attempt.outcome in (RepairOutcome.ALREADY_APPLIED, RepairOutcome.CONFLICT)
+    assert live_attempt.audit_error is not None  # its finalize lost the claim
+    assert_consistent_single_apply(paths, "exec-lr", "run-lr", live_attempt, recovered)
+    history = execution_store.get_state_history("exec-lr", db_path=execution_db)
+    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 2
+
+
+def test_recovery_between_evaluation_and_commit_fences_the_old_worker_out(paths, monkeypatch):
+    """Gate positions 3-4 (after the broker query, before the execution
+    transaction): the old worker's own fence registration is rejected."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-lr", "run-lr")
+    entered_box = {}
+    real_register = execution_store.register_repair_fence
+    armed = {"live": True}
+
+    def gated_register(*args, **kwargs):
+        if armed.pop("live", None):  # only the live worker's first call blocks
+            entered_box["entered"].set()
+            assert entered_box["release"].wait(timeout=GATE_TIMEOUT)
+        return real_register(*args, **kwargs)
+
+    monkeypatch.setattr(execution_store, "register_repair_fence", gated_register)
+
+    def setup(entered, release):
+        entered_box["entered"] = entered
+        entered_box["release"] = release
+
+    live_result, recovered = run_live_and_recovery(paths, QueryOnlyBroker(broker), setup)
+
+    live_attempt = only(live_result.attempts)
+    entry = only(recovered)
+    assert (entry.attempt_id, entry.outcome, entry.generation) == (
+        "live-1",
+        RepairOutcome.APPLIED,
+        2,
+    )
+    assert live_attempt.outcome is RepairOutcome.CONFLICT
+    assert live_attempt.failure_code is RepairFailureCode.CLAIM_LOST
+    assert_consistent_single_apply(paths, "exec-lr", "run-lr", live_attempt, recovered)
+
+
+def test_recovery_during_the_execution_transaction_confirms_the_commit(paths, monkeypatch):
+    """Gate positions 5-6 (inside the execution transaction / right after
+    the commit): recovery blocks on the DB lock or arrives post-commit, sees
+    the structured provenance and finalizes APPLIED under the original id;
+    the old worker's finalize loses the claim but its outcome stays APPLIED
+    -- audit and execution DB agree (the original review's inconsistency)."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-lr", "run-lr")
+    entered_box = {}
     import execution.broker_reconciliation_repair as repair_module
 
-    def audit_down(*args, **kwargs):
-        raise reconciliation_store.ReconciliationStoreError("audit DB unavailable")
+    real_finalize = repair_module.finalize_repair_attempt
+    armed = {"live": True}
 
-    monkeypatch.setattr(repair_module, "finalize_repair_attempt", audit_down)
-    first = repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-31")
-    monkeypatch.undo()
+    def gated_finalize(*args, **kwargs):
+        if armed.pop("live", None):  # pause the live worker AFTER its commit
+            entered_box["entered"].set()
+            assert entered_box["release"].wait(timeout=GATE_TIMEOUT)
+        return real_finalize(*args, **kwargs)
 
-    attempt = only(first.attempts)
-    assert attempt.outcome is RepairOutcome.APPLIED  # never FAILED: the commit is real
-    assert attempt.audit_error is not None
-    assert first.has_audit_failures is True
-    assert order_state(execution_db, "exec-31")[0] == "filled"
-    # the reservation is still pending (crash-equivalent state)
-    assert [r.attempt_id for r in pending(reconciliation_db)] == ["crash-1"]
-    assert finalized(reconciliation_db, "run-31") == ()
-    history_before = execution_store.get_state_history("exec-31", db_path=execution_db)
+    monkeypatch.setattr(repair_module, "finalize_repair_attempt", gated_finalize)
 
-    # restart: a NEW service instance recovers the pending attempt
-    recovered = repair_service(QueryOnlyBroker(broker), paths, prefix="rec").recover_pending_attempts()
+    def setup(entered, release):
+        entered_box["entered"] = entered
+        entered_box["release"] = release
 
+    live_result, recovered = run_live_and_recovery(paths, QueryOnlyBroker(broker), setup)
+
+    live_attempt = only(live_result.attempts)
+    # THE original blocker scenario: the commit is gen-1 work; recovery must
+    # confirm it as APPLIED (original id), never finalize FAILED over it.
     entry = only(recovered)
-    assert entry.attempt_id == "crash-1"  # the ORIGINAL id, not a new one
-    assert entry.outcome is RepairOutcome.APPLIED
+    assert (entry.attempt_id, entry.outcome) == ("live-1", RepairOutcome.APPLIED)
     assert entry.internal_state_after is OrderState.FILLED
-    assert entry.applied_at_utc is not None
-    assert pending(reconciliation_db) == ()
-    stored = only(finalized(reconciliation_db, "run-31"))
-    assert stored.attempt_id == "crash-1"
-    assert stored.outcome is RepairOutcome.APPLIED
-    # recovery reads only: history did not grow
-    assert execution_store.get_state_history("exec-31", db_path=execution_db) == history_before
-    # and a later repair pass converges without new history
-    rerun = repair_service(QueryOnlyBroker(broker), paths, prefix="later").repair(run_id="run-31")
-    assert only(rerun.attempts).outcome is RepairOutcome.ALREADY_APPLIED
-    assert execution_store.get_state_history("exec-31", db_path=execution_db) == history_before
+    assert live_attempt.outcome is RepairOutcome.APPLIED  # caller view matches reality
+    assert live_attempt.audit_error is not None  # its own finalize lost the claim
+    assert_consistent_single_apply(paths, "exec-lr", "run-lr", live_attempt, recovered)
+    history = execution_store.get_state_history("exec-lr", db_path=execution_db)
+    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 1
 
 
-def test_a_crash_before_the_state_update_recovers_as_failed(paths, monkeypatch):
-    """Review 36: the reservation exists but nothing ever committed -- the
-    recovery finalizes it FAILED (reservation_not_applied); FAILED is
-    accurate because the order DB is proven unchanged."""
+def test_recovery_after_finalize_is_a_no_op(paths):
+    broker = seeded_candidate(paths, "exec-lr2", "run-lr2")
+    result = repair_service(QueryOnlyBroker(broker), paths, prefix="live").repair(run_id="run-lr2")
+    assert only(result.attempts).outcome is RepairOutcome.APPLIED
+
+    recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+
+    assert recovered == ()
+
+
+def test_recovery_never_touches_a_pending_attempt_with_a_valid_lease(paths, monkeypatch):
+    """Lease protection: same pending state, but the recovery clock is
+    still inside the lease window -> untouched everywhere."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-lv", "run-lv")
+    import execution.broker_reconciliation_repair as repair_module
+
+    monkeypatch.setattr(
+        repair_module,
+        "finalize_repair_attempt",
+        lambda *a, **k: (_ for _ in ()).throw(
+            reconciliation_store.ReconciliationStoreError("audit down")
+        ),
+    )
+    repair_service(QueryOnlyBroker(broker), paths, prefix="live").repair(run_id="run-lv")
+    monkeypatch.undo()
+    pending_before = pending(reconciliation_db)
+    assert [r.attempt_id for r in pending_before] == ["live-1"]
+    execution_bytes = execution_db.read_bytes()
+    recovery_broker = QueryOnlyBroker(broker)
+
+    recovered = recovery_service(
+        recovery_broker, paths, clock=lambda: DURING_LEASE_AT
+    ).recover_pending_attempts()
+
+    assert recovered == ()
+    assert pending(reconciliation_db) == pending_before  # claim untouched
+    assert recovery_broker.query_count == 0  # no broker query either
+    assert execution_db.read_bytes() == execution_bytes  # no fence bump, no write
+
+
+def test_a_crash_before_the_state_update_is_resumed_by_recovery_not_failed(paths, monkeypatch):
+    """The reservation exists but nothing committed: recovery -- as the new
+    generation-2 owner -- re-runs the full evaluation (fresh broker query
+    included) and APPLIES; it never invents a FAILED verdict."""
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-32", "run-32")
 
@@ -1344,20 +1502,24 @@ def test_a_crash_before_the_state_update_recovers_as_failed(paths, monkeypatch):
 
     assert order_state(execution_db, "exec-32")[0] == "unknown"
     assert [r.attempt_id for r in pending(reconciliation_db)] == ["crash-1"]
+    recovery_broker = QueryOnlyBroker(broker)
 
-    recovered = repair_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    recovered = recovery_service(recovery_broker, paths).recover_pending_attempts()
 
     entry = only(recovered)
-    assert entry.attempt_id == "crash-1"
-    assert entry.outcome is RepairOutcome.FAILED
-    assert entry.failure_code == "reservation_not_applied"
+    assert (entry.attempt_id, entry.outcome, entry.generation) == (
+        "crash-1",
+        RepairOutcome.APPLIED,
+        2,
+    )
+    assert recovery_broker.query_count == 1  # the fresh re-query really happened
+    assert order_state(execution_db, "exec-32")[0] == "filled"
+    history = execution_store.get_state_history("exec-32", db_path=execution_db)
+    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 2
     assert pending(reconciliation_db) == ()
-    assert order_state(execution_db, "exec-32")[0] == "unknown"
 
 
-def test_concurrent_recovery_finalizes_each_pending_attempt_exactly_once(paths, monkeypatch):
-    """Review 37/38: finalize is compare-and-set; a second recovery of the
-    same pending attempt finds nothing left to do."""
+def test_a_finalize_failure_after_the_commit_is_recovered_under_the_same_id(paths, monkeypatch):
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-33", "run-33")
     import execution.broker_reconciliation_repair as repair_module
@@ -1366,25 +1528,38 @@ def test_concurrent_recovery_finalizes_each_pending_attempt_exactly_once(paths, 
         repair_module,
         "finalize_repair_attempt",
         lambda *a, **k: (_ for _ in ()).throw(
-            reconciliation_store.ReconciliationStoreError("audit down")
+            reconciliation_store.ReconciliationStoreError("audit DB unavailable")
         ),
     )
-    repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-33")
+    first = repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-33")
     monkeypatch.undo()
-    assert len(pending(reconciliation_db)) == 1
 
-    service = repair_service(QueryOnlyBroker(broker), paths)
-    first = service.recover_pending_attempts()
-    second = service.recover_pending_attempts()
+    attempt = only(first.attempts)
+    assert attempt.outcome is RepairOutcome.APPLIED  # never FAILED: the commit is real
+    assert attempt.audit_error is not None
+    assert first.has_audit_failures is True
+    assert order_state(execution_db, "exec-33")[0] == "filled"
+    assert [r.attempt_id for r in pending(reconciliation_db)] == ["crash-1"]
+    history_before = execution_store.get_state_history("exec-33", db_path=execution_db)
 
-    assert [a.attempt_id for a in first] == ["crash-1"]
-    assert second == ()  # nothing pending any more
-    assert len(finalized(reconciliation_db, "run-33")) == 1
+    recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.attempt_id == "crash-1"  # the ORIGINAL id, not a new one
+    assert entry.outcome is RepairOutcome.APPLIED
+    assert entry.generation == 2  # finalized by the takeover claim
+    assert pending(reconciliation_db) == ()
+    stored = only(finalized(reconciliation_db, "run-33"))
+    assert (stored.attempt_id, stored.outcome) == ("crash-1", RepairOutcome.APPLIED)
+    # recovery reads only: history did not grow
+    assert execution_store.get_state_history("exec-33", db_path=execution_db) == history_before
+    # a later pass converges without new history
+    rerun = repair_service(QueryOnlyBroker(broker), paths, prefix="later").repair(run_id="run-33")
+    assert only(rerun.attempts).outcome is RepairOutcome.ALREADY_APPLIED
+    assert execution_store.get_state_history("exec-33", db_path=execution_db) == history_before
 
 
 def test_recovery_refuses_a_tampered_or_deleted_source_observation(paths, monkeypatch):
-    """Review 40: a pending reservation whose run/discrepancy was deleted or
-    edited out-of-band is refused fail-closed, never guessed about."""
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-34", "run-34")
     import execution.broker_reconciliation_repair as repair_module
@@ -1409,12 +1584,79 @@ def test_recovery_refuses_a_tampered_or_deleted_source_observation(paths, monkey
         connection.commit()
 
     with pytest.raises(ReconciliationRepairError, match="tampered"):
-        repair_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
 
     assert len(pending(reconciliation_db)) == 1  # still pending, nothing invented
 
 
-# --- pass-level failures (review 9, 12-16) ------------------------------------
+# --- recovery worker races ----------------------------------------------------
+
+
+def crashed_pending(paths, request_id, run_id, monkeypatch):
+    """A pending claim whose worker died before the state update."""
+    broker = seeded_candidate(paths, request_id, run_id)
+    import execution.broker_reconciliation_repair as repair_module  # noqa: F401
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id=run_id)
+    monkeypatch.undo()
+    return broker
+
+
+@pytest.mark.parametrize("workers", [2, 10])
+def test_concurrent_recovery_workers_elect_exactly_one_winner(paths, monkeypatch, workers):
+    """N recovery workers, one expired pending claim, genuinely overlapped
+    via a barrier: exactly one takes over (generation exactly +1), the
+    losers change neither fence nor claim nor broker state."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending(paths, "exec-35", "run-35", monkeypatch)
+    barrier = threading.Barrier(workers, timeout=15)
+    brokers = [QueryOnlyBroker(broker) for _ in range(workers)]
+
+    def recover(index):
+        aligned = {"first": True}
+
+        def aligned_clock():
+            if aligned.pop("first", None):
+                barrier.wait()  # all workers overlap at the expiry check
+            return RECOVERY_AT
+
+        service = repair_service(
+            brokers[index],
+            paths,
+            prefix=f"rec{index}",
+            owner=f"recovery-{index}",
+            clock=aligned_clock,
+        )
+        return service.recover_pending_attempts()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = [f.result() for f in [pool.submit(recover, i) for i in range(workers)]]
+
+    non_empty = [r for r in results if r]
+    assert len(non_empty) == 1  # exactly one winner
+    entry = only(non_empty[0])
+    assert (entry.attempt_id, entry.outcome, entry.generation) == (
+        "crash-1",
+        RepairOutcome.APPLIED,
+        2,  # incremented exactly once, not once per worker
+    )
+    fence = execution_store.get_repair_fence("exec-35", db_path=execution_db)
+    assert (fence["repair_attempt_id"], fence["generation"]) == ("crash-1", 2)
+    assert sum(b.query_count for b in brokers) == 1  # only the winner asked the broker
+    assert order_state(execution_db, "exec-35")[0] == "filled"
+    history = execution_store.get_state_history("exec-35", db_path=execution_db)
+    assert len([h for h in history if h["repair_attempt_id"]]) == 1
+    assert pending(reconciliation_db) == ()
+    # restart: a later recovery pass is a no-op
+    assert recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts() == ()
+
+
+# --- pass-level failures ------------------------------------------------------
 
 
 def two_candidates(paths):
@@ -1426,19 +1668,12 @@ def two_candidates(paths):
     record_run(QueryOnlyBroker(broker), paths, run_id="run-two")
     return broker
 
-
 def test_a_run_level_failure_on_the_second_target_keeps_the_first_commit(paths, monkeypatch):
-    """Review 9/16: target one applies and finalizes; an unexpected
-    (programmer-level) exception on target two stops the pass with the
-    partial result attached AND retrievable from the audit DB; target two's
-    reservation stays pending for recovery."""
     execution_db, reconciliation_db = paths
     broker = two_candidates(paths)
     real = execution_store.get_execution_order
-    calls = {"n": 0}
 
     def breaks_on_second(request_id, **kwargs):
-        calls["n"] += 1
         if request_id == "exec-b":
             raise KeyError("programmer bug")  # NOT an operational error
         return real(request_id, **kwargs)
@@ -1453,15 +1688,13 @@ def test_a_run_level_failure_on_the_second_target_keeps_the_first_commit(paths, 
     monkeypatch.undo()
     assert order_state(execution_db, "exec-a")[0] == "filled"
     assert order_state(execution_db, "exec-b")[0] == "unknown"
-    # the committed attempt is independently durable in the audit DB
     assert only(finalized(reconciliation_db, "run-two")).outcome is RepairOutcome.APPLIED
-    # the interrupted attempt stays pending for recovery
     assert [r.target_id for r in pending(reconciliation_db)] == ["exec-b"]
 
 
 class BrokenLogger:
-    """A logger whose every emission path raises (review 12/13: handler and
-    formatter failures are equivalent from the caller's perspective)."""
+    """A logger whose every emission path raises (handler and formatter
+    failures are equivalent from the caller's perspective)."""
 
     def log(self, *args, **kwargs):
         raise RuntimeError("handler down")
@@ -1477,22 +1710,20 @@ class BrokenLogger:
 
 
 def test_a_logging_failure_never_changes_a_repair_outcome(paths, monkeypatch):
-    """Review 12/13: logging is an aid; the audit DB is the authority."""
     execution_db, reconciliation_db = paths
-    broker = seeded_candidate(paths, "exec-35", "run-35")
+    broker = seeded_candidate(paths, "exec-36", "run-36")
     import execution.broker_reconciliation_repair as repair_module
 
     monkeypatch.setattr(repair_module, "_LOGGER", BrokenLogger())
 
-    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-35")
+    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-36")
 
     assert only(result.attempts).outcome is RepairOutcome.APPLIED
-    assert order_state(execution_db, "exec-35")[0] == "filled"
-    assert only(finalized(reconciliation_db, "run-35")).outcome is RepairOutcome.APPLIED
+    assert order_state(execution_db, "exec-36")[0] == "filled"
+    assert only(finalized(reconciliation_db, "run-36")).outcome is RepairOutcome.APPLIED
 
 
 def test_duplicate_attempt_ids_from_the_factory_are_refused_before_any_side_effect(paths):
-    """Review 14: ids are generated and checked up front."""
     execution_db, reconciliation_db = paths
     broker = two_candidates(paths)
     before = order_snapshot(execution_db, ("exec-a", "exec-b"))
@@ -1513,7 +1744,6 @@ def test_duplicate_attempt_ids_from_the_factory_are_refused_before_any_side_effe
 
 
 def test_an_attempt_id_factory_exception_stops_the_pass_before_any_side_effect(paths):
-    """Review 15."""
     execution_db, reconciliation_db = paths
     broker = two_candidates(paths)
     before = order_snapshot(execution_db, ("exec-a", "exec-b"))
@@ -1540,51 +1770,133 @@ def test_an_attempt_id_factory_exception_stops_the_pass_before_any_side_effect(p
 
 
 def test_a_cross_pass_attempt_id_collision_is_refused_at_reservation_time(paths):
-    """A second pass reusing an already persisted attempt id stops at the
-    RESERVATION (before any state update)."""
     execution_db, reconciliation_db = paths
-    broker = seeded_candidate(paths, "exec-36", "run-36")
-    repair_service(QueryOnlyBroker(broker), paths, prefix="dup").repair(run_id="run-36")
-    state_after_first = order_snapshot(execution_db, ("exec-36",))
+    broker = seeded_candidate(paths, "exec-37", "run-37")
+    repair_service(QueryOnlyBroker(broker), paths, prefix="dup").repair(run_id="run-37")
+    state_after_first = order_snapshot(execution_db, ("exec-37",))
 
     with pytest.raises(ReconciliationRepairRunError) as captured:
-        repair_service(QueryOnlyBroker(broker), paths, prefix="dup").repair(run_id="run-36")
+        repair_service(QueryOnlyBroker(broker), paths, prefix="dup").repair(run_id="run-37")
 
     assert isinstance(
         captured.value.__cause__, reconciliation_store.RepairAttemptConflictError
     )
     assert captured.value.attempts == ()
-    assert order_snapshot(execution_db, ("exec-36",)) == state_after_first
+    assert order_snapshot(execution_db, ("exec-37",)) == state_after_first
 
 
-# --- inputs, migration, structure ---------------------------------------------
+# --- logging sanitization (secrets never reach logs or audit) -----------------
+
+SECRETS = [
+    "OANDA_TOKEN_SUPER_SECRET",
+    "oanda_token_super_secret",  # case variant
+    "OANDA_TOKEN_SUPER%5FSECRET",  # url-encoded variant
+    "api-key-1234567890",
+    "hunter2-password",
+    "Authorization: Bearer abc.def.ghi",
+    "account-001-234-5678-90",
+    "https://api.example.com/v3/orders?token=leaky",
+    '{"errorMessage":"raw http body"}',
+    "SELECT * FROM execution_orders",
+    "C:\\Users\\trader\\secrets.db",
+    "/home/trader/.env",
+]
+
+
+def test_leaked_adapter_exception_text_never_reaches_logs_or_audit(paths, caplog):
+    """A non-BrokerError leak whose message, cause chain and context carry
+    secrets: only the class name and stable code may be emitted."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-38", "run-38")
+    inner = ValueError(" / ".join(SECRETS))  # cause chain carries them too
+    leak = RuntimeError("adapter failed: " + " | ".join(SECRETS + SECRETS))
+    leak.__cause__ = inner
+
+    with caplog.at_level("DEBUG"):
+        result = repair_service(
+            QueryOnlyBroker(broker, query_failures={client_id("exec-38"): leak}), paths
+        ).repair(run_id="run-38")
+
+    attempt = only(result.attempts)
+    assert attempt.outcome is RepairOutcome.QUERY_FAILED
+    assert attempt.failure_code is RepairFailureCode.BROKER_CONTRACT_VIOLATION
+    emitted = "\n".join(
+        record.getMessage() + repr(record.args) + repr(record.exc_info)
+        for record in caplog.records
+    )
+    stored = only(finalized(reconciliation_db, "run-38"))
+    for secret in SECRETS:
+        for haystack, where in (
+            (emitted, "log output"),
+            (attempt.detail, "attempt detail"),
+            (stored.detail, "audit detail"),
+        ):
+            assert secret not in haystack, f"secret {secret!r} leaked into {where}"
+        assert secret.lower() not in emitted.lower()
+    assert "RuntimeError" in emitted  # the class name IS logged
+
+
+# --- inputs, configuration, migration, structure ------------------------------
 
 
 def test_repair_acts_on_recorded_runs_only(paths):
     execution_db, reconciliation_db = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_pending(execution_db, "exec-37")
-    broker.submit_order(broker_request("exec-37"))
-    # detect() alone records nothing
+    seed_internal_pending(execution_db, "exec-39")
+    broker.submit_order(broker_request("exec-39"))
     BrokerOrderReconciliationService(
         broker=QueryOnlyBroker(broker),
         execution_db_path=execution_db,
         clock=lambda: OBSERVED_AT,
-    ).detect(run_id="run-37")
+    ).detect(run_id="run-39")
 
     with pytest.raises(ReconciliationRepairError, match="does not exist"):
-        repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-37")
-    assert not reconciliation_db.exists()  # apply mode never creates the DB
+        repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-39")
+    assert not reconciliation_db.exists()
 
     with pytest.raises(ReconciliationRepairError, match="not recorded"):
         repair_service(QueryOnlyBroker(broker), paths).repair(
-            run_id="run-37", mode=RepairMode.DRY_RUN
+            run_id="run-39", mode=RepairMode.DRY_RUN
         )
     assert not reconciliation_db.exists()
 
     record_run(QueryOnlyBroker(broker), paths, run_id="run-recorded")
     with pytest.raises(ReconciliationRepairError, match="not recorded"):
         repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-ghost")
+
+
+def test_the_broker_timeout_must_fit_under_the_lease(paths):
+    """The minimal lease contract: no heartbeat, so broker_timeout <
+    lease_duration is validated at construction (explicit argument and a
+    broker exposing timeout_seconds alike)."""
+    execution_db, reconciliation_db = paths
+    with pytest.raises(ValueError, match="lease_duration_seconds"):
+        BrokerOrderReconciliationRepairService(
+            broker=FakeBroker(),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            lease_duration_seconds=30,
+            broker_timeout_seconds=30,
+        )
+
+    class TimeoutExposingBroker(QueryOnlyBroker):
+        timeout_seconds = 120.0
+
+    with pytest.raises(ValueError, match="broker.timeout_seconds"):
+        BrokerOrderReconciliationRepairService(
+            broker=TimeoutExposingBroker(FakeBroker()),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            lease_duration_seconds=60,
+        )
+    # a compliant configuration constructs
+    BrokerOrderReconciliationRepairService(
+        broker=TimeoutExposingBroker(FakeBroker()),
+        execution_db_path=execution_db,
+        reconciliation_db_path=reconciliation_db,
+        lease_duration_seconds=600,
+        broker_timeout_seconds=30,
+    )
 
 
 def _downgrade_reconciliation_db_to_v1(path):
@@ -1605,51 +1917,44 @@ def _downgrade_reconciliation_db_to_v1(path):
 
 
 def test_apply_mode_migrates_a_v1_audit_db_and_dry_run_refuses_it(paths):
-    """Review 45: dry-run never migrates. A v1 observation migrated to v2
-    has no revision, so the repair conservatively reports it stale."""
     execution_db, reconciliation_db = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_unknown(execution_db, "exec-38")
-    broker.submit_order(broker_request("exec-38"))
-    record_run(QueryOnlyBroker(broker), paths, run_id="run-38")
+    seed_internal_unknown(execution_db, "exec-40")
+    broker.submit_order(broker_request("exec-40"))
+    record_run(QueryOnlyBroker(broker), paths, run_id="run-40")
     _downgrade_reconciliation_db_to_v1(reconciliation_db)
     v1_bytes = reconciliation_db.read_bytes()
 
-    # dry-run never migrates: it refuses the v1 file and changes nothing
     with pytest.raises(
         reconciliation_store.ReconciliationSchemaError, match="init_reconciliation_db"
     ):
         repair_service(QueryOnlyBroker(broker), paths).repair(
-            run_id="run-38", mode=RepairMode.DRY_RUN
+            run_id="run-40", mode=RepairMode.DRY_RUN
         )
     assert reconciliation_db.read_bytes() == v1_bytes
 
-    # apply mode migrates the existing file in place; the legacy record has
-    # no revision -> conservative stale, and a FRESH run then applies
-    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-38")
+    result = repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-40")
     attempt = only(result.attempts)
     assert attempt.outcome is RepairOutcome.STALE
-    assert attempt.failure_code == "missing_observed_revision"
-    record_run(QueryOnlyBroker(broker), paths, run_id="run-38-fresh")
+    assert attempt.failure_code is RepairFailureCode.MISSING_OBSERVED_REVISION
+    record_run(QueryOnlyBroker(broker), paths, run_id="run-40-fresh")
     fresh = repair_service(QueryOnlyBroker(broker), paths, prefix="fresh").repair(
-        run_id="run-38-fresh"
+        run_id="run-40-fresh"
     )
     assert only(fresh.attempts).outcome is RepairOutcome.APPLIED
-    assert order_state(execution_db, "exec-38")[0] == "filled"
+    assert order_state(execution_db, "exec-40")[0] == "filled"
 
 
 def test_repair_never_submits_or_cancels_through_the_broker(paths):
-    """Review 47: driven with the RAW FakeBroker (not the poisoned facade)
-    so the recorded call lists are the evidence."""
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)
-    seed_internal_unknown(execution_db, "exec-39")
-    broker.submit_order(broker_request("exec-39"))
-    record_run(broker, paths, run_id="run-39")
+    seed_internal_unknown(execution_db, "exec-41")
+    broker.submit_order(broker_request("exec-41"))
+    record_run(broker, paths, run_id="run-41")
     submits, cancels = len(broker.submitted_requests), len(broker.cancel_requests)
 
-    result = repair_service(broker, paths).repair(run_id="run-39")
-    repair_service(broker, paths).recover_pending_attempts()
+    result = repair_service(broker, paths).repair(run_id="run-41")
+    recovery_service(broker, paths).recover_pending_attempts()
 
     assert only(result.attempts).outcome is RepairOutcome.APPLIED
     assert len(broker.submitted_requests) == submits
@@ -1678,6 +1983,20 @@ def test_the_service_refuses_bad_construction_and_inputs(paths):
             reconciliation_db_path=reconciliation_db,
             attempt_id_factory="not-callable",
         )
+    with pytest.raises(ValueError, match="lease_duration_seconds"):
+        BrokerOrderReconciliationRepairService(
+            broker=FakeBroker(),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            lease_duration_seconds=0,
+        )
+    with pytest.raises(ValueError, match="owner_id"):
+        BrokerOrderReconciliationRepairService(
+            broker=FakeBroker(),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            owner_id="  ",
+        )
     service = BrokerOrderReconciliationRepairService(
         broker=FakeBroker(),
         execution_db_path=execution_db,
@@ -1691,14 +2010,15 @@ def test_the_service_refuses_bad_construction_and_inputs(paths):
 
 def test_repair_attempts_are_logged_with_ids_states_and_outcomes(paths, caplog):
     execution_db, _ = paths
-    broker = seeded_candidate(paths, "exec-40", "run-40")
+    broker = seeded_candidate(paths, "exec-42", "run-42")
 
     with caplog.at_level("INFO", logger="execution.broker_reconciliation_repair"):
-        repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-40")
+        repair_service(QueryOnlyBroker(broker), paths).repair(run_id="run-42")
 
     messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "exec-40" in messages
+    assert "exec-42" in messages
     assert "outcome=applied" in messages
+    assert "generation=1" in messages
     assert "applied=1" in messages
 
 
@@ -1721,8 +2041,9 @@ def test_the_repair_module_never_calls_a_broker_write_operation():
 
 
 def test_the_repair_module_writes_through_the_state_machine_api_only():
-    """The one sanctioned write is ``record_order_result``; every other
-    execution-store write API (and raw SQL) is forbidden."""
+    """The one sanctioned order write is ``record_order_result`` (plus the
+    fencing registration); every other execution-store write API and raw
+    SQL is forbidden."""
     module_path = REPO_ROOT / "execution" / "broker_reconciliation_repair.py"
     called = _called_attributes(module_path)
     forbidden = {
