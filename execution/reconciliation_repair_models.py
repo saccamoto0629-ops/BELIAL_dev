@@ -136,6 +136,14 @@ class RepairOutcome(enum.Enum):
     this attempt: the store refused/failed before commit (its transaction
     rolled back) or a required read did not answer. Never used for an
     attempt whose state update committed.
+    ``BLOCKED``         -- the takeover protocol found a state it must NOT
+    resolve automatically (a fence ahead of the intent, a mismatched
+    identity, several active intents, a corrupt chain). Nothing is queried
+    and nothing is written to the order store; the attempt stays PENDING and
+    the durable record is the takeover intent row (status ``blocked`` with a
+    reason code and the observed generations / identities). Reported to the
+    caller so a human can act -- never a silent skip. APPLY mode only, and
+    never stored as a finalized attempt outcome.
     """
 
     APPLIED = "applied"
@@ -147,6 +155,7 @@ class RepairOutcome(enum.Enum):
     REJECTED = "rejected"
     QUERY_FAILED = "query_failed"
     FAILED = "failed"
+    BLOCKED = "blocked"
 
 
 class RepairFailureCode(enum.Enum):
@@ -187,6 +196,116 @@ class RepairFailureCode(enum.Enum):
     CAS_CONFLICT_UNRESOLVABLE = "cas_conflict_unresolvable"
     CLAIM_LOST = "claim_lost"
     REPAIR_FENCE_CONFLICT = "repair_fence_conflict"
+    # takeover protocol (re-review r4): reported with outcome BLOCKED
+    TAKEOVER_INTENT_MISSING = "takeover_intent_missing"
+    TAKEOVER_IDENTITY_MISMATCH = "takeover_identity_mismatch"
+    FENCE_AHEAD = "fence_ahead"
+    MULTIPLE_ACTIVE_INTENTS = "multiple_active_intents"
+    CLAIM_INTENT_MISMATCH = "claim_intent_mismatch"
+    FENCE_INTENT_MISMATCH = "fence_intent_mismatch"
+    TAKEOVER_PROTOCOL_CORRUPT = "takeover_protocol_corrupt"
+
+
+class TakeoverIntentStatus(enum.Enum):
+    """The CLOSED lifecycle of one durable takeover intent (r4 review).
+
+    ``PREPARED``        -- the intent is committed in the reconciliation DB
+    but nothing else has moved yet. This is what makes a takeover
+    RESTARTABLE: the identity (takeover id, target owner, target claim
+    execution id, target generation) is durable BEFORE the first cross-DB
+    side effect, so a worker that dies mid-protocol is resumed with the SAME
+    identity instead of inventing a new one.
+    ``FENCE_INSTALLED`` -- the execution DB fence carries exactly this
+    intent's identity.
+    ``CLAIM_PROMOTED``  -- the attempt's claim row carries exactly this
+    intent's identity (the takeover is now effective).
+    ``COMPLETED``       -- the attempt was finalized under this intent.
+    ``CANCELLED``       -- the takeover became UNNECESSARY before it took
+    effect: the attempt was finalized by the claim this intent meant to
+    replace (a slow-but-alive worker finished first). Nothing is wrong, the
+    intent simply never applies -- terminal, and never resumed.
+    ``BLOCKED``         -- the protocol found a state it must not resolve
+    automatically; a reason code and the observed generations / identities
+    are stored. Never resumed automatically.
+    """
+
+    PREPARED = "prepared"
+    FENCE_INSTALLED = "fence_installed"
+    CLAIM_PROMOTED = "claim_promoted"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    BLOCKED = "blocked"
+
+
+#: Statuses whose intent is still driving a takeover (at most one per attempt).
+ACTIVE_INTENT_STATUSES: frozenset[TakeoverIntentStatus] = frozenset(
+    {
+        TakeoverIntentStatus.PREPARED,
+        TakeoverIntentStatus.FENCE_INSTALLED,
+        TakeoverIntentStatus.CLAIM_PROMOTED,
+    }
+)
+
+#: Forward-only transition table. Re-applying the CURRENT status is an
+#: idempotent no-op (handled by the store); anything not listed here is
+#: refused, so a completed or blocked intent never moves again.
+ALLOWED_INTENT_TRANSITIONS: dict[TakeoverIntentStatus, frozenset[TakeoverIntentStatus]] = {
+    TakeoverIntentStatus.PREPARED: frozenset(
+        {
+            TakeoverIntentStatus.FENCE_INSTALLED,
+            TakeoverIntentStatus.CANCELLED,
+            TakeoverIntentStatus.BLOCKED,
+        }
+    ),
+    TakeoverIntentStatus.FENCE_INSTALLED: frozenset(
+        {
+            TakeoverIntentStatus.CLAIM_PROMOTED,
+            TakeoverIntentStatus.CANCELLED,
+            TakeoverIntentStatus.BLOCKED,
+        }
+    ),
+    TakeoverIntentStatus.CLAIM_PROMOTED: frozenset(
+        {TakeoverIntentStatus.COMPLETED, TakeoverIntentStatus.BLOCKED}
+    ),
+    TakeoverIntentStatus.COMPLETED: frozenset(),
+    TakeoverIntentStatus.CANCELLED: frozenset(),
+    TakeoverIntentStatus.BLOCKED: frozenset(),
+}
+
+
+class TakeoverBlockedReason(enum.Enum):
+    """Why a takeover was parked for a human -- CLOSED set (r4 review).
+
+    Stored on the intent row (DB CHECK generated from this enum) together
+    with the observed generations and fence identity, so an operator can see
+    exactly which inconsistency stopped the protocol.
+    """
+
+    FENCE_AHEAD = "fence_ahead"
+    FENCE_IDENTITY_MISMATCH = "fence_identity_mismatch"
+    ORPHAN_FENCE_WITHOUT_INTENT = "orphan_fence_without_intent"
+    CLAIM_AHEAD_OF_INTENT = "claim_ahead_of_intent"
+    CLAIM_IDENTITY_MISMATCH = "claim_identity_mismatch"
+    MULTIPLE_ACTIVE_INTENTS = "multiple_active_intents"
+    INTENT_SOURCE_MISMATCH = "intent_source_mismatch"
+    ATTEMPT_ALREADY_FINALIZED = "attempt_already_finalized"
+    PROTOCOL_CORRUPT = "protocol_corrupt"
+
+
+#: Which repair failure code each blocked reason is reported as.
+BLOCKED_REASON_FAILURE_CODES: dict[TakeoverBlockedReason, RepairFailureCode] = {
+    TakeoverBlockedReason.FENCE_AHEAD: RepairFailureCode.FENCE_AHEAD,
+    TakeoverBlockedReason.FENCE_IDENTITY_MISMATCH: RepairFailureCode.FENCE_INTENT_MISMATCH,
+    TakeoverBlockedReason.ORPHAN_FENCE_WITHOUT_INTENT: RepairFailureCode.TAKEOVER_INTENT_MISSING,
+    TakeoverBlockedReason.CLAIM_AHEAD_OF_INTENT: RepairFailureCode.CLAIM_INTENT_MISMATCH,
+    TakeoverBlockedReason.CLAIM_IDENTITY_MISMATCH: RepairFailureCode.CLAIM_INTENT_MISMATCH,
+    TakeoverBlockedReason.MULTIPLE_ACTIVE_INTENTS: RepairFailureCode.MULTIPLE_ACTIVE_INTENTS,
+    TakeoverBlockedReason.INTENT_SOURCE_MISMATCH: RepairFailureCode.TAKEOVER_IDENTITY_MISMATCH,
+    TakeoverBlockedReason.ATTEMPT_ALREADY_FINALIZED: (
+        RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT
+    ),
+    TakeoverBlockedReason.PROTOCOL_CORRUPT: RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
+}
 
 
 # Outcomes that carry the resulting/planned internal state.
@@ -254,6 +373,17 @@ _ALLOWED_FAILURE_CODES: dict[RepairOutcome, frozenset[RepairFailureCode]] = {
             RepairFailureCode.CAS_CONFLICT_UNRESOLVABLE,
         }
     ),
+    RepairOutcome.BLOCKED: frozenset(
+        {
+            RepairFailureCode.TAKEOVER_INTENT_MISSING,
+            RepairFailureCode.TAKEOVER_IDENTITY_MISMATCH,
+            RepairFailureCode.FENCE_AHEAD,
+            RepairFailureCode.MULTIPLE_ACTIVE_INTENTS,
+            RepairFailureCode.CLAIM_INTENT_MISMATCH,
+            RepairFailureCode.FENCE_INTENT_MISMATCH,
+            RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
+        }
+    ),
 }
 
 
@@ -267,6 +397,184 @@ def _require_optional_revision(value, field_name: str) -> None:
 def _require_generation(value, field_name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{field_name} must be an int >= 1, got {value!r}")
+
+
+def _require_takeover_id_for_generation(takeover_id, generation, *, subject: str) -> None:
+    """Generation 1 is the ORIGINAL claim (no takeover); every later
+    generation exists only because a durable takeover intent created it, so
+    its id must be carried with the claim."""
+    if generation == 1:
+        if takeover_id is not None:
+            raise ValueError(
+                f"{subject} at generation 1 is the original claim and carries no takeover_id"
+            )
+        return
+    if takeover_id is None:
+        raise ValueError(
+            f"{subject} at generation {generation} must name the takeover_id that created it"
+        )
+    _require_non_empty_str(takeover_id, "takeover_id")
+
+
+@dataclass(frozen=True)
+class RepairTakeoverIntent:
+    """A DURABLE takeover intent -- the source of truth for one takeover.
+
+    Committed to the reconciliation DB (``prepared``) BEFORE any cross-DB
+    side effect, so every later step -- execution-DB fence install,
+    reconciliation claim promotion, attempt finalize -- uses ONE identity
+    that survives a process death: ``takeover_id`` + ``target_owner_id`` +
+    ``target_claim_execution_id`` + ``target_generation``. A restarted
+    worker LOADS the active intent and continues it; it never mints a new
+    identity, and no step ever accepts a different one.
+
+    ``source_*`` pins the claim being replaced (the CAS precondition), and
+    ``target_generation`` is always ``source_generation + 1``. Rows are kept
+    forever (completed / blocked included) as the audit trail of the
+    identity chain.
+    """
+
+    takeover_id: str
+    repair_attempt_id: str
+    source_generation: int
+    target_generation: int
+    source_owner_id: str
+    source_claim_execution_id: str
+    target_owner_id: str
+    target_claim_execution_id: str
+    lease_expires_at_utc: datetime
+    status: TakeoverIntentStatus
+    created_at_utc: datetime
+    fence_installed_at_utc: datetime | None = None
+    claim_promoted_at_utc: datetime | None = None
+    completed_at_utc: datetime | None = None
+    cancelled_at_utc: datetime | None = None
+    blocked_at_utc: datetime | None = None
+    blocked_reason: TakeoverBlockedReason | None = None
+    observed_claim_generation: int | None = None
+    observed_fence_generation: int | None = None
+    observed_fence_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.takeover_id, "takeover_id")
+        _require_non_empty_str(self.repair_attempt_id, "repair_attempt_id")
+        _require_generation(self.source_generation, "source_generation")
+        _require_generation(self.target_generation, "target_generation")
+        if self.target_generation != self.source_generation + 1:
+            raise ValueError(
+                "target_generation must be source_generation + 1, got "
+                f"{self.source_generation} -> {self.target_generation}"
+            )
+        for name in (
+            "source_owner_id",
+            "source_claim_execution_id",
+            "target_owner_id",
+            "target_claim_execution_id",
+        ):
+            _require_non_empty_str(getattr(self, name), name)
+        if self.target_claim_execution_id == self.source_claim_execution_id:
+            raise ValueError(
+                "target_claim_execution_id must differ from the claim it replaces "
+                "(a takeover is a NEW execution of the attempt)"
+            )
+        if not isinstance(self.status, TakeoverIntentStatus):
+            raise ValueError(f"status must be a TakeoverIntentStatus, got {self.status!r}")
+        _require_utc(self.created_at_utc, "created_at_utc")
+        _require_utc(self.lease_expires_at_utc, "lease_expires_at_utc")
+        if self.lease_expires_at_utc <= self.created_at_utc:
+            raise ValueError(
+                "lease_expires_at_utc must lie after created_at_utc: "
+                f"{self.created_at_utc.isoformat()} -> {self.lease_expires_at_utc.isoformat()}"
+            )
+        for name in (
+            "fence_installed_at_utc",
+            "claim_promoted_at_utc",
+            "completed_at_utc",
+            "cancelled_at_utc",
+            "blocked_at_utc",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _require_utc(value, name)
+                if value < self.created_at_utc:
+                    raise ValueError(f"{name} must not precede created_at_utc")
+        if self.blocked_reason is not None and not isinstance(
+            self.blocked_reason, TakeoverBlockedReason
+        ):
+            raise ValueError(
+                f"blocked_reason must be a TakeoverBlockedReason or None, got "
+                f"{self.blocked_reason!r}"
+            )
+        if self.observed_fence_identity is not None:
+            _require_non_empty_str(self.observed_fence_identity, "observed_fence_identity")
+        for name in ("observed_claim_generation", "observed_fence_generation"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_generation(value, name)
+
+        # status <-> timestamp consistency (forward-only, no gaps)
+        is_blocked = self.status is TakeoverIntentStatus.BLOCKED
+        if is_blocked != (self.blocked_at_utc is not None):
+            raise ValueError("blocked_at_utc must be set exactly for blocked intents")
+        if is_blocked != (self.blocked_reason is not None):
+            raise ValueError("blocked_reason must be set exactly for blocked intents")
+        if not is_blocked and (
+            self.observed_claim_generation is not None
+            or self.observed_fence_generation is not None
+            or self.observed_fence_identity is not None
+        ):
+            raise ValueError("observed_* diagnostics belong to blocked intents only")
+        if (self.status is TakeoverIntentStatus.COMPLETED) != (self.completed_at_utc is not None):
+            raise ValueError("completed_at_utc must be set exactly for completed intents")
+        if (self.status is TakeoverIntentStatus.CANCELLED) != (self.cancelled_at_utc is not None):
+            raise ValueError("cancelled_at_utc must be set exactly for cancelled intents")
+        reached_fence = self.status in (
+            TakeoverIntentStatus.FENCE_INSTALLED,
+            TakeoverIntentStatus.CLAIM_PROMOTED,
+            TakeoverIntentStatus.COMPLETED,
+        )
+        if reached_fence and self.fence_installed_at_utc is None:
+            raise ValueError(f"status {self.status.value!r} requires fence_installed_at_utc")
+        reached_claim = self.status in (
+            TakeoverIntentStatus.CLAIM_PROMOTED,
+            TakeoverIntentStatus.COMPLETED,
+        )
+        if reached_claim and self.claim_promoted_at_utc is None:
+            raise ValueError(f"status {self.status.value!r} requires claim_promoted_at_utc")
+        if self.status is TakeoverIntentStatus.PREPARED and (
+            self.fence_installed_at_utc is not None or self.claim_promoted_at_utc is not None
+        ):
+            raise ValueError("a prepared intent has not installed a fence or promoted a claim")
+        if (
+            self.status is TakeoverIntentStatus.FENCE_INSTALLED
+            and self.claim_promoted_at_utc is not None
+        ):
+            raise ValueError("a fence_installed intent has not promoted a claim yet")
+        if (
+            self.claim_promoted_at_utc is not None
+            and self.fence_installed_at_utc is not None
+            and self.claim_promoted_at_utc < self.fence_installed_at_utc
+        ):
+            raise ValueError("claim_promoted_at_utc must not precede fence_installed_at_utc")
+        if (
+            self.completed_at_utc is not None
+            and self.claim_promoted_at_utc is not None
+            and self.completed_at_utc < self.claim_promoted_at_utc
+        ):
+            raise ValueError("completed_at_utc must not precede claim_promoted_at_utc")
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in ACTIVE_INTENT_STATUSES
+
+    def fence_identity(self) -> str:
+        """The identity string recorded as ``observed_fence_identity`` when a
+        foreign fence blocks a takeover (stable, no free text)."""
+        return (
+            f"attempt={self.repair_attempt_id} generation={self.target_generation} "
+            f"takeover={self.takeover_id} claim={self.target_claim_execution_id} "
+            f"owner={self.target_owner_id}"
+        )
 
 
 @dataclass(frozen=True)
@@ -291,6 +599,7 @@ class RepairAttemptReservation:
     generation: int
     lease_expires_at_utc: datetime
     last_claimed_at_utc: datetime
+    takeover_id: str | None = None
     execution_request_id: str | None = None
     client_order_id: str | None = None
     reconciliation_internal_state: OrderState | None = None
@@ -311,6 +620,9 @@ class RepairAttemptReservation:
         _require_non_empty_str(self.owner_id, "owner_id")
         _require_non_empty_str(self.claim_execution_id, "claim_execution_id")
         _require_generation(self.generation, "generation")
+        _require_takeover_id_for_generation(
+            self.takeover_id, self.generation, subject="a reservation"
+        )
         _require_utc(self.lease_expires_at_utc, "lease_expires_at_utc")
         _require_utc(self.last_claimed_at_utc, "last_claimed_at_utc")
         if self.lease_expires_at_utc <= self.last_claimed_at_utc:
@@ -370,6 +682,7 @@ class OrderRepairAttempt:
     owner_id: str | None = None
     claim_execution_id: str | None = None
     generation: int | None = None
+    takeover_id: str | None = None
     execution_request_id: str | None = None
     client_order_id: str | None = None
     reconciliation_internal_state: OrderState | None = None
@@ -440,13 +753,19 @@ class OrderRepairAttempt:
             _require_non_empty_str(self.owner_id, "owner_id")
             _require_non_empty_str(self.claim_execution_id, "claim_execution_id")
             _require_generation(self.generation, "generation")
+            _require_takeover_id_for_generation(
+                self.takeover_id, self.generation, subject="an attempt"
+            )
         else:
             if (
                 self.owner_id is not None
                 or self.claim_execution_id is not None
                 or self.generation is not None
+                or self.takeover_id is not None
             ):
-                raise ValueError("dry-run attempts carry no claim (owner/claim/generation)")
+                raise ValueError(
+                    "dry-run attempts carry no claim (owner/claim/generation/takeover)"
+                )
 
         is_execution_target = self.target_type is ReconciliationTargetType.EXECUTION_ORDER
         if is_execution_target != (self.execution_request_id is not None):

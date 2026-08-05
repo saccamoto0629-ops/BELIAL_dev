@@ -189,6 +189,7 @@ import logging
 import os
 import sqlite3
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -277,9 +278,21 @@ _FENCE_COLUMNS: tuple[str, ...] = (
     "execution_request_id",
     "repair_attempt_id",
     "generation",
+    "takeover_id",
     "owner_id",
     "claim_execution_id",
     "updated_at_utc",
+)
+#: The identity columns a repair commit must match EXACTLY (r4 review): the
+#: attempt id and generation alone are NOT enough -- the takeover id and the
+#: claim execution id are what distinguish two executions of the same
+#: generation, so they are part of the fencing token.
+_FENCE_IDENTITY_COLUMNS: tuple[str, ...] = (
+    "repair_attempt_id",
+    "generation",
+    "takeover_id",
+    "owner_id",
+    "claim_execution_id",
 )
 REQUIRED_ORDER_COLUMNS: frozenset[str] = frozenset(_ORDER_COLUMNS)
 REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
@@ -357,14 +370,78 @@ class ExecutionRepairFenceConflictError(ExecutionStoreError):
     """The caller's repair fencing token is not the currently authorized one
     (Issue #104 re-review).
 
-    Raised inside the ``record_order_result`` transaction when the caller
-    supplies repair provenance whose (attempt_id, generation) does not match
-    the order's ``execution_repair_fences`` row -- i.e. its claim was taken
-    over (generation moved on) or a newer attempt now owns the order. Also
-    raised by :func:`register_repair_fence` when a stale registration cannot
-    take the fence. The transaction rolls back and the DB is untouched; the
-    caller classifies its work as a typed lost-claim result, never as
-    applied."""
+    Raised inside the ``record_order_result`` transaction when the supplied
+    :class:`RepairFenceToken` does not match the order's
+    ``execution_repair_fences`` row in FULL -- attempt id, generation,
+    takeover id, owner and claim execution id -- i.e. the claim was taken
+    over, a different execution of the same generation holds the fence, or a
+    newer attempt owns the order. Also raised by
+    :func:`register_repair_fence` when a registration may not take the
+    fence. The transaction rolls back and the DB is untouched; the caller
+    classifies its work as a typed lost-claim result, never as applied."""
+
+
+@dataclass(frozen=True)
+class RepairFenceToken:
+    """The COMPLETE identity of a repair execution (Issue #104 re-review r4).
+
+    One object carries the identity through both stores, so the fence, the
+    state update and the audit row can never drift apart: the reconciliation
+    DB's durable takeover intent mints it, :func:`register_repair_fence`
+    installs it and :func:`record_order_result` re-verifies it inside its
+    own transaction.
+
+    ``takeover_id`` is None exactly at ``generation`` 1 (the original claim,
+    which no takeover created) and required for every later generation --
+    that is what makes two executions of the same attempt and generation
+    distinguishable, which an (attempt id, generation) pair alone cannot do.
+    """
+
+    repair_attempt_id: str
+    generation: int
+    owner_id: str
+    claim_execution_id: str
+    takeover_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.repair_attempt_id, "repair_attempt_id")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 1
+        ):
+            raise ValueError(f"generation must be an int >= 1, got {self.generation!r}")
+        _require_non_empty_str(self.owner_id, "owner_id")
+        _require_non_empty_str(self.claim_execution_id, "claim_execution_id")
+        if self.generation == 1:
+            if self.takeover_id is not None:
+                raise ValueError(
+                    "generation 1 is the original claim and carries no takeover_id"
+                )
+        else:
+            if self.takeover_id is None:
+                raise ValueError(
+                    f"generation {self.generation} exists only because of a takeover and "
+                    "must carry its takeover_id"
+                )
+            _require_non_empty_str(self.takeover_id, "takeover_id")
+
+    def identity(self) -> tuple:
+        return (
+            self.repair_attempt_id,
+            self.generation,
+            self.takeover_id,
+            self.owner_id,
+            self.claim_execution_id,
+        )
+
+    def describe(self) -> str:
+        """Stable, secret-free rendering for error messages and audits."""
+        return (
+            f"(attempt {self.repair_attempt_id!r}, generation {self.generation}, "
+            f"takeover {self.takeover_id!r}, claim {self.claim_execution_id!r}, "
+            f"owner {self.owner_id!r})"
+        )
 
 
 class ExecutionOrderStateConflictError(ExecutionStoreError):
@@ -493,9 +570,11 @@ def _create_fences_table_sql() -> str:
                 CHECK (trim(execution_request_id) <> ''),
             repair_attempt_id TEXT NOT NULL CHECK (trim(repair_attempt_id) <> ''),
             generation INTEGER NOT NULL CHECK (generation >= 1),
+            takeover_id TEXT CHECK (takeover_id IS NULL OR trim(takeover_id) <> ''),
             owner_id TEXT NOT NULL CHECK (trim(owner_id) <> ''),
             claim_execution_id TEXT NOT NULL CHECK (trim(claim_execution_id) <> ''),
-            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00')
+            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00'),
+            CHECK ((generation = 1) = (takeover_id IS NULL))
         ) WITHOUT ROWID
     """
 
@@ -1863,8 +1942,7 @@ def record_order_result(
     previous_result: OrderResult | None = None,
     expected_current_state: OrderState | None = None,
     expected_revision: int | None = None,
-    repair_attempt_id: str | None = None,
-    repair_generation: int | None = None,
+    repair_fence: RepairFenceToken | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Record a full broker ``OrderResult`` snapshot for this order.
@@ -1901,18 +1979,20 @@ def record_order_result(
       TOCTOU window COMPLETELY: a state-only comparison cannot see a
       concurrent same-state change (an UNKNOWN -> UNKNOWN record, a further
       partial fill, a snapshot refresh), the revision can.
-    - ``repair_attempt_id`` + ``repair_generation`` (Issue #104, always
-      together) record STRUCTURED repair provenance on the appended history
-      row AND make the update FENCED: inside this same transaction the
-      order's ``execution_repair_fences`` row must name exactly this
-      (attempt_id, generation) -- otherwise
-      :class:`ExecutionRepairFenceConflictError` rolls everything back. A
-      worker whose claim was taken over (its lease expired and a recovery
-      worker incremented the generation) therefore cannot commit, even
-      while the order's state and revision still match. The partial UNIQUE
-      index additionally lets one attempt commit at most one history row
-      DB-wide, and recovery attributes an applied repair by these columns
-      -- never by parsing the human-readable reason string.
+    - ``repair_fence`` (Issue #104, a :class:`RepairFenceToken`) records
+      STRUCTURED repair provenance on the appended history row AND makes the
+      update FENCED: inside this same transaction the order's
+      ``execution_repair_fences`` row must match the token in FULL --
+      attempt id, generation, TAKEOVER ID, owner and claim execution id --
+      otherwise :class:`ExecutionRepairFenceConflictError` rolls everything
+      back. Attempt id and generation ALONE are deliberately not enough: two
+      executions of the same generation (a worker that died mid-takeover and
+      the worker that resumed it) are distinguished only by the takeover /
+      claim execution ids. A worker whose claim was taken over therefore
+      cannot commit, even while the order's state and revision still match.
+      The partial UNIQUE index additionally lets one attempt commit at most
+      one history row DB-wide, and recovery attributes an applied repair by
+      the history's provenance columns -- never by parsing the reason string.
     """
     if not isinstance(result, OrderResult):
         raise ValueError(f"result must be an OrderResult, got {result!r}")
@@ -1931,49 +2011,43 @@ def record_order_result(
         raise ValueError(
             f"expected_revision must be a non-negative int or None, got {expected_revision!r}"
         )
-    if repair_attempt_id is not None:
-        _require_non_empty_str(repair_attempt_id, "repair_attempt_id")
-    if (repair_attempt_id is None) != (repair_generation is None):
-        raise ValueError(
-            "repair_attempt_id and repair_generation must be supplied together "
-            "(the fencing token is the pair)"
-        )
-    if repair_generation is not None and (
-        isinstance(repair_generation, bool)
-        or not isinstance(repair_generation, int)
-        or repair_generation < 1
-    ):
-        raise ValueError(f"repair_generation must be an int >= 1, got {repair_generation!r}")
+    if repair_fence is not None and not isinstance(repair_fence, RepairFenceToken):
+        raise ValueError(f"repair_fence must be a RepairFenceToken or None, got {repair_fence!r}")
+    repair_attempt_id = None if repair_fence is None else repair_fence.repair_attempt_id
+    repair_generation = None if repair_fence is None else repair_fence.generation
     _require_non_empty_str(reason, "reason")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
 
-        if repair_attempt_id is not None:
+        if repair_fence is not None:
             # FENCE check (Issue #104 re-review): the currently authorized
-            # repair claim for this order -- registered / taken over via
-            # register_repair_fence -- must be exactly this (attempt,
-            # generation). Verified INSIDE the update transaction, so a
-            # takeover between the caller's read and this commit is always
-            # detected, state/revision equality notwithstanding.
+            # repair execution for this order -- installed via
+            # register_repair_fence from a durable takeover intent -- must
+            # match this token in FULL (attempt, generation, takeover id,
+            # owner, claim execution id). Verified INSIDE the update
+            # transaction, so a takeover between the caller's read and this
+            # commit is always detected, state/revision equality
+            # notwithstanding.
             fence = connection.execute(
-                f"SELECT repair_attempt_id, generation FROM {FENCES_TABLE} "
+                f"SELECT {', '.join(_FENCE_IDENTITY_COLUMNS)} FROM {FENCES_TABLE} "
                 "WHERE execution_request_id = ?",
                 (execution_request_id,),
             ).fetchone()
-            if (
-                fence is None
-                or fence["repair_attempt_id"] != repair_attempt_id
-                or fence["generation"] != repair_generation
-            ):
+            if fence is None or tuple(fence) != repair_fence.identity():
                 raise ExecutionRepairFenceConflictError(
                     f"repair update for execution order {execution_request_id!r} carries "
-                    f"fencing token ({repair_attempt_id!r}, generation {repair_generation}) "
-                    "but the order's authorized fence is "
+                    f"the fencing token {repair_fence.describe()} but the order's "
+                    "authorized fence is "
                     + (
                         "absent"
                         if fence is None
-                        else f"({fence['repair_attempt_id']!r}, generation {fence['generation']})"
+                        else (
+                            f"(attempt {fence['repair_attempt_id']!r}, generation "
+                            f"{fence['generation']}, takeover {fence['takeover_id']!r}, "
+                            f"claim {fence['claim_execution_id']!r}, owner "
+                            f"{fence['owner_id']!r})"
+                        )
                     )
                     + "; the claim was lost and nothing was changed"
                 )
@@ -2060,40 +2134,45 @@ def record_order_result(
 def register_repair_fence(
     execution_request_id: str,
     *,
-    repair_attempt_id: str,
-    generation: int,
-    owner_id: str,
-    claim_execution_id: str,
+    token: RepairFenceToken,
     registered_at_utc: datetime,
     db_path: Path | None = None,
 ) -> None:
-    """Register or take over the order's repair fencing token -- atomically.
+    """Install the order's repair fencing token -- atomically (r4 review).
 
-    Rules, all inside one ``BEGIN IMMEDIATE`` transaction:
+    The token comes from the reconciliation DB's durable takeover intent (or,
+    at generation 1, from the attempt's original claim), so installing it is
+    the second step of a restartable cross-DB protocol. All inside one
+    ``BEGIN IMMEDIATE`` transaction:
 
-    - no fence row for the order -> INSERT.
-    - existing fence for a DIFFERENT attempt -> REPLACE (a new attempt now
-      claims the order; the previous attempt's later commit/finalize fails
-      its fence/claim checks as a typed lost claim -- never a wrong write).
-    - existing fence for the SAME attempt:
-        - ``generation`` greater than stored -> takeover (recovery path);
-        - same generation AND same ``claim_execution_id`` -> idempotent
-          re-registration by the same claim;
-        - anything else (stale generation, or the same generation held by a
-          different claim execution) ->
-          :class:`ExecutionRepairFenceConflictError` -- of concurrent
-          takeover attempts exactly one wins, and a worker whose claim was
-          taken over cannot re-arm its old token.
+    IDEMPOTENT SUCCESS -- the stored fence already equals the token in FULL
+    (attempt id, generation, takeover id, owner, claim execution id):
+    nothing is written and the call returns. A worker that died after
+    installing its fence can therefore always retry this step.
 
-    The fence row is retained after the repair finishes (see
+    CONFLICT (:class:`ExecutionRepairFenceConflictError`, DB untouched) --
+    everything else for the SAME attempt:
+
+    - the stored generation is GREATER (a later takeover already owns the
+      order -- generation rollback is impossible),
+    - the stored generation EQUALS but any identity component differs (a
+      DIFFERENT execution holds this generation: never adopted, because
+      "same attempt and generation" says nothing about which execution is
+      the legitimate one -- only the durable intent does),
+    - the token would SKIP a generation (``stored + 1`` is the only legal
+      step forward, so a fence can never run ahead of the intent chain).
+
+    A fence held for a DIFFERENT attempt is REPLACED: attempt ids are unique
+    per reservation, so a new attempt legitimately takes the order over; the
+    previous attempt's later commit / finalize then fails its own fence and
+    claim checks as a typed lost claim -- never a wrong write.
+
+    Fence rows are retained after a repair finishes (see
     :func:`_create_fences_table_sql`).
     """
     _require_non_empty_str(execution_request_id, "execution_request_id")
-    _require_non_empty_str(repair_attempt_id, "repair_attempt_id")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
-        raise ValueError(f"generation must be an int >= 1, got {generation!r}")
-    _require_non_empty_str(owner_id, "owner_id")
-    _require_non_empty_str(claim_execution_id, "claim_execution_id")
+    if not isinstance(token, RepairFenceToken):
+        raise ValueError(f"token must be a RepairFenceToken, got {token!r}")
     _require_utc(registered_at_utc, "registered_at_utc")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
@@ -2109,12 +2188,33 @@ def register_repair_fence(
             f"SELECT * FROM {FENCES_TABLE} WHERE execution_request_id = ?",
             (execution_request_id,),
         ).fetchone()
+        if fence is not None and fence["repair_attempt_id"] == token.repair_attempt_id:
+            stored_identity = tuple(fence[column] for column in _FENCE_IDENTITY_COLUMNS)
+            if stored_identity == token.identity():
+                return  # idempotent: this exact execution already holds it
+            if fence["generation"] != token.generation - 1:
+                raise ExecutionRepairFenceConflictError(
+                    f"repair fence for execution order {execution_request_id!r} is held at "
+                    f"(attempt {fence['repair_attempt_id']!r}, generation "
+                    f"{fence['generation']}, takeover {fence['takeover_id']!r}, claim "
+                    f"{fence['claim_execution_id']!r}); installing "
+                    f"{token.describe()} would "
+                    + (
+                        "roll the generation back"
+                        if fence["generation"] > token.generation
+                        else "skip a generation"
+                        if fence["generation"] < token.generation - 1
+                        else "replace a different execution of the same generation"
+                    )
+                    + " and changes nothing"
+                )
         record = (
             execution_request_id,
-            repair_attempt_id,
-            generation,
-            owner_id,
-            claim_execution_id,
+            token.repair_attempt_id,
+            token.generation,
+            token.takeover_id,
+            token.owner_id,
+            token.claim_execution_id,
             _iso(registered_at_utc),
         )
         if fence is None:
@@ -2124,33 +2224,11 @@ def register_repair_fence(
                 record,
             )
             return
-        if fence["repair_attempt_id"] == repair_attempt_id:
-            same_claim = (
-                fence["generation"] == generation
-                and fence["claim_execution_id"] == claim_execution_id
-            )
-            if not same_claim and fence["generation"] >= generation:
-                raise ExecutionRepairFenceConflictError(
-                    f"repair fence for execution order {execution_request_id!r} is held at "
-                    f"generation {fence['generation']} (claim "
-                    f"{fence['claim_execution_id']!r}); registration with generation "
-                    f"{generation} lost the claim and changes nothing"
-                )
-            if same_claim:
-                return  # idempotent re-registration by the holding claim
-        # takeover (same attempt, greater generation) or a different attempt
         updated = connection.execute(
             f"UPDATE {FENCES_TABLE} SET repair_attempt_id = ?, generation = ?, "
-            "owner_id = ?, claim_execution_id = ?, updated_at_utc = ? "
+            "takeover_id = ?, owner_id = ?, claim_execution_id = ?, updated_at_utc = ? "
             "WHERE execution_request_id = ?",
-            (
-                repair_attempt_id,
-                generation,
-                owner_id,
-                claim_execution_id,
-                _iso(registered_at_utc),
-                execution_request_id,
-            ),
+            (*record[1:], execution_request_id),
         )
         if updated.rowcount != 1:  # pragma: no cover - defence in depth
             raise ExecutionRepairFenceConflictError(

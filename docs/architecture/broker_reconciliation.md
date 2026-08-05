@@ -125,12 +125,15 @@ claim(reservation: owner A / generation 1 / lease = now + lease_duration、pendi
 finalized
 ```
 
-lease 期限切れ後は recovery worker が新しい generation で takeover できる。
+lease 期限切れ後は recovery worker が新しい generation で takeover できる。takeover は **durable takeover intent** に駆動される再入可能な cross-DB protocol である(再レビュー r4)。
 
 ```text
 owner A / generation 1
     ↓ lease expiry(それ以前は誰も — 同じ owner_id を使う別実行であっても — 触れない)
-owner B / generation 2 が takeover(fence bump → claim CAS の順で原子的に)
+takeover intent(takeover_id / target owner / target claim execution id / generation 2)を
+reconciliation DB へ prepared で durable commit  ← ここで identity が確定する
+    ↓
+owner B / generation 2 が intent の identity のまま fence install → claim promotion
     ↓
 owner A / generation 1 の遅延 commit は Execution DB の fence 照合で拒否される
 owner A / generation 1 の遅延 finalize は claim CAS で拒否される
@@ -138,35 +141,92 @@ owner A / generation 1 の遅延 finalize は claim CAS で拒否される
 
 **claim 契約**
 
-- 新規 reservation: `owner_id` = 実行中の worker、`generation` = 1、`lease_expires_at_utc` = `reserved_at + lease_duration`、`status` = pending。
+- 新規 reservation: `owner_id` = 実行中の worker、`generation` = 1、`takeover_id` = NULL(原初の claim は takeover 由来ではない)、`lease_expires_at_utc` = `reserved_at + lease_duration`、`status` = pending。
 - lease 有効中の pending は**再取得できない**。判定に使うのは owner 名ではなく **lease の期限だけ**なので、同一 service instance・同一 `owner_id` からの並行呼び出しでも二重実行にはならない。
-- takeover は lease 期限切れ後のみ。`claim_repair_attempt()` が `UPDATE ... SET generation = generation + 1, owner_id = ?, claim_execution_id = ?, lease_expires_at_utc = ? WHERE attempt_id = ? AND status = 'pending' AND generation = ?` という**原子的 CAS** を発行する。N 個の recovery worker が同時に走っても勝者はちょうど 1 つで、敗者は typed な `RepairClaimLostError`(既に finalized なら `RepairAttemptConflictError`)を受け取り**何も変更しない**。
+- takeover は lease 期限切れ後のみ。**identity を作れるのは intent 作成の 1 箇所だけ**で、claim の昇格(`promote_repair_claim()`)は intent の `target_*` を CAS で焼き付けるだけである。generation ≥ 2 の claim は必ず `takeover_id` を持つ(DB CHECK)。
 - lease 期限判定は呼び出し側 clock の契約、原子性は CAS の責務、と役割を分離している(store は clock を持たない)。
 
-**fencing(Execution DB 側)** — `record_order_result()` の transaction から reconciliation DB の claim を読むことはできない(SQLite ファイルを跨ぐ単一トランザクションは存在しない)ため、**案 A: Execution DB 内の fence mirror**(`execution_repair_fences`)を採用する。
+### durable takeover intent(再レビュー r4)
+
+2 つのストアは同時に commit できない。したがって「先に identity を durable にしてから両 DB を順に動かす」以外に、**restart 後も同じ identity で続行できる**方法はない。`broker_reconciliation_repair_takeover_intents` はそのための表であり、**takeover の source of truth** である。
+
+| 列 | 意味 |
+|---|---|
+| `takeover_id`(PK) | この takeover の identity。fence・claim・finalize のすべてが提示する |
+| `repair_attempt_id` | 対象 attempt(FK) |
+| `source_generation` / `target_generation` | 何世代から何世代へ(`target = source + 1` を DB CHECK で固定) |
+| `source_owner_id` / `source_claim_execution_id` | 置換される旧 claim(CAS の前提条件) |
+| `target_owner_id` / `target_claim_execution_id` | 正当な新 owner / 実行単位 |
+| `lease_expires_at_utc` | この takeover を完了させる期限。切れたら**同じ intent を**別 worker が再開できる |
+| `status` | `prepared` / `fence_installed` / `claim_promoted` / `completed` / `cancelled` / `blocked` |
+| `created_at_utc` / `fence_installed_at_utc` / `claim_promoted_at_utc` / `completed_at_utc` / `cancelled_at_utc` / `blocked_at_utc` | 各段階の時刻(status と整合を DB CHECK で固定) |
+| `blocked_reason` / `observed_claim_generation` / `observed_fence_generation` / `observed_fence_identity` | blocked の診断(closed set + 観測値) |
+
+**一意性**(すべて DB 制約): active intent(`prepared` / `fence_installed` / `claim_promoted`)は **attempt ごとに高々 1 件**(partial UNIQUE index)/ `UNIQUE (repair_attempt_id, source_generation)` = **同じ generation を 2 度 takeover できない** / `takeover_id` は PK / `target_generation = source_generation + 1` / status・blocked reason は closed set。作成時にはさらに transaction 内で「attempt は pending か」「lease は本当に切れているか」「source identity は現在の claim と一致するか」を検証する。複数 worker が同時に作成すると **1 件だけが勝ち**、敗者は何も書かずに離脱する(勝者の intent が新しい lease を持つため、その attempt は勝者のものになる)。
+
+**state machine**(前進のみ・同一遷移は冪等・別 identity は拒否):
 
 ```text
-1. reconciliation DB で claim 取得(新規 = generation 1 / takeover = generation N+1)
-2. Execution DB で同じ (attempt_id, generation) の fence を原子的に登録・takeover
-3. record_order_result() が同じ transaction 内で fence 一致を検証
-4. 一致する generation だけが状態更新できる
-5. takeover 後、旧 generation の commit は ExecutionRepairFenceConflictError で全 rollback
+prepared → fence_installed → claim_promoted → completed
+   ↓             ↓                 ↓
+ cancelled     cancelled         blocked
+   ↓             ↓
+ blocked       blocked
 ```
 
-takeover の順序は **fence を先、claim CAS を後**にする(旧 generation が commit できなくなってから初めて再評価を始めるため)。ただし **mutex は claim CAS の方**であり、fence は「どの generation なら commit してよいか」の barrier にすぎない。
+`cancelled` は「takeover が不要になった」= 置換対象の claim 自身が attempt を finalize した場合(遅いだけで生きていた worker が勝った)。`completed` / `cancelled` / `blocked` は終端で、二度と動かない。unknown status は model / DB CHECK / restore のすべてで fail-closed。
 
-**孤立 fence の adoption(再入可能な takeover)**: 2 つの cross-DB commit(fence 更新 → claim CAS)は原子化できないので、fence を更新した直後にプロセスが停止すると「fence = generation N+1 / 監査 claim = generation N」という不一致が残る。この fence は**どの claim にも裏付けられていない孤立 fence**であり、次の worker が(自分の attempt ID と目標 generation に**完全一致する場合に限り**)そのまま **adopt** する — 何も書き換えずに claim CAS へ進み、勝者だけが commit する。adopt を認めないと、その attempt は「fence は N+1 なので登録できない / claim は N のままなので誰も進めない」という状態で**永久に pending のまま回収不能**になる(PR #107 再レビュー r3 の P1 指摘)。adopt の条件は「同一 attempt ID かつ同一 generation」だけで、より新しい generation・別 attempt・fence 不在・Execution DB 読み取り失敗はいずれも adopt せず(fail-closed)、fence を追い越された worker が barrier をすり抜ける余地はない。
+### cross-DB protocol(8 段階・各段階から restart 可能)
 
-**recovery 契約**(`recover_pending_attempts()`): pending reservation を列挙し、**lease が有効なものは一切触らない**(finalize しない・takeover しない・Broker 照会しない・Execution DB を変更しない)。lease 期限切れのものだけを次の順で処理する。
+```text
+1. reconciliation DB : intent を prepared で durable commit
+2. execution DB      : その identity を fence として install(同一 token は冪等)
+3. reconciliation DB : intent → fence_installed
+4. reconciliation DB : claim を intent の identity へ promotion(CAS・冪等)
+5. reconciliation DB : intent → claim_promoted
+6. 処理              : Broker 再照会 + eligibility + fencing された Execution 更新
+7. reconciliation DB : attempt finalize
+8. reconciliation DB : intent → completed
+```
 
-1. Execution DB の fence を `generation + 1` へ bump(敗者は typed conflict を受け、**孤立 fence だった場合のみ** adopt して次へ進む。それ以外は何も書かずに離脱する)。
-2. reconciliation DB の claim を同じ generation へ CAS で takeover(**ここが単一勝者を決める**)。
-3. state history の**構造化 provenance 列 `repair_attempt_id` / `repair_generation`**(reason 文字列の解析はしない)を確認。
-4. 既に適用済みなら**元の attempt ID のまま** `applied` へ finalize(commit 済みの状態・broker ID・broker 時刻で確定)。
-5. 未適用なら、新 generation の正当な owner として **fresh Broker 再照会 + eligibility 再検証を最初からやり直す**(適用できるなら applied、できないならその理由の typed outcome)。
-6. **「history に無い」だけを根拠に `failed` へ確定することはしない。** Broker 再照会なしに失敗認定してよい根拠はない。
+どの段階の間でプロセスが落ちても、次の worker は **active intent を読み出し**、`takeover_id` / `target_owner_id` / `target_claim_execution_id` / `target_generation` を**そのまま**使って続きから再開する(新しい identity を作らない)。intent の lease が切れている場合は、まずその lease を原子的 CAS で取り直すため、**再開者も 1 人だけ**になる。
 
-元の run / discrepancy が削除・改竄されていた場合は fail-closed で復旧を拒否する(`ReconciliationRepairError`)。broker-only target のように execution order を持たない reservation は fence を使わず claim CAS だけで takeover する。
+### identity の完全一致(fencing)
+
+`record_order_result()` の transaction から reconciliation DB の claim を読むことはできない(SQLite ファイルを跨ぐ単一トランザクションは存在しない)ため、**案 A: Execution DB 内の fence mirror**(`execution_repair_fences`)を採用する。fence は attempt ID と generation だけでなく **takeover ID / owner / claim execution id** も保持し、次の 4 箇所が**同一 identity** を共有する。
+
+```text
+takeover intent  ==  Execution fence  ==  Reconciliation claim  ==  attempt finalize
+```
+
+- `register_repair_fence(token=...)`: **完全一致した token のみ冪等成功**。同一 attempt・同一 generation でも takeover ID / claim execution id / owner が違えば `ExecutionRepairFenceConflictError`(= 別 identity は**決して adopt しない**)。generation の巻き戻し・飛び越しも同様に拒否(`stored + 1` だけが前進)。別 attempt の fence は置換される(attempt ID は reservation ごとに一意なので、新しい attempt が正当にその注文を取る)。
+- `record_order_result(..., repair_fence=token)`: 同一 `BEGIN IMMEDIATE` 内で **fence の 5 要素 identity + expected revision + expected current state** を検証し、1 つでも外れれば全 rollback。したがって takeover された旧 worker は**状態も revision も一致していても** commit できない。
+- `finalize_repair_attempt()`: `attempt_id` + `owner_id` + `claim_execution_id` + `generation` + **`takeover_id`** + `status = pending` の CAS。旧 identity は APPLIED を上書きできない。
+
+**旧 worker が先に commit した場合**(intent prepared 後〜fence install 前の窓): 旧 generation の fence はまだ有効なので commit は成功しうる。その後 takeover 側は state history の構造化 provenance でそれを検出し、**再適用せずに** `applied` へ収束する。逆に、fence を追い越された worker が自分の commit を拒否された場合は、provenance を見て `already_applied` を返す(**自分がやっていない適用を `applied` と偽らない**)。どちらの経路でも history は 1 行、audit は APPLIED、attempt ID は同一である。
+
+### recovery 契約(`recover_pending_attempts()`)
+
+pending reservation を列挙し、次のように処理する。
+
+| 観測 | 動作 |
+|---|---|
+| active intent あり・intent の lease 有効 | **触らない**(他 worker が駆動中) |
+| active intent あり・lease 期限切れ | **同じ identity で再開**(lease を CAS で取得した 1 人だけ) |
+| active intent なし・claim の lease 有効 | **触らない**(照会も finalize も takeover もしない) |
+| active intent なし・claim の lease 期限切れ | 新しい intent を 1 件だけ作成して protocol を開始 |
+| blocked intent が同 generation に存在 | **自動処理しない**。typed `BLOCKED` を返すだけ(新しい行も generation も増えない) |
+| 安全に収束できない状態 | 下記のとおり durable に `blocked` へ |
+
+**blocked にする状態**(黙って `continue` しない): Execution fence が intent の target generation より先行 / fence が別 attempt・別 takeover・別 claim・別 owner / active intent が無いのに fence だけ先行 / active intent が複数 / claim が intent の target を追い越している / intent の source が現在 claim と不一致 / finalized attempt に別 identity の active intent が残っている / intent status が unknown。いずれも **intent 行へ reason code と observed 値(claim generation・fence generation・fence identity)と `blocked_at_utc` を保存**し、呼び出し側へ `RepairOutcome.BLOCKED` + `RepairFailureCode`(`fence_ahead` / `fence_intent_mismatch` / `takeover_intent_missing` / `claim_intent_mismatch` / `multiple_active_intents` / `takeover_identity_mismatch` / `takeover_protocol_corrupt`)を返す。**blocked の間は Broker 照会も Execution 更新も行わない**(attempt は pending のまま人手の判断を待つ)。
+
+処理を継続できる場合は、state history の**構造化 provenance 列 `repair_attempt_id` / `repair_generation`**(reason 文字列の解析はしない)を確認し、既に適用済みなら**元の attempt ID のまま** `applied` へ finalize、未適用なら**新 owner として fresh Broker 再照会 + eligibility 再検証を最初からやり直す**。**「history に無い」だけを根拠に `failed` へ確定することはしない。**
+
+元の run / discrepancy が削除・改竄されていた場合は fail-closed で復旧を拒否する(`ReconciliationRepairError`)。broker-only target のように execution order を持たない reservation は fence を使わず claim promotion だけで takeover する。
+
+### intent の保持方針(retention)
+
+intent 行は**物理削除しない**。`completed` / `cancelled` / `blocked` のすべてが残るため、「どの実行がどの generation を所有し、何を適用したか」という identity chain を attempt finalize 後も監査できる。増加量は **1 attempt あたり takeover 回数分**(通常 0、crash 後で 1)であり、attempt 自体が run ごとの append であることを考えると無視できる。active intent の検索は partial UNIQUE index、attempt 単位の履歴は `(repair_attempt_id, source_generation, takeover_id)` の index で引く。将来 cleanup が必要になった場合も、**terminal な intent だけ**を対象にできる(active intent を消すと fencing の根拠が失われる)。
 
 ### repair eligibility の再検証(保存結果を無条件に信用しない)
 
@@ -181,8 +241,8 @@ takeover の順序は **fence を先、claim CAS を後**にする(旧 generatio
 
 ### 適用・冪等性・並行実行(post-commit 安全性)
 
-- 適用は `execution_store.record_order_result(..., expected_current_state=..., expected_revision=観測 revision, repair_attempt_id=..., repair_generation=...)` の 1 呼び出しのみ。store は `BEGIN IMMEDIATE` トランザクション内で **4 つ**を検証する: **expected `repair_attempt_id`** / **expected `generation`**(fence 行との一致)/ **expected order revision** / **expected current state**。いずれかが不一致なら全 rollback。
-- **takeover 後の旧 worker は、状態も revision もまだ同じであっても commit できない**(fence が generation 2 を指しているため)。この拒否は typed な `ExecutionRepairFenceConflictError` で、呼び出し側は**決して `applied` にせず**、`conflict` + `failure_code = repair_fence_conflict` / `claim_lost` として結果化する。
+- 適用は `execution_store.record_order_result(..., expected_current_state=..., expected_revision=観測 revision, repair_fence=RepairFenceToken(...))` の 1 呼び出しのみ。store は `BEGIN IMMEDIATE` トランザクション内で **fence の 5 要素 identity(attempt id / generation / takeover id / owner / claim execution id)+ expected order revision + expected current state** を検証する。いずれかが不一致なら全 rollback。**attempt ID と generation だけでは通らない**(同一 generation の別実行を区別できないため)。
+- **takeover 後の旧 worker は、状態も revision もまだ同じであっても commit できない**(fence が別 identity を指しているため)。この拒否は typed な `ExecutionRepairFenceConflictError` で、呼び出し側は**決して `applied` にせず**、`conflict` + `failure_code = repair_fence_conflict` / `claim_lost` として結果化する。ただし state history の provenance が「この attempt は(別実行によって)適用済み」と示す場合だけは `already_applied` を返す — 事実に反する `conflict` を audit に残さないため。
 - CAS に敗れた worker は `ExecutionOrderStateConflictError` を受けて再読取し、3-way 検証つきで `already_applied` / `stale` / `conflict` として結果化する。
 - **APPLIED attempt は commit 前に完全構築・検証される**: `broker_state_updated_at_utc` は Broker snapshot の `updated_at_utc`、broker 参照 ID は store と同じ導出式、監査 detail も事前確定。**commit 後は一切の計算をしない**(store の戻り値も clock も参照しない)ため、commit 後の例外が「実際には適用済みなのに `failed`」を生む経路は存在しない。`failed` は **execution order DB の注文状態が無変更であることが store の rollback で証明されている場合のみ**使われる。
 - 同一 repair を複数回・複数 worker で実行しても、**状態履歴は高々 1 行しか増えず**(history 側も `repair_attempt_id` の partial UNIQUE で 1 attempt = 高々 1 行を DB レベルで強制。generation を跨いでも「1 attempt = 高々 1 回の適用」は変わらないので UNIQUE の単位は attempt ID のままでよい)、最終状態は Broker が確認した状態のまま壊れない(`already_applied` は成功と区別される明示的な no-op)。current row も同じ transaction で 1 回だけ動く。
@@ -199,7 +259,7 @@ lease は「1 attempt の処理時間より十分長い固定値」を採る(hea
 
 - 改竄などで **unknown な failure code を持つ行は読み取り時に fail-closed** で拒否される(`ReconciliationIntegrityError`)。
 - **outcome × failure_code の組合せも検証**する: `applied` / `already_applied` / `would_apply` は failure code なし、`skipped` は不適格理由コード、`query_failed` は query 系コード必須、`stale` / `conflict` / `rejected` / `failed` はそれぞれの許可集合から必須。集合は `_ALLOWED_FAILURE_CODES` に 1 箇所だけ定義する。
-- claim / fence 由来のコードもこの集合に含まれる: `claim_lost`(takeover により claim を失った)/ `repair_fence_conflict`(fence が別 generation を指していた)。
+- claim / fence / takeover 由来のコードもこの集合に含まれる: `claim_lost`(takeover により claim を失った)/ `repair_fence_conflict`(fence が別 identity を指していた)/ **`BLOCKED` 専用の 7 種**(`takeover_intent_missing` / `takeover_identity_mismatch` / `fence_ahead` / `multiple_active_intents` / `claim_intent_mismatch` / `fence_intent_mismatch` / `takeover_protocol_corrupt`)。`BLOCKED` は**監査行として finalize されない**(attempt は pending のまま)ため、attempts テーブルの outcome CHECK には含めず、durable な記録は intent 行の `status = 'blocked'` + `blocked_reason`(こちらも Enum 生成の CHECK)である。
 
 ### run-level integrity failure と部分結果
 
@@ -254,7 +314,7 @@ clock の呼び出しは **pass 開始 / attempt ごとの claim / attempt ご�
 
 ### 照合のみモード(dry-run)
 
-`mode=RepairMode.DRY_RUN` は上記の評価(store 読み取り + Broker 照会)をすべて実行するが、**一切書き込まない**: 注文更新なし・履歴追加なし・**claim / lease / generation なし**・**fence 行なし**・監査行なし・DB 作成 / migration なし(v1 監査 DB は migration せず明示的に拒否)・recovery を起動しない・Broker write 呼び出しなし・state file / ファイルシステム副作用なし(**両 DB** のバイト列・mtime・ディレクトリエントリ・journal / WAL / SHM・`user_version` の不変をテストで固定)。dry-run の attempt は `owner_id` / `claim_execution_id` / `generation` を**持たない**(モデル不変条件で強制)。適用可能な対象は `would_apply` として返る(`applied` とは区別され、永続化もされない)。破損 DB は無変更で拒否する。
+`mode=RepairMode.DRY_RUN` は上記の評価(store 読み取り + Broker 照会)をすべて実行するが、**一切書き込まない**: 注文更新なし・履歴追加なし・**claim / lease / generation なし**・**takeover intent なし**・**fence 行なし**(既存 fence の更新もしない)・監査行なし・DB 作成 / migration なし(v1 監査 DB は migration せず明示的に拒否)・recovery を起動しない・Broker write 呼び出しなし・state file / ファイルシステム副作用なし(**両 DB** のバイト列・mtime・ディレクトリエントリ・journal / WAL / SHM・`user_version` の不変をテストで固定)。dry-run の attempt は `owner_id` / `claim_execution_id` / `generation` / `takeover_id` を**持たない**(モデル不変条件で強制)。適用可能な対象は `would_apply` として返る(`applied` とは区別され、永続化もされない)。破損 DB は無変更で拒否する。
 
 ## 永続化(`reconciliation_store.py`)
 
@@ -268,11 +328,15 @@ clock の呼び出しは **pass 開始 / attempt ごとの claim / attempt ご�
 | `broker_reconciliation_discrepancies` | `discrepancy_id`(PK AUTOINCREMENT)/ `run_id`(FK → runs)/ `discrepancy_type` / `target_type` / `target_id` / `resolution_category` / `internal_state` / `broker_state` / `client_order_id` / `broker_order_id` / `broker_error_code` / `detail` / `observed_at_utc` / `internal_revision`(v2 / Issue #104: 観測時点の注文 revision。v1 由来の行は NULL = 自動修復対象外)。同一 run の `(target_type, target_id)` は UNIQUE |
 | `broker_reconciliation_repair_attempts`(WITHOUT ROWID、Issue #104 / v2) | `attempt_id`(PK)/ `run_id`(FK → runs)/ `mode` / **`status`(pending / finalized)** / `target_type` / `target_id`(**複合 FK → discrepancies の UNIQUE key** = attempt は必ず実在する観測へ紐づく)/ **claim: `owner_id` / `claim_execution_id` / `generation`(≥ 1)/ `lease_expires_at_utc` / `last_claimed_at_utc`** / `execution_request_id` / `client_order_id` / `reconciliation_internal_state` / `reconciliation_broker_state` / `internal_revision` / `internal_state_before` / `internal_state_after` / `outcome`(pending 中は NULL)/ `broker_order_id` / `broker_error_code` / `failure_code` / `detail` / `observed_at_utc` / `reserved_at_utc` / **`broker_state_updated_at_utc`**(旧 `applied_at_utc`)/ **`finalized_at_utc`** |
 
-index: `idx_broker_reconciliation_discrepancies_run (run_id, discrepancy_id)`、`idx_broker_reconciliation_repair_attempts_run (run_id, status, reserved_at_utc, attempt_id)`(pending 列挙 = recovery の work list がこの index で引ける)。CHECK 制約がモデル不変条件を二重化する(既知 enum 値のみ、UTC 接尾辞、非負カウント / revision、`query_failure` ⇔ `query_failed` ⇔ `broker_error_code IS NOT NULL`、attempt 側は `mode = 'apply'` のみ・`would_apply` 非永続・`(status='pending') ⇔ (outcome IS NULL)`・pending 行は outcome 系列 NULL・finalized 行は `applied` ⇔ `broker_state_updated_at_utc`・`applied`/`already_applied` ⇔ `internal_state_after` ⇔ `failure_code IS NULL`・`query_failed` ⇔ `broker_error_code`)。
+| `broker_reconciliation_repair_takeover_intents`(WITHOUT ROWID、Issue #104 / v2) | `takeover_id`(PK)/ `repair_attempt_id`(FK → repairs)/ `source_generation` / `target_generation` / `source_owner_id` / `source_claim_execution_id` / `target_owner_id` / `target_claim_execution_id` / `lease_expires_at_utc` / `status` / `created_at_utc` / `fence_installed_at_utc` / `claim_promoted_at_utc` / `completed_at_utc` / `cancelled_at_utc` / `blocked_at_utc` / `blocked_reason` / `observed_claim_generation` / `observed_fence_generation` / `observed_fence_identity`。`UNIQUE (repair_attempt_id, source_generation)` |
+
+index: `idx_broker_reconciliation_discrepancies_run (run_id, discrepancy_id)`、`idx_broker_reconciliation_repair_attempts_run (run_id, status, reserved_at_utc, attempt_id)`(pending 列挙 = recovery の work list がこの index で引ける)、`idx_..._takeover_intents_active (repair_attempt_id) WHERE status IN ('prepared','fence_installed','claim_promoted')`(**active intent は attempt ごとに高々 1 件**を DB が保証)、`idx_..._takeover_intents_attempt (repair_attempt_id, source_generation, takeover_id)`。CHECK 制約がモデル不変条件を二重化する(既知 enum 値のみ、UTC 接尾辞、非負カウント / revision、`query_failure` ⇔ `query_failed` ⇔ `broker_error_code IS NOT NULL`、attempt 側は `mode = 'apply'` のみ・`would_apply` 非永続・`(status='pending') ⇔ (outcome IS NULL)`・pending 行は outcome 系列 NULL・finalized 行は `applied` ⇔ `broker_state_updated_at_utc`・`applied`/`already_applied` ⇔ `internal_state_after` ⇔ `failure_code IS NULL`・`query_failed` ⇔ `broker_error_code`)。
 
 claim 列の CHECK: `generation >= 1`、`owner_id` / `claim_execution_id` / `lease_expires_at_utc` / `last_claimed_at_utc` は **NOT NULL**(APPLY モードの行しか存在しないため、pending / finalized を問わず claim は必須 = 「どの実行がこの結果を確定させたか」が監査に残る)、UTC 接尾辞必須、`(status='finalized') ⇔ (finalized_at_utc IS NOT NULL)`、`failure_code` は **`RepairFailureCode` から生成した値一覧**の `IN (...)`(手書きの重複なし)。malformed な lease / generation・非 UTC・unknown failure code は書き込み時に CHECK で、読み取り時にモデル不変条件で **fail-closed** に落ちる。
 
-**claim 列の保持方針**: finalize 後も claim 列は保持する(消さない)。どの owner / claim execution / generation が確定させたかは監査事実そのものであり、finalized 行はもう takeover 対象にならない(CAS が `status='pending'` を要求する)ため保持による危険はない。
+attempts 側の `takeover_id` は generation ≥ 2 でのみ NOT NULL(`CHECK ((generation = 1) = (takeover_id IS NULL))`)で、intent 行への FK を張る。intents 側の CHECK は `target_generation = source_generation + 1`、`source_generation >= 1`、`target_claim_execution_id <> source_claim_execution_id`、status × 各 timestamp の整合(`prepared` は fence/claim 時刻を持てない、`claim_promoted` は両方必須、など)、`blocked` ⇔ (`blocked_at_utc` かつ `blocked_reason`)、`cancelled` ⇔ `cancelled_at_utc`、`completed` ⇔ `completed_at_utc`、observed 列は blocked 専用、status / blocked_reason は **Enum から生成した closed set**。
+
+**claim 列の保持方針**: finalize 後も claim 列(および `takeover_id`)は保持する(消さない)。どの owner / claim execution / takeover / generation が確定させたかは監査事実そのものであり、finalized 行はもう takeover 対象にならない(CAS が `status='pending'` を要求する)ため保持による危険はない。intent 行も同様に保持する(上記 retention)。
 
 ### 重複方針(明示)
 
@@ -288,7 +352,7 @@ pending 行だけが例外的に **claim 列のみ** in-place 更新される(`c
 
 ### migration / 初期化
 
-`init_reconciliation_db()` は**冪等**で、pristine な DB(`sqlite_master` 0 件かつ `user_version` 0)にのみ schema を作成し、現行 schema の既存 DB は closed-world 検証のみを行う(既存行は無変更)。**v1 → v2 migration(Issue #104)**: **リリース済み v1 と完全一致した DB のみ**を単一トランザクションで additive に migration する(`ALTER TABLE discrepancies ADD COLUMN internal_revision` — SQLite は列をテーブル制約の前・列リスト末尾へ挿入するため migration 後の DDL は v2 参照 CREATE と token 正規化で一致 — → repair テーブル + index 作成 → version bump → v2 完全再検証 → COMMIT。途中失敗は全 rollback で v1 ファイル無変更。既存 discrepancy 行は `internal_revision = NULL` で読み戻され自動修復対象外)。**読み取り経路は migration しない**(v1 DB は `init_reconciliation_db()` を指すエラーで拒否 = dry-run / read-only の無副作用契約を維持)。それ以外(partial schema・制約欠損 lookalike・trigger / view・他コンポーネントの DB)は **DB を変更せず**明示的に失敗する。読み取りは true read-only 接続(`execution/sqlite_ro.py`)で行い、存在しない DB を作成しない。復元時はモデル不変条件で厳格に再検証する(帯域外改竄・malformed pending 行は `ReconciliationIntegrityError` で fail-closed)。
+`init_reconciliation_db()` は**冪等**で、pristine な DB(`sqlite_master` 0 件かつ `user_version` 0)にのみ schema を作成し、現行 schema の既存 DB は closed-world 検証のみを行う(既存行は無変更)。**v1 → v2 migration(Issue #104)**: **リリース済み v1 と完全一致した DB のみ**を単一トランザクションで additive に migration する(`ALTER TABLE discrepancies ADD COLUMN internal_revision` — SQLite は列をテーブル制約の前・列リスト末尾へ挿入するため migration 後の DDL は v2 参照 CREATE と token 正規化で一致 — → repair テーブル + index → **takeover intents テーブル + 2 index** → version bump → v2 完全再検証 → COMMIT。途中失敗は全 rollback で v1 ファイル無変更。既存 discrepancy 行は `internal_revision = NULL` で読み戻され自動修復対象外)。**repair 監査テーブルと takeover intents テーブルは同じ未リリース変更(v2)で導入されるため、両者の間に中間バージョンは存在しない**(v1 → v2 の 1 段階で両方が作られる)。v1 由来の DB に pending attempt は存在しえないので、**既存行から intent を捏造することはない**(intent は常に本物の takeover からのみ生まれる)。**読み取り経路は migration しない**(v1 DB は `init_reconciliation_db()` を指すエラーで拒否 = dry-run / read-only の無副作用契約を維持)。それ以外(partial schema・制約欠損 lookalike・trigger / view・他コンポーネントの DB)は **DB を変更せず**明示的に失敗する。読み取りは true read-only 接続(`execution/sqlite_ro.py`)で行い、存在しない DB を作成しない。復元時はモデル不変条件で厳格に再検証する(帯域外改竄・malformed pending 行は `ReconciliationIntegrityError` で fail-closed)。
 
 ## 記録先(3 系統)
 
@@ -328,7 +392,7 @@ recovered = repairer.recover_pending_attempts()                         # lease 
 
 position / trade / transaction / SL・TP の照合、OANDA Demo Adapter を使った手動照合(Issue #105)、Broker への注文送信・キャンセル・replace・close(修復は内部 DB のみ)、Broker 側のみの注文の自動採用、Broker に存在しない内部 position の自動 close、SL / TP 注文の再作成、Broker 状態の推測、無条件の自動決済、scheduler / 常駐 Bot への組み込み、Live 接続解禁。
 
-claim まわりの非スコープ: **lease の heartbeat / renewal**(固定 lease + `broker_timeout < lease_duration` の構築時検証で代替)、hung worker の強制中断(lease 期限切れによる takeover のみ)、worker 間の分散ロックサービス、fence 行の GC(新しい attempt が来れば置換されるため蓄積しない)。
+claim / takeover まわりの非スコープ: **処理中の lease heartbeat**(固定 lease + `broker_timeout < lease_duration` の構築時検証で代替。intent の lease は「再開の排他」としてのみ CAS で取り直す)、hung worker の強制中断(lease 期限切れによる takeover のみ)、worker 間の分散ロックサービス、blocked からの自動復旧(人手の判断が要る)、intent / fence 行の GC(監査証跡として保持)。
 
 ## テスト
 

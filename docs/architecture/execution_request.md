@@ -134,22 +134,29 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 - `execution_request_id` TEXT PRIMARY KEY(FK → `execution_orders`)— 注文ごとに高々 1 行
 - `repair_attempt_id` TEXT NOT NULL / `generation` INTEGER NOT NULL CHECK(`>= 1`)
+- `takeover_id` TEXT NULL(generation ≥ 2 でのみ NOT NULL。`CHECK ((generation = 1) = (takeover_id IS NULL))`)
 - `owner_id` TEXT NOT NULL / `claim_execution_id` TEXT NOT NULL(**どの実行**が現在この注文の修復を所有しているか)
 - `updated_at_utc` TEXT NOT NULL(UTC)
 
 reconciliation DB の claim を `record_order_result()` のトランザクション内から読むことは(SQLite ファイルを跨げないため)できない。そこで **Execution DB 側に claim の mirror を置き、状態更新と同じトランザクションで照合する**(案 A)。責務は「現在どの (attempt, generation) が更新を許可されているか」だけで、注文行や通常の submission 経路には一切影響しない。
 
-`register_repair_fence()` の規則(すべて単一 `BEGIN IMMEDIATE` 内):
+fencing token は `RepairFenceToken`(attempt id / generation / takeover id / owner / claim execution id)という**1 つの identity オブジェクト**として扱う。reconciliation DB の durable takeover intent がこれを生成し、fence 登録と状態更新の両方が同じオブジェクトを提示する。
+
+`register_repair_fence(token=...)` の規則(すべて単一 `BEGIN IMMEDIATE` 内):
 
 | 現在の fence | 要求 | 結果 |
 |---|---|---|
 | 無し | 任意 | INSERT |
 | 別 attempt | 任意 | REPLACE(新しい attempt が所有権を取る。旧 attempt の後続 commit / finalize は typed に失敗する) |
-| 同一 attempt / stored `<` 要求 generation | takeover | UPDATE(recovery の takeover。**同時に走った複数 worker のうち 1 つだけが勝つ**) |
-| 同一 attempt / 同一 generation / 同一 claim execution | 再登録 | 冪等 no-op |
-| 同一 attempt / stored `>=` 要求 generation(別 claim) | 旧 worker の再武装 | `ExecutionRepairFenceConflictError`(DB 無変更) |
+| 同一 attempt / **5 要素すべて一致** | 再登録(restart 後の retry) | 冪等 no-op |
+| 同一 attempt / stored generation + 1 = 要求 generation | takeover | UPDATE |
+| 同一 attempt / 同一 generation・**別 takeover id / 別 claim / 別 owner** | 別実行の割り込み | `ExecutionRepairFenceConflictError`(DB 無変更) |
+| 同一 attempt / stored `>` 要求 generation | 巻き戻し | `ExecutionRepairFenceConflictError` |
+| 同一 attempt / stored + 1 `<` 要求 generation | 飛び越し | `ExecutionRepairFenceConflictError` |
 
-fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい attempt が来れば無条件に置換されるため蓄積せず、「最後にどの実行がこの注文を修復したか」の手がかりとしても読める(`get_repair_fence()`。読み取り経路は read-only 接続で、存在しない DB を作成しない)。dry-run は fence を作成も更新もしない。
+**「同じ attempt かつ同じ generation」でも identity が違えば adopt しない**のが要点である(誰が正当かを決めるのは durable intent だけで、intent は restart 後も同じ token を提示する)。
+
+fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい attempt が来れば無条件に置換されるため蓄積せず、「最後にどの実行がこの注文を修復したか」の手がかりとしても読める(`get_repair_fence()`。読み取り経路は read-only 接続で、存在しない DB を作成しない)。dry-run は fence を作成も更新もしない。**旧 schema(v3 以前)から migrate した DB では fence テーブルは空**であり、fence が無い注文への repair commit は typed に拒否されるので、migration 直後に不明な identity が滑り込む窓は無い。
 
 ### 状態更新 API の契約
 
@@ -178,7 +185,7 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 - 遷移は snapshot との内容検証に加えて、**現在の追跡状態**(snapshot の後に state-only UNKNOWN が記録されていることがある)に対しても検証する。
 - `expected_current_state` / `expected_revision`(Issue #104、optional)を渡すと**原子的 compare-and-set** になる: 同一 `BEGIN IMMEDIATE` トランザクション内で読み直した現在状態 / **revision**(= 履歴行数。すべての書き込み — same-state 再観測・snapshot / broker_order_id / timestamp のみの更新を含む — で必ず 1 増える導出値。schema 列ではない)が一致しなければ `ExecutionOrderStateConflictError` で拒否し、DB は無変更のまま rollback する。**state だけの比較では same-state 更新(UNKNOWN → UNKNOWN 履歴追加・部分約定の増加・snapshot refresh)を検出できないため、repair は revision CAS を用いる**。省略時は従来どおり(same-state 再観測は許可・記録)。read API が返す行 dict には同一トランザクションで導出した `revision` キーが含まれる。
 - `repair_attempt_id` / `repair_generation`(Issue #104、optional。**両方 or どちらも無し**)は追加される history 行に**構造化された repair provenance**として記録される(schema v4 列 + partial UNIQUE index)。1 つの repair attempt は DB 全体で高々 1 行しか commit できず、recovery は reason 文字列の解析ではなくこの列で「この attempt が適用済みか」を判定する。provenance 付き history 行は必ず完全 snapshot を伴う(復元時検証)。
-- **fencing 検証(Issue #104 再レビュー)**: `repair_attempt_id` / `repair_generation` を伴う更新は、**同じトランザクション内で** `execution_repair_fences` の行が**ちょうどこの (attempt, generation)** を指していることを確認する。fence が無い / 別 attempt / 別 generation のいずれでも `ExecutionRepairFenceConflictError` で**全 rollback**する。したがって claim を takeover された旧 worker は、**現在状態も revision もまだ一致していても** commit できない。1 回の更新で検証されるのは `expected_current_state` / `expected_revision` / `repair_attempt_id` / `repair_generation` の 4 点すべてであり、どれか 1 つでも外れれば DB は無変更のままになる。呼び出し側はこの typed 例外を `applied` に分類してはならない(repair サービスは `conflict` + `claim_lost` / `repair_fence_conflict` として結果化する)。
+- **fencing 検証(Issue #104 再レビュー r4)**: `repair_fence` を伴う更新は、**同じトランザクション内で** `execution_repair_fences` の行が**この token と 5 要素すべて一致**(attempt id / generation / takeover id / owner / claim execution id)することを確認する。fence が無い / 別 attempt / 別 generation / **同一 generation の別実行**のいずれでも `ExecutionRepairFenceConflictError` で**全 rollback**する。したがって claim を takeover された旧 worker は、**現在状態も revision もまだ一致していても** commit できない。1 回の更新で検証されるのは `expected_current_state` / `expected_revision` / fence identity の全要素であり、どれか 1 つでも外れれば DB は無変更のままになる。呼び出し側はこの typed 例外を `applied` に分類してはならない(repair サービスは `conflict` + `claim_lost` / `repair_fence_conflict`、あるいは provenance が示す場合のみ `already_applied` として結果化する)。
 
 **`record_order_state`(state-only 経路)は UNKNOWN の記録専用**である。UNKNOWN は「完全な `OrderResult` を構造上取得できなかった」(submit / query の結果喪失、例: `BrokerTimeoutError`)ことを表す唯一の状態であるため、snapshot 無しで記録できるのはこれだけとする。他のすべての観測は Broker snapshot を伴うため `record_order_result` を通る。state-only UNKNOWN は保存済み snapshot に**触れない**ため、結果不明になる前に判明していた fill が後続の解決を検証し続ける。また state-only 更新は保存済み `broker_order_id` を**確認できるだけ**であり、新規導入・変更はできない(Broker ID は完全な `OrderResult` からのみ得られる)。
 
@@ -212,7 +219,7 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 
 - schema version は **v4**(v1 = PR #91 初版、v2 = r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加、v3 = Issue #76 で `signal_id` の UNIQUE index を追加、**v4 = Issue #104 で history の repair provenance 2 列 + `execution_repair_fences` テーブル**)。
 - **v2 → v3 migration**(Issue #76): `init_db()` が「**完全な構造検証で v2 と一致した DB のみ**」を additive に migration する — 重複 `signal_id` の事前 scan → `CREATE UNIQUE INDEX` → version bump → **完全再検証** → COMMIT を**単一の `BEGIN IMMEDIATE` トランザクション**で行う。途中失敗は全体 rollback となり中途半端な schema は残らない。既存行は削除・書き換えされない。**既存データに重複 signal がある場合は明示的に失敗**し(重複の解消は人間の判断)、DB は無変更。
-- **v3 → v4 migration**(Issue #104): 完全一致した v3 DB のみを `init_db()` が additive に migration する — `ALTER TABLE ... ADD COLUMN repair_attempt_id` / `ADD COLUMN repair_generation`(SQLite は列を**テーブル制約の前・列リスト末尾**へ挿入するため、migration 後の DDL は v4 参照 CREATE と token 正規化で一致する)+ `CREATE TABLE execution_repair_fences` + partial UNIQUE index + version bump + **完全再検証**を単一トランザクションで行う。既存 history 行は両列 NULL として読み戻され、fence テーブルは空で始まる(fence の無い注文への repair commit は typed に拒否されるため、migration 直後に旧 generation が滑り込む窓は無い)。途中失敗は全 rollback で v3 ファイル無変更。v2 DB は v3 を経由して連鎖 migration される。v1 および migratable でない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 / v3 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
+- **v3 → v4 migration**(Issue #104): 完全一致した v3 DB のみを `init_db()` が additive に migration する — `ALTER TABLE ... ADD COLUMN repair_attempt_id` / `ADD COLUMN repair_generation`(SQLite は列を**テーブル制約の前・列リスト末尾**へ挿入するため、migration 後の DDL は v4 参照 CREATE と token 正規化で一致する)+ `CREATE TABLE execution_repair_fences`(`takeover_id` 列を含む)+ partial UNIQUE index + version bump + **完全再検証**を単一トランザクションで行う。既存 history 行は両列 NULL として読み戻され、fence テーブルは空で始まる(fence の無い注文への repair commit は typed に拒否されるため、migration 直後に不明な identity が滑り込む窓は無い)。fence テーブルは v4 で新設されるため、**旧 schema 由来の fence 行や NULL identity は存在しない**。途中失敗は全 rollback で v3 ファイル無変更。v2 DB は v3 を経由して連鎖 migration される。v1 および migratable でない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 / v3 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
 - `init_db()` が schema を**新規作成するのは pristine な DB のみ**(PR #91 レビュー r2 Major 2): `sqlite_master` のオブジェクトが **0 件**かつ `user_version = 0`。**version だけが設定された DB・metadata だけが残った DB(`sqlite_sequence` 等)は新規 DB として扱わず**、DB を変更せずに失敗する。
 - 既存 schema の判定は**列名ではなく完全な構造検証**で行う(PR #91 レビュー r2 Minor 2 / r3 Major 1 / r3 Minor 1)。
   - **sqlite_master 全 object 集合の closed-world 検証(r3 Major 1)**: `type IN ('table','index')` の抽出ではなく、**全 type の object 集合**を pristine な参照 schema(in-memory)の集合と完全一致で比較する。許可される SQLite 内部 object は本 schema 自身が作るもの(AUTOINCREMENT の `sqlite_sequence`、UNIQUE 制約の `sqlite_autoindex_*`)だけを**明示的に**参照集合へ含める。**trigger・view・予期しないテーブル・予期しない index は type を問わずすべて失敗**である(trigger / view は store の背後で行を書き換え・削除できるため、存在自体を拒否する)。

@@ -507,6 +507,9 @@ from execution.reconciliation_repair_models import (  # noqa: E402
     RepairFailureCode,
     RepairMode,
     RepairOutcome,
+    RepairTakeoverIntent,
+    TakeoverBlockedReason,
+    TakeoverIntentStatus,
 )
 
 
@@ -761,150 +764,391 @@ def test_internal_revision_round_trips_on_discrepancies(tmp_path):
     assert restored.discrepancies[0].internal_revision == 3
 
 
-# --- claim takeover / finalize fencing (Issue #104 re-review) ------------------
+# --- durable takeover intents (Issue #104 re-review r4) -----------------------
 
 
-def test_claim_takeover_increments_the_generation_and_replaces_the_claim(tmp_path):
+def sample_intent(attempt_id="attempt-1", takeover_id="tk-1", **overrides):
+    kwargs = dict(
+        takeover_id=takeover_id,
+        repair_attempt_id=attempt_id,
+        source_generation=1,
+        target_generation=2,
+        source_owner_id="worker-1",
+        source_claim_execution_id="claim-1",
+        target_owner_id="worker-2",
+        target_claim_execution_id="claim-2",
+        lease_expires_at_utc=at(2000),
+        status=TakeoverIntentStatus.PREPARED,
+        created_at_utc=at(1300),
+    )
+    kwargs.update(overrides)
+    return RepairTakeoverIntent(**kwargs)
+
+
+def reserved_db(tmp_path, **reservation_overrides):
     path = recorded_run_db(tmp_path)
-    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.reserve_repair_attempt(sample_reservation(**reservation_overrides), db_path=path)
+    return path
 
-    taken = store.claim_repair_attempt(
-        "attempt-1",
-        expected_generation=1,
-        new_owner_id="worker-2",
-        new_claim_execution_id="claim-2",
-        new_lease_expires_at_utc=at(2000),
-        claimed_at_utc=at(1300),
+
+def prepared(path, intent=None, *, observed=None):
+    intent = intent or sample_intent()
+    return store.create_takeover_intent(
+        intent, observed_at_utc=observed or at(1300), db_path=path
+    )
+
+
+def fence_installed(path, intent=None, *, at_utc=None):
+    intent = intent or sample_intent()
+    return store.advance_takeover_intent(
+        intent,
+        to_status=TakeoverIntentStatus.FENCE_INSTALLED,
+        at_utc=at_utc or at(1301),
         db_path=path,
     )
 
-    assert taken.generation == 2
-    assert taken.owner_id == "worker-2"
-    assert taken.claim_execution_id == "claim-2"
-    assert taken.lease_expires_at_utc == at(2000)
-    assert taken.last_claimed_at_utc == at(1300)
-    # everything else is the original reservation, untouched
-    assert taken.attempt_id == "attempt-1"
-    assert taken.reserved_at_utc == at(10)
-    assert store.list_pending_repair_attempts(db_path=path) == (taken,)
+
+def test_a_prepared_intent_round_trips_and_is_the_active_one(tmp_path):
+    path = reserved_db(tmp_path)
+    created = prepared(path)
+
+    assert created == sample_intent()
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == sample_intent()
+    assert store.list_takeover_intents(attempt_id="attempt-1", db_path=path) == (sample_intent(),)
+    # the claim itself is untouched until the promotion step
+    assert only_pending(path).generation == 1
 
 
-def test_claim_takeover_with_a_stale_generation_is_refused(tmp_path):
-    path = recorded_run_db(tmp_path)
-    store.reserve_repair_attempt(sample_reservation(), db_path=path)
-    current = store.claim_repair_attempt(
-        "attempt-1",
-        expected_generation=1,
-        new_owner_id="worker-2",
-        new_claim_execution_id="claim-2",
-        new_lease_expires_at_utc=at(2000),
-        claimed_at_utc=at(1300),
-        db_path=path,
-    )
+def only_pending(path):
+    pending = store.list_pending_repair_attempts(db_path=path)
+    assert len(pending) == 1, pending
+    return pending[0]
 
-    with pytest.raises(store.RepairClaimLostError, match="another worker won"):
-        store.claim_repair_attempt(
-            "attempt-1",
-            expected_generation=1,  # stale: the row moved on to generation 2
-            new_owner_id="worker-3",
-            new_claim_execution_id="claim-3",
-            new_lease_expires_at_utc=at(2600),
-            claimed_at_utc=at(1301),
+
+def test_an_intent_cannot_be_created_while_the_lease_is_valid(tmp_path):
+    path = reserved_db(tmp_path)
+    with pytest.raises(store.TakeoverIntentConflictError, match="claimed until"):
+        store.create_takeover_intent(sample_intent(), observed_at_utc=at(11), db_path=path)
+    assert store.list_takeover_intents(db_path=path) == ()
+
+
+def test_a_second_active_intent_is_refused(tmp_path):
+    path = reserved_db(tmp_path)
+    prepared(path)
+    with pytest.raises(store.TakeoverIntentConflictError, match="already has the active"):
+        store.create_takeover_intent(
+            sample_intent(takeover_id="tk-2", target_claim_execution_id="claim-3"),
+            observed_at_utc=at(1300),
             db_path=path,
         )
-    # the losing takeover changed nothing
-    assert store.list_pending_repair_attempts(db_path=path) == (current,)
+    assert len(store.list_takeover_intents(db_path=path)) == 1
 
 
-def test_claim_takeover_of_a_finalized_attempt_is_refused(tmp_path):
-    path = recorded_run_db(tmp_path)
-    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+def test_an_intent_whose_source_identity_moved_on_is_refused(tmp_path):
+    path = reserved_db(tmp_path)
+    for override in (
+        {"source_generation": 2, "target_generation": 3},
+        {"source_owner_id": "someone-else"},
+        {"source_claim_execution_id": "claim-someone-else"},
+    ):
+        with pytest.raises(store.TakeoverIntentConflictError, match="preconditions|generation"):
+            store.create_takeover_intent(
+                sample_intent(takeover_id=f"tk-{len(override)}", **override),
+                observed_at_utc=at(1300),
+                db_path=path,
+            )
+    assert store.list_takeover_intents(db_path=path) == ()
+
+
+def test_an_intent_for_a_finalized_attempt_is_refused(tmp_path):
+    path = reserved_db(tmp_path)
     store.finalize_repair_attempt(sample_attempt(), db_path=path)
+    with pytest.raises(store.RepairAttemptConflictError, match="already finalized"):
+        store.create_takeover_intent(sample_intent(), observed_at_utc=at(1300), db_path=path)
+    assert store.list_takeover_intents(db_path=path) == ()
 
-    with pytest.raises(store.RepairAttemptConflictError, match="no claim to take over"):
-        store.claim_repair_attempt(
-            "attempt-1",
-            expected_generation=1,
-            new_owner_id="worker-2",
-            new_claim_execution_id="claim-2",
-            new_lease_expires_at_utc=at(2000),
-            claimed_at_utc=at(1300),
+
+def test_the_same_source_generation_can_never_be_taken_over_twice(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    fence_installed(path)
+    store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    store.advance_takeover_intent(
+        intent, to_status=TakeoverIntentStatus.CLAIM_PROMOTED, at_utc=at(1303), db_path=path
+    )
+    store.advance_takeover_intent(
+        intent, to_status=TakeoverIntentStatus.COMPLETED, at_utc=at(1304), db_path=path
+    )
+
+    # a second takeover of generation 1 (already consumed) is refused by the DB
+    with pytest.raises(store.TakeoverIntentConflictError):
+        store.create_takeover_intent(
+            sample_intent(takeover_id="tk-again", target_claim_execution_id="claim-9"),
+            observed_at_utc=at(3000),
             db_path=path,
         )
-    assert store.get_repair_attempt("attempt-1", db_path=path) == sample_attempt()
+    # but the NEXT generation may be taken over
+    following = store.create_takeover_intent(
+        sample_intent(
+            takeover_id="tk-2",
+            source_generation=2,
+            target_generation=3,
+            source_owner_id="worker-2",
+            source_claim_execution_id="claim-2",
+            target_owner_id="worker-3",
+            target_claim_execution_id="claim-3",
+            created_at_utc=at(3000),
+            lease_expires_at_utc=at(3600),
+        ),
+        observed_at_utc=at(3000),
+        db_path=path,
+    )
+    assert following.target_generation == 3
 
 
-def test_claim_takeover_of_an_unknown_attempt_is_refused(tmp_path):
-    path = recorded_run_db(tmp_path)
-    with pytest.raises(store.ReconciliationStoreError, match="no reservation"):
-        store.claim_repair_attempt(
-            "attempt-ghost",
-            expected_generation=1,
-            new_owner_id="worker-2",
-            new_claim_execution_id="claim-2",
-            new_lease_expires_at_utc=at(2000),
-            claimed_at_utc=at(1300),
-            db_path=path,
-        )
-
-
-def test_exactly_one_of_concurrent_takeover_workers_wins(tmp_path):
-    """Genuinely concurrent CAS: N barrier-aligned threads race the takeover
-    of the same generation; exactly one wins, every loser observes the typed
-    RepairClaimLostError and the row ends at generation 2 (not N+1)."""
-    path = recorded_run_db(tmp_path)
-    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+def test_exactly_one_of_concurrent_intent_creations_wins(tmp_path):
+    """Genuinely concurrent: N barrier-aligned workers try to prepare a
+    takeover of the SAME expired claim. Exactly one intent exists afterwards
+    and the losers can read the winner's identity to join it."""
+    path = reserved_db(tmp_path)
     workers = 4
     barrier = threading.Barrier(workers)
 
-    def takeover(index):
-        barrier.wait()  # all workers issue the CAS as close together as possible
+    def prepare(index):
+        barrier.wait()
         try:
-            return store.claim_repair_attempt(
-                "attempt-1",
-                expected_generation=1,
-                new_owner_id=f"recovery-{index}",
-                new_claim_execution_id=f"claim-r{index}",
-                new_lease_expires_at_utc=at(2000),
-                claimed_at_utc=at(1300),
+            return store.create_takeover_intent(
+                sample_intent(
+                    takeover_id=f"tk-{index}",
+                    target_owner_id=f"worker-{index}",
+                    target_claim_execution_id=f"claim-w{index}",
+                ),
+                observed_at_utc=at(1300),
                 db_path=path,
             )
-        except store.RepairClaimLostError:
+        except store.TakeoverIntentConflictError:
             return None
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(takeover, range(workers)))
+        results = list(pool.map(prepare, range(workers)))
 
-    winners = [taken for taken in results if taken is not None]
+    winners = [intent for intent in results if intent is not None]
     assert len(winners) == 1
-    assert winners[0].generation == 2  # exactly one increment happened
-    stored = store.list_pending_repair_attempts(db_path=path)
+    stored = store.list_takeover_intents(db_path=path)
     assert stored == (winners[0],)
+    # every loser can join the winner by loading the active intent
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == winners[0]
 
 
-def test_finalize_under_a_lost_claim_is_refused_and_the_new_claim_completes(tmp_path):
-    path = recorded_run_db(tmp_path)
-    store.reserve_repair_attempt(sample_reservation(), db_path=path)
-    store.claim_repair_attempt(
-        "attempt-1",
-        expected_generation=1,
-        new_owner_id="worker-2",
-        new_claim_execution_id="claim-2",
-        new_lease_expires_at_utc=at(2000),
-        claimed_at_utc=at(1300),
+def test_intent_transitions_are_forward_only_and_idempotent(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+
+    first = fence_installed(path, intent)
+    assert first.status is TakeoverIntentStatus.FENCE_INSTALLED
+    assert first.fence_installed_at_utc == at(1301)
+    # re-applying the same step after a crash is a no-op, timestamps unchanged
+    again = fence_installed(path, intent, at_utc=at(9999))
+    assert again == first
+
+    with pytest.raises(store.TakeoverIntentStateError, match="cannot move"):
+        store.advance_takeover_intent(
+            intent, to_status=TakeoverIntentStatus.COMPLETED, at_utc=at(1302), db_path=path
+        )
+    store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    promoted = store.advance_takeover_intent(
+        intent, to_status=TakeoverIntentStatus.CLAIM_PROMOTED, at_utc=at(1303), db_path=path
+    )
+    completed = store.advance_takeover_intent(
+        intent, to_status=TakeoverIntentStatus.COMPLETED, at_utc=at(1304), db_path=path
+    )
+    assert (promoted.status, completed.status) == (
+        TakeoverIntentStatus.CLAIM_PROMOTED,
+        TakeoverIntentStatus.COMPLETED,
+    )
+    # a completed intent never moves again -- and is no longer active
+    with pytest.raises(store.TakeoverIntentStateError):
+        fence_installed(path, intent, at_utc=at(1305))
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) is None
+
+
+def test_a_transition_by_a_foreign_identity_is_refused(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    for override in (
+        {"target_owner_id": "impostor"},
+        {"target_claim_execution_id": "claim-impostor"},
+        {"source_generation": 2, "target_generation": 3},
+        {"repair_attempt_id": "attempt-other"},
+    ):
+        with pytest.raises(store.TakeoverIntentStateError, match="does not match"):
+            store.advance_takeover_intent(
+                sample_intent(**override),
+                to_status=TakeoverIntentStatus.FENCE_INSTALLED,
+                at_utc=at(1301),
+                db_path=path,
+            )
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+
+
+def test_a_transition_on_an_unknown_intent_is_refused(tmp_path):
+    path = reserved_db(tmp_path)
+    with pytest.raises(store.TakeoverIntentStateError, match="not recorded"):
+        store.advance_takeover_intent(
+            sample_intent(takeover_id="tk-ghost"),
+            to_status=TakeoverIntentStatus.FENCE_INSTALLED,
+            at_utc=at(1301),
+            db_path=path,
+        )
+
+
+def test_claim_promotion_requires_the_fence_step_first(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    with pytest.raises(store.TakeoverIntentStateError, match="execution fence"):
+        store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    assert only_pending(path).generation == 1
+
+
+def test_claim_promotion_moves_the_claim_onto_the_intent_identity_idempotently(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    fence_installed(path, intent)
+
+    promoted = store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+
+    assert (promoted.generation, promoted.owner_id, promoted.claim_execution_id) == (
+        2,
+        "worker-2",
+        "claim-2",
+    )
+    assert promoted.takeover_id == "tk-1"
+    assert promoted.lease_expires_at_utc == at(2000)  # the intent's lease
+    assert promoted.last_claimed_at_utc == at(1302)
+    assert promoted.attempt_id == "attempt-1" and promoted.reserved_at_utc == at(10)
+    # replaying the promotion after a crash returns the same row, writes nothing
+    assert store.promote_repair_claim(intent, promoted_at_utc=at(7777), db_path=path) == promoted
+    assert only_pending(path) == promoted
+
+
+def test_claim_promotion_by_a_stale_intent_is_refused(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    fence_installed(path, intent)
+    store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    store.advance_takeover_intent(
+        intent, to_status=TakeoverIntentStatus.CLAIM_PROMOTED, at_utc=at(1303), db_path=path
+    )
+    store.advance_takeover_intent(
+        intent, to_status=TakeoverIntentStatus.COMPLETED, at_utc=at(1304), db_path=path
+    )
+    second = store.create_takeover_intent(
+        sample_intent(
+            takeover_id="tk-2",
+            source_generation=2,
+            target_generation=3,
+            source_owner_id="worker-2",
+            source_claim_execution_id="claim-2",
+            target_owner_id="worker-3",
+            target_claim_execution_id="claim-3",
+            created_at_utc=at(3000),
+            lease_expires_at_utc=at(3600),
+        ),
+        observed_at_utc=at(3000),
+        db_path=path,
+    )
+    store.advance_takeover_intent(
+        second, to_status=TakeoverIntentStatus.FENCE_INSTALLED, at_utc=at(3001), db_path=path
+    )
+    store.promote_repair_claim(second, promoted_at_utc=at(3002), db_path=path)
+
+    # the first (completed) intent can never move the claim back
+    with pytest.raises(store.TakeoverIntentStateError):
+        store.promote_repair_claim(intent, promoted_at_utc=at(3003), db_path=path)
+    assert only_pending(path).generation == 3
+
+
+def test_blocking_records_the_diagnosis_and_is_idempotent(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+
+    blocked = store.block_takeover_intent(
+        intent,
+        reason=TakeoverBlockedReason.FENCE_AHEAD,
+        at_utc=at(1400),
+        observed_claim_generation=1,
+        observed_fence_generation=3,
+        observed_fence_identity="attempt=attempt-1 generation=3 takeover=tk-x",
         db_path=path,
     )
 
-    # the original (generation 1) worker resurrects and tries to finalize
+    assert blocked.status is TakeoverIntentStatus.BLOCKED
+    assert blocked.blocked_reason is TakeoverBlockedReason.FENCE_AHEAD
+    assert (blocked.observed_claim_generation, blocked.observed_fence_generation) == (1, 3)
+    assert blocked.blocked_at_utc == at(1400)
+    # blocked is terminal: no active intent, no automatic resumption
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) is None
+    with pytest.raises(store.TakeoverIntentStateError):
+        fence_installed(path, intent, at_utc=at(1401))
+    # blocking again keeps the ORIGINAL diagnosis
+    same = store.block_takeover_intent(
+        intent, reason=TakeoverBlockedReason.PROTOCOL_CORRUPT, at_utc=at(1500), db_path=path
+    )
+    assert same == blocked
+    # and the attempt is still pending -- nothing was finalized
+    assert only_pending(path).generation == 1
+
+
+def test_a_blocked_intent_can_be_inserted_without_a_predecessor(tmp_path):
+    """An execution fence ahead of every known intent has no active intent to
+    block: the diagnosis is inserted directly, and it occupies the (attempt,
+    source generation) slot so the doomed takeover is never silently retried."""
+    path = reserved_db(tmp_path)
+    blocked = store.insert_blocked_takeover_intent(
+        sample_intent(
+            takeover_id="tk-blocked",
+            status=TakeoverIntentStatus.BLOCKED,
+            blocked_at_utc=at(1400),
+            blocked_reason=TakeoverBlockedReason.ORPHAN_FENCE_WITHOUT_INTENT,
+            observed_claim_generation=1,
+            observed_fence_generation=2,
+            observed_fence_identity="attempt=attempt-1 generation=2 takeover=unknown",
+        ),
+        db_path=path,
+    )
+    assert store.list_takeover_intents(attempt_id="attempt-1", db_path=path) == (blocked,)
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) is None
+    with pytest.raises(store.TakeoverIntentConflictError):
+        store.create_takeover_intent(sample_intent(), observed_at_utc=at(1500), db_path=path)
+
+
+def test_finalize_requires_the_current_claim_including_the_takeover_id(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    fence_installed(path, intent)
+    store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+
+    # the ORIGINAL generation-1 worker resurrects and tries to finalize
     with pytest.raises(store.RepairClaimLostError, match="generation 2"):
         store.finalize_repair_attempt(sample_attempt(), db_path=path)
-    assert len(store.list_pending_repair_attempts(db_path=path)) == 1  # still pending
+    # so does a worker with the right generation but a forged takeover id
+    with pytest.raises(store.RepairClaimLostError):
+        store.finalize_repair_attempt(
+            sample_attempt(
+                owner_id="worker-2",
+                claim_execution_id="claim-2",
+                generation=2,
+                takeover_id="tk-forged",
+            ),
+            db_path=path,
+        )
+    assert len(store.list_pending_repair_attempts(db_path=path)) == 1
 
-    # only the current claim (generation 2) can complete the row
     completed = sample_attempt(
         owner_id="worker-2",
         claim_execution_id="claim-2",
         generation=2,
+        takeover_id="tk-1",
         finalized_at_utc=at(1400),
     )
     store.finalize_repair_attempt(completed, db_path=path)
@@ -912,12 +1156,104 @@ def test_finalize_under_a_lost_claim_is_refused_and_the_new_claim_completes(tmp_
     assert store.list_pending_repair_attempts(db_path=path) == ()
 
 
+def test_a_blocked_outcome_is_never_finalized_into_the_attempt_row(tmp_path):
+    path = reserved_db(tmp_path)
+    with pytest.raises(store.ReconciliationStoreError, match="stays PENDING|BLOCKED|blocked"):
+        store.finalize_repair_attempt(
+            sample_attempt(
+                outcome=RepairOutcome.BLOCKED,
+                failure_code=RepairFailureCode.FENCE_AHEAD,
+                internal_state_after=None,
+                broker_state_updated_at_utc=None,
+            ),
+            db_path=path,
+        )
+    assert len(store.list_pending_repair_attempts(db_path=path)) == 1
+
+
 def test_finalize_requires_the_finalized_timestamp(tmp_path):
-    path = recorded_run_db(tmp_path)
-    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    path = reserved_db(tmp_path)
     with pytest.raises(store.ReconciliationStoreError, match="finalized_at_utc"):
         store.finalize_repair_attempt(sample_attempt(finalized_at_utc=None), db_path=path)
     assert len(store.list_pending_repair_attempts(db_path=path)) == 1
+
+
+def test_unknown_intent_status_or_blocked_reason_fails_closed(tmp_path):
+    path = reserved_db(tmp_path)
+    prepared(path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")  # simulate damage
+        connection.execute(f"UPDATE {store.TAKEOVER_INTENTS_TABLE} SET status = 'teleported'")
+        connection.commit()
+    with pytest.raises(store.ReconciliationIntegrityError, match="unknown status"):
+        store.list_takeover_intents(db_path=path)
+    with pytest.raises(store.ReconciliationIntegrityError, match="unknown status"):
+        store.get_active_takeover_intent("attempt-1", db_path=path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE {store.TAKEOVER_INTENTS_TABLE} SET status = 'blocked', "
+            "blocked_at_utc = ?, blocked_reason = 'because'",
+            (store._iso(at(1400)),),
+        )
+        connection.commit()
+    with pytest.raises(store.ReconciliationIntegrityError, match="unknown blocked reason"):
+        store.list_takeover_intents(db_path=path)
+
+
+def test_db_check_constraints_reject_malformed_intents(tmp_path):
+    path = reserved_db(tmp_path)
+    columns = ", ".join(store._INTENT_COLUMNS)
+    placeholders = ", ".join("?" for _ in store._INTENT_COLUMNS)
+    base = [
+        "tk-x",
+        "attempt-1",
+        1,
+        2,
+        "worker-1",
+        "claim-1",
+        "worker-2",
+        "claim-2",
+        store._iso(at(2000)),
+        "prepared",
+        store._iso(at(1300)),
+        None,  # fence_installed_at_utc
+        None,  # claim_promoted_at_utc
+        None,  # completed_at_utc
+        None,  # cancelled_at_utc
+        None,  # blocked_at_utc
+        None,  # blocked_reason
+        None,  # observed_claim_generation
+        None,  # observed_fence_generation
+        None,  # observed_fence_identity
+    ]
+    mutations = {
+        "unknown status": (9, "teleported"),
+        "generation gap": (3, 4),
+        "generation zero": (2, 0),
+        "same claim identity": (7, "claim-1"),
+        "non-utc timestamp": (10, "2026-07-20 12:00:00"),
+        "unknown blocked reason": (16, "because"),
+    }
+    for label, (index, value) in mutations.items():
+        record = list(base)
+        record[index] = value
+        with closing(sqlite3.connect(path)) as connection:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"INSERT INTO {store.TAKEOVER_INTENTS_TABLE} ({columns}) "
+                    f"VALUES ({placeholders})",
+                    record,
+                )
+        assert store.list_takeover_intents(db_path=path) == (), label
+
+
+def test_intent_reads_return_defaults_for_a_missing_db(tmp_path):
+    missing = tmp_path / "nothing.sqlite3"
+    assert store.get_active_takeover_intent("attempt-1", db_path=missing) is None
+    assert store.list_takeover_intents(db_path=missing) == ()
+    assert not missing.exists()
 
 
 # --- v1 -> v2 migration (Issue #104) ------------------------------------------
@@ -928,6 +1264,9 @@ def downgrade_to_v1(path):
     the discrepancies revision column (asserted against the pristine v1
     reference)."""
     with closing(sqlite3.connect(path)) as connection:
+        connection.execute(f"DROP INDEX {store._INTENT_ACTIVE_INDEX}")
+        connection.execute(f"DROP INDEX {store._INTENT_ATTEMPT_INDEX}")
+        connection.execute(f"DROP TABLE {store.TAKEOVER_INTENTS_TABLE}")
         connection.execute(f"DROP INDEX {store._REPAIRS_RUN_INDEX}")
         connection.execute(f"DROP TABLE {store.REPAIRS_TABLE}")
         connection.execute(

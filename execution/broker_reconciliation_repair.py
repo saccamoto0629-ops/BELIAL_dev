@@ -61,37 +61,57 @@ their query timeout below the lease duration -- see the docs.
 Crash / takeover recovery (:meth:`recover_pending_attempts`)
 ------------------------------------------------------------
 
-Pending reservations are enumerated from the audit DB:
+A takeover is a RESTARTABLE cross-DB protocol driven by a DURABLE INTENT
+(``broker_reconciliation_repair_takeover_intents``). The intent is committed
+BEFORE the first side effect and is the SOURCE OF TRUTH for one identity --
+``takeover_id`` + ``target_owner_id`` + ``target_claim_execution_id`` +
+``target_generation`` -- which every later step must present unchanged::
 
-- LEASE STILL VALID -> untouched. No takeover, no finalize, no broker
-  query, no execution-DB change: a live worker owns it.
-- LEASE EXPIRED -> fenced takeover: (a) the EXECUTION-DB fence is bumped to
-  ``generation + 1`` FIRST, so the old generation loses its ability to
-  commit before anything is re-evaluated (losers of that race write
-  nothing), then (b) the reconciliation-DB claim is taken over by atomic
-  CAS (owner / claim execution id replaced, generation incremented, lease
-  extended). **The claim CAS -- not the fence -- is the mutex**: exactly one
-  worker wins it, and the fence is the generation BARRIER that its winner
-  needs. That separation is what makes the takeover restartable: the two
-  cross-DB commits are not atomic, so a worker can die after arming the
-  fence and before claiming. The fence it left behind is an ORPHAN at the
-  target generation and is ADOPTED by the next worker (verified to name
-  this attempt at this generation) instead of stranding the attempt as
-  pending forever. A resurrected old worker can neither commit nor
-  finalize -- it holds a lower generation. Then, under the new claim:
-  - the execution history's STRUCTURED provenance (``repair_attempt_id``)
-    already names this attempt -> the state update committed before the
-    crash; finalize ``applied`` under the ORIGINAL attempt id.
-  - no provenance -> the update never committed; the recovery worker
-    CONTINUES the attempt as its legitimate new owner: fresh broker
-    re-query plus the full eligibility evaluation, then commit/finalize
-    under the new generation. Recovery never invents a ``failed`` verdict
-    without that re-evaluation.
+    1. reconciliation DB : intent committed as ``prepared``
+    2. execution DB      : that identity installed as the order's fence
+    3. reconciliation DB : intent -> ``fence_installed``
+    4. reconciliation DB : the attempt's claim promoted onto the identity
+    5. reconciliation DB : intent -> ``claim_promoted``
+    6. broker re-query + eligibility + fenced execution update
+    7. reconciliation DB : attempt finalized
+    8. reconciliation DB : intent -> ``completed``
 
-Cross-DB consistency: reservation (audit) -> fence + commit (orders) ->
-finalize (audit) is an explicit outbox-style sequence; every crash window
-is recoverable and the fence closes the "old worker resurrects after
-takeover" window inside the execution DB transaction itself.
+The two stores cannot commit together, so a process can die between ANY two
+steps. Because the identity is durable first, the next worker LOADS the
+intent and continues from its recorded stage with the SAME identity -- it
+never mints a new one, and no step ever accepts a different one. Every step
+is idempotent for the identical identity and refuses any other.
+
+Per pending reservation:
+
+- ACTIVE intent, lease still valid -> UNTOUCHED (a worker is driving it).
+- ACTIVE intent, lease expired -> RESUMED: its lease is re-acquired by an
+  atomic CAS (exactly one of any number of workers wins) and the protocol
+  continues from its stage.
+- no active intent, claim lease still valid -> UNTOUCHED.
+- no active intent, claim lease expired -> a new intent is prepared; the
+  partial UNIQUE index makes exactly one concurrent creator win and the
+  losers change nothing.
+- a state the protocol must NOT resolve -- an execution fence ahead of the
+  intent, a fence/claim held by a foreign identity, several active intents,
+  an unknown intent status, an active intent on a finalized attempt under a
+  foreign identity -- is durably BLOCKED on the intent row (reason code plus
+  the observed generations and fence identity) and returned as a typed
+  ``BLOCKED`` attempt. Never a silent skip, never an empty result.
+
+Under the promoted claim the attempt is completed as before: the state
+history's STRUCTURED provenance (``repair_attempt_id``) already naming this
+attempt proves the update committed -> finalize ``applied`` under the
+ORIGINAL attempt id; otherwise the attempt is RE-EVALUATED in full (fresh
+broker query + eligibility + fenced commit). Recovery never invents a
+``failed`` verdict without that re-evaluation.
+
+A worker whose execution is no longer the fence holder cannot commit (the
+fence check compares the FULL identity inside the update transaction) and
+cannot finalize (the finalize CAS compares owner + claim execution id +
+generation + takeover id). If its attempt was applied by the execution that
+did hold the fence, it reports ``already_applied`` -- never ``applied`` for
+work it did not do, and never a verdict contradicting the audit row.
 
 Failure classification and logging (Issue #104 re-review)
 ---------------------------------------------------------
@@ -154,22 +174,37 @@ from execution.reconciliation_models import (
     ResolutionCategory,
 )
 from execution.reconciliation_repair_models import (
+    BLOCKED_REASON_FAILURE_CODES,
     OrderRepairAttempt,
     ReconciliationRepairResult,
     RepairAttemptReservation,
     RepairFailureCode,
     RepairMode,
     RepairOutcome,
+    RepairTakeoverIntent,
+    TakeoverBlockedReason,
+    TakeoverIntentStatus,
 )
 from execution.reconciliation_store import (
+    ReconciliationIntegrityError,
     ReconciliationStoreError,
     RepairAttemptConflictError,
     RepairClaimLostError,
-    claim_repair_attempt,
+    TakeoverIntentConflictError,
+    TakeoverIntentStateError,
+    advance_takeover_intent,
+    block_takeover_intent,
+    create_takeover_intent,
     finalize_repair_attempt,
+    renew_takeover_intent_lease,
+    get_active_takeover_intent,
     get_reconciliation_run,
+    get_repair_attempt,
     init_reconciliation_db,
+    insert_blocked_takeover_intent,
     list_pending_repair_attempts,
+    list_takeover_intents,
+    promote_repair_claim,
     reserve_repair_attempt,
 )
 
@@ -217,15 +252,67 @@ def _new_claim_execution_id() -> str:
     return f"claim-{os.urandom(8).hex()}"
 
 
+def _new_takeover_id() -> str:
+    return f"takeover-{os.urandom(8).hex()}"
+
+
+def _describe_fence(fence: dict) -> str:
+    """Stable, secret-free rendering of a stored fence row (audits/logs)."""
+    return (
+        f"attempt={fence['repair_attempt_id']} generation={fence['generation']} "
+        f"takeover={fence['takeover_id']} claim={fence['claim_execution_id']} "
+        f"owner={fence['owner_id']}"
+    )
+
+
 class _Claim:
-    """The claim under which one attempt is being executed (in-memory)."""
+    """The claim under which one attempt is being executed (in-memory).
 
-    __slots__ = ("owner_id", "claim_execution_id", "generation")
+    ``takeover_id`` is None only for generation 1 (the original claim); every
+    later generation carries the id of the DURABLE takeover intent that
+    created it, and that id travels with the claim into the execution DB's
+    fence and into the finalized audit row -- one identity everywhere."""
 
-    def __init__(self, owner_id: str, claim_execution_id: str, generation: int):
+    __slots__ = ("owner_id", "claim_execution_id", "generation", "takeover_id")
+
+    def __init__(
+        self,
+        owner_id: str,
+        claim_execution_id: str,
+        generation: int,
+        takeover_id: str | None = None,
+    ):
         self.owner_id = owner_id
         self.claim_execution_id = claim_execution_id
         self.generation = generation
+        self.takeover_id = takeover_id
+
+    @classmethod
+    def from_intent(cls, intent: RepairTakeoverIntent) -> "_Claim":
+        return cls(
+            intent.target_owner_id,
+            intent.target_claim_execution_id,
+            intent.target_generation,
+            intent.takeover_id,
+        )
+
+    @classmethod
+    def from_reservation(cls, reservation: RepairAttemptReservation) -> "_Claim":
+        return cls(
+            reservation.owner_id,
+            reservation.claim_execution_id,
+            reservation.generation,
+            reservation.takeover_id,
+        )
+
+    def fence_token(self, attempt_id: str) -> execution_store.RepairFenceToken:
+        return execution_store.RepairFenceToken(
+            repair_attempt_id=attempt_id,
+            generation=self.generation,
+            owner_id=self.owner_id,
+            claim_execution_id=self.claim_execution_id,
+            takeover_id=self.takeover_id,
+        )
 
 
 class BrokerOrderReconciliationRepairService:
@@ -404,126 +491,604 @@ class BrokerOrderReconciliationRepairService:
     def recover_pending_attempts(
         self, *, run_id: str | None = None
     ) -> tuple[OrderRepairAttempt, ...]:
-        """Take over and complete pending attempts whose lease EXPIRED.
+        """Resume or take over pending attempts whose lease EXPIRED (r4).
 
-        For each pending reservation (optionally restricted to one run):
+        The takeover is a RESTARTABLE cross-DB protocol driven by a DURABLE
+        intent, so a process death between any two commits is resumed with
+        the SAME identity instead of minting a new one:
 
-        - lease still valid -> UNTOUCHED (no takeover, no finalize, no
-          broker query, no execution-DB change): a live worker owns it.
-        - lease expired -> fenced takeover: the execution-DB fence is bumped
-          to ``generation + 1`` FIRST (so the old generation can no longer
-          commit; losers of that race write nothing), then the
-          reconciliation-DB claim CAS -- **the mutex** -- elects exactly one
-          owner among any number of concurrent recovery workers. A fence
-          left at the target generation by a worker that died before its
-          claim CAS is an ORPHAN and is adopted (see
-          :meth:`_adoptable_fence`), so a half-finished takeover can always
-          be restarted. Under the new claim: a history row whose STRUCTURED
-          ``repair_attempt_id`` equals the reservation's id proves the state
-          update committed -> finalize ``applied`` under the ORIGINAL
-          attempt id; otherwise the attempt is RE-EVALUATED in full (fresh
-          broker query, eligibility, fenced commit) as the new legitimate
-          owner -- recovery never invents a ``failed`` verdict without that
-          re-evaluation.
+        1. reconciliation DB -- commit the takeover intent as ``prepared``
+           (target owner / claim execution id / generation / takeover id);
+        2. execution DB -- install that identity as the order's fence
+           (idempotent for the identical token);
+        3. reconciliation DB -- intent -> ``fence_installed``;
+        4. reconciliation DB -- promote the attempt's claim onto the intent
+           identity (compare-and-set on the source claim, idempotent);
+        5. reconciliation DB -- intent -> ``claim_promoted``;
+        6. broker re-query + eligibility + fenced execution update (skipped
+           when the state history's provenance already names this attempt);
+        7. reconciliation DB -- finalize the attempt;
+        8. reconciliation DB -- intent -> ``completed``.
+
+        Per pending reservation:
+
+        - an ACTIVE intent whose lease is still valid -> UNTOUCHED (another
+          worker is driving it right now);
+        - an ACTIVE intent whose lease expired -> RESUMED from its recorded
+          stage under its recorded identity;
+        - no active intent and a valid claim lease -> UNTOUCHED;
+        - no active intent and an expired claim lease -> a new intent is
+          prepared (exactly one of any number of concurrent workers wins the
+          insert; the losers change nothing);
+        - a state the protocol must not resolve (a fence ahead of the
+          intent, a foreign fence / claim identity, several active intents,
+          an unresolvable chain) -> durably BLOCKED on the intent row and
+          reported as a typed ``BLOCKED`` attempt. Never a silent skip.
 
         Recovery is fail-closed: a reservation whose source run /
         discrepancy has been deleted or tampered with is refused with
         :class:`ReconciliationRepairError` instead of being guessed about.
         """
         db_path = self._reconciliation_db_path
-        pending = list_pending_repair_attempts(run_id=run_id, db_path=db_path)
         recovered: list[OrderRepairAttempt] = []
-        for reservation in pending:
-            now = self._now()
-            if reservation.lease_expires_at_utc > now:
-                continue  # the lease protects a (possibly live) worker
-            run, discrepancy = self._verified_source(reservation)
-            new_claim = _Claim(
-                self._owner_id, _new_claim_execution_id(), reservation.generation + 1
-            )
-            if reservation.execution_request_id is not None:
-                # Fence FIRST: the old generation must lose its ability to
-                # commit BEFORE this worker re-evaluates anything. The fence
-                # is a generation BARRIER, not the mutex -- the claim CAS
-                # below elects the single winner.
-                try:
-                    execution_store.register_repair_fence(
-                        reservation.execution_request_id,
-                        repair_attempt_id=reservation.attempt_id,
-                        generation=new_claim.generation,
-                        owner_id=new_claim.owner_id,
-                        claim_execution_id=new_claim.claim_execution_id,
-                        registered_at_utc=now,
-                        db_path=self._execution_db_path,
-                    )
-                except ExecutionRepairFenceConflictError:
-                    # A fence at or beyond our target generation exists. Two
-                    # cases, and only one of them is ours to abandon:
-                    #
-                    # - beyond it -> another worker legitimately advanced
-                    #   past this generation; not ours.
-                    # - exactly AT our target generation -> a takeover that
-                    #   committed its fence and then DIED before its claim
-                    #   CAS (the two cross-DB commits are not atomic). That
-                    #   fence is ORPHANED: no audit claim backs it. Adopting
-                    #   it is safe and required -- it is precisely the
-                    #   barrier we wanted, the claim CAS still elects exactly
-                    #   one owner, and refusing it would strand the attempt
-                    #   as pending forever (PR #107 re-review r3 P1).
-                    if not self._adoptable_fence(
-                        reservation.execution_request_id,
-                        reservation.attempt_id,
-                        new_claim.generation,
-                    ):
-                        continue
-                except execution_store.ExecutionOrderNotFoundError:
-                    pass  # no order -> nothing to fence; the claim CAS decides
-            try:
-                claimed = claim_repair_attempt(
-                    reservation.attempt_id,
-                    expected_generation=reservation.generation,
-                    new_owner_id=new_claim.owner_id,
-                    new_claim_execution_id=new_claim.claim_execution_id,
-                    new_lease_expires_at_utc=now + self._lease_duration,
-                    claimed_at_utc=now,
-                    db_path=db_path,
-                )
-            except (RepairClaimLostError, RepairAttemptConflictError):
-                continue  # someone else took it over or finalized it first
-            attempt = self._resume_claimed_attempt(run, discrepancy, claimed, new_claim)
-            attempt = self._finalize(attempt)
-            self._safe_log_attempt(attempt)
-            recovered.append(attempt)
+        seen_attempts: set[str] = set()
+        for reservation in list_pending_repair_attempts(run_id=run_id, db_path=db_path):
+            seen_attempts.add(reservation.attempt_id)
+            entry = self._recover_one(reservation, self._now())
+            if entry is not None:
+                self._safe_log_attempt(entry)
+                recovered.append(entry)
+        recovered.extend(self._report_orphaned_active_intents(seen_attempts, run_id))
         return tuple(recovered)
 
-    # --- recovery helpers ---------------------------------------------------
+    # --- takeover protocol --------------------------------------------------
 
-    def _adoptable_fence(
-        self, execution_request_id: str, attempt_id: str, generation: int
-    ) -> bool:
-        """Is the order's fence an ORPHAN left at exactly ``generation``?
-
-        True only when the stored fence names THIS attempt at THIS
-        generation -- i.e. a takeover whose fence commit landed but whose
-        claim CAS did not (the two cross-DB commits cannot be made atomic).
-        Adopting it writes nothing: it is already exactly the barrier this
-        generation needs, the reconciliation claim CAS still elects the
-        single owner, and ``record_order_result`` re-verifies the same
-        (attempt id, generation) pair inside its own transaction. Any other
-        fence -- a newer generation, a different attempt, none at all, or an
-        unreadable execution DB -- is not ours.
-        """
+    def _recover_one(
+        self, reservation: RepairAttemptReservation, now: datetime
+    ) -> OrderRepairAttempt | None:
+        """One pending attempt: resume, take over, leave alone -- or block."""
         try:
-            fence = execution_store.get_repair_fence(
+            intent = get_active_takeover_intent(
+                reservation.attempt_id, db_path=self._reconciliation_db_path
+            )
+            blocked = (
+                None
+                if intent is not None
+                else self._blocked_intent_for_current_generation(reservation)
+            )
+        except ReconciliationIntegrityError as exc:
+            # several active intents / an unknown status: never guessed at
+            return self._block_without_active_intent(
+                reservation,
+                now,
+                reason=(
+                    TakeoverBlockedReason.MULTIPLE_ACTIVE_INTENTS
+                    if "ACTIVE takeover intents" in str(exc)
+                    else TakeoverBlockedReason.PROTOCOL_CORRUPT
+                ),
+                detail=(
+                    "the attempt's takeover intents are inconsistent "
+                    f"({type(exc).__name__}); recovery refuses to choose one"
+                ),
+            )
+        if intent is not None:
+            if intent.lease_expires_at_utc > now:
+                return None  # another worker is driving this takeover
+            return self._drive_takeover(reservation, intent, now)
+
+        if blocked is not None:
+            return self._blocked_report(
+                reservation,
+                blocked.blocked_reason,
+                detail=(
+                    f"takeover intent {blocked.takeover_id} is BLOCKED "
+                    f"({blocked.blocked_reason.value}); the attempt stays pending for "
+                    "manual intervention and no further takeover is started"
+                ),
+            )
+        if reservation.lease_expires_at_utc > now:
+            return None  # the lease protects a (possibly live) worker
+
+        problem = self._fence_precondition(reservation)
+        if problem is not None:
+            reason, detail = problem
+            return self._block_without_active_intent(
+                reservation, now, reason=reason, detail=detail
+            )
+        intent = self._prepare_intent(reservation, now)
+        if intent is None:
+            return None  # another worker won the intent insert; it owns this now
+        return self._drive_takeover(reservation, intent, now)
+
+    def _prepare_intent(
+        self, reservation: RepairAttemptReservation, now: datetime
+    ) -> RepairTakeoverIntent | None:
+        """Step 1: mint ONE identity and commit it durably.
+
+        Returns None when another worker won the insert (its intent is
+        active and freshly leased, so this worker changes nothing)."""
+        candidate = RepairTakeoverIntent(
+            takeover_id=_new_takeover_id(),
+            repair_attempt_id=reservation.attempt_id,
+            source_generation=reservation.generation,
+            target_generation=reservation.generation + 1,
+            source_owner_id=reservation.owner_id,
+            source_claim_execution_id=reservation.claim_execution_id,
+            target_owner_id=self._owner_id,
+            target_claim_execution_id=_new_claim_execution_id(),
+            lease_expires_at_utc=now + self._lease_duration,
+            status=TakeoverIntentStatus.PREPARED,
+            created_at_utc=now,
+        )
+        try:
+            return create_takeover_intent(
+                candidate, observed_at_utc=now, db_path=self._reconciliation_db_path
+            )
+        except (TakeoverIntentConflictError, RepairAttemptConflictError):
+            return None
+
+    def _drive_takeover(
+        self,
+        reservation: RepairAttemptReservation,
+        intent: RepairTakeoverIntent,
+        now: datetime,
+    ) -> OrderRepairAttempt | None:
+        """Steps 2-8 for ONE intent, resumable from any stage.
+
+        Every step is idempotent under the intent's identity, so re-running
+        this after a crash at any commit boundary converges instead of
+        forking a second takeover."""
+        run, discrepancy = self._verified_source(reservation)
+        if intent.lease_expires_at_utc <= now:
+            # Resuming an abandoned takeover: acquire its lease first, so
+            # only ONE worker resumes it -- with the intent's ORIGINAL
+            # identity, never a new one.
+            try:
+                intent = renew_takeover_intent_lease(
+                    intent,
+                    new_lease_expires_at_utc=now + self._lease_duration,
+                    db_path=self._reconciliation_db_path,
+                )
+            except (TakeoverIntentConflictError, TakeoverIntentStateError):
+                return None  # another worker resumed it first
+        claim = _Claim.from_intent(intent)
+
+        if intent.status is TakeoverIntentStatus.PREPARED:
+            problem = self._install_fence(reservation, intent, now)
+            if problem is not None:
+                return self._block_intent(reservation, intent, now, *problem)
+            intent = advance_takeover_intent(
+                intent,
+                to_status=TakeoverIntentStatus.FENCE_INSTALLED,
+                at_utc=now,
+                db_path=self._reconciliation_db_path,
+            )
+        elif intent.status is TakeoverIntentStatus.FENCE_INSTALLED:
+            # re-assert the SAME token (idempotent) so a crash between the
+            # fence commit and the status update cannot leave them apart
+            problem = self._install_fence(reservation, intent, now)
+            if problem is not None:
+                return self._block_intent(reservation, intent, now, *problem)
+
+        if intent.status in (
+            TakeoverIntentStatus.FENCE_INSTALLED,
+            TakeoverIntentStatus.CLAIM_PROMOTED,
+        ):
+            try:
+                reservation = promote_repair_claim(
+                    intent, promoted_at_utc=now, db_path=self._reconciliation_db_path
+                )
+            except RepairClaimLostError as exc:
+                return self._block_intent(
+                    reservation,
+                    intent,
+                    now,
+                    TakeoverBlockedReason.CLAIM_IDENTITY_MISMATCH,
+                    (
+                        "the attempt's claim no longer matches this takeover intent "
+                        f"({type(exc).__name__}); the protocol refuses to promote it"
+                    ),
+                )
+            except RepairAttemptConflictError:
+                return self._block_intent(
+                    reservation,
+                    intent,
+                    now,
+                    TakeoverBlockedReason.ATTEMPT_ALREADY_FINALIZED,
+                    (
+                        "the attempt was finalized while this takeover was in flight; "
+                        "the intent is parked instead of re-applying anything"
+                    ),
+                )
+            if intent.status is TakeoverIntentStatus.FENCE_INSTALLED:
+                intent = advance_takeover_intent(
+                    intent,
+                    to_status=TakeoverIntentStatus.CLAIM_PROMOTED,
+                    at_utc=now,
+                    db_path=self._reconciliation_db_path,
+                )
+
+        if reservation.takeover_id != intent.takeover_id:
+            return self._block_intent(
+                reservation,
+                intent,
+                now,
+                TakeoverBlockedReason.CLAIM_IDENTITY_MISMATCH,
+                (
+                    "the attempt's claim is held by a different takeover than this "
+                    "intent; recovery refuses to act under a foreign identity"
+                ),
+            )
+
+        attempt = self._resume_claimed_attempt(run, discrepancy, reservation, claim)
+        attempt = self._finalize(attempt)
+        try:
+            advance_takeover_intent(
+                intent,
+                to_status=TakeoverIntentStatus.COMPLETED,
+                at_utc=now,
+                db_path=self._reconciliation_db_path,
+            )
+        except (TakeoverIntentStateError, ReconciliationStoreError) as exc:
+            # The work is done and audited; the intent stays active and the
+            # next pass completes it (every step is idempotent).
+            self._safe_log_sanitized_exception(
+                "completing a takeover intent failed",
+                exc,
+                failure_code=None,
+                attempt_id=reservation.attempt_id,
+                run_id=reservation.run_id,
+                target_id=reservation.target_id,
+            )
+        return attempt
+
+    def _install_fence(
+        self,
+        reservation: RepairAttemptReservation,
+        intent: RepairTakeoverIntent,
+        now: datetime,
+    ) -> tuple[TakeoverBlockedReason, str] | None:
+        """Step 2: install the intent's identity as the order's fence.
+
+        Returns None on success (including the idempotent retry of an
+        identical token) or the (reason, detail) of a blocking mismatch. A
+        broker-only target has no order to fence -- the claim promotion
+        alone carries the takeover."""
+        if reservation.execution_request_id is None:
+            return None
+        token = _Claim.from_intent(intent).fence_token(reservation.attempt_id)
+        try:
+            execution_store.register_repair_fence(
+                reservation.execution_request_id,
+                token=token,
+                registered_at_utc=now,
+                db_path=self._execution_db_path,
+            )
+            return None
+        except ExecutionRepairFenceConflictError:
+            fence = self._read_fence(reservation.execution_request_id)
+            observed = "unreadable" if fence is None else _describe_fence(fence)
+            reason = (
+                TakeoverBlockedReason.FENCE_AHEAD
+                if fence is not None and fence["generation"] > intent.target_generation
+                else TakeoverBlockedReason.FENCE_IDENTITY_MISMATCH
+            )
+            return (
+                reason,
+                (
+                    "the execution fence cannot be installed for this takeover "
+                    f"(intent {intent.takeover_id} targets generation "
+                    f"{intent.target_generation}; the order's fence is {observed})"
+                ),
+            )
+        except execution_store.ExecutionOrderNotFoundError:
+            return None  # no order row -> nothing to fence; the claim decides
+        except ExecutionStoreError as exc:
+            return (
+                TakeoverBlockedReason.PROTOCOL_CORRUPT,
+                (
+                    "the execution store could not be asked about this order's repair "
+                    f"fence ({type(exc).__name__}); the takeover is parked instead of "
+                    "proceeding blind"
+                ),
+            )
+
+    def _fence_precondition(
+        self, reservation: RepairAttemptReservation
+    ) -> tuple[TakeoverBlockedReason, str] | None:
+        """Before minting a NEW intent: is the order's fence consistent with
+        this attempt's claim? A fence at or beyond the generation we are
+        about to create means a protocol ran that we have no durable intent
+        for -- never silently overwritten, always parked."""
+        if reservation.execution_request_id is None:
+            return None
+        fence = self._read_fence(reservation.execution_request_id)
+        if fence is None or fence["repair_attempt_id"] != reservation.attempt_id:
+            return None
+        target = reservation.generation + 1
+        if fence["generation"] < target:
+            return None
+        reason = (
+            TakeoverBlockedReason.FENCE_AHEAD
+            if fence["generation"] > target
+            else TakeoverBlockedReason.ORPHAN_FENCE_WITHOUT_INTENT
+        )
+        return (
+            reason,
+            (
+                f"the order's repair fence is {_describe_fence(fence)} while the attempt's "
+                f"claim is at generation {reservation.generation} and no takeover intent "
+                "explains it; recovery refuses to overwrite a fence it cannot account for"
+            ),
+        )
+
+    def _read_fence(self, execution_request_id: str) -> dict | None:
+        try:
+            return execution_store.get_repair_fence(
                 execution_request_id, db_path=self._execution_db_path
             )
         except ExecutionStoreError:
-            return False  # fail-closed: never guess about the fence
-        return (
-            fence is not None
-            and fence["repair_attempt_id"] == attempt_id
-            and fence["generation"] == generation
+            return None
+
+    # --- blocked reporting --------------------------------------------------
+
+    def _block_intent(
+        self,
+        reservation: RepairAttemptReservation,
+        intent: RepairTakeoverIntent,
+        now: datetime,
+        reason: TakeoverBlockedReason,
+        detail: str,
+    ) -> OrderRepairAttempt:
+        """Park an active intent durably and report it to the caller."""
+        fence = (
+            None
+            if reservation.execution_request_id is None
+            else self._read_fence(reservation.execution_request_id)
         )
+        try:
+            block_takeover_intent(
+                intent,
+                reason=reason,
+                at_utc=now,
+                observed_claim_generation=reservation.generation,
+                observed_fence_generation=None if fence is None else fence["generation"],
+                observed_fence_identity=None if fence is None else _describe_fence(fence),
+                db_path=self._reconciliation_db_path,
+            )
+        except ReconciliationStoreError as exc:
+            self._safe_log_sanitized_exception(
+                "recording a blocked takeover intent failed",
+                exc,
+                failure_code=BLOCKED_REASON_FAILURE_CODES[reason],
+                attempt_id=reservation.attempt_id,
+                run_id=reservation.run_id,
+                target_id=reservation.target_id,
+            )
+        return self._blocked_report(reservation, reason, detail=detail)
+
+    def _block_without_active_intent(
+        self,
+        reservation: RepairAttemptReservation,
+        now: datetime,
+        *,
+        reason: TakeoverBlockedReason,
+        detail: str,
+    ) -> OrderRepairAttempt:
+        """Park an inconsistency that has no active intent to carry it: a
+        blocked intent row is INSERTED so the diagnosis is durable and the
+        same doomed takeover is never silently retried."""
+        fence = (
+            None
+            if reservation.execution_request_id is None
+            else self._read_fence(reservation.execution_request_id)
+        )
+        record = RepairTakeoverIntent(
+            takeover_id=_new_takeover_id(),
+            repair_attempt_id=reservation.attempt_id,
+            source_generation=reservation.generation,
+            target_generation=reservation.generation + 1,
+            source_owner_id=reservation.owner_id,
+            source_claim_execution_id=reservation.claim_execution_id,
+            target_owner_id=self._owner_id,
+            target_claim_execution_id=_new_claim_execution_id(),
+            lease_expires_at_utc=now + self._lease_duration,
+            status=TakeoverIntentStatus.BLOCKED,
+            created_at_utc=now,
+            blocked_at_utc=now,
+            blocked_reason=reason,
+            observed_claim_generation=reservation.generation,
+            observed_fence_generation=None if fence is None else fence["generation"],
+            observed_fence_identity=None if fence is None else _describe_fence(fence),
+        )
+        try:
+            insert_blocked_takeover_intent(record, db_path=self._reconciliation_db_path)
+        except ReconciliationStoreError as exc:
+            # e.g. a blocked intent for this generation already exists -- the
+            # diagnosis is already durable; still report it to the caller.
+            self._safe_log_sanitized_exception(
+                "recording a blocked takeover intent failed",
+                exc,
+                failure_code=BLOCKED_REASON_FAILURE_CODES[reason],
+                attempt_id=reservation.attempt_id,
+                run_id=reservation.run_id,
+                target_id=reservation.target_id,
+            )
+        return self._blocked_report(reservation, reason, detail=detail)
+
+    def _blocked_intent_for_current_generation(
+        self, reservation: RepairAttemptReservation
+    ) -> RepairTakeoverIntent | None:
+        """A blocked intent already diagnosed for this exact claim (so a
+        repeated recovery reports it again instead of starting over)."""
+        for intent in list_takeover_intents(
+            attempt_id=reservation.attempt_id, db_path=self._reconciliation_db_path
+        ):
+            if (
+                intent.status is TakeoverIntentStatus.BLOCKED
+                and intent.source_generation == reservation.generation
+            ):
+                return intent
+        return None
+
+    def _blocked_report(
+        self,
+        reservation: RepairAttemptReservation,
+        reason: TakeoverBlockedReason,
+        *,
+        detail: str,
+    ) -> OrderRepairAttempt:
+        """The caller-visible BLOCKED result. The attempt itself stays
+        PENDING -- nothing is finalized, nothing is applied."""
+        return OrderRepairAttempt(
+            attempt_id=reservation.attempt_id,
+            run_id=reservation.run_id,
+            mode=RepairMode.APPLY,
+            target_type=reservation.target_type,
+            target_id=reservation.target_id,
+            outcome=RepairOutcome.BLOCKED,
+            detail=detail,
+            failure_code=BLOCKED_REASON_FAILURE_CODES[reason],
+            reserved_at_utc=reservation.reserved_at_utc,
+            owner_id=reservation.owner_id,
+            claim_execution_id=reservation.claim_execution_id,
+            generation=reservation.generation,
+            takeover_id=reservation.takeover_id,
+            execution_request_id=reservation.execution_request_id,
+            client_order_id=reservation.client_order_id,
+            reconciliation_internal_state=reservation.reconciliation_internal_state,
+            reconciliation_broker_state=reservation.reconciliation_broker_state,
+            internal_revision=reservation.internal_revision,
+            observed_at_utc=reservation.observed_at_utc,
+        )
+
+    def _report_orphaned_active_intents(
+        self, seen_attempts: set[str], run_id: str | None
+    ) -> list[OrderRepairAttempt]:
+        """Active intents whose attempt is already FINALIZED are corrupt --
+        the protocol parks and reports them instead of leaving them to age
+        invisibly."""
+        reports: list[OrderRepairAttempt] = []
+        try:
+            intents = list_takeover_intents(db_path=self._reconciliation_db_path)
+        except ReconciliationIntegrityError as exc:
+            # damaged intent rows: the per-attempt pass above already reported
+            # them as BLOCKED; this sweep must not hide those results.
+            self._safe_log_sanitized_exception(
+                "scanning takeover intents failed",
+                exc,
+                failure_code=RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
+                attempt_id=None,
+                run_id=run_id,
+                target_id=None,
+            )
+            return reports
+        for intent in intents:
+            if not intent.is_active or intent.repair_attempt_id in seen_attempts:
+                continue
+            stored = get_repair_attempt(
+                intent.repair_attempt_id, db_path=self._reconciliation_db_path
+            )
+            if stored is None:
+                continue  # neither pending nor finalized: nothing to say
+            if run_id is not None and stored.run_id != run_id:
+                continue
+            now = self._now()
+            resolution = self._resolve_intent_of_finalized_attempt(intent, stored, now)
+            if resolution is not None:
+                continue  # converged safely (completed / cancelled), nothing to report
+            try:
+                block_takeover_intent(
+                    intent,
+                    reason=TakeoverBlockedReason.ATTEMPT_ALREADY_FINALIZED,
+                    at_utc=now,
+                    observed_claim_generation=stored.generation,
+                    db_path=self._reconciliation_db_path,
+                )
+            except ReconciliationStoreError as exc:
+                self._safe_log_sanitized_exception(
+                    "parking a takeover intent of a finalized attempt failed",
+                    exc,
+                    failure_code=RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
+                    attempt_id=intent.repair_attempt_id,
+                    run_id=stored.run_id,
+                    target_id=stored.target_id,
+                )
+            report = OrderRepairAttempt(
+                attempt_id=stored.attempt_id,
+                run_id=stored.run_id,
+                mode=RepairMode.APPLY,
+                target_type=stored.target_type,
+                target_id=stored.target_id,
+                outcome=RepairOutcome.BLOCKED,
+                detail=(
+                    f"takeover intent {intent.takeover_id} is still active although the "
+                    f"attempt is finalized ({stored.outcome.value}); the intent was parked "
+                    "and no state was touched"
+                ),
+                failure_code=RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
+                reserved_at_utc=stored.reserved_at_utc,
+                owner_id=stored.owner_id,
+                claim_execution_id=stored.claim_execution_id,
+                generation=stored.generation,
+                takeover_id=stored.takeover_id,
+                execution_request_id=stored.execution_request_id,
+                client_order_id=stored.client_order_id,
+                reconciliation_internal_state=stored.reconciliation_internal_state,
+                reconciliation_broker_state=stored.reconciliation_broker_state,
+                internal_revision=stored.internal_revision,
+                observed_at_utc=stored.observed_at_utc,
+            )
+            self._safe_log_attempt(report)
+            reports.append(report)
+        return reports
+
+    def _resolve_intent_of_finalized_attempt(
+        self, intent: RepairTakeoverIntent, stored: OrderRepairAttempt, now: datetime
+    ) -> TakeoverIntentStatus | None:
+        """Converge an active intent whose attempt is already FINALIZED.
+
+        Two states are benign and converge without human attention:
+
+        - the attempt was finalized UNDER THIS INTENT (a crash lost only the
+          last status update) -> ``completed``;
+        - the intent never took effect because the claim it meant to replace
+          finalized the attempt first (a slow-but-alive worker won) ->
+          ``cancelled``.
+
+        Anything else -- the attempt was finalized under a DIFFERENT
+        identity while this intent already owned the claim -- is corrupt and
+        returns None so the caller blocks and reports it.
+        """
+        if (
+            intent.status is TakeoverIntentStatus.CLAIM_PROMOTED
+            and stored.takeover_id == intent.takeover_id
+        ):
+            target = TakeoverIntentStatus.COMPLETED
+        elif intent.status in (
+            TakeoverIntentStatus.PREPARED,
+            TakeoverIntentStatus.FENCE_INSTALLED,
+        ) and stored.claim_execution_id == intent.source_claim_execution_id:
+            target = TakeoverIntentStatus.CANCELLED
+        else:
+            return None
+        try:
+            advance_takeover_intent(
+                intent, to_status=target, at_utc=now, db_path=self._reconciliation_db_path
+            )
+        except (TakeoverIntentStateError, ReconciliationStoreError) as exc:
+            self._safe_log_sanitized_exception(
+                "closing the takeover intent of a finalized attempt failed",
+                exc,
+                failure_code=None,
+                attempt_id=intent.repair_attempt_id,
+                run_id=stored.run_id,
+                target_id=stored.target_id,
+            )
+            return None
+        return target
+
+    # --- recovery helpers ---------------------------------------------------
 
     def _verified_source(
         self, reservation: RepairAttemptReservation
@@ -566,30 +1131,78 @@ class BrokerOrderReconciliationRepairService:
             run, discrepancy, reservation.attempt_id, RepairMode.APPLY,
             reservation.reserved_at_utc, claim,
         )
-        committed = None
-        if reservation.execution_request_id is not None:
-            history = execution_store.get_state_history(
-                reservation.execution_request_id, db_path=self._execution_db_path
-            )
-            for entry in history:
-                if entry["repair_attempt_id"] == reservation.attempt_id:
-                    committed = entry
-                    break
+        committed = self._committed_provenance(
+            reservation.execution_request_id, reservation.attempt_id
+        )
         if committed is not None:
-            return make(
-                outcome=RepairOutcome.APPLIED,
-                before=reservation.reconciliation_internal_state,
-                after=OrderState(committed["new_state"]),
-                broker_order_id=committed["broker_order_id"],
-                broker_state_updated_at=datetime.fromisoformat(committed["changed_at_utc"]),
-                detail=(
-                    "recovered pending claim: the state history carries this attempt id "
-                    f"(state {committed['new_state']!r} committed before the takeover); "
-                    "finalized under the original attempt id"
-                ),
+            return self._applied_from_provenance(
+                committed, reservation.reconciliation_internal_state, make
             )
         # nothing committed: continue the attempt as its legitimate new owner
         return self._evaluate(run, discrepancy, reservation.attempt_id, RepairMode.APPLY, make, claim)
+
+    def _committed_provenance(
+        self, execution_request_id: str | None, attempt_id: str
+    ) -> dict | None:
+        """The state-history row this ATTEMPT committed, if any.
+
+        Structured provenance only (``repair_attempt_id``) -- the reason
+        string is never parsed. This is what makes "somebody already applied
+        this attempt" a fact rather than a guess, whichever generation did
+        it."""
+        if execution_request_id is None:
+            return None
+        try:
+            history = execution_store.get_state_history(
+                execution_request_id, db_path=self._execution_db_path
+            )
+        except ExecutionStoreError:
+            return None
+        for entry in history:
+            if entry["repair_attempt_id"] == attempt_id:
+                return entry
+        return None
+
+    def _applied_from_provenance(self, committed: dict, before: OrderState | None, make):
+        """The CURRENT owner finalizing the attempt's single audit record."""
+        return make(
+            outcome=RepairOutcome.APPLIED,
+            before=before,
+            after=OrderState(committed["new_state"]),
+            broker_order_id=committed["broker_order_id"],
+            broker_state_updated_at=datetime.fromisoformat(committed["changed_at_utc"]),
+            detail=(
+                "the state history carries this attempt id at generation "
+                f"{committed['repair_generation']} (state {committed['new_state']!r} was "
+                "committed by it); finalized as applied under the original attempt id "
+                "without re-applying anything"
+            ),
+        )
+
+    def _already_applied_by_another_execution(
+        self, committed: dict, before: OrderState | None, make
+    ):
+        """A worker that did NOT commit, reporting the truth about the order.
+
+        Its own update was refused (fence lost / revision moved / the
+        attempt's provenance row already exists), and the structured
+        provenance proves the attempt was applied by a different execution.
+        The outcome is deliberately ``already_applied`` -- NOT ``applied``:
+        this worker changed nothing, while the audit row (written by the
+        execution that did commit) still says applied. Caller and reality
+        agree without either of them claiming the other's work."""
+        return make(
+            outcome=RepairOutcome.ALREADY_APPLIED,
+            before=before,
+            after=OrderState(committed["new_state"]),
+            broker_order_id=committed["broker_order_id"],
+            detail=(
+                "this execution did not commit: the state history already carries this "
+                f"attempt id at generation {committed['repair_generation']} (state "
+                f"{committed['new_state']!r}); nothing was changed here and the attempt's "
+                "audit record belongs to the execution that applied it"
+            ),
+        )
 
     # --- one discrepancy ----------------------------------------------------
 
@@ -651,6 +1264,7 @@ class BrokerOrderReconciliationRepairService:
                 outcome=outcome,
                 detail=detail,
                 reserved_at_utc=reserved_at,
+                takeover_id=None if claim is None else claim.takeover_id,
                 owner_id=None if claim is None else claim.owner_id,
                 claim_execution_id=None if claim is None else claim.claim_execution_id,
                 generation=None if claim is None else claim.generation,
@@ -670,6 +1284,7 @@ class BrokerOrderReconciliationRepairService:
                 broker_state_updated_at_utc=broker_state_updated_at,
             )
 
+        make.attempt_id = attempt_id  # so helpers can look up this attempt's provenance
         return make
 
     def _reservation(
@@ -690,6 +1305,7 @@ class BrokerOrderReconciliationRepairService:
             detail="reserved: repair evaluation started",
             owner_id=claim.owner_id,
             claim_execution_id=claim.claim_execution_id,
+            takeover_id=claim.takeover_id,
             generation=claim.generation,
             lease_expires_at_utc=reserved_at + self._lease_duration,
             last_claimed_at_utc=reserved_at,
@@ -990,49 +1606,53 @@ class BrokerOrderReconciliationRepairService:
             broker_state_updated_at=fresh.updated_at_utc,
             detail=reason,
         )
+        token = claim.fence_token(attempt_id)
         try:
             try:
                 execution_store.register_repair_fence(
                     request_id,
-                    repair_attempt_id=attempt_id,
-                    generation=claim.generation,
-                    owner_id=claim.owner_id,
-                    claim_execution_id=claim.claim_execution_id,
+                    token=token,
                     registered_at_utc=applied_attempt.reserved_at_utc,
                     db_path=self._execution_db_path,
                 )
             except ExecutionRepairFenceConflictError:
-                # Arming failed. It is still ours iff the stored fence is
-                # already the exact barrier this claim needs -- the case
-                # where a takeover armed the fence and then died before its
-                # claim CAS, and THIS worker subsequently won that claim
-                # (PR #107 re-review r3 P1). Anything else means the claim
-                # was fenced out (a later takeover, or a newer attempt now
-                # owns the order).
-                if not self._adoptable_fence(request_id, attempt_id, claim.generation):
-                    return make(
-                        outcome=RepairOutcome.CONFLICT,
-                        failure_code=RepairFailureCode.CLAIM_LOST,
-                        before=current,
-                        detail=(
-                            "the repair fencing token was superseded before the commit "
-                            "(the claim was taken over or a newer attempt owns the order); "
-                            "nothing was changed by this worker"
-                        ),
+                # This execution's identity may not hold the fence: either a
+                # takeover moved it on, or a newer attempt owns the order. It
+                # is NEVER adopted on a partial match -- only the identical
+                # token is idempotent (r4 review). If the attempt was already
+                # applied (by whoever held the fence), converge on that fact
+                # rather than reporting a conflict against reality.
+                committed = self._committed_provenance(request_id, attempt_id)
+                if committed is not None:
+                    return self._already_applied_by_another_execution(
+                        committed, current, make
                     )
+                return make(
+                    outcome=RepairOutcome.CONFLICT,
+                    failure_code=RepairFailureCode.CLAIM_LOST,
+                    before=current,
+                    detail=(
+                        "the repair fencing token was superseded before the commit "
+                        "(the claim was taken over or a newer attempt owns the order); "
+                        "nothing was changed by this worker"
+                    ),
+                )
             execution_store.record_order_result(
                 request_id,
                 fresh,
                 reason=reason,
                 expected_current_state=current,
                 expected_revision=discrepancy.internal_revision,
-                repair_attempt_id=attempt_id,
-                repair_generation=claim.generation,
+                repair_fence=token,
                 db_path=self._execution_db_path,
             )
         except ExecutionRepairFenceConflictError:
             # rejected INSIDE the update transaction: the fence moved between
-            # arming and the commit -- typed lost claim, nothing was changed
+            # arming and the commit. If this attempt nevertheless applied,
+            # the audit must agree with the execution DB, not with the race.
+            committed = self._committed_provenance(request_id, attempt_id)
+            if committed is not None:
+                return self._already_applied_by_another_execution(committed, current, make)
             return make(
                 outcome=RepairOutcome.CONFLICT,
                 failure_code=RepairFailureCode.REPAIR_FENCE_CONFLICT,
@@ -1046,6 +1666,11 @@ class BrokerOrderReconciliationRepairService:
         except ExecutionOrderStateConflictError:
             return self._concurrent_loss(discrepancy, current, fresh, make)
         except ExecutionOrderConflictError as exc:
+            committed = self._committed_provenance(request_id, attempt_id)
+            if committed is not None:
+                # this attempt's own history row exists: another execution
+                # applied it. Report reality, not a conflict against it.
+                return self._already_applied_by_another_execution(committed, current, make)
             self._safe_log_sanitized_exception(
                 "conditional repair update hit a uniqueness conflict",
                 exc,
@@ -1228,7 +1853,15 @@ class BrokerOrderReconciliationRepairService:
         fresh: OrderResult,
         make,
     ) -> OrderRepairAttempt:
-        """The state/revision compare-and-set lost: re-read and classify."""
+        """The state/revision compare-and-set lost: re-read and classify.
+
+        If THIS attempt's provenance is already in the history, the update
+        it lost the race to was its own (a resumed execution of the same
+        takeover intent): converge on ``applied`` instead of contradicting
+        the execution DB."""
+        committed = self._committed_provenance(discrepancy.target_id, make.attempt_id)
+        if committed is not None:
+            return self._already_applied_by_another_execution(committed, expected, make)
         try:
             row = execution_store.get_execution_order(
                 discrepancy.target_id, db_path=self._execution_db_path

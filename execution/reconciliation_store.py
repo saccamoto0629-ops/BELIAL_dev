@@ -105,11 +105,16 @@ from execution.reconciliation_models import (
     ResolutionCategory,
 )
 from execution.reconciliation_repair_models import (
+    ACTIVE_INTENT_STATUSES,
+    ALLOWED_INTENT_TRANSITIONS,
     OrderRepairAttempt,
     RepairAttemptReservation,
     RepairFailureCode,
     RepairMode,
     RepairOutcome,
+    RepairTakeoverIntent,
+    TakeoverBlockedReason,
+    TakeoverIntentStatus,
 )
 from execution.sqlite_ro import ReadOnlyDbMissingError, connect_read_only
 
@@ -122,14 +127,19 @@ BUSY_TIMEOUT_SECONDS = 30
 RUNS_TABLE = "broker_reconciliation_runs"
 DISCREPANCIES_TABLE = "broker_reconciliation_discrepancies"
 REPAIRS_TABLE = "broker_reconciliation_repair_attempts"
+TAKEOVER_INTENTS_TABLE = "broker_reconciliation_repair_takeover_intents"
 
 # v1: initial Issue #103 schema (runs + discrepancies).
 # v2 (Issue #104): + broker_reconciliation_repair_attempts (two-phase repair
-#     audit: pending reservation -> finalized outcome) and
-#     discrepancies.internal_revision (the internal order's revision at
+#     audit: pending CLAIM -> finalized outcome),
+#     + broker_reconciliation_repair_takeover_intents (the DURABLE takeover
+#     intents that make a cross-DB takeover restartable under ONE identity)
+#     and discrepancies.internal_revision (the internal order's revision at
 #     observation time, so repair can prove the order is unchanged). Additive
-#     over v1 (ALTER ADD COLUMN + new table + index); init migrates a
-#     verified v1 DB in place (see the module docstring).
+#     over v1 (ALTER ADD COLUMN + new tables + indexes); init migrates a
+#     verified v1 DB in place (see the module docstring). Both v2 tables are
+#     introduced by the same unreleased change, so there is no intermediate
+#     released version between them to migrate from.
 SCHEMA_VERSION = 2
 _MIGRATABLE_VERSION = 1
 
@@ -181,8 +191,32 @@ _RESERVATION_COLUMNS: tuple[str, ...] = (
     "owner_id",
     "claim_execution_id",
     "generation",
+    "takeover_id",
     "lease_expires_at_utc",
     "last_claimed_at_utc",
+)
+# The intent row's columns, in DDL order.
+_INTENT_COLUMNS: tuple[str, ...] = (
+    "takeover_id",
+    "repair_attempt_id",
+    "source_generation",
+    "target_generation",
+    "source_owner_id",
+    "source_claim_execution_id",
+    "target_owner_id",
+    "target_claim_execution_id",
+    "lease_expires_at_utc",
+    "status",
+    "created_at_utc",
+    "fence_installed_at_utc",
+    "claim_promoted_at_utc",
+    "completed_at_utc",
+    "cancelled_at_utc",
+    "blocked_at_utc",
+    "blocked_reason",
+    "observed_claim_generation",
+    "observed_fence_generation",
+    "observed_fence_identity",
 )
 # Identity/anchor columns that must be IDENTICAL between the stored pending
 # reservation and the finalizing attempt (a finalize may only complete the
@@ -236,6 +270,27 @@ class RepairClaimLostError(ReconciliationStoreError):
     typed lost-claim result, never recorded as a competing outcome."""
 
 
+class TakeoverIntentConflictError(ReconciliationStoreError):
+    """An active takeover intent already exists for this attempt, or the
+    intent's preconditions no longer hold (r4 review).
+
+    Raised when a worker tries to CREATE an intent while another one is
+    active, when the attempt is already finalized, when the claim's lease is
+    still valid, or when the intent's ``source_*`` identity does not match
+    the attempt's current claim. The loser must LOAD the winner's active
+    intent and continue it under the SAME identity -- never mint a new one.
+    """
+
+
+class TakeoverIntentStateError(ReconciliationStoreError):
+    """An intent transition was refused (r4 review).
+
+    Either the transition is not allowed by the closed lifecycle (backwards,
+    out of a terminal status) or the caller's identity does not match the
+    stored intent. Re-applying the CURRENT status is NOT an error -- it is
+    an idempotent no-op, so a restarted worker can always retry its step."""
+
+
 def reconciliation_db_path() -> Path:
     raw = (os.getenv("BROKER_RECONCILIATION_DB_PATH") or str(DEFAULT_DB_PATH)).strip()
     path = Path(raw)
@@ -254,6 +309,25 @@ def _parse_utc(text: str) -> datetime:
 
 
 # --- schema ------------------------------------------------------------------
+
+
+def _iso_optional(value: datetime | None) -> str | None:
+    return None if value is None else _iso(value)
+
+
+def _parse_optional_utc(text: str | None) -> datetime | None:
+    return None if text is None else _parse_utc(text)
+
+
+def _require_utc_argument(value, field_name: str) -> None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ReconciliationStoreError(
+            f"{field_name} must be a timezone-aware UTC datetime, got {value!r}"
+        )
+
+
+def _read_path(db_path: Path | None) -> Path:
+    return Path(db_path) if db_path is not None else reconciliation_db_path()
 
 
 def _enum_values_sql(values) -> str:
@@ -376,6 +450,8 @@ def _create_repairs_table_sql() -> str:
             owner_id TEXT NOT NULL CHECK (trim(owner_id) <> ''),
             claim_execution_id TEXT NOT NULL CHECK (trim(claim_execution_id) <> ''),
             generation INTEGER NOT NULL CHECK (generation >= 1),
+            takeover_id TEXT
+                CHECK (takeover_id IS NULL OR trim(takeover_id) <> ''),
             lease_expires_at_utc TEXT NOT NULL CHECK (lease_expires_at_utc LIKE '%+00:00'),
             last_claimed_at_utc TEXT NOT NULL CHECK (last_claimed_at_utc LIKE '%+00:00'),
             internal_state_before TEXT
@@ -411,7 +487,94 @@ def _create_repairs_table_sql() -> str:
             CHECK (status = '{pending}'
                    OR (outcome = '{query_failed}') = (broker_error_code IS NOT NULL)),
             CHECK (status = '{pending}'
-                   OR (outcome IN ('{applied}', '{already}')) = (failure_code IS NULL))
+                   OR (outcome IN ('{applied}', '{already}')) = (failure_code IS NULL)),
+            CHECK ((generation = 1) = (takeover_id IS NULL)),
+            FOREIGN KEY (takeover_id)
+                REFERENCES {TAKEOVER_INTENTS_TABLE} (takeover_id)
+        ) WITHOUT ROWID
+    """
+
+
+def _create_takeover_intents_table_sql() -> str:
+    """DURABLE takeover intents (Issue #104 re-review r4).
+
+    One row per takeover of one repair attempt, committed BEFORE the first
+    cross-DB side effect. It is the SOURCE OF TRUTH for the takeover
+    identity: every later step (execution-DB fence, claim promotion, attempt
+    finalize) must carry exactly this ``takeover_id`` / ``target_owner_id``
+    / ``target_claim_execution_id`` / ``target_generation``, and a restarted
+    worker resumes THIS row instead of minting a new identity.
+
+    Constraints enforce the protocol: ``target_generation`` is always
+    ``source_generation + 1``, at most ONE active intent per attempt
+    (partial UNIQUE index), at most one intent per (attempt, source
+    generation) so a generation can never be taken over twice, a closed
+    status set, a closed blocked-reason set, and status/timestamp coherence
+    (a ``fence_installed`` row must carry ``fence_installed_at_utc`` and no
+    later stamps, etc.). Rows are NEVER deleted -- completed and blocked
+    intents are the audit trail of the identity chain."""
+    statuses = _enum_values_sql(TakeoverIntentStatus)
+    reasons = _enum_values_sql(TakeoverBlockedReason)
+    prepared = TakeoverIntentStatus.PREPARED.value
+    fence_installed = TakeoverIntentStatus.FENCE_INSTALLED.value
+    claim_promoted = TakeoverIntentStatus.CLAIM_PROMOTED.value
+    completed = TakeoverIntentStatus.COMPLETED.value
+    cancelled = TakeoverIntentStatus.CANCELLED.value
+    blocked = TakeoverIntentStatus.BLOCKED.value
+    return f"""
+        CREATE TABLE {TAKEOVER_INTENTS_TABLE} (
+            takeover_id TEXT PRIMARY KEY NOT NULL CHECK (trim(takeover_id) <> ''),
+            repair_attempt_id TEXT NOT NULL
+                REFERENCES {REPAIRS_TABLE} (attempt_id)
+                CHECK (trim(repair_attempt_id) <> ''),
+            source_generation INTEGER NOT NULL CHECK (source_generation >= 1),
+            target_generation INTEGER NOT NULL CHECK (target_generation >= 2),
+            source_owner_id TEXT NOT NULL CHECK (trim(source_owner_id) <> ''),
+            source_claim_execution_id TEXT NOT NULL
+                CHECK (trim(source_claim_execution_id) <> ''),
+            target_owner_id TEXT NOT NULL CHECK (trim(target_owner_id) <> ''),
+            target_claim_execution_id TEXT NOT NULL
+                CHECK (trim(target_claim_execution_id) <> ''),
+            lease_expires_at_utc TEXT NOT NULL CHECK (lease_expires_at_utc LIKE '%+00:00'),
+            status TEXT NOT NULL CHECK (status IN ('{statuses}')),
+            created_at_utc TEXT NOT NULL CHECK (created_at_utc LIKE '%+00:00'),
+            fence_installed_at_utc TEXT
+                CHECK (fence_installed_at_utc IS NULL
+                       OR fence_installed_at_utc LIKE '%+00:00'),
+            claim_promoted_at_utc TEXT
+                CHECK (claim_promoted_at_utc IS NULL OR claim_promoted_at_utc LIKE '%+00:00'),
+            completed_at_utc TEXT
+                CHECK (completed_at_utc IS NULL OR completed_at_utc LIKE '%+00:00'),
+            cancelled_at_utc TEXT
+                CHECK (cancelled_at_utc IS NULL OR cancelled_at_utc LIKE '%+00:00'),
+            blocked_at_utc TEXT
+                CHECK (blocked_at_utc IS NULL OR blocked_at_utc LIKE '%+00:00'),
+            blocked_reason TEXT
+                CHECK (blocked_reason IS NULL OR blocked_reason IN ('{reasons}')),
+            observed_claim_generation INTEGER
+                CHECK (observed_claim_generation IS NULL OR observed_claim_generation >= 1),
+            observed_fence_generation INTEGER
+                CHECK (observed_fence_generation IS NULL OR observed_fence_generation >= 1),
+            observed_fence_identity TEXT
+                CHECK (observed_fence_identity IS NULL OR trim(observed_fence_identity) <> ''),
+            UNIQUE (repair_attempt_id, source_generation),
+            CHECK (target_generation = source_generation + 1),
+            CHECK (target_claim_execution_id <> source_claim_execution_id),
+            CHECK ((status = '{blocked}') = (blocked_at_utc IS NOT NULL)),
+            CHECK ((status = '{blocked}') = (blocked_reason IS NOT NULL)),
+            CHECK ((status = '{completed}') = (completed_at_utc IS NOT NULL)),
+            CHECK ((status = '{cancelled}') = (cancelled_at_utc IS NOT NULL)),
+            CHECK (status = '{blocked}'
+                   OR (observed_claim_generation IS NULL
+                       AND observed_fence_generation IS NULL
+                       AND observed_fence_identity IS NULL)),
+            CHECK (status <> '{prepared}'
+                   OR (fence_installed_at_utc IS NULL AND claim_promoted_at_utc IS NULL)),
+            CHECK (status <> '{fence_installed}'
+                   OR (fence_installed_at_utc IS NOT NULL AND claim_promoted_at_utc IS NULL)),
+            CHECK (status NOT IN ('{claim_promoted}', '{completed}')
+                   OR (fence_installed_at_utc IS NOT NULL
+                       AND claim_promoted_at_utc IS NOT NULL))
         ) WITHOUT ROWID
     """
 
@@ -420,6 +583,22 @@ _DISCREPANCIES_RUN_INDEX = f"idx_{DISCREPANCIES_TABLE}_run"
 _REPAIRS_RUN_INDEX = f"idx_{REPAIRS_TABLE}_run"
 _REPAIRS_RUN_INDEX_SQL = (
     f"CREATE INDEX {_REPAIRS_RUN_INDEX} ON {REPAIRS_TABLE} (run_id, status, reserved_at_utc, attempt_id)"
+)
+# At most ONE active intent per attempt -- enforced by the DB, not by a
+# read-then-write race: two workers preparing a takeover concurrently means
+# exactly one INSERT survives and the loser must load the winner's intent.
+_INTENT_ACTIVE_INDEX = f"idx_{TAKEOVER_INTENTS_TABLE}_active"
+_INTENT_ACTIVE_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX {_INTENT_ACTIVE_INDEX} ON {TAKEOVER_INTENTS_TABLE} "
+    "(repair_attempt_id) WHERE status IN ("
+    + ", ".join(f"'{status.value}'" for status in sorted(ACTIVE_INTENT_STATUSES, key=lambda s: s.value))
+    + ")"
+)
+# Ordered lookup of an attempt's full intent history (audit + restart).
+_INTENT_ATTEMPT_INDEX = f"idx_{TAKEOVER_INTENTS_TABLE}_attempt"
+_INTENT_ATTEMPT_INDEX_SQL = (
+    f"CREATE INDEX {_INTENT_ATTEMPT_INDEX} ON {TAKEOVER_INTENTS_TABLE} "
+    "(repair_attempt_id, source_generation, takeover_id)"
 )
 
 
@@ -433,7 +612,7 @@ def _create_index_sql() -> str:
 def _tables_for(version: int) -> tuple[str, ...]:
     tables = [RUNS_TABLE, DISCREPANCIES_TABLE]
     if version >= SCHEMA_VERSION:
-        tables.append(REPAIRS_TABLE)
+        tables.extend((REPAIRS_TABLE, TAKEOVER_INTENTS_TABLE))
     return tuple(tables)
 
 
@@ -447,6 +626,9 @@ def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERS
     if version >= SCHEMA_VERSION:
         connection.execute(_create_repairs_table_sql())
         connection.execute(_REPAIRS_RUN_INDEX_SQL)
+        connection.execute(_create_takeover_intents_table_sql())
+        connection.execute(_INTENT_ACTIVE_INDEX_SQL)
+        connection.execute(_INTENT_ATTEMPT_INDEX_SQL)
     connection.execute(f"PRAGMA user_version = {version}")
 
 
@@ -638,10 +820,14 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection, db_path: Path) -> None:
     )
     connection.execute(_create_repairs_table_sql())
     connection.execute(_REPAIRS_RUN_INDEX_SQL)
+    connection.execute(_create_takeover_intents_table_sql())
+    connection.execute(_INTENT_ACTIVE_INDEX_SQL)
+    connection.execute(_INTENT_ATTEMPT_INDEX_SQL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     _LOGGER.info(
         "migrated broker reconciliation DB %s from schema v%d to v%d (added "
-        "discrepancies.internal_revision and repair attempts table %s)",
+        "discrepancies.internal_revision, repair attempts table %s and its "
+        "durable takeover intents)",
         db_path,
         _MIGRATABLE_VERSION,
         SCHEMA_VERSION,
@@ -919,6 +1105,7 @@ def reserve_repair_attempt(
         reservation.owner_id,
         reservation.claim_execution_id,
         reservation.generation,
+        reservation.takeover_id,
         _iso(reservation.lease_expires_at_utc),
         _iso(reservation.last_claimed_at_utc),
     )
@@ -957,78 +1144,600 @@ def reserve_repair_attempt(
             ) from exc
 
 
-def claim_repair_attempt(
-    attempt_id: str,
-    *,
-    expected_generation: int,
-    new_owner_id: str,
-    new_claim_execution_id: str,
-    new_lease_expires_at_utc: datetime,
-    claimed_at_utc: datetime,
-    db_path: Path | None = None,
-) -> RepairAttemptReservation:
-    """Take over an expired pending claim -- atomic fenced compare-and-set.
+def _restore_intent(row: sqlite3.Row) -> RepairTakeoverIntent:
+    """Rebuild an intent, fail-closed on unknown status / blocked reason."""
+    try:
+        status = TakeoverIntentStatus(row["status"])
+    except ValueError as exc:
+        raise ReconciliationIntegrityError(
+            f"takeover intent {row['takeover_id']!r} carries unknown status "
+            f"{row['status']!r}; refusing to restore it"
+        ) from exc
+    reason = row["blocked_reason"]
+    if reason is not None:
+        try:
+            reason = TakeoverBlockedReason(reason)
+        except ValueError as exc:
+            raise ReconciliationIntegrityError(
+                f"takeover intent {row['takeover_id']!r} carries unknown blocked reason "
+                f"{row['blocked_reason']!r}; refusing to restore it"
+            ) from exc
+    try:
+        return RepairTakeoverIntent(
+            takeover_id=row["takeover_id"],
+            repair_attempt_id=row["repair_attempt_id"],
+            source_generation=row["source_generation"],
+            target_generation=row["target_generation"],
+            source_owner_id=row["source_owner_id"],
+            source_claim_execution_id=row["source_claim_execution_id"],
+            target_owner_id=row["target_owner_id"],
+            target_claim_execution_id=row["target_claim_execution_id"],
+            lease_expires_at_utc=_parse_utc(row["lease_expires_at_utc"]),
+            status=status,
+            created_at_utc=_parse_utc(row["created_at_utc"]),
+            fence_installed_at_utc=_parse_optional_utc(row["fence_installed_at_utc"]),
+            claim_promoted_at_utc=_parse_optional_utc(row["claim_promoted_at_utc"]),
+            completed_at_utc=_parse_optional_utc(row["completed_at_utc"]),
+            cancelled_at_utc=_parse_optional_utc(row["cancelled_at_utc"]),
+            blocked_at_utc=_parse_optional_utc(row["blocked_at_utc"]),
+            blocked_reason=reason,
+            observed_claim_generation=row["observed_claim_generation"],
+            observed_fence_generation=row["observed_fence_generation"],
+            observed_fence_identity=row["observed_fence_identity"],
+        )
+    except ValueError as exc:
+        raise ReconciliationIntegrityError(
+            f"stored takeover intent {row['takeover_id']!r} fails validation: {exc}"
+        ) from exc
 
-    The takeover succeeds only while the row is still ``pending`` AND still
-    at ``expected_generation``; it increments the generation, replaces the
-    owner / claim execution id and extends the lease. Of any number of
-    concurrent takeover attempts exactly one wins; the losers observe
-    :class:`RepairClaimLostError` (still pending, someone else claimed it)
-    or :class:`RepairAttemptConflictError` (already finalized). Lease
-    EXPIRY is the CALLER's contract (checked against its clock before
-    calling); this CAS enforces atomicity, not the clock. Returns the
-    reservation as stored after the takeover.
+
+def _intent_record(intent: RepairTakeoverIntent) -> tuple:
+    return (
+        intent.takeover_id,
+        intent.repair_attempt_id,
+        intent.source_generation,
+        intent.target_generation,
+        intent.source_owner_id,
+        intent.source_claim_execution_id,
+        intent.target_owner_id,
+        intent.target_claim_execution_id,
+        _iso(intent.lease_expires_at_utc),
+        intent.status.value,
+        _iso(intent.created_at_utc),
+        _iso_optional(intent.fence_installed_at_utc),
+        _iso_optional(intent.claim_promoted_at_utc),
+        _iso_optional(intent.completed_at_utc),
+        _iso_optional(intent.cancelled_at_utc),
+        _iso_optional(intent.blocked_at_utc),
+        None if intent.blocked_reason is None else intent.blocked_reason.value,
+        intent.observed_claim_generation,
+        intent.observed_fence_generation,
+        intent.observed_fence_identity,
+    )
+
+
+def _insert_intent(connection: sqlite3.Connection, intent: RepairTakeoverIntent) -> None:
+    try:
+        connection.execute(
+            f"INSERT INTO {TAKEOVER_INTENTS_TABLE} ({', '.join(_INTENT_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _INTENT_COLUMNS)})",
+            _intent_record(intent),
+        )
+    except sqlite3.IntegrityError as exc:
+        # UNIQUE(takeover_id) / UNIQUE(attempt, source_generation) / the
+        # partial UNIQUE active index / FK / CHECK -- all mean "this intent
+        # may not exist", never "overwrite what is there".
+        raise TakeoverIntentConflictError(
+            f"takeover intent {intent.takeover_id!r} for repair attempt "
+            f"{intent.repair_attempt_id!r} (generation {intent.source_generation} -> "
+            f"{intent.target_generation}) violates a DB constraint and was not created: "
+            f"{type(exc).__name__}"
+        ) from exc
+
+
+def _active_intent_row(connection: sqlite3.Connection, attempt_id: str):
+    """The attempt's single ACTIVE intent row, or None -- fail-closed.
+
+    Every intent row of the attempt is restored (so an unknown status or
+    blocked reason raises instead of being filtered away as "not active"),
+    and more than one active intent -- which the partial UNIQUE index makes
+    impossible in-band -- is refused rather than resolved by guessing."""
+    rows = connection.execute(
+        f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} WHERE repair_attempt_id = ? "
+        "ORDER BY source_generation, takeover_id",
+        (attempt_id,),
+    ).fetchall()
+    active = [row for row in rows if _restore_intent(row).is_active]
+    if len(active) > 1:
+        raise ReconciliationIntegrityError(
+            f"repair attempt {attempt_id!r} has {len(active)} ACTIVE takeover intents "
+            f"({', '.join(sorted(row['takeover_id'] for row in active))}); at most one is "
+            "permitted and the protocol refuses to guess which is real"
+        )
+    return active[0] if active else None
+
+
+def create_takeover_intent(
+    intent: RepairTakeoverIntent,
+    *,
+    observed_at_utc: datetime,
+    db_path: Path | None = None,
+) -> RepairTakeoverIntent:
+    """Durably record the intent to take over an EXPIRED claim (r4 review).
+
+    This is step 1 of the cross-DB takeover protocol and the ONLY place a
+    takeover identity is minted. Everything is checked inside one
+    transaction, against the CURRENT claim:
+
+    - the attempt exists and is still ``pending`` (a finalized attempt can
+      never get an active intent);
+    - its lease has EXPIRED relative to ``observed_at_utc`` (the caller's
+      clock is the contract; the atomicity is this transaction's);
+    - ``source_generation`` / ``source_owner_id`` /
+      ``source_claim_execution_id`` match the claim being replaced;
+    - no other ACTIVE intent exists (partial UNIQUE index), and this
+      (attempt, source generation) was never taken over before.
+
+    A loser of the race gets :class:`TakeoverIntentConflictError` and must
+    LOAD the winner's active intent (``get_active_takeover_intent``) and
+    continue it -- never mint a second identity.
     """
-    if not isinstance(attempt_id, str) or not attempt_id.strip():
-        raise ReconciliationStoreError(f"attempt_id must be a non-empty string, got {attempt_id!r}")
-    if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) \
-            or expected_generation < 1:
+    if not isinstance(intent, RepairTakeoverIntent):
         raise ReconciliationStoreError(
-            f"expected_generation must be an int >= 1, got {expected_generation!r}"
+            f"intent must be a RepairTakeoverIntent, got {intent!r}"
+        )
+    if intent.status is not TakeoverIntentStatus.PREPARED:
+        raise ReconciliationStoreError(
+            f"a new takeover intent must be created as "
+            f"{TakeoverIntentStatus.PREPARED.value!r}, got {intent.status.value!r}"
+        )
+    _require_utc_argument(observed_at_utc, "observed_at_utc")
+    db_path = _require_existing_db(db_path)
+    with _verified_txn(db_path) as connection:
+        row = _claim_row_for_intent(connection, intent)
+        lease = _parse_utc(row["lease_expires_at_utc"])
+        if lease > observed_at_utc:
+            raise TakeoverIntentConflictError(
+                f"repair attempt {intent.repair_attempt_id!r} is claimed until "
+                f"{lease.isoformat()} (observed {observed_at_utc.isoformat()}); a valid "
+                "lease may never be taken over"
+            )
+        active = _active_intent_row(connection, intent.repair_attempt_id)
+        if active is not None:
+            raise TakeoverIntentConflictError(
+                f"repair attempt {intent.repair_attempt_id!r} already has the active "
+                f"takeover intent {active['takeover_id']!r} (status {active['status']!r}); "
+                "load and continue it instead of creating another"
+            )
+        _insert_intent(connection, intent)
+        return intent
+
+
+def _claim_row_for_intent(connection: sqlite3.Connection, intent: RepairTakeoverIntent):
+    """The attempt row an intent acts on, with its source identity verified."""
+    row = connection.execute(
+        f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (intent.repair_attempt_id,)
+    ).fetchone()
+    if row is None:
+        raise ReconciliationStoreError(
+            f"repair attempt {intent.repair_attempt_id!r} has no reservation; there is "
+            "nothing to take over"
+        )
+    if row["status"] != ATTEMPT_STATUS_PENDING:
+        raise RepairAttemptConflictError(
+            f"repair attempt {intent.repair_attempt_id!r} is already finalized "
+            f"(outcome {row['outcome']!r}); there is no claim to take over"
+        )
+    if (
+        row["generation"] != intent.source_generation
+        or row["owner_id"] != intent.source_owner_id
+        or row["claim_execution_id"] != intent.source_claim_execution_id
+    ):
+        raise TakeoverIntentConflictError(
+            f"repair attempt {intent.repair_attempt_id!r} is claimed at generation "
+            f"{row['generation']} by claim {row['claim_execution_id']!r}, not at the "
+            f"intent's source generation {intent.source_generation} / claim "
+            f"{intent.source_claim_execution_id!r}; the intent's preconditions no longer hold"
+        )
+    return row
+
+
+def insert_blocked_takeover_intent(
+    intent: RepairTakeoverIntent, *, db_path: Path | None = None
+) -> RepairTakeoverIntent:
+    """Durably park an UNRESOLVABLE takeover as a ``blocked`` intent.
+
+    Used when the protocol finds a state it must not resolve automatically
+    and there is no active intent to block (e.g. an execution fence ahead of
+    every known intent). The row carries the reason code and the observed
+    generations / fence identity, so an operator can see exactly what
+    stopped it. It occupies the (attempt, source generation) slot, which is
+    what prevents a later pass from silently starting the same doomed
+    takeover again (and from returning an empty "nothing to do").
+    """
+    if not isinstance(intent, RepairTakeoverIntent):
+        raise ReconciliationStoreError(f"intent must be a RepairTakeoverIntent, got {intent!r}")
+    if intent.status is not TakeoverIntentStatus.BLOCKED:
+        raise ReconciliationStoreError(
+            f"insert_blocked_takeover_intent requires status "
+            f"{TakeoverIntentStatus.BLOCKED.value!r}, got {intent.status.value!r}"
         )
     db_path = _require_existing_db(db_path)
     with _verified_txn(db_path) as connection:
+        attempt = connection.execute(
+            f"SELECT attempt_id FROM {REPAIRS_TABLE} WHERE attempt_id = ?",
+            (intent.repair_attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise ReconciliationStoreError(
+                f"repair attempt {intent.repair_attempt_id!r} has no reservation; a blocked "
+                "takeover intent must reference a real attempt"
+            )
+        _insert_intent(connection, intent)
+        return intent
+
+
+def advance_takeover_intent(
+    intent: RepairTakeoverIntent,
+    *,
+    to_status: TakeoverIntentStatus,
+    at_utc: datetime,
+    db_path: Path | None = None,
+) -> RepairTakeoverIntent:
+    """Move an intent forward along its closed lifecycle -- IDEMPOTENTLY.
+
+    The stored row must match ``intent``'s full identity (takeover id,
+    attempt, generations, target owner / claim execution id). Re-applying
+    the status the row ALREADY has is a no-op that returns the stored intent
+    (so a restarted worker may always retry its step); any other
+    non-permitted move -- backwards, skipping a stage, out of ``completed``
+    / ``blocked`` -- raises :class:`TakeoverIntentStateError`.
+    """
+    if not isinstance(to_status, TakeoverIntentStatus):
+        raise ReconciliationStoreError(
+            f"to_status must be a TakeoverIntentStatus, got {to_status!r}"
+        )
+    if to_status is TakeoverIntentStatus.BLOCKED:
+        raise ReconciliationStoreError(
+            "use block_takeover_intent() to block an intent (a reason code and the "
+            "observed state are mandatory)"
+        )
+    _require_utc_argument(at_utc, "at_utc")
+    db_path = _require_existing_db(db_path)
+    with _verified_txn(db_path) as connection:
+        stored = _verified_intent_row(connection, intent)
+        current = TakeoverIntentStatus(stored["status"])
+        if current is to_status:
+            return _restore_intent(stored)  # idempotent retry after a crash
+        if to_status not in ALLOWED_INTENT_TRANSITIONS[current]:
+            raise TakeoverIntentStateError(
+                f"takeover intent {intent.takeover_id!r} cannot move from "
+                f"{current.value!r} to {to_status.value!r}"
+            )
+        column = {
+            TakeoverIntentStatus.FENCE_INSTALLED: "fence_installed_at_utc",
+            TakeoverIntentStatus.CLAIM_PROMOTED: "claim_promoted_at_utc",
+            TakeoverIntentStatus.COMPLETED: "completed_at_utc",
+            TakeoverIntentStatus.CANCELLED: "cancelled_at_utc",
+        }[to_status]
+        try:
+            updated = connection.execute(
+                f"UPDATE {TAKEOVER_INTENTS_TABLE} SET status = ?, {column} = ? "
+                "WHERE takeover_id = ? AND status = ?",
+                (to_status.value, _iso(at_utc), intent.takeover_id, current.value),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ReconciliationStoreError(
+                f"advancing takeover intent {intent.takeover_id!r} to {to_status.value!r} "
+                f"violates a DB constraint: {type(exc).__name__}"
+            ) from exc
+        if updated.rowcount != 1:  # pragma: no cover - defence in depth
+            raise TakeoverIntentStateError(
+                f"takeover intent {intent.takeover_id!r} changed status concurrently; "
+                "nothing was updated"
+            )
+        return _restore_intent(
+            connection.execute(
+                f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} WHERE takeover_id = ?",
+                (intent.takeover_id,),
+            ).fetchone()
+        )
+
+
+def renew_takeover_intent_lease(
+    intent: RepairTakeoverIntent,
+    *,
+    new_lease_expires_at_utc: datetime,
+    db_path: Path | None = None,
+) -> RepairTakeoverIntent:
+    """Take over the RESUMPTION of an active intent -- atomic CAS on its lease.
+
+    The intent's lease is the deadline for finishing the takeover; once it
+    expires ANY worker may resume the intent, but only ONE may do so at a
+    time. The CAS is on the observed lease value, so of several workers that
+    find the same expired intent exactly one wins and the losers get
+    :class:`TakeoverIntentConflictError` (and change nothing). The IDENTITY
+    -- takeover id, target owner, target claim execution id, generations --
+    is never touched: resuming means continuing the SAME takeover, never
+    minting a new one.
+    """
+    _require_utc_argument(new_lease_expires_at_utc, "new_lease_expires_at_utc")
+    db_path = _require_existing_db(db_path)
+    with _verified_txn(db_path) as connection:
+        stored = _verified_intent_row(connection, intent)
+        status = TakeoverIntentStatus(stored["status"])
+        if status not in ACTIVE_INTENT_STATUSES:
+            raise TakeoverIntentStateError(
+                f"takeover intent {intent.takeover_id!r} is {status.value!r} and is no "
+                "longer resumable"
+            )
+        if new_lease_expires_at_utc <= _parse_utc(stored["lease_expires_at_utc"]):
+            # somebody already resumed it with a lease at least this long
+            raise TakeoverIntentConflictError(
+                f"takeover intent {intent.takeover_id!r} is leased until "
+                f"{stored['lease_expires_at_utc']}, at or beyond the requested "
+                f"{new_lease_expires_at_utc.isoformat()}; another worker resumed it"
+            )
+        updated = connection.execute(
+            f"UPDATE {TAKEOVER_INTENTS_TABLE} SET lease_expires_at_utc = ? "
+            "WHERE takeover_id = ? AND status = ? AND lease_expires_at_utc = ?",
+            (
+                _iso(new_lease_expires_at_utc),
+                intent.takeover_id,
+                stored["status"],
+                stored["lease_expires_at_utc"],
+            ),
+        )
+        if updated.rowcount != 1:
+            raise TakeoverIntentConflictError(
+                f"takeover intent {intent.takeover_id!r} was resumed by another worker; "
+                "nothing was changed"
+            )
+        return _restore_intent(
+            connection.execute(
+                f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} WHERE takeover_id = ?",
+                (intent.takeover_id,),
+            ).fetchone()
+        )
+
+
+def block_takeover_intent(
+    intent: RepairTakeoverIntent,
+    *,
+    reason: TakeoverBlockedReason,
+    at_utc: datetime,
+    observed_claim_generation: int | None = None,
+    observed_fence_generation: int | None = None,
+    observed_fence_identity: str | None = None,
+    db_path: Path | None = None,
+) -> RepairTakeoverIntent:
+    """Park an ACTIVE intent as ``blocked`` with its diagnosis (r4 review).
+
+    Idempotent: an intent already blocked keeps its ORIGINAL reason and
+    timestamps (the first diagnosis is the real one) and is returned as
+    stored. A completed intent is never blocked."""
+    if not isinstance(reason, TakeoverBlockedReason):
+        raise ReconciliationStoreError(
+            f"reason must be a TakeoverBlockedReason, got {reason!r}"
+        )
+    _require_utc_argument(at_utc, "at_utc")
+    db_path = _require_existing_db(db_path)
+    with _verified_txn(db_path) as connection:
+        stored = _verified_intent_row(connection, intent)
+        current = TakeoverIntentStatus(stored["status"])
+        if current is TakeoverIntentStatus.BLOCKED:
+            return _restore_intent(stored)
+        if TakeoverIntentStatus.BLOCKED not in ALLOWED_INTENT_TRANSITIONS[current]:
+            raise TakeoverIntentStateError(
+                f"takeover intent {intent.takeover_id!r} is {current.value!r} and can no "
+                "longer be blocked"
+            )
+        try:
+            connection.execute(
+                f"UPDATE {TAKEOVER_INTENTS_TABLE} SET status = ?, blocked_at_utc = ?, "
+                "blocked_reason = ?, observed_claim_generation = ?, "
+                "observed_fence_generation = ?, observed_fence_identity = ? "
+                "WHERE takeover_id = ? AND status = ?",
+                (
+                    TakeoverIntentStatus.BLOCKED.value,
+                    _iso(at_utc),
+                    reason.value,
+                    observed_claim_generation,
+                    observed_fence_generation,
+                    observed_fence_identity,
+                    intent.takeover_id,
+                    current.value,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ReconciliationStoreError(
+                f"blocking takeover intent {intent.takeover_id!r} violates a DB "
+                f"constraint: {type(exc).__name__}"
+            ) from exc
+        return _restore_intent(
+            connection.execute(
+                f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} WHERE takeover_id = ?",
+                (intent.takeover_id,),
+            ).fetchone()
+        )
+
+
+def _verified_intent_row(connection: sqlite3.Connection, intent: RepairTakeoverIntent):
+    """The stored row for ``intent``, with its IDENTITY verified.
+
+    Identity = takeover id + attempt + both generations + target owner +
+    target claim execution id + the source claim it replaces. A mismatch is
+    never "close enough": it means the caller is acting on a different
+    takeover and is refused."""
+    if not isinstance(intent, RepairTakeoverIntent):
+        raise ReconciliationStoreError(f"intent must be a RepairTakeoverIntent, got {intent!r}")
+    row = connection.execute(
+        f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} WHERE takeover_id = ?",
+        (intent.takeover_id,),
+    ).fetchone()
+    if row is None:
+        raise TakeoverIntentStateError(
+            f"takeover intent {intent.takeover_id!r} is not recorded; a takeover step may "
+            "only act on a durable intent"
+        )
+    mismatched = sorted(
+        column
+        for column, expected in (
+            ("repair_attempt_id", intent.repair_attempt_id),
+            ("source_generation", intent.source_generation),
+            ("target_generation", intent.target_generation),
+            ("source_owner_id", intent.source_owner_id),
+            ("source_claim_execution_id", intent.source_claim_execution_id),
+            ("target_owner_id", intent.target_owner_id),
+            ("target_claim_execution_id", intent.target_claim_execution_id),
+        )
+        if row[column] != expected
+    )
+    if mismatched:
+        raise TakeoverIntentStateError(
+            f"takeover intent {intent.takeover_id!r} does not match the stored intent "
+            f"(differing: {', '.join(mismatched)}); refusing to act on a foreign identity"
+        )
+    return row
+
+
+def get_active_takeover_intent(
+    attempt_id: str, *, db_path: Path | None = None
+) -> RepairTakeoverIntent | None:
+    """The attempt's ACTIVE takeover intent, or None.
+
+    This is what a restarted worker reads FIRST: the intent carries the
+    identity to continue with. Several active intents is out-of-band damage
+    and fails closed (:class:`ReconciliationIntegrityError`) rather than
+    picking one. Missing DB -> None, file never created."""
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise ReconciliationStoreError(f"attempt_id must be a non-empty string, got {attempt_id!r}")
+    try:
+        with _verified_read(_read_path(db_path)) as connection:
+            row = _active_intent_row(connection, attempt_id)
+    except ReadOnlyDbMissingError:
+        return None
+    return None if row is None else _restore_intent(row)
+
+
+def list_takeover_intents(
+    *, attempt_id: str | None = None, db_path: Path | None = None
+) -> tuple[RepairTakeoverIntent, ...]:
+    """Every intent (active, completed and blocked), oldest first.
+
+    Intents are retained forever: they are the audit trail proving which
+    identity owned each generation of an attempt."""
+    try:
+        with _verified_read(_read_path(db_path)) as connection:
+            if attempt_id is None:
+                rows = connection.execute(
+                    f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} "
+                    "ORDER BY created_at_utc, repair_attempt_id, source_generation"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    f"SELECT * FROM {TAKEOVER_INTENTS_TABLE} WHERE repair_attempt_id = ? "
+                    "ORDER BY source_generation, created_at_utc",
+                    (attempt_id,),
+                ).fetchall()
+    except ReadOnlyDbMissingError:
+        return ()
+    return tuple(_restore_intent(row) for row in rows)
+
+
+def promote_repair_claim(
+    intent: RepairTakeoverIntent,
+    *,
+    promoted_at_utc: datetime,
+    db_path: Path | None = None,
+) -> RepairAttemptReservation:
+    """Move the attempt's claim onto the intent's identity -- step 4.
+
+    Compare-and-set on the SOURCE claim (pending status, source generation,
+    source owner, source claim execution id); on success the row carries the
+    intent's ``target_*`` identity, its ``takeover_id`` and the intent's
+    lease. IDEMPOTENT: if the row already carries exactly this intent's
+    identity the stored reservation is returned unchanged, so a worker that
+    died after the promotion resumes without a second write.
+
+    A row that moved on to another identity raises
+    :class:`RepairClaimLostError`; a finalized attempt raises
+    :class:`RepairAttemptConflictError`. The intent must be ``fence_installed``
+    -- promoting a claim before the execution fence carries the identity
+    would open the very window the fence exists to close.
+    """
+    _require_utc_argument(promoted_at_utc, "promoted_at_utc")
+    db_path = _require_existing_db(db_path)
+    with _verified_txn(db_path) as connection:
+        stored_intent = _verified_intent_row(connection, intent)
+        status = TakeoverIntentStatus(stored_intent["status"])
+        if status not in (
+            TakeoverIntentStatus.FENCE_INSTALLED,
+            TakeoverIntentStatus.CLAIM_PROMOTED,
+        ):
+            raise TakeoverIntentStateError(
+                f"takeover intent {intent.takeover_id!r} is {status.value!r}; the claim may "
+                "only be promoted once the execution fence carries this identity"
+            )
         row = connection.execute(
-            f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (attempt_id,)
+            f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?",
+            (intent.repair_attempt_id,),
         ).fetchone()
         if row is None:
             raise ReconciliationStoreError(
-                f"repair attempt {attempt_id!r} has no reservation; nothing to take over"
+                f"repair attempt {intent.repair_attempt_id!r} has no reservation"
             )
         if row["status"] != ATTEMPT_STATUS_PENDING:
             raise RepairAttemptConflictError(
-                f"repair attempt {attempt_id!r} is already finalized "
-                f"(outcome {row['outcome']!r}); there is no claim to take over"
+                f"repair attempt {intent.repair_attempt_id!r} is already finalized "
+                f"(outcome {row['outcome']!r}); its claim cannot be promoted"
             )
+        if (
+            row["generation"] == intent.target_generation
+            and row["takeover_id"] == intent.takeover_id
+            and row["owner_id"] == intent.target_owner_id
+            and row["claim_execution_id"] == intent.target_claim_execution_id
+        ):
+            return _restore_reservation(row)  # already promoted by this intent
         try:
             updated = connection.execute(
                 f"UPDATE {REPAIRS_TABLE} SET owner_id = ?, claim_execution_id = ?, "
-                "generation = generation + 1, lease_expires_at_utc = ?, "
+                "generation = ?, takeover_id = ?, lease_expires_at_utc = ?, "
                 "last_claimed_at_utc = ? "
-                "WHERE attempt_id = ? AND status = ? AND generation = ?",
+                "WHERE attempt_id = ? AND status = ? AND generation = ? AND owner_id = ? "
+                "AND claim_execution_id = ?",
                 (
-                    new_owner_id,
-                    new_claim_execution_id,
-                    _iso(new_lease_expires_at_utc),
-                    _iso(claimed_at_utc),
-                    attempt_id,
+                    intent.target_owner_id,
+                    intent.target_claim_execution_id,
+                    intent.target_generation,
+                    intent.takeover_id,
+                    _iso(intent.lease_expires_at_utc),
+                    _iso(promoted_at_utc),
+                    intent.repair_attempt_id,
                     ATTEMPT_STATUS_PENDING,
-                    expected_generation,
+                    intent.source_generation,
+                    intent.source_owner_id,
+                    intent.source_claim_execution_id,
                 ),
             )
-        except sqlite3.IntegrityError as exc:  # CHECK violation
+        except sqlite3.IntegrityError as exc:
             raise ReconciliationStoreError(
-                f"taking over repair attempt {attempt_id!r} violates a DB constraint: {exc}"
+                f"promoting the claim of repair attempt {intent.repair_attempt_id!r} "
+                f"violates a DB constraint: {type(exc).__name__}"
             ) from exc
         if updated.rowcount != 1:
             raise RepairClaimLostError(
-                f"repair attempt {attempt_id!r} is no longer at generation "
-                f"{expected_generation}; another worker won the takeover"
+                f"repair attempt {intent.repair_attempt_id!r} is claimed at generation "
+                f"{row['generation']} by claim {row['claim_execution_id']!r}; takeover "
+                f"intent {intent.takeover_id!r} expected generation "
+                f"{intent.source_generation} / claim {intent.source_claim_execution_id!r}"
             )
-        stored = connection.execute(
-            f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (attempt_id,)
-        ).fetchone()
-        return _restore_reservation(stored)
+        return _restore_reservation(
+            connection.execute(
+                f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?",
+                (intent.repair_attempt_id,),
+            ).fetchone()
+        )
 
 
 def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None = None) -> None:
@@ -1056,6 +1765,12 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
     if attempt.finalized_at_utc is None:
         raise ReconciliationStoreError(
             f"finalizing repair attempt {attempt.attempt_id!r} requires finalized_at_utc"
+        )
+    if attempt.outcome is RepairOutcome.BLOCKED:
+        raise ReconciliationStoreError(
+            f"repair attempt {attempt.attempt_id!r} cannot be finalized as "
+            f"{RepairOutcome.BLOCKED.value!r}: a blocked takeover leaves the attempt "
+            "PENDING for manual intervention and is recorded on the takeover intent row"
         )
     db_path = _require_existing_db(db_path)
     expected_identity = {
@@ -1106,11 +1821,14 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
             row["owner_id"] != attempt.owner_id
             or row["claim_execution_id"] != attempt.claim_execution_id
             or row["generation"] != attempt.generation
+            or row["takeover_id"] != attempt.takeover_id
         ):
             raise RepairClaimLostError(
                 f"repair attempt {attempt.attempt_id!r} is claimed by generation "
-                f"{row['generation']} (owner {row['owner_id']!r}), not by this worker's "
-                f"generation {attempt.generation}; the lost claim's outcome is not stored"
+                f"{row['generation']} (owner {row['owner_id']!r}, claim "
+                f"{row['claim_execution_id']!r}, takeover {row['takeover_id']!r}), not by "
+                f"this worker's generation {attempt.generation} / takeover "
+                f"{attempt.takeover_id!r}; the lost claim's outcome is not stored"
             )
         try:
             updated = connection.execute(
@@ -1119,7 +1837,8 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
                 "broker_error_code = ?, failure_code = ?, broker_state_updated_at_utc = ?, "
                 "finalized_at_utc = ? "
                 "WHERE attempt_id = ? AND status = ? AND owner_id = ? "
-                "AND claim_execution_id = ? AND generation = ?",
+                "AND claim_execution_id = ? AND generation = ? "
+                "AND takeover_id IS ?",
                 (
                     ATTEMPT_STATUS_FINALIZED,
                     attempt.outcome.value,
@@ -1142,6 +1861,7 @@ def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None
                     attempt.owner_id,
                     attempt.claim_execution_id,
                     attempt.generation,
+                    attempt.takeover_id,
                 ),
             )
         except sqlite3.IntegrityError as exc:  # CHECK violation
@@ -1178,6 +1898,7 @@ def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
             owner_id=row["owner_id"],
             claim_execution_id=row["claim_execution_id"],
             generation=row["generation"],
+            takeover_id=row["takeover_id"],
             execution_request_id=row["execution_request_id"],
             client_order_id=row["client_order_id"],
             reconciliation_internal_state=state("reconciliation_internal_state"),
@@ -1229,6 +1950,7 @@ def _restore_reservation(row: sqlite3.Row) -> RepairAttemptReservation:
             owner_id=row["owner_id"],
             claim_execution_id=row["claim_execution_id"],
             generation=row["generation"],
+            takeover_id=row["takeover_id"],
             lease_expires_at_utc=_parse_utc(row["lease_expires_at_utc"]),
             last_claimed_at_utc=_parse_utc(row["last_claimed_at_utc"]),
             execution_request_id=row["execution_request_id"],

@@ -13,12 +13,18 @@ import pytest
 from broker.broker_models import BrokerErrorCode, OrderState
 from execution.reconciliation_models import ReconciliationTargetType
 from execution.reconciliation_repair_models import (
+    ACTIVE_INTENT_STATUSES,
+    ALLOWED_INTENT_TRANSITIONS,
+    BLOCKED_REASON_FAILURE_CODES,
     OrderRepairAttempt,
     ReconciliationRepairResult,
     RepairAttemptReservation,
     RepairFailureCode,
     RepairMode,
     RepairOutcome,
+    RepairTakeoverIntent,
+    TakeoverBlockedReason,
+    TakeoverIntentStatus,
 )
 
 T0 = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -378,3 +384,188 @@ def test_a_result_refuses_foreign_or_inconsistent_attempts():
         result(finished_at_utc=T0 - timedelta(seconds=1))
     with pytest.raises(ValueError):
         result(attempts=[attempt()])
+
+
+# --- durable takeover intents (re-review r4) ----------------------------------
+
+
+def intent(**overrides) -> RepairTakeoverIntent:
+    kwargs = dict(
+        takeover_id="tk-1",
+        repair_attempt_id="attempt-1",
+        source_generation=1,
+        target_generation=2,
+        source_owner_id="worker-1",
+        source_claim_execution_id="claim-1",
+        target_owner_id="worker-2",
+        target_claim_execution_id="claim-2",
+        lease_expires_at_utc=at(700),
+        status=TakeoverIntentStatus.PREPARED,
+        created_at_utc=at(100),
+    )
+    kwargs.update(overrides)
+    return RepairTakeoverIntent(**kwargs)
+
+
+def test_a_prepared_intent_carries_the_identity_of_one_takeover():
+    prepared = intent()
+    assert prepared.is_active is True
+    assert prepared.status is TakeoverIntentStatus.PREPARED
+    assert "takeover=tk-1" in prepared.fence_identity()
+    assert "claim=claim-2" in prepared.fence_identity()
+
+
+def test_the_target_generation_is_always_one_step_forward():
+    for bad in (1, 3):
+        with pytest.raises(ValueError, match="source_generation \\+ 1"):
+            intent(target_generation=bad)
+    with pytest.raises(ValueError, match="target_generation must be an int >= 1"):
+        intent(target_generation=0)
+    with pytest.raises(ValueError, match="source_generation must be an int >= 1"):
+        intent(source_generation=0, target_generation=1)
+
+
+def test_a_takeover_must_name_a_new_execution():
+    with pytest.raises(ValueError, match="must differ"):
+        intent(target_claim_execution_id="claim-1")
+    for field in (
+        "takeover_id",
+        "repair_attempt_id",
+        "source_owner_id",
+        "source_claim_execution_id",
+        "target_owner_id",
+        "target_claim_execution_id",
+    ):
+        with pytest.raises(ValueError):
+            intent(**{field: "  "})
+
+
+def test_the_lease_must_outlive_the_intents_creation():
+    with pytest.raises(ValueError, match="lease_expires_at_utc"):
+        intent(lease_expires_at_utc=at(100))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        intent(created_at_utc=datetime(2026, 8, 1, 12, 0, 0))
+
+
+def test_status_and_timestamps_must_agree():
+    with pytest.raises(ValueError, match="fence_installed_at_utc"):
+        intent(status=TakeoverIntentStatus.FENCE_INSTALLED)
+    with pytest.raises(ValueError, match="claim_promoted_at_utc"):
+        intent(status=TakeoverIntentStatus.CLAIM_PROMOTED, fence_installed_at_utc=at(110))
+    with pytest.raises(ValueError, match="completed_at_utc"):
+        intent(
+            status=TakeoverIntentStatus.COMPLETED,
+            fence_installed_at_utc=at(110),
+            claim_promoted_at_utc=at(120),
+        )
+    with pytest.raises(ValueError, match="cancelled_at_utc"):
+        intent(status=TakeoverIntentStatus.CANCELLED)
+    with pytest.raises(ValueError, match="blocked_at_utc"):
+        intent(status=TakeoverIntentStatus.BLOCKED, blocked_reason=TakeoverBlockedReason.FENCE_AHEAD)
+    with pytest.raises(ValueError, match="blocked_reason"):
+        intent(status=TakeoverIntentStatus.BLOCKED, blocked_at_utc=at(200))
+    with pytest.raises(ValueError, match="prepared intent"):
+        intent(fence_installed_at_utc=at(110))
+    with pytest.raises(ValueError, match="not precede"):
+        intent(
+            status=TakeoverIntentStatus.CLAIM_PROMOTED,
+            fence_installed_at_utc=at(120),
+            claim_promoted_at_utc=at(110),
+        )
+
+
+def test_observed_diagnostics_belong_to_blocked_intents_only():
+    with pytest.raises(ValueError, match="observed_"):
+        intent(observed_fence_generation=3)
+    blocked = intent(
+        status=TakeoverIntentStatus.BLOCKED,
+        blocked_at_utc=at(200),
+        blocked_reason=TakeoverBlockedReason.FENCE_AHEAD,
+        observed_claim_generation=1,
+        observed_fence_generation=3,
+        observed_fence_identity="attempt=attempt-1 generation=3",
+    )
+    assert blocked.is_active is False
+    assert blocked.observed_fence_generation == 3
+
+
+def test_the_intent_lifecycle_is_closed_and_forward_only():
+    assert set(ALLOWED_INTENT_TRANSITIONS) == set(TakeoverIntentStatus)
+    assert ACTIVE_INTENT_STATUSES == frozenset(
+        {
+            TakeoverIntentStatus.PREPARED,
+            TakeoverIntentStatus.FENCE_INSTALLED,
+            TakeoverIntentStatus.CLAIM_PROMOTED,
+        }
+    )
+    # terminal statuses never move again
+    for terminal in (
+        TakeoverIntentStatus.COMPLETED,
+        TakeoverIntentStatus.CANCELLED,
+        TakeoverIntentStatus.BLOCKED,
+    ):
+        assert ALLOWED_INTENT_TRANSITIONS[terminal] == frozenset()
+    # no transition ever goes backwards
+    order = [
+        TakeoverIntentStatus.PREPARED,
+        TakeoverIntentStatus.FENCE_INSTALLED,
+        TakeoverIntentStatus.CLAIM_PROMOTED,
+        TakeoverIntentStatus.COMPLETED,
+    ]
+    for index, status in enumerate(order[:-1]):
+        for target in ALLOWED_INTENT_TRANSITIONS[status]:
+            assert target not in order[: index + 1]
+
+
+def test_every_blocked_reason_maps_to_a_blocked_failure_code():
+    assert set(BLOCKED_REASON_FAILURE_CODES) == set(TakeoverBlockedReason)
+    for reason, code in BLOCKED_REASON_FAILURE_CODES.items():
+        blocked_attempt = attempt(
+            outcome=RepairOutcome.BLOCKED,
+            failure_code=code,
+            internal_state_after=None,
+            broker_state_updated_at_utc=None,
+            finalized_at_utc=None,
+        )
+        assert blocked_attempt.failure_code is code, reason
+
+
+def test_a_blocked_attempt_rejects_a_foreign_failure_code():
+    with pytest.raises(ValueError, match="not permitted"):
+        attempt(
+            outcome=RepairOutcome.BLOCKED,
+            failure_code=RepairFailureCode.BROKER_QUERY_FAILED,
+            internal_state_after=None,
+            broker_state_updated_at_utc=None,
+        )
+    with pytest.raises(ValueError, match="failure_code"):
+        attempt(
+            outcome=RepairOutcome.BLOCKED,
+            failure_code=None,
+            internal_state_after=None,
+            broker_state_updated_at_utc=None,
+        )
+
+
+def test_the_takeover_id_is_bound_to_the_generation():
+    assert reservation(generation=1, takeover_id=None).takeover_id is None
+    with pytest.raises(ValueError, match="original claim"):
+        reservation(generation=1, takeover_id="tk-1")
+    with pytest.raises(ValueError, match="must name the takeover_id"):
+        reservation(generation=2, takeover_id=None)
+    assert reservation(generation=2, takeover_id="tk-1").takeover_id == "tk-1"
+
+    assert attempt(generation=2, takeover_id="tk-1").takeover_id == "tk-1"
+    with pytest.raises(ValueError, match="must name the takeover_id"):
+        attempt(generation=2)
+    with pytest.raises(ValueError, match="dry-run attempts carry no claim"):
+        attempt(
+            mode=RepairMode.DRY_RUN,
+            outcome=RepairOutcome.WOULD_APPLY,
+            owner_id=None,
+            claim_execution_id=None,
+            generation=None,
+            takeover_id="tk-1",
+            broker_state_updated_at_utc=None,
+            finalized_at_utc=None,
+        )

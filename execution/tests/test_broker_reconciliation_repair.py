@@ -18,7 +18,9 @@ concurrency tests.
 import ast
 import itertools
 import pathlib
+import sqlite3
 import threading
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -63,6 +65,8 @@ from execution.reconciliation_repair_models import (
     RepairFailureCode,
     RepairMode,
     RepairOutcome,
+    TakeoverBlockedReason,
+    TakeoverIntentStatus,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -74,6 +78,8 @@ INTERNAL_T = datetime(2025, 12, 31, 12, 0, 0, tzinfo=timezone.utc)
 OBSERVED_AT = datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
 REPAIR_AT = datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
 RECOVERY_AT = datetime(2026, 3, 2, 0, 0, 0, tzinfo=timezone.utc)  # lease long expired
+# a restarted recovery process runs after the crashed worker's intent lease
+RESTART_AT = RECOVERY_AT + timedelta(days=1)
 DURING_LEASE_AT = REPAIR_AT + timedelta(seconds=10)  # lease still valid
 LEASE_SECONDS = 600
 FILL_PRICE = Decimal("2400")
@@ -1323,8 +1329,10 @@ def assert_consistent_single_apply(paths, request_id, run_id, live_attempt, reco
     # the live caller's view never contradicts reality
     assert live_attempt.attempt_id == "live-1"
     if live_attempt.outcome is RepairOutcome.APPLIED:
-        # it really did commit (gen 1 provenance) or was recovered as applied
-        assert repair_rows[0]["repair_generation"] == live_attempt.generation
+        # either it committed itself, or it converged on the provenance of
+        # the execution that did -- both are the truth about THIS attempt
+        assert repair_rows[0]["repair_generation"] in (live_attempt.generation, 2)
+        assert stored.outcome is RepairOutcome.APPLIED
     else:
         # it did not commit: recovery (generation 2) did
         assert live_attempt.outcome in (RepairOutcome.CONFLICT, RepairOutcome.ALREADY_APPLIED)
@@ -1398,8 +1406,12 @@ def test_recovery_between_evaluation_and_commit_fences_the_old_worker_out(paths,
         RepairOutcome.APPLIED,
         2,
     )
-    assert live_attempt.outcome is RepairOutcome.CONFLICT
-    assert live_attempt.failure_code is RepairFailureCode.CLAIM_LOST
+    # the resumed live worker is fenced out. It never claims the work it did
+    # not do (no APPLIED) -- but it also does not contradict reality: the
+    # structured provenance proves ITS attempt id was applied by generation 2.
+    assert live_attempt.outcome is RepairOutcome.ALREADY_APPLIED
+    assert live_attempt.failure_code is None
+    assert "did not commit" in live_attempt.detail
     assert_consistent_single_apply(paths, "exec-lr", "run-lr", live_attempt, recovered)
 
 
@@ -1519,123 +1531,257 @@ def test_a_crash_before_the_state_update_is_resumed_by_recovery_not_failed(paths
     assert pending(reconciliation_db) == ()
 
 
-def test_a_recovery_death_between_the_fence_and_the_claim_is_resumable(paths, monkeypatch):
-    """PR #107 re-review r3 P1: the two cross-DB commits of a takeover (fence
-    bump, then claim CAS) can be split by a process death, leaving the
-    execution fence one generation AHEAD of the audit claim. A later recovery
-    -- with a DIFFERENT claim identity -- must still converge: the fence
-    accepts re-registration at the target generation and the claim CAS (the
-    real mutex) elects it. The attempt must never be stranded as pending."""
-    execution_db, reconciliation_db = paths
-    broker = seeded_candidate(paths, "exec-40", "run-40")
+# --- durable takeover intent: crash at every transaction boundary -------------
+
+
+CRASH_POINTS = (
+    # (label, patched callable, which call dies)
+    ("before the intent insert", "create_takeover_intent", 1),
+    ("before the fence install", "register_repair_fence", 1),
+    ("before the fence_installed status", "advance_takeover_intent", 1),
+    ("before the claim promotion", "promote_repair_claim", 1),
+    ("before the claim_promoted status", "advance_takeover_intent", 2),
+    ("before the execution update", "record_order_result", 1),
+    ("before the finalize", "finalize_repair_attempt", 1),
+    ("before the intent completion", "advance_takeover_intent", 3),
+)
+
+
+def crash_after(monkeypatch, name, *, calls_before_crash):
+    """Let the first ``calls_before_crash - 1`` calls through, then die like a
+    killed process (KeyboardInterrupt escapes every ``except Exception``)."""
     import execution.broker_reconciliation_repair as repair_module
 
-    def crash(*args, **kwargs):
-        raise KeyboardInterrupt("process killed after the fence commit")
+    target = repair_module if hasattr(repair_module, name) else execution_store
+    real = getattr(target, name)
+    seen = {"count": 0}
 
-    # 1) the live attempt crashes before its state update
-    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    def killed(*args, **kwargs):
+        seen["count"] += 1
+        if seen["count"] >= calls_before_crash:
+            raise KeyboardInterrupt(f"process killed at {name} call {seen['count']}")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, killed)
+    return seen
+
+
+@pytest.mark.parametrize("name,index", [(c[1], c[2]) for c in CRASH_POINTS],
+                         ids=[c[0] for c in CRASH_POINTS])
+def test_a_takeover_converges_after_a_crash_at_any_boundary(paths, monkeypatch, name, index):
+    """Kill the recovery worker at each cross-DB commit boundary of the
+    takeover protocol, then restart it as a DIFFERENT service instance. The
+    restart must reuse the durable intent (same takeover id, same target
+    owner / claim execution id, same generation) and converge: one applied
+    attempt, one provenance row, one completed intent, no stranded pending."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-cr", "run-cr")
+
+    def die(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    # a live attempt that crashed before its state update
+    monkeypatch.setattr(execution_store, "record_order_result", die)
     with pytest.raises(KeyboardInterrupt):
-        repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-40")
+        repair_service(QueryOnlyBroker(broker), paths, prefix="live").repair(run_id="run-cr")
     monkeypatch.undo()
 
-    # 2) the FIRST recovery dies between the fence bump and the claim CAS
-    monkeypatch.setattr(repair_module, "claim_repair_attempt", crash)
+    # the first recovery worker dies at the parametrized boundary
+    crash_after(monkeypatch, name, calls_before_crash=index)
     with pytest.raises(KeyboardInterrupt):
-        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+        recovery_service(
+            QueryOnlyBroker(broker), paths, owner="worker-crashed"
+        ).recover_pending_attempts()
     monkeypatch.undo()
 
-    orphan = execution_store.get_repair_fence("exec-40", db_path=execution_db)
-    assert orphan["generation"] == 2  # fence advanced
-    assert only(pending(reconciliation_db)).generation == 1  # claim did not
-    orphan_claim = orphan["claim_execution_id"]
+    identity_before = [
+        (i.takeover_id, i.target_owner_id, i.target_claim_execution_id, i.target_generation)
+        for i in reconciliation_store.list_takeover_intents(
+            attempt_id="live-1", db_path=reconciliation_db
+        )
+    ]
+    still_pending = bool(
+        reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db)
+    )
 
-    # 3) a fresh recovery process (new claim identity) must complete the work
+    # a fresh process (different owner id) resumes
     recovery_broker = QueryOnlyBroker(broker)
-    recovered = recovery_service(recovery_broker, paths).recover_pending_attempts()
+    recovered = recovery_service(
+        recovery_broker,
+        paths,
+        owner="worker-restarted",
+        clock=lambda: RESTART_AT,  # after the crashed worker's intent lease
+    ).recover_pending_attempts()
 
+    if still_pending:
+        entry = only(recovered)
+        assert (entry.attempt_id, entry.outcome, entry.generation) == (
+            "live-1",
+            RepairOutcome.APPLIED,
+            2,
+        )
+    else:
+        # the crash happened after the finalize: nothing is left to recover,
+        # and the restart only closes the intent (never a BLOCKED report)
+        assert recovered == ()
+    assert order_state(execution_db, "exec-cr")[0] == "filled"
+    history = execution_store.get_state_history("exec-cr", db_path=execution_db)
+    provenance = [h for h in history if h["repair_attempt_id"]]
+    assert len(provenance) == 1 and provenance[0]["repair_generation"] == 2
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
+    stored = only(finalized(reconciliation_db, "run-cr"))
+    assert (stored.attempt_id, stored.outcome) == ("live-1", RepairOutcome.APPLIED)
+
+    intents = reconciliation_store.list_takeover_intents(
+        attempt_id="live-1", db_path=reconciliation_db
+    )
+    assert len(intents) == 1  # exactly ONE takeover, never a second identity
+    intent = intents[0]
+    assert intent.status is TakeoverIntentStatus.COMPLETED
+    assert (intent.source_generation, intent.target_generation) == (1, 2)
+    if identity_before:  # the crash happened after the intent became durable
+        assert identity_before == [
+            (
+                intent.takeover_id,
+                intent.target_owner_id,
+                intent.target_claim_execution_id,
+                intent.target_generation,
+            )
+        ]
+        assert intent.target_owner_id == "worker-crashed"  # the DEAD worker's identity
+
+    # identity chain: intent == fence == claim == finalized attempt
+    fence = execution_store.get_repair_fence("exec-cr", db_path=execution_db)
+    assert (
+        fence["repair_attempt_id"],
+        fence["generation"],
+        fence["takeover_id"],
+        fence["owner_id"],
+        fence["claim_execution_id"],
+    ) == (
+        "live-1",
+        intent.target_generation,
+        intent.takeover_id,
+        intent.target_owner_id,
+        intent.target_claim_execution_id,
+    )
+    assert (
+        stored.generation,
+        stored.takeover_id,
+        stored.owner_id,
+        stored.claim_execution_id,
+    ) == (
+        intent.target_generation,
+        intent.takeover_id,
+        intent.target_owner_id,
+        intent.target_claim_execution_id,
+    )
+
+    # a further restart is a pure no-op
+    assert (
+        recovery_service(
+            QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+        ).recover_pending_attempts()
+        == ()
+    )
+    assert execution_store.get_state_history("exec-cr", db_path=execution_db) == history
+
+
+def test_repeated_restarts_never_mint_a_second_identity(paths, monkeypatch):
+    """10 restarts of the same half-finished takeover: the intent, the fence
+    and the claim keep ONE identity and the generation never runs away."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-id", "run-id")
+
+    def die(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    monkeypatch.setattr(execution_store, "record_order_result", die)
+    with pytest.raises(KeyboardInterrupt):
+        repair_service(QueryOnlyBroker(broker), paths, prefix="live").repair(run_id="run-id")
+    monkeypatch.undo()
+
+    # every recovery attempt dies right after installing the fence
+    crash_after(monkeypatch, "advance_takeover_intent", calls_before_crash=1)
+    for attempt_number in range(10):
+        with pytest.raises(KeyboardInterrupt):
+            recovery_service(
+                QueryOnlyBroker(broker),
+                paths,
+                owner=f"worker-{attempt_number}",
+                clock=lambda n=attempt_number: RECOVERY_AT + timedelta(days=n),
+            ).recover_pending_attempts()
+    monkeypatch.undo()
+
+    intents = reconciliation_store.list_takeover_intents(
+        attempt_id="live-1", db_path=reconciliation_db
+    )
+    assert len(intents) == 1
+    intent = intents[0]
+    assert intent.status is TakeoverIntentStatus.PREPARED
+    fence = execution_store.get_repair_fence("exec-id", db_path=execution_db)
+    assert fence["generation"] == 2 and fence["takeover_id"] == intent.takeover_id
+    pending_now = reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db)
+    assert only(pending_now).generation == 1
+
+    recovered = recovery_service(
+        QueryOnlyBroker(broker), paths, clock=lambda: RECOVERY_AT + timedelta(days=20)
+    ).recover_pending_attempts()
     entry = only(recovered)
-    assert (entry.attempt_id, entry.outcome, entry.generation) == (
-        "crash-1",
+    assert (entry.outcome, entry.generation, entry.takeover_id) == (
         RepairOutcome.APPLIED,
         2,
+        intent.takeover_id,
     )
-    assert recovery_broker.query_count == 1  # it really re-evaluated
-    assert order_state(execution_db, "exec-40")[0] == "filled"
-    history = execution_store.get_state_history("exec-40", db_path=execution_db)
-    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 2
-    assert pending(reconciliation_db) == ()  # nothing stranded
-    stored = only(finalized(reconciliation_db, "run-40"))
-    assert (stored.attempt_id, stored.outcome) == ("crash-1", RepairOutcome.APPLIED)
-    # the ORPHANED fence row was adopted, not rewritten: it is a generation
-    # barrier (the commit check compares attempt id + generation), while the
-    # audit row remains the authority on who owns the attempt
-    fence = execution_store.get_repair_fence("exec-40", db_path=execution_db)
-    assert (fence["generation"], fence["claim_execution_id"]) == (2, orphan_claim)
-    assert stored.claim_execution_id != orphan_claim  # a different, live claim finalized
-
-
-def test_only_this_attempts_own_generation_is_adoptable(paths, monkeypatch):
-    """Adoption is deliberately narrow: ONLY a fence naming this attempt at
-    exactly this generation counts (an orphan). A newer generation, another
-    attempt's fence, or no fence at all is never adopted -- so a fenced-out
-    worker can never talk its way past the barrier."""
-    execution_db, reconciliation_db = paths
-    broker = seeded_candidate(paths, "exec-42", "run-42")
-    service = repair_service(QueryOnlyBroker(broker), paths, prefix="probe")
-
-    execution_store.register_repair_fence(
-        "exec-42",
-        repair_attempt_id="attempt-someone-else",
-        generation=2,
-        owner_id="other-worker",
-        claim_execution_id="claim-other",
-        registered_at_utc=REPAIR_AT,
-        db_path=execution_db,
+    assert (
+        len(
+            reconciliation_store.list_takeover_intents(
+                attempt_id="live-1", db_path=reconciliation_db
+            )
+        )
+        == 1
     )
 
-    assert service._adoptable_fence("exec-42", "attempt-mine", 2) is False  # other attempt
-    assert service._adoptable_fence("exec-42", "attempt-someone-else", 1) is False  # older
-    assert service._adoptable_fence("exec-42", "attempt-someone-else", 3) is False  # newer
-    assert service._adoptable_fence("exec-42", "attempt-someone-else", 2) is True
-    assert service._adoptable_fence("exec-ghost", "attempt-mine", 1) is False  # no fence
 
-
-
-def test_a_recovery_death_after_the_claim_strands_nothing_for_the_next_generation(
-    paths, monkeypatch
-):
-    """The other side of the same cross-DB window: the takeover's claim CAS
-    committed but the process died before the execution update. The claim
-    holder's own lease now protects it; once THAT lease expires the next
-    recovery takes generation 3 and completes the work."""
+def test_a_recovery_death_after_the_claim_promotion_resumes_the_same_intent(paths, monkeypatch):
+    """The claim promotion committed but the process died before the
+    execution update. The intent stays active with ITS lease: while that
+    lease is valid nobody touches it, and once it expires the SAME intent is
+    resumed -- never a generation 3."""
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-41", "run-41")
 
-    def crash(*args, **kwargs):
+    def die(*args, **kwargs):
         raise KeyboardInterrupt("process killed")
 
-    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    monkeypatch.setattr(execution_store, "record_order_result", die)
     with pytest.raises(KeyboardInterrupt):
         repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-41")
-    # the first recovery claims (generation 2) and then dies before committing
     with pytest.raises(KeyboardInterrupt):
         recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
     monkeypatch.undo()
 
-    claimed = only(pending(reconciliation_db))
-    assert claimed.generation == 2  # the claim is durable
-    # while ITS lease is valid, nobody may take over
+    claimed = only(reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db))
+    assert claimed.generation == 2  # the promotion is durable
+    intent = only(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    )
+    assert intent.status is TakeoverIntentStatus.CLAIM_PROMOTED
+    assert claimed.takeover_id == intent.takeover_id
+
+    # while the intent's lease is valid, nobody may touch it
     untouched = BrokerOrderReconciliationRepairService(
         broker=QueryOnlyBroker(broker),
         execution_db_path=execution_db,
         reconciliation_db_path=reconciliation_db,
         owner_id="worker-early",
         lease_duration_seconds=LEASE_SECONDS,
-        clock=lambda: RECOVERY_AT,  # still inside generation 2's lease
+        clock=lambda: RECOVERY_AT,
     ).recover_pending_attempts()
     assert untouched == ()
-    assert only(pending(reconciliation_db)).generation == 2
+    assert order_state(execution_db, "exec-41")[0] == "unknown"
 
     later = BrokerOrderReconciliationRepairService(
         broker=QueryOnlyBroker(broker),
@@ -1650,12 +1796,11 @@ def test_a_recovery_death_after_the_claim_strands_nothing_for_the_next_generatio
     assert (entry.attempt_id, entry.outcome, entry.generation) == (
         "crash-1",
         RepairOutcome.APPLIED,
-        3,
+        2,  # the SAME intent, not a new generation
     )
+    assert entry.takeover_id == intent.takeover_id
     assert order_state(execution_db, "exec-41")[0] == "filled"
-    history = execution_store.get_state_history("exec-41", db_path=execution_db)
-    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 3
-    assert pending(reconciliation_db) == ()
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
 
 
 def test_a_finalize_failure_after_the_commit_is_recovered_under_the_same_id(paths, monkeypatch):
@@ -1793,6 +1938,393 @@ def test_concurrent_recovery_workers_elect_exactly_one_winner(paths, monkeypatch
     assert pending(reconciliation_db) == ()
     # restart: a later recovery pass is a no-op
     assert recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts() == ()
+
+
+# --- ahead / corrupt states: typed BLOCKED, never a silent skip ---------------
+
+
+def crashed_pending_at(paths, request_id, run_id, monkeypatch, *, prefix="crash"):
+    """A pending generation-1 claim whose worker died before the update."""
+    broker = seeded_candidate(paths, request_id, run_id)
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        repair_service(QueryOnlyBroker(broker), paths, prefix=prefix).repair(run_id=run_id)
+    monkeypatch.undo()
+    return broker
+
+
+def force_fence(execution_db, request_id, *, attempt_id, generation, takeover, claim, owner="w"):
+    """Install a fence directly (bypassing the protocol) to build a corrupt
+    state that the recovery must refuse rather than resolve."""
+    with closing(sqlite3.connect(execution_db)) as connection:
+        connection.execute(
+            f"INSERT INTO {execution_store.FENCES_TABLE} (execution_request_id, "
+            "repair_attempt_id, generation, takeover_id, owner_id, claim_execution_id, "
+            "updated_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (execution_request_id) DO UPDATE SET repair_attempt_id = excluded."
+            "repair_attempt_id, generation = excluded.generation, takeover_id = excluded."
+            "takeover_id, owner_id = excluded.owner_id, claim_execution_id = excluded."
+            "claim_execution_id, updated_at_utc = excluded.updated_at_utc",
+            (
+                request_id,
+                attempt_id,
+                generation,
+                takeover,
+                owner,
+                claim,
+                REPAIR_AT.isoformat(),
+            ),
+        )
+        connection.commit()
+
+
+def blocked_intents(reconciliation_db, attempt_id):
+    return [
+        intent
+        for intent in reconciliation_store.list_takeover_intents(
+            attempt_id=attempt_id, db_path=reconciliation_db
+        )
+        if intent.status is TakeoverIntentStatus.BLOCKED
+    ]
+
+
+def test_a_fence_ahead_of_the_claim_blocks_instead_of_being_overwritten(paths, monkeypatch):
+    """claim generation 1, no intent, fence generation 3: nobody can account
+    for that fence, so the takeover is parked durably and reported -- never
+    silently continued and never an empty result."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-50", "run-50", monkeypatch)
+    force_fence(
+        execution_db,
+        "exec-50",
+        attempt_id="crash-1",
+        generation=3,
+        takeover="tk-unknown",
+        claim="claim-unknown",
+    )
+    before = execution_db.read_bytes()
+
+    recovery_broker = QueryOnlyBroker(broker)
+    recovered = recovery_service(recovery_broker, paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.FENCE_AHEAD
+    assert recovery_broker.query_count == 0  # nothing is queried while blocked
+    assert execution_db.read_bytes() == before  # and nothing is written
+    assert order_state(execution_db, "exec-50")[0] == "unknown"
+
+    intent = only(blocked_intents(reconciliation_db, "crash-1"))
+    assert intent.blocked_reason is TakeoverBlockedReason.FENCE_AHEAD
+    assert (intent.observed_claim_generation, intent.observed_fence_generation) == (1, 3)
+    assert "generation=3" in intent.observed_fence_identity
+    assert intent.blocked_at_utc == RECOVERY_AT
+
+    # repeated recovery reports it again -- no new rows, no new generation
+    again = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    assert only(again).failure_code is RepairFailureCode.FENCE_AHEAD
+    assert len(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    ) == 1
+    assert only(pending(reconciliation_db)).generation == 1
+
+
+def test_an_orphan_fence_at_the_next_generation_blocks(paths, monkeypatch):
+    """claim generation 1, no intent, fence generation 2: exactly the state
+    the previous design silently adopted. It is now parked: no durable
+    intent explains that fence."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-51", "run-51", monkeypatch)
+    force_fence(
+        execution_db,
+        "exec-51",
+        attempt_id="crash-1",
+        generation=2,
+        takeover="tk-orphan",
+        claim="claim-orphan",
+    )
+
+    recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.TAKEOVER_INTENT_MISSING
+    intent = only(blocked_intents(reconciliation_db, "crash-1"))
+    assert intent.blocked_reason is TakeoverBlockedReason.ORPHAN_FENCE_WITHOUT_INTENT
+    assert order_state(execution_db, "exec-51")[0] == "unknown"
+
+
+def test_a_foreign_identity_on_our_target_generation_blocks(paths, monkeypatch):
+    """An intent exists for generation 2 but the fence at generation 2 is
+    held by a DIFFERENT execution: never adopted (the r4 finding), blocked."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-52", "run-52", monkeypatch)
+    # a real intent, stopped right after preparation
+    crash_after(monkeypatch, "register_repair_fence", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = only(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    )
+    assert intent.status is TakeoverIntentStatus.PREPARED
+    force_fence(
+        execution_db,
+        "exec-52",
+        attempt_id="crash-1",
+        generation=intent.target_generation,
+        takeover="tk-somebody-else",
+        claim="claim-somebody-else",
+    )
+
+    recovered = recovery_service(
+        QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+    ).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.FENCE_INTENT_MISMATCH
+    blocked = only(blocked_intents(reconciliation_db, "crash-1"))
+    assert blocked.takeover_id == intent.takeover_id  # the SAME intent was parked
+    assert blocked.blocked_reason is TakeoverBlockedReason.FENCE_IDENTITY_MISMATCH
+    assert order_state(execution_db, "exec-52")[0] == "unknown"
+
+
+def test_several_active_intents_block_instead_of_picking_one(paths, monkeypatch):
+    """Two active intents for one attempt are impossible in-band (the partial
+    UNIQUE index refuses the second), and if damage produced them anyway the
+    recovery refuses to choose -- it parks the attempt and reports it."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-53", "run-53", monkeypatch)
+    crash_after(monkeypatch, "register_repair_fence", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+
+    # the DB itself refuses a second active intent
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO {reconciliation_store.TAKEOVER_INTENTS_TABLE} "
+                "SELECT 'tk-forged', repair_attempt_id, source_generation, "
+                "target_generation, source_owner_id, source_claim_execution_id, 'forger', "
+                "'claim-forged', lease_expires_at_utc, status, created_at_utc, "
+                "fence_installed_at_utc, claim_promoted_at_utc, completed_at_utc, "
+                "cancelled_at_utc, blocked_at_utc, blocked_reason, "
+                "observed_claim_generation, observed_fence_generation, "
+                f"observed_fence_identity FROM {reconciliation_store.TAKEOVER_INTENTS_TABLE}"
+            )
+
+    # and if such damage existed, the read fails closed and recovery blocks
+    import execution.broker_reconciliation_repair as repair_module
+
+    def two_active(*args, **kwargs):
+        raise reconciliation_store.ReconciliationIntegrityError(
+            "repair attempt 'crash-1' has 2 ACTIVE takeover intents (tk-a, tk-b)"
+        )
+
+    monkeypatch.setattr(repair_module, "get_active_takeover_intent", two_active)
+    recovered = recovery_service(
+        QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+    ).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.MULTIPLE_ACTIVE_INTENTS
+    assert order_state(execution_db, "exec-53")[0] == "unknown"
+    assert only(pending(reconciliation_db)).generation == 1
+
+
+def test_an_unknown_intent_status_blocks_fail_closed(paths, monkeypatch):
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-54", "run-54", monkeypatch)
+    crash_after(monkeypatch, "register_repair_fence", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE {reconciliation_store.TAKEOVER_INTENTS_TABLE} SET status = 'teleported'"
+        )
+        connection.commit()
+
+    recovered = recovery_service(
+        QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+    ).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT
+    assert order_state(execution_db, "exec-54")[0] == "unknown"
+
+
+def test_an_active_intent_for_a_finalized_attempt_is_reported(paths, monkeypatch):
+    """A claim_promoted intent whose attempt was finalized under a DIFFERENT
+    identity cannot be explained away: it is parked and reported."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-55", "run-55", monkeypatch)
+    crash_after(monkeypatch, "finalize_repair_attempt", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = only(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    )
+    assert intent.status is TakeoverIntentStatus.CLAIM_PROMOTED
+    # finalize the attempt out-of-band under a foreign takeover id
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE {reconciliation_store.REPAIRS_TABLE} SET status = 'finalized', "
+            "outcome = 'failed', failure_code = 'store_update_failed', takeover_id = "
+            "'tk-foreign', finalized_at_utc = ?",
+            (RECOVERY_AT.isoformat(),),
+        )
+        connection.commit()
+
+    recovered = recovery_service(
+        QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+    ).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT
+    assert only(blocked_intents(reconciliation_db, "crash-1")).blocked_reason is (
+        TakeoverBlockedReason.ATTEMPT_ALREADY_FINALIZED
+    )
+
+
+def test_an_old_worker_that_finishes_first_cancels_the_takeover(paths, monkeypatch):
+    """Reviewer item: the intent is prepared, then the SLOW-BUT-ALIVE original
+    worker commits and finalizes. The takeover never took effect, so it is
+    CANCELLED -- the attempt keeps its APPLIED audit row, the history keeps
+    exactly one provenance row, and nothing is re-applied."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-56", "run-56")
+    gate = threading.Event()
+    released = threading.Event()
+    real_record = execution_store.record_order_result
+    armed = {"live": True}
+
+    def gated_record(*args, **kwargs):
+        if armed.pop("live", None):
+            gate.set()
+            assert released.wait(timeout=GATE_TIMEOUT)
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(execution_store, "record_order_result", gated_record)
+    live_result = {}
+
+    def live():
+        try:
+            live_result["value"] = repair_service(
+                QueryOnlyBroker(broker), paths, prefix="live"
+            ).repair(run_id="run-56")
+        except BaseException as exc:  # pragma: no cover - surfaced by the assert
+            live_result["error"] = exc
+
+    thread = threading.Thread(target=live)
+    thread.start()
+    assert gate.wait(timeout=GATE_TIMEOUT)
+    # while the live worker is paused mid-commit, a recovery prepares a
+    # takeover (its lease looks expired to the recovery clock)
+    crash_after(monkeypatch, "register_repair_fence", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    monkeypatch.setattr(execution_store, "record_order_result", real_record)
+    released.set()
+    thread.join(timeout=GATE_TIMEOUT)
+    assert not thread.is_alive() and "error" not in live_result
+
+    live_attempt = only(live_result["value"].attempts)
+    assert live_attempt.outcome is RepairOutcome.APPLIED  # the old worker DID apply
+    assert order_state(execution_db, "exec-56")[0] == "filled"
+
+    recovered = recovery_service(
+        QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+    ).recover_pending_attempts()
+
+    assert recovered == ()  # nothing to do, nothing wrong
+    intent = only(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="live-1", db_path=reconciliation_db
+        )
+    )
+    assert intent.status is TakeoverIntentStatus.CANCELLED
+    stored = only(finalized(reconciliation_db, "run-56"))
+    assert stored.outcome is RepairOutcome.APPLIED  # never overwritten
+    history = execution_store.get_state_history("exec-56", db_path=execution_db)
+    assert len([h for h in history if h["repair_attempt_id"]]) == 1
+
+
+@pytest.mark.parametrize("workers", [2, 10])
+def test_concurrent_workers_join_one_abandoned_intent(paths, monkeypatch, workers):
+    """An abandoned (lease-expired) intent is resumed by N barrier-aligned
+    workers at once. Exactly one resumes it, the rest change nothing, and the
+    identity stays the ORIGINAL one -- no worker mints a second takeover."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-57", "run-57", monkeypatch)
+    crash_after(monkeypatch, "advance_takeover_intent", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(
+            QueryOnlyBroker(broker), paths, owner="worker-dead"
+        ).recover_pending_attempts()
+    monkeypatch.undo()
+    abandoned = only(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    )
+    barrier = threading.Barrier(workers, timeout=GATE_TIMEOUT)
+    brokers = [QueryOnlyBroker(broker) for _ in range(workers)]
+
+    def resume(index):
+        aligned = {"first": True}
+
+        def aligned_clock():
+            if aligned.pop("first", None):
+                barrier.wait()
+            return RESTART_AT
+
+        return repair_service(
+            brokers[index],
+            paths,
+            prefix=f"res{index}",
+            owner=f"worker-{index}",
+            clock=aligned_clock,
+        ).recover_pending_attempts()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = [f.result() for f in [pool.submit(resume, i) for i in range(workers)]]
+
+    non_empty = [r for r in results if r]
+    assert len(non_empty) == 1
+    entry = only(non_empty[0])
+    assert (entry.outcome, entry.generation, entry.takeover_id) == (
+        RepairOutcome.APPLIED,
+        abandoned.target_generation,
+        abandoned.takeover_id,  # the ORIGINAL identity, not a new one
+    )
+    assert sum(b.query_count for b in brokers) == 1
+    intents = reconciliation_store.list_takeover_intents(
+        attempt_id="crash-1", db_path=reconciliation_db
+    )
+    assert len(intents) == 1 and intents[0].status is TakeoverIntentStatus.COMPLETED
+    history = execution_store.get_state_history("exec-57", db_path=execution_db)
+    assert len([h for h in history if h["repair_attempt_id"]]) == 1
+    assert pending(reconciliation_db) == ()
 
 
 # --- pass-level failures ------------------------------------------------------
@@ -1975,6 +2507,95 @@ def test_leaked_adapter_exception_text_never_reaches_logs_or_audit(paths, caplog
     assert "RuntimeError" in emitted  # the class name IS logged
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "create_takeover_intent",
+        "get_active_takeover_intent",
+        "register_repair_fence",
+        "promote_repair_claim",
+        "advance_takeover_intent",
+        "block_takeover_intent",
+        "insert_blocked_takeover_intent",
+        "list_takeover_intents",
+    ],
+)
+def test_no_takeover_path_ever_logs_a_raw_exception(paths, monkeypatch, caplog, name):
+    """Every step of the takeover protocol -- intent insert / load / fence
+    install / claim promotion / status update / blocking / the fallback --
+    may leak nothing but the exception CLASS NAME and our own ids."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-58", "run-58", monkeypatch)
+    import execution.broker_reconciliation_repair as repair_module
+
+    inner = ValueError(" / ".join(SECRETS))
+    leak = RuntimeError("store failed: " + " | ".join(SECRETS + SECRETS))
+    leak.__cause__ = inner
+
+    target = repair_module if hasattr(repair_module, name) else execution_store
+
+    def boom(*args, **kwargs):
+        raise leak
+
+    monkeypatch.setattr(target, name, boom)
+
+    with caplog.at_level("DEBUG"):
+        try:
+            recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+        except Exception as exc:  # a programmer-error escape is allowed...
+            recovered = ()
+            assert type(exc) is RuntimeError  # ...but it must be the raw object,
+            assert exc is leak  # not a re-wrapped copy carrying secrets onward
+
+    emitted = "\n".join(
+        record.getMessage() + repr(record.args) + repr(record.exc_info)
+        for record in caplog.records
+    )
+    details = "\n".join(entry.detail + (entry.audit_error or "") for entry in recovered)
+    stored_details = "\n".join(
+        intent.observed_fence_identity or ""
+        for intent in reconciliation_store.list_takeover_intents(db_path=reconciliation_db)
+    )
+    for secret in SECRETS:
+        for haystack, where in (
+            (emitted, "log output"),
+            (details, "reported details"),
+            (stored_details, "stored intent diagnostics"),
+        ):
+            assert secret not in haystack, f"secret {secret!r} leaked into {where}"
+            assert secret.lower() not in haystack.lower()
+
+
+def test_dry_run_creates_no_takeover_intent_and_no_fence(paths, monkeypatch):
+    """The dry-run no-side-effect contract extended to the r4 objects."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-59", "run-59", monkeypatch)
+    before = (execution_db.read_bytes(), reconciliation_db.read_bytes())
+    stats_before = (execution_db.stat().st_mtime_ns, reconciliation_db.stat().st_mtime_ns)
+    fence_before = execution_store.get_repair_fence("exec-59", db_path=execution_db)
+
+    result = repair_service(QueryOnlyBroker(broker), paths).repair(
+        run_id="run-59", mode=RepairMode.DRY_RUN
+    )
+
+    attempt = only(result.attempts)
+    assert attempt.mode is RepairMode.DRY_RUN
+    assert (attempt.owner_id, attempt.claim_execution_id, attempt.generation) == (
+        None,
+        None,
+        None,
+    )
+    assert attempt.takeover_id is None
+    assert (execution_db.read_bytes(), reconciliation_db.read_bytes()) == before
+    assert (execution_db.stat().st_mtime_ns, reconciliation_db.stat().st_mtime_ns) == stats_before
+    assert reconciliation_store.list_takeover_intents(db_path=reconciliation_db) == ()
+    # the crashed live worker's own fence is untouched -- dry-run installs none
+    assert execution_store.get_repair_fence("exec-59", db_path=execution_db) == fence_before
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == (
+        only(pending(reconciliation_db)),
+    )
+
+
 # --- inputs, configuration, migration, structure ------------------------------
 
 
@@ -2043,6 +2664,9 @@ def _downgrade_reconciliation_db_to_v1(path):
     from contextlib import closing
 
     with closing(sqlite3.connect(path)) as connection:
+        connection.execute(f"DROP INDEX {reconciliation_store._INTENT_ACTIVE_INDEX}")
+        connection.execute(f"DROP INDEX {reconciliation_store._INTENT_ATTEMPT_INDEX}")
+        connection.execute(f"DROP TABLE {reconciliation_store.TAKEOVER_INTENTS_TABLE}")
         connection.execute(f"DROP INDEX {reconciliation_store._REPAIRS_RUN_INDEX}")
         connection.execute(f"DROP TABLE {reconciliation_store.REPAIRS_TABLE}")
         connection.execute(
