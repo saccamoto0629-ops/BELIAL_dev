@@ -1811,3 +1811,96 @@ def test_updates_refuse_a_v2_db_without_migrating_it(db_path):
     with pytest.raises(store.ExecutionSchemaError):
         store.mark_submitting("exec-1", reason="submit", changed_at_utc=at(1), db_path=db_path)
     assert full_db_state(db_path) == before
+
+
+# --- expected_current_state compare-and-set (Issue #104) ----------------------
+
+
+def _filled_result(seconds=3):
+    return make_result(
+        OrderState.FILLED, filled="10", fills=(fill("F-1", "10", seconds),), updated_at=at(seconds)
+    )
+
+
+def test_record_order_result_with_the_matching_expected_state_applies(db_path):
+    submit_and_accept(db_path)
+    updated = store.record_order_result(
+        "exec-1",
+        _filled_result(),
+        reason="reconciliation repair",
+        expected_current_state=OrderState.ACCEPTED,
+        db_path=db_path,
+    )
+    assert updated["order_state"] == "filled"
+
+
+def test_record_order_result_with_a_stale_expected_state_is_refused_atomically(db_path):
+    submit_and_accept(db_path)
+    history_before = store.get_state_history("exec-1", db_path=db_path)
+    before = db_path.read_bytes()
+
+    with pytest.raises(store.ExecutionOrderStateConflictError, match="'accepted'"):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(),
+            reason="stale repair",
+            expected_current_state=OrderState.UNKNOWN,
+            db_path=db_path,
+        )
+
+    assert db_path.read_bytes() == before
+    assert store.get_state_history("exec-1", db_path=db_path) == history_before
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
+
+
+def test_expected_current_state_must_be_an_order_state(db_path):
+    submit_and_accept(db_path)
+    with pytest.raises(ValueError, match="expected_current_state"):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(),
+            reason="typed",
+            expected_current_state="accepted",
+            db_path=db_path,
+        )
+
+
+def test_the_cas_guard_prevents_a_duplicate_same_state_re_observation(db_path):
+    """Two workers each resolve ACCEPTED -> FILLED with the same snapshot:
+    without the guard the loser's call would be a LEGAL same-state terminal
+    re-observation and would append a duplicate history row."""
+    submit_and_accept(db_path)
+    snapshot = _filled_result()
+    store.record_order_result(
+        "exec-1",
+        snapshot,
+        reason="worker 1",
+        expected_current_state=OrderState.ACCEPTED,
+        db_path=db_path,
+    )
+    history_after_first = store.get_state_history("exec-1", db_path=db_path)
+
+    with pytest.raises(store.ExecutionOrderStateConflictError):
+        store.record_order_result(
+            "exec-1",
+            snapshot,
+            reason="worker 2",
+            expected_current_state=OrderState.ACCEPTED,
+            db_path=db_path,
+        )
+
+    assert store.get_state_history("exec-1", db_path=db_path) == history_after_first
+
+
+def test_record_order_result_without_the_guard_keeps_the_existing_contract(db_path):
+    """Omitting expected_current_state stays exactly the pre-#104 behaviour:
+    a same-state terminal re-observation is allowed and recorded."""
+    submit_and_accept(db_path)
+    snapshot = _filled_result()
+    store.record_order_result("exec-1", snapshot, reason="first", db_path=db_path)
+    history_len = len(store.get_state_history("exec-1", db_path=db_path))
+    refreshed = make_result(
+        OrderState.FILLED, filled="10", fills=(fill("F-1", "10", 3),), updated_at=at(4)
+    )
+    store.record_order_result("exec-1", refreshed, reason="re-observation", db_path=db_path)
+    assert len(store.get_state_history("exec-1", db_path=db_path)) == history_len + 1

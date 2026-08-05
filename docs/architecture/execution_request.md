@@ -153,6 +153,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - **history に anchor された直前 snapshot を必ず `validate_order_result_update()` の old 側として使用**する(メモリ上のコピーは使わない)。stale な snapshot を根拠に、既知の fill・`filled_quantity` / `remaining_quantity`・`broker_order_id`・`updated_at_utc` を巻き戻すことは、**プロセス再起動直後であっても**不可能である。
 - 呼び出し側が `previous_result` を渡す場合、**anchored snapshot と完全一致するときのみ受理**する(呼び出し側の stale 前提を検出する)。
 - 遷移は snapshot との内容検証に加えて、**現在の追跡状態**(snapshot の後に state-only UNKNOWN が記録されていることがある)に対しても検証する。
+- `expected_current_state`(Issue #104、optional)を渡すと**原子的 compare-and-set** になる: 同一 `BEGIN IMMEDIATE` トランザクション内で読み直した現在状態がその状態と一致しなければ `ExecutionOrderStateConflictError` で拒否し、DB は無変更のまま rollback する。読み取り → 判定 → 書き込みの TOCTOU を閉じるための契約で、reconciliation repair が「別プロセスが先に適用済みの観測を same-state 再観測として二重記録してしまう」ことを防ぐ。省略時は従来どおり(same-state 再観測は許可・記録)。
 
 **`record_order_state`(state-only 経路)は UNKNOWN の記録専用**である。UNKNOWN は「完全な `OrderResult` を構造上取得できなかった」(submit / query の結果喪失、例: `BrokerTimeoutError`)ことを表す唯一の状態であるため、snapshot 無しで記録できるのはこれだけとする。他のすべての観測は Broker snapshot を伴うため `record_order_result` を通る。state-only UNKNOWN は保存済み snapshot に**触れない**ため、結果不明になる前に判明していた fill が後続の解決を検証し続ける。また state-only 更新は保存済み `broker_order_id` を**確認できるだけ**であり、新規導入・変更はできない(Broker ID は完全な `OrderResult` からのみ得られる)。
 
@@ -168,7 +169,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - `list_in_flight_orders()`(Issue #103)は、**終端でない全注文**(`order_state` が pending / accepted / partially_filled / unknown)だけを返す read-only APIであり、終端状態を in-flight と誤分類しない。`list_reconciliation_orders()`(同)は Broker state を持つ全注文(in-flight + terminal、`created` は除外)を返し、Broker 照合の完全な比較対象抽出に使う。終端状態は BELIAL 内では不変でも、Broker の外部事実と矛盾していないか監査する必要があるためである。`list_client_order_ids()`(同)は Broker 側にのみ存在する注文を判定するための `client_order_id` 全件(終端・created 含む)を返す。`get_execution_order_by_broker_order_id()`(同)は **`broker_order_id` を現在所有している注文**を返す(DB 全体 UNIQUE のため高々 1 件。未割当は None)— Broker 観測を反映可能と判断する前に、その ID が別 Execution Request に割当済みでないことを確認するために使う。いずれも missing DB を作成せず、状態行を返す 3 APIは行ごとに完全な bundle 検証を通す([Broker Reconciliation](broker_reconciliation.md))。
 - UNKNOWN の解決は、後続照会の結果(完全な `OrderResult`)を `record_order_result` で記録することによってのみ行われる。許可される解決先は既存遷移表のとおり(accepted / partially_filled / filled / cancelled / rejected)で、**保存済み snapshot の fill を失う解決(例: 部分約定既知のまま fill 無しの CANCELLED / REJECTED へ確定)は `validate_order_result_update()` が拒否**する。
 - store / API は UNKNOWN を「未発注」「拒否」「再送可」へ**自動変換しない**。即時再送可能状態として扱わない。
-- 自動照会 runner・**定期** reconciliation は**非スコープ**(未実装)。Broker 照合の**差分検出**(内部状態を変更しない照合・分類・記録)は Issue #103 で実装済み([Broker Reconciliation](broker_reconciliation.md))であり、UNKNOWN の**実際の解決(修復)は Issue #104**。
+- 自動照会 runner・**定期** reconciliation は**非スコープ**(未実装)。Broker 照合の**差分検出**(内部状態を変更しない照合・分類・記録)は Issue #103 で、`auto_repair_candidate` に分類された注文状態の**安全な修復**(既存状態機械経由・冪等・`expected_current_state` による compare-and-set。stale / conflict / manual review は変更しない)は Issue #104 で実装済み([Broker Reconciliation](broker_reconciliation.md))。いずれもサービス API の明示呼び出しのみで、scheduler への組み込みはない。
 
 ### 二重発注防止と idempotency(Issue #76)
 

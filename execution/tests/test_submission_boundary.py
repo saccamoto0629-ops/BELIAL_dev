@@ -15,26 +15,30 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 # The only files that may CALL <something>.submit_order(...):
 # - broker/tests exercise the broker boundary itself (Issue #73);
 # - execution/live_submission.py holds THE single gated call;
-# - execution/tests/test_broker_reconciliation.py seeds the FakeBroker test
-#   double with the broker-side state a reconciliation run is supposed to
-#   observe (Issue #103). It is a fixture, not a production path: the
-#   reconciliation module itself is separately pinned to ZERO submit/cancel
-#   calls (test_the_reconciliation_module_never_calls_a_broker_write_operation
+# - execution/tests/test_broker_reconciliation.py and
+#   execution/tests/test_broker_reconciliation_repair.py seed the FakeBroker
+#   test double with the broker-side state a reconciliation/repair run is
+#   supposed to observe (Issue #103 / #104). They are fixtures, not
+#   production paths: the reconciliation and repair modules themselves are
+#   separately pinned to ZERO submit/cancel calls (their module AST tests
 #   plus a poisoned broker facade used by every test there).
 # (broker/fake_broker.py only DEFINES submit_order; a def is not a call.)
 SUBMIT_ORDER_ALLOWED = {
     "broker/tests",
     "execution/live_submission.py",
     "execution/tests/test_broker_reconciliation.py",
+    "execution/tests/test_broker_reconciliation_repair.py",
 }
 
 # Broker CANCELLATION has no production caller at all: the cancel Execution
-# use case is not implemented (Issue #99), and reconciliation (Issue #103) is
-# detection-only. Pinning it repository-wide means a future module cannot
-# quietly start cancelling broker orders.
+# use case is not implemented (Issue #99), reconciliation (Issue #103) is
+# detection-only and repair (Issue #104) only updates the internal DB.
+# Pinning it repository-wide means a future module cannot quietly start
+# cancelling broker orders.
 CANCEL_ORDER_ALLOWED = {
     "broker/tests",
     "execution/tests/test_broker_reconciliation.py",
+    "execution/tests/test_broker_reconciliation_repair.py",
 }
 
 # The only files that may CALL <something>.to_order_request(...):

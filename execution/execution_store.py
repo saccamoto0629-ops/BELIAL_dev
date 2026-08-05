@@ -329,6 +329,18 @@ class ExecutionOrderConflictError(ExecutionStoreError):
     (execution_request_id / signal_id / client_order_id / broker_order_id)."""
 
 
+class ExecutionOrderStateConflictError(ExecutionStoreError):
+    """The order's CURRENT tracked state differs from the state the caller
+    conditioned the update on (Issue #104 compare-and-set guard).
+
+    Raised by :func:`record_order_result` when ``expected_current_state`` is
+    supplied and the row read INSIDE the write transaction no longer holds
+    that state -- i.e. another process advanced the order between the
+    caller's read and this update. The transaction is rolled back and the DB
+    is untouched; the caller re-reads and decides (typically: the same
+    outcome was already applied, or the observation is stale)."""
+
+
 def execution_db_path() -> Path:
     raw = (os.getenv("EXECUTION_ORDER_DB_PATH") or str(DEFAULT_DB_PATH)).strip()
     path = Path(raw)
@@ -1664,6 +1676,7 @@ def record_order_result(
     *,
     reason: str,
     previous_result: OrderResult | None = None,
+    expected_current_state: OrderState | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Record a full broker ``OrderResult`` snapshot for this order.
@@ -1688,16 +1701,40 @@ def record_order_result(
     - the snapshot (current row AND history row), the state and the history
       entry commit in ONE transaction; a DB-wide ``broker_order_id``
       uniqueness conflict rolls all of it back
-      (:class:`ExecutionOrderConflictError`).
+      (:class:`ExecutionOrderConflictError`),
+    - ``expected_current_state`` (Issue #104, optional) makes the update a
+      COMPARE-AND-SET: the row's current ``order_state`` -- read inside this
+      same ``BEGIN IMMEDIATE`` transaction -- must be exactly that state, or
+      the update fails with :class:`ExecutionOrderStateConflictError` and the
+      DB stays untouched. This closes the read -> decide -> write TOCTOU
+      window for callers (reconciliation repair) that must not re-record an
+      observation another process already applied: without the guard, a
+      concurrent same-state re-observation would legally append a duplicate
+      history row.
     """
     if not isinstance(result, OrderResult):
         raise ValueError(f"result must be an OrderResult, got {result!r}")
     if previous_result is not None and not isinstance(previous_result, OrderResult):
         raise ValueError(f"previous_result must be an OrderResult, got {previous_result!r}")
+    if expected_current_state is not None and not isinstance(expected_current_state, OrderState):
+        raise ValueError(
+            f"expected_current_state must be an OrderState or None, got "
+            f"{expected_current_state!r}"
+        )
     _require_non_empty_str(reason, "reason")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
+
+        if expected_current_state is not None:
+            current = None if row["order_state"] is None else OrderState(row["order_state"])
+            if current is not expected_current_state:
+                raise ExecutionOrderStateConflictError(
+                    f"execution order {execution_request_id!r} is in state "
+                    f"{None if current is None else current.value!r}, not the expected "
+                    f"{expected_current_state.value!r}; the conditional update is refused "
+                    "and nothing was changed"
+                )
 
         if result.client_order_id != row["client_order_id"]:
             raise ValueError(

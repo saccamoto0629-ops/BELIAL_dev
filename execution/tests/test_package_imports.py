@@ -26,6 +26,8 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.reconciliation_models import OrderDiscrepancy, ReconciliationRun",
     "from execution import reconciliation_store",
     "from execution.broker_reconciliation import BrokerOrderReconciliationService",
+    "from execution.reconciliation_repair_models import OrderRepairAttempt, RepairMode, RepairOutcome",
+    "from execution.broker_reconciliation_repair import BrokerOrderReconciliationRepairService",
     "from execution.sqlite_ro import connect_read_only",
     "from execution.strict_json import load_strict_json_file",
     "from execution.shadow_runner import main as shadow_runner_main",

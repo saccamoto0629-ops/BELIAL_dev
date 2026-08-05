@@ -495,3 +495,213 @@ def test_the_default_db_path_is_execution_owned_and_env_overridable(tmp_path, mo
     assert store.reconciliation_db_path() == tmp_path / "custom.sqlite3"
     monkeypatch.setenv("BROKER_RECONCILIATION_DB_PATH", "relative.sqlite3")
     assert store.reconciliation_db_path() == store.BASE_DIR / "relative.sqlite3"
+
+
+# --- repair attempts / schema v2 (Issue #104) ---------------------------------
+
+
+from execution.reconciliation_repair_models import (  # noqa: E402
+    OrderRepairAttempt,
+    RepairMode,
+    RepairOutcome,
+)
+
+
+def sample_attempt(attempt_id="attempt-1", run_id="run-1", **overrides) -> OrderRepairAttempt:
+    kwargs = dict(
+        attempt_id=attempt_id,
+        run_id=run_id,
+        mode=RepairMode.APPLY,
+        target_type=ReconciliationTargetType.EXECUTION_ORDER,
+        target_id="exec-1",
+        outcome=RepairOutcome.APPLIED,
+        detail="the broker confirmed state 'filled'",
+        attempted_at_utc=at(10),
+        execution_request_id="exec-1",
+        client_order_id="client-1",
+        reconciliation_internal_state=OrderState.PENDING,
+        reconciliation_broker_state=OrderState.FILLED,
+        internal_state_before=OrderState.PENDING,
+        internal_state_after=OrderState.FILLED,
+        broker_order_id="B-1",
+        observed_at_utc=at(1),
+        applied_at_utc=at(11),
+    )
+    kwargs.update(overrides)
+    return OrderRepairAttempt(**kwargs)
+
+
+def recorded_run_db(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    store.record_reconciliation_run(sample_run(), db_path=path)
+    return path
+
+
+def test_a_repair_attempt_round_trips_with_every_field(tmp_path):
+    path = recorded_run_db(tmp_path)
+    original = sample_attempt()
+    store.record_repair_attempt(original, db_path=path)
+    assert store.get_repair_attempt("attempt-1", db_path=path) == original
+    assert store.list_repair_attempts(run_id="run-1", db_path=path) == (original,)
+
+
+def test_a_skipped_attempt_for_a_broker_only_target_round_trips(tmp_path):
+    path = recorded_run_db(tmp_path)
+    skipped = sample_attempt(
+        attempt_id="attempt-skip",
+        target_type=ReconciliationTargetType.BROKER_ORDER,
+        target_id="client-9",
+        outcome=RepairOutcome.SKIPPED,
+        detail="broker-only orders are never adopted automatically",
+        execution_request_id=None,
+        client_order_id="client-9",
+        reconciliation_internal_state=None,
+        reconciliation_broker_state=OrderState.FILLED,
+        internal_state_before=None,
+        internal_state_after=None,
+        broker_order_id="B-9",
+        applied_at_utc=None,
+    )
+    store.record_repair_attempt(skipped, db_path=path)
+    assert store.get_repair_attempt("attempt-skip", db_path=path) == skipped
+
+
+def test_recording_the_same_attempt_id_twice_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.record_repair_attempt(sample_attempt(), db_path=path)
+    with pytest.raises(store.RepairAttemptConflictError):
+        store.record_repair_attempt(sample_attempt(), db_path=path)
+    assert len(store.list_repair_attempts(db_path=path)) == 1
+
+
+def test_an_attempt_for_an_unrecorded_run_is_refused(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    with pytest.raises(store.ReconciliationStoreError, match="not recorded"):
+        store.record_repair_attempt(sample_attempt(run_id="run-ghost"), db_path=path)
+    assert store.list_repair_attempts(db_path=path) == ()
+
+
+def test_a_dry_run_attempt_is_never_persisted(tmp_path):
+    path = recorded_run_db(tmp_path)
+    dry = sample_attempt(
+        mode=RepairMode.DRY_RUN,
+        outcome=RepairOutcome.WOULD_APPLY,
+        applied_at_utc=None,
+    )
+    with pytest.raises(store.ReconciliationStoreError, match="dry-run"):
+        store.record_repair_attempt(dry, db_path=path)
+    assert store.list_repair_attempts(db_path=path) == ()
+
+
+def test_recording_an_attempt_never_creates_a_missing_db(tmp_path):
+    path = db(tmp_path)
+    with pytest.raises(store.ReconciliationStoreError, match="init_reconciliation_db"):
+        store.record_repair_attempt(sample_attempt(), db_path=path)
+    assert not path.exists()
+
+
+def test_repair_reads_return_the_empty_default_for_a_missing_db(tmp_path):
+    path = db(tmp_path)
+    assert store.get_repair_attempt("attempt-1", db_path=path) is None
+    assert store.list_repair_attempts(db_path=path) == ()
+    assert not path.exists()
+
+
+def test_a_tampered_attempt_row_fails_restore_time_validation(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.record_repair_attempt(sample_attempt(), db_path=path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            f"UPDATE {store.REPAIRS_TABLE} SET attempted_at_utc = 'garbage+00:00'"
+        )
+        connection.commit()
+    with pytest.raises(store.ReconciliationIntegrityError):
+        store.get_repair_attempt("attempt-1", db_path=path)
+
+
+def test_attempts_survive_a_process_restart(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.record_repair_attempt(sample_attempt(), db_path=path)
+    store._REFERENCE_SCHEMA_CACHE = None  # rebuild the reference like a fresh import
+    assert store.get_repair_attempt("attempt-1", db_path=path) == sample_attempt()
+
+
+# --- v1 -> v2 migration (Issue #104) ------------------------------------------
+
+
+def downgrade_to_v1(path):
+    """Rebuild the exact released v1 file: the v1 tables are byte-identical
+    between the versions, so dropping the additive v2 objects is a faithful
+    downgrade (asserted against the pristine v1 reference)."""
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(f"DROP INDEX {store._REPAIRS_RUN_INDEX}")
+        connection.execute(f"DROP TABLE {store.REPAIRS_TABLE}")
+        connection.execute(f"PRAGMA user_version = {store._MIGRATABLE_VERSION}")
+        connection.commit()
+    with closing(sqlite3.connect(path)) as connection:
+        assert store._schema_problems(connection, version=store._MIGRATABLE_VERSION) == []
+
+
+def test_init_migrates_a_valid_v1_db_and_keeps_every_row(tmp_path):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v1(path)
+
+    store.init_reconciliation_db(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert version == store.SCHEMA_VERSION
+    assert store.REPAIRS_TABLE in tables
+    assert store.get_reconciliation_run("run-1", db_path=path) == sample_run()
+    assert store.list_repair_attempts(db_path=path) == ()
+    # idempotent: a second init only verifies
+    store.init_reconciliation_db(path)
+
+
+def test_reads_and_writes_never_migrate_a_v1_db(tmp_path):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v1(path)
+    before = path.read_bytes()
+
+    with pytest.raises(store.ReconciliationSchemaError, match="init_reconciliation_db"):
+        store.get_reconciliation_run("run-1", db_path=path)
+    with pytest.raises(store.ReconciliationSchemaError):
+        store.record_reconciliation_run(sample_run("run-2"), db_path=path)
+    with pytest.raises(store.ReconciliationSchemaError):
+        store.record_repair_attempt(sample_attempt(), db_path=path)
+
+    assert path.read_bytes() == before
+
+
+def test_a_failed_migration_rolls_back_to_the_untouched_v1_file(tmp_path, monkeypatch):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v1(path)
+    before = path.read_bytes()
+    monkeypatch.setattr(
+        store, "_REPAIRS_RUN_INDEX_SQL", "CREATE INDEX broken ON missing_table (x)"
+    )
+
+    with pytest.raises(store.ReconciliationStoreError):
+        store.init_reconciliation_db(path)
+
+    assert path.read_bytes() == before
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == store._MIGRATABLE_VERSION
+
+
+def test_a_v1_lookalike_with_extra_objects_is_not_migrated(tmp_path):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v1(path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("CREATE TABLE stray (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    before = path.read_bytes()
+    with pytest.raises(store.ReconciliationSchemaError, match="unexpected"):
+        store.init_reconciliation_db(path)
+    assert path.read_bytes() == before
