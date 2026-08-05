@@ -13,6 +13,7 @@ from execution.reconciliation_models import ReconciliationTargetType
 from execution.reconciliation_repair_models import (
     OrderRepairAttempt,
     ReconciliationRepairResult,
+    RepairAttemptReservation,
     RepairMode,
     RepairOutcome,
 )
@@ -24,6 +25,25 @@ def at(seconds: int) -> datetime:
     return T0 + timedelta(seconds=seconds)
 
 
+def reservation(**overrides) -> RepairAttemptReservation:
+    kwargs = dict(
+        attempt_id="attempt-1",
+        run_id="run-1",
+        target_type=ReconciliationTargetType.EXECUTION_ORDER,
+        target_id="exec-1",
+        reserved_at_utc=at(1),
+        detail="reserved: repair evaluation started",
+        execution_request_id="exec-1",
+        client_order_id="client-1",
+        reconciliation_internal_state=OrderState.UNKNOWN,
+        reconciliation_broker_state=OrderState.FILLED,
+        internal_revision=2,
+        observed_at_utc=at(0),
+    )
+    kwargs.update(overrides)
+    return RepairAttemptReservation(**kwargs)
+
+
 def attempt(**overrides) -> OrderRepairAttempt:
     kwargs = dict(
         attempt_id="attempt-1",
@@ -33,11 +53,12 @@ def attempt(**overrides) -> OrderRepairAttempt:
         target_id="exec-1",
         outcome=RepairOutcome.APPLIED,
         detail="the broker confirmed state 'filled'",
-        attempted_at_utc=at(1),
+        reserved_at_utc=at(1),
         execution_request_id="exec-1",
         client_order_id="client-1",
         reconciliation_internal_state=OrderState.UNKNOWN,
         reconciliation_broker_state=OrderState.FILLED,
+        internal_revision=2,
         internal_state_before=OrderState.UNKNOWN,
         internal_state_after=OrderState.FILLED,
         broker_order_id="B-1",
@@ -53,10 +74,60 @@ def skipped(**overrides) -> OrderRepairAttempt:
         outcome=RepairOutcome.SKIPPED,
         internal_state_after=None,
         applied_at_utc=None,
+        failure_code="not_eligible_manual_review",
         detail="manual review targets are never auto-repaired",
     )
     kwargs.update(overrides)
     return attempt(**kwargs)
+
+
+# --- reservation invariants ---------------------------------------------------
+
+
+def test_a_valid_reservation_constructs():
+    entry = reservation()
+    assert entry.internal_revision == 2
+    assert entry.reconciliation_internal_state is OrderState.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("attempt_id", ""),
+        ("run_id", " "),
+        ("target_id", ""),
+        ("detail", ""),
+        ("target_type", "execution_order"),
+        ("reconciliation_internal_state", "unknown"),
+        ("internal_revision", -1),
+        ("internal_revision", True),
+        ("reserved_at_utc", datetime(2026, 8, 1)),
+        ("observed_at_utc", datetime(2026, 8, 1)),
+    ],
+)
+def test_malformed_reservation_fields_are_rejected(field, value):
+    with pytest.raises(ValueError):
+        reservation(**{field: value})
+
+
+def test_a_reservation_pairs_execution_target_and_request_id():
+    with pytest.raises(ValueError, match="execution_request_id"):
+        reservation(execution_request_id=None)
+    with pytest.raises(ValueError, match="execution_request_id"):
+        reservation(target_type=ReconciliationTargetType.BROKER_ORDER, target_id="client-9")
+    broker_only = reservation(
+        target_type=ReconciliationTargetType.BROKER_ORDER,
+        target_id="client-9",
+        execution_request_id=None,
+        reconciliation_internal_state=None,
+        internal_revision=None,
+    )
+    assert broker_only.execution_request_id is None
+
+
+def test_an_execution_reservation_requires_the_observed_internal_state():
+    with pytest.raises(ValueError, match="internal state"):
+        reservation(reconciliation_internal_state=None)
 
 
 # --- attempt invariants -------------------------------------------------------
@@ -66,6 +137,7 @@ def test_a_valid_applied_attempt_constructs():
     entry = attempt()
     assert entry.outcome is RepairOutcome.APPLIED
     assert entry.applied_at_utc == at(2)
+    assert entry.failure_code is None
 
 
 @pytest.mark.parametrize(
@@ -81,10 +153,11 @@ def test_a_valid_applied_attempt_constructs():
         ("reconciliation_internal_state", "unknown"),
         ("internal_state_after", "filled"),
         ("broker_error_code", "timeout"),
-        ("attempted_at_utc", datetime(2026, 8, 1)),
+        ("internal_revision", -3),
+        ("reserved_at_utc", datetime(2026, 8, 1)),
     ],
 )
-def test_malformed_fields_are_rejected(field, value):
+def test_malformed_attempt_fields_are_rejected(field, value):
     with pytest.raises(ValueError):
         attempt(**{field: value})
 
@@ -110,6 +183,14 @@ def test_applied_at_exists_exactly_for_applied():
         skipped(applied_at_utc=at(2))
 
 
+def test_applied_at_lives_in_the_broker_clock_domain():
+    """applied_at is the committed state-history timestamp (= the broker
+    snapshot's updated_at) and is deliberately NOT ordered against the
+    repair-side reservation clock."""
+    entry = attempt(applied_at_utc=at(1) - timedelta(days=30))
+    assert entry.applied_at_utc < entry.reserved_at_utc
+
+
 def test_the_after_state_exists_exactly_for_applied_like_outcomes():
     with pytest.raises(ValueError, match="internal_state_after"):
         attempt(internal_state_after=None)
@@ -128,11 +209,24 @@ def test_the_broker_error_code_exists_exactly_for_query_failed():
     with pytest.raises(ValueError, match="broker_error_code"):
         skipped(broker_error_code=BrokerErrorCode.TIMEOUT)
     with pytest.raises(ValueError, match="broker_error_code"):
-        skipped(outcome=RepairOutcome.QUERY_FAILED)
+        skipped(outcome=RepairOutcome.QUERY_FAILED, failure_code="broker_query_failed")
     entry = skipped(
-        outcome=RepairOutcome.QUERY_FAILED, broker_error_code=BrokerErrorCode.TIMEOUT
+        outcome=RepairOutcome.QUERY_FAILED,
+        broker_error_code=BrokerErrorCode.TIMEOUT,
+        failure_code="broker_query_failed",
     )
     assert entry.broker_error_code is BrokerErrorCode.TIMEOUT
+
+
+def test_the_failure_code_exists_exactly_for_non_success_outcomes():
+    with pytest.raises(ValueError, match="failure_code"):
+        attempt(failure_code="some_code")  # applied must not carry one
+    with pytest.raises(ValueError, match="failure_code"):
+        skipped(failure_code=None)  # skipped must carry one
+    with pytest.raises(ValueError):
+        skipped(failure_code="  ")
+    stale = skipped(outcome=RepairOutcome.STALE, failure_code="internal_order_changed")
+    assert stale.failure_code == "internal_order_changed"
 
 
 def test_execution_request_id_exists_exactly_for_execution_order_targets():
@@ -145,6 +239,7 @@ def test_execution_request_id_exists_exactly_for_execution_order_targets():
         target_id="client-9",
         execution_request_id=None,
         reconciliation_internal_state=None,
+        internal_revision=None,
         internal_state_before=None,
     )
     assert entry.execution_request_id is None
@@ -155,14 +250,9 @@ def test_an_execution_target_requires_the_observed_internal_state():
         attempt(reconciliation_internal_state=None)
 
 
-def test_applied_at_never_precedes_attempted_at():
-    with pytest.raises(ValueError, match="applied_at_utc"):
-        attempt(attempted_at_utc=at(5), applied_at_utc=at(4))
-
-
 def test_audit_error_is_optional_metadata():
-    entry = replace(attempt(), audit_error="ReconciliationStoreError: disk full")
-    assert entry.audit_error == "ReconciliationStoreError: disk full"
+    entry = replace(attempt(), audit_error="finalize failed; reservation stays pending")
+    assert entry.audit_error is not None
     with pytest.raises(ValueError):
         attempt(audit_error="  ")
 
@@ -193,7 +283,7 @@ def test_a_valid_result_exposes_outcome_helpers():
 
 
 def test_has_audit_failures_reflects_attempt_metadata():
-    flagged = replace(attempt(), audit_error="append failed")
+    flagged = replace(attempt(), audit_error="finalize failed")
     summary = result(attempts=(flagged,))
     assert summary.has_audit_failures is True
 

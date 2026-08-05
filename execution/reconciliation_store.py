@@ -40,15 +40,23 @@ already stored ``run_id`` therefore raises
 run: repeated recording cannot corrupt an existing audit trail, and a
 repeated run simply uses a new id.
 
-Repair attempts (Issue #104) follow the same stance: ATTEMPT-SCOPED APPEND
-into ``broker_reconciliation_repair_attempts`` (FK -> run). Every attempt
--- applied, already applied, skipped, stale, conflicting, rejected, failed
--- is an independent audit event; re-running a repair appends new attempt
-rows (typically ``already_applied``) and never updates or flags the stored
-run / discrepancy rows. ``attempt_id`` is the PRIMARY KEY; re-recording one
-raises :class:`RepairAttemptConflictError`. Dry-run attempts are never
-recorded (:func:`record_repair_attempt` refuses them): dry-run is a
-no-side-effect contract, not an audit category.
+Repair attempts (Issue #104) follow the same append stance with a TWO-PHASE
+lifecycle in ``broker_reconciliation_repair_attempts`` (FK -> run, composite
+FK -> the exact discrepancy): every attempt is INSERTed as a ``pending``
+RESERVATION (:func:`reserve_repair_attempt`) BEFORE anything is evaluated
+or written to the execution order store, and completed exactly once to
+``finalized`` (:func:`finalize_repair_attempt`, compare-and-set on the
+pending status; double finalize raises
+:class:`RepairAttemptConflictError`). Every attempt -- applied, already
+applied, skipped, stale, conflicting, rejected, query-failed, failed -- is
+an independent audit event; re-running a repair reserves new attempt rows
+and never updates or flags the stored run / discrepancy rows or earlier
+attempts. ``attempt_id`` is the PRIMARY KEY; reusing one is refused at
+RESERVATION time -- before any state update could have happened. A pending
+row that never finalized (crash) stays discoverable
+(:func:`list_pending_repair_attempts`) and is finalized later under its
+original id by the repair service's recovery. Dry-run reserves and records
+nothing: dry-run is a no-side-effect contract, not an audit category.
 
 Schema policy: identical to ``execution_store`` / ``safety_store`` --
 :func:`init_reconciliation_db` creates the schema only into a PRISTINE
@@ -63,15 +71,18 @@ restored row is re-validated strictly through the model invariants, so an
 out-of-band edited DB raises :class:`ReconciliationIntegrityError` instead
 of being trusted.
 
-Migration (Issue #104): schema v2 adds the repair-attempts table and its
-index; the v1 tables are byte-identical between the versions, so the
-v1 -> v2 migration is purely ADDITIVE. ``init_reconciliation_db`` migrates
-a COMPLETE, verified v1 schema in ONE ``BEGIN IMMEDIATE`` transaction
-(create table -> create index -> version bump -> full v2 re-verification ->
-COMMIT); existing rows are read back unchanged and a failed migration rolls
-back to the untouched v1 file. Read paths NEVER migrate (they refuse a v1
-DB with a schema error pointing at ``init_reconciliation_db``), so
-dry-run / read-only contracts keep their no-side-effect guarantee.
+Migration (Issue #104): schema v2 adds the repair-attempts table + index
+and the ``discrepancies.internal_revision`` column (nullable ``ALTER TABLE
+ADD COLUMN`` -- existing rows read back as NULL and are never
+auto-repaired); the runs table is byte-identical between the versions, so
+the v1 -> v2 migration is purely ADDITIVE. ``init_reconciliation_db``
+migrates a COMPLETE, verified v1 schema in ONE ``BEGIN IMMEDIATE``
+transaction (alter -> create table -> create index -> version bump -> full
+v2 re-verification -> COMMIT); existing rows are read back unchanged and a
+failed migration rolls back to the untouched v1 file. Read paths NEVER
+migrate (they refuse a v1 DB with a schema error pointing at
+``init_reconciliation_db``), so dry-run / read-only contracts keep their
+no-side-effect guarantee.
 """
 
 from __future__ import annotations
@@ -95,6 +106,7 @@ from execution.reconciliation_models import (
 )
 from execution.reconciliation_repair_models import (
     OrderRepairAttempt,
+    RepairAttemptReservation,
     RepairMode,
     RepairOutcome,
 )
@@ -111,11 +123,19 @@ DISCREPANCIES_TABLE = "broker_reconciliation_discrepancies"
 REPAIRS_TABLE = "broker_reconciliation_repair_attempts"
 
 # v1: initial Issue #103 schema (runs + discrepancies).
-# v2 (Issue #104): + broker_reconciliation_repair_attempts (repair audit).
-#     Purely additive over v1 (the v1 tables are byte-identical); init
-#     migrates a verified v1 DB in place (see the module docstring).
+# v2 (Issue #104): + broker_reconciliation_repair_attempts (two-phase repair
+#     audit: pending reservation -> finalized outcome) and
+#     discrepancies.internal_revision (the internal order's revision at
+#     observation time, so repair can prove the order is unchanged). Additive
+#     over v1 (ALTER ADD COLUMN + new table + index); init migrates a
+#     verified v1 DB in place (see the module docstring).
 SCHEMA_VERSION = 2
 _MIGRATABLE_VERSION = 1
+
+# Repair attempt lifecycle statuses (Issue #104): a row is INSERTed as
+# ``pending`` (the reservation) and completed exactly once to ``finalized``.
+ATTEMPT_STATUS_PENDING = "pending"
+ATTEMPT_STATUS_FINALIZED = "finalized"
 
 _RUN_COLUMNS: tuple[str, ...] = (
     "run_id",
@@ -138,26 +158,41 @@ _DISCREPANCY_COLUMNS: tuple[str, ...] = (
     "broker_error_code",
     "detail",
     "observed_at_utc",
+    "internal_revision",
 )
-_REPAIR_COLUMNS: tuple[str, ...] = (
+# Columns set by the RESERVATION (INSERT, status pending); the remaining
+# outcome columns stay NULL until finalize.
+_RESERVATION_COLUMNS: tuple[str, ...] = (
     "attempt_id",
+    "run_id",
+    "mode",
+    "status",
+    "target_type",
+    "target_id",
+    "execution_request_id",
+    "client_order_id",
+    "reconciliation_internal_state",
+    "reconciliation_broker_state",
+    "internal_revision",
+    "detail",
+    "observed_at_utc",
+    "reserved_at_utc",
+)
+# Identity/anchor columns that must be IDENTICAL between the stored pending
+# reservation and the finalizing attempt (a finalize may only complete the
+# reservation it belongs to).
+_ATTEMPT_IDENTITY_COLUMNS: tuple[str, ...] = (
     "run_id",
     "mode",
     "target_type",
     "target_id",
     "execution_request_id",
     "client_order_id",
-    "outcome",
     "reconciliation_internal_state",
     "reconciliation_broker_state",
-    "internal_state_before",
-    "internal_state_after",
-    "broker_order_id",
-    "broker_error_code",
-    "detail",
+    "internal_revision",
     "observed_at_utc",
-    "attempted_at_utc",
-    "applied_at_utc",
+    "reserved_at_utc",
 )
 
 
@@ -225,11 +260,19 @@ def _create_runs_table_sql() -> str:
     """
 
 
-def _create_discrepancies_table_sql() -> str:
-    """Full current schema for the discrepancy rows. The CHECKs mirror the
-    ``OrderDiscrepancy`` invariants: known enum members only, and the
-    ``query_failed`` category is used exactly for the ``query_failure`` kind
-    (which is also the only kind carrying a broker error code)."""
+# Shared between the v2 reference CREATE and the v1 -> v2 ALTER so a migrated
+# DB token-normalizes identically to a freshly created one (SQLite inserts an
+# added column at the end of the column list, before the table constraints).
+_DISCREPANCY_REVISION_COLUMN_DDL = (
+    "internal_revision INTEGER CHECK (internal_revision IS NULL OR internal_revision >= 0)"
+)
+
+
+def _create_discrepancies_table_sql(*, version: int = SCHEMA_VERSION) -> str:
+    """Full schema for the discrepancy rows at ``version``. The CHECKs
+    mirror the ``OrderDiscrepancy`` invariants: known enum members only, and
+    the ``query_failed`` category is used exactly for the ``query_failure``
+    kind (which is also the only kind carrying a broker error code)."""
     types = _enum_values_sql(DiscrepancyType)
     targets = _enum_values_sql(ReconciliationTargetType)
     categories = _enum_values_sql(ResolutionCategory)
@@ -237,6 +280,9 @@ def _create_discrepancies_table_sql() -> str:
     codes = _enum_values_sql(BrokerErrorCode)
     query_failure = DiscrepancyType.QUERY_FAILURE.value
     query_failed = ResolutionCategory.QUERY_FAILED.value
+    revision_column = (
+        f",\n            {_DISCREPANCY_REVISION_COLUMN_DDL}" if version >= 2 else ""
+    )
     return f"""
         CREATE TABLE {DISCREPANCIES_TABLE} (
             discrepancy_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,7 +300,7 @@ def _create_discrepancies_table_sql() -> str:
             broker_error_code TEXT
                 CHECK (broker_error_code IS NULL OR broker_error_code IN ('{codes}')),
             detail TEXT NOT NULL CHECK (trim(detail) <> ''),
-            observed_at_utc TEXT NOT NULL CHECK (observed_at_utc LIKE '%+00:00'),
+            observed_at_utc TEXT NOT NULL CHECK (observed_at_utc LIKE '%+00:00'){revision_column},
             UNIQUE (run_id, target_type, target_id),
             CHECK ((discrepancy_type = '{query_failure}') = (resolution_category = '{query_failed}')),
             CHECK ((discrepancy_type = '{query_failure}') = (broker_error_code IS NOT NULL))
@@ -263,11 +309,17 @@ def _create_discrepancies_table_sql() -> str:
 
 
 def _create_repairs_table_sql() -> str:
-    """Full current schema for the repair-attempt rows (Issue #104). The
-    CHECKs mirror the ``OrderRepairAttempt`` invariants as a second guard.
-    ``mode`` admits only ``apply``: dry-run attempts are never persisted, so
-    a stored row claiming one is corruption by construction. Likewise
-    ``would_apply`` is not a storable outcome."""
+    """Full current schema for the repair-attempt rows (Issue #104).
+
+    Two-phase lifecycle: a row is INSERTed as ``status = 'pending'`` (the
+    reservation, outcome columns NULL) and completed exactly once to
+    ``status = 'finalized'``. The CHECKs mirror the model invariants as a
+    second guard, split by status so a pending row cannot smuggle outcome
+    data and a finalized row cannot miss it. ``mode`` admits only ``apply``
+    (dry-run persists nothing) and ``would_apply`` is not a storable
+    outcome. The composite FK pins every attempt to the exact discrepancy
+    it acted on (the discrepancies table's UNIQUE (run_id, target_type,
+    target_id) is the parent key)."""
     targets = _enum_values_sql(ReconciliationTargetType)
     states = _enum_values_sql(OrderState)
     codes = _enum_values_sql(BrokerErrorCode)
@@ -279,6 +331,8 @@ def _create_repairs_table_sql() -> str:
     already = RepairOutcome.ALREADY_APPLIED.value
     query_failed = RepairOutcome.QUERY_FAILED.value
     execution_target = ReconciliationTargetType.EXECUTION_ORDER.value
+    pending = ATTEMPT_STATUS_PENDING
+    finalized = ATTEMPT_STATUS_FINALIZED
     return f"""
         CREATE TABLE {REPAIRS_TABLE} (
             attempt_id TEXT PRIMARY KEY NOT NULL CHECK (trim(attempt_id) <> ''),
@@ -286,33 +340,48 @@ def _create_repairs_table_sql() -> str:
                 REFERENCES {RUNS_TABLE} (run_id)
                 CHECK (trim(run_id) <> ''),
             mode TEXT NOT NULL CHECK (mode IN ('{apply_mode}')),
+            status TEXT NOT NULL CHECK (status IN ('{pending}', '{finalized}')),
             target_type TEXT NOT NULL CHECK (target_type IN ('{targets}')),
             target_id TEXT NOT NULL CHECK (trim(target_id) <> ''),
             execution_request_id TEXT
                 CHECK (execution_request_id IS NULL OR trim(execution_request_id) <> ''),
             client_order_id TEXT CHECK (client_order_id IS NULL OR trim(client_order_id) <> ''),
-            outcome TEXT NOT NULL CHECK (outcome IN ('{storable_outcomes}')),
             reconciliation_internal_state TEXT
                 CHECK (reconciliation_internal_state IS NULL
                        OR reconciliation_internal_state IN ('{states}')),
             reconciliation_broker_state TEXT
                 CHECK (reconciliation_broker_state IS NULL
                        OR reconciliation_broker_state IN ('{states}')),
+            internal_revision INTEGER
+                CHECK (internal_revision IS NULL OR internal_revision >= 0),
             internal_state_before TEXT
                 CHECK (internal_state_before IS NULL OR internal_state_before IN ('{states}')),
             internal_state_after TEXT
                 CHECK (internal_state_after IS NULL OR internal_state_after IN ('{states}')),
+            outcome TEXT CHECK (outcome IS NULL OR outcome IN ('{storable_outcomes}')),
             broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
             broker_error_code TEXT
                 CHECK (broker_error_code IS NULL OR broker_error_code IN ('{codes}')),
+            failure_code TEXT CHECK (failure_code IS NULL OR trim(failure_code) <> ''),
             detail TEXT NOT NULL CHECK (trim(detail) <> ''),
             observed_at_utc TEXT CHECK (observed_at_utc IS NULL OR observed_at_utc LIKE '%+00:00'),
-            attempted_at_utc TEXT NOT NULL CHECK (attempted_at_utc LIKE '%+00:00'),
+            reserved_at_utc TEXT NOT NULL CHECK (reserved_at_utc LIKE '%+00:00'),
             applied_at_utc TEXT CHECK (applied_at_utc IS NULL OR applied_at_utc LIKE '%+00:00'),
+            FOREIGN KEY (run_id, target_type, target_id)
+                REFERENCES {DISCREPANCIES_TABLE} (run_id, target_type, target_id),
             CHECK ((target_type = '{execution_target}') = (execution_request_id IS NOT NULL)),
-            CHECK ((outcome = '{applied}') = (applied_at_utc IS NOT NULL)),
-            CHECK ((outcome IN ('{applied}', '{already}')) = (internal_state_after IS NOT NULL)),
-            CHECK ((outcome = '{query_failed}') = (broker_error_code IS NOT NULL))
+            CHECK ((status = '{pending}') = (outcome IS NULL)),
+            CHECK (status <> '{pending}'
+                   OR (internal_state_before IS NULL AND internal_state_after IS NULL
+                       AND broker_order_id IS NULL AND broker_error_code IS NULL
+                       AND failure_code IS NULL AND applied_at_utc IS NULL)),
+            CHECK (status = '{pending}' OR (outcome = '{applied}') = (applied_at_utc IS NOT NULL)),
+            CHECK (status = '{pending}'
+                   OR (outcome IN ('{applied}', '{already}')) = (internal_state_after IS NOT NULL)),
+            CHECK (status = '{pending}'
+                   OR (outcome = '{query_failed}') = (broker_error_code IS NOT NULL)),
+            CHECK (status = '{pending}'
+                   OR (outcome IN ('{applied}', '{already}')) = (failure_code IS NULL))
         ) WITHOUT ROWID
     """
 
@@ -320,7 +389,7 @@ def _create_repairs_table_sql() -> str:
 _DISCREPANCIES_RUN_INDEX = f"idx_{DISCREPANCIES_TABLE}_run"
 _REPAIRS_RUN_INDEX = f"idx_{REPAIRS_TABLE}_run"
 _REPAIRS_RUN_INDEX_SQL = (
-    f"CREATE INDEX {_REPAIRS_RUN_INDEX} ON {REPAIRS_TABLE} (run_id, attempted_at_utc, attempt_id)"
+    f"CREATE INDEX {_REPAIRS_RUN_INDEX} ON {REPAIRS_TABLE} (run_id, status, reserved_at_utc, attempt_id)"
 )
 
 
@@ -343,7 +412,7 @@ def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERS
     migration reference and by migration tests; real DBs are created at the
     current version)."""
     connection.execute(_create_runs_table_sql())
-    connection.execute(_create_discrepancies_table_sql())
+    connection.execute(_create_discrepancies_table_sql(version=version))
     connection.execute(_create_index_sql())
     if version >= SCHEMA_VERSION:
         connection.execute(_create_repairs_table_sql())
@@ -524,16 +593,25 @@ def _verified_read(db_path: Path):
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection, db_path: Path) -> None:
     """Migrate a fully verified v1 schema to v2 inside the caller's
-    transaction (Issue #104): additive ``CREATE TABLE`` for the repair
-    attempts + its index + version bump. Existing rows are untouched;
-    nothing is deleted or rewritten. The caller re-verifies the complete v2
-    schema before COMMIT; any failure rolls back to the untouched v1 file."""
+    transaction (Issue #104): additive ``ALTER TABLE ... ADD COLUMN
+    internal_revision`` on the discrepancies table (SQLite inserts the
+    column at the end of the column list, before the table constraints --
+    exactly where the v2 reference CREATE declares it, so the migrated DDL
+    token-normalizes identically; existing rows read back with
+    ``internal_revision = NULL`` and are never auto-repaired), plus the
+    repair-attempts table, its index and the version bump. Existing rows
+    are untouched; nothing is deleted or rewritten. The caller re-verifies
+    the complete v2 schema before COMMIT; any failure rolls back to the
+    untouched v1 file."""
+    connection.execute(
+        f"ALTER TABLE {DISCREPANCIES_TABLE} ADD COLUMN {_DISCREPANCY_REVISION_COLUMN_DDL}"
+    )
     connection.execute(_create_repairs_table_sql())
     connection.execute(_REPAIRS_RUN_INDEX_SQL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     _LOGGER.info(
-        "migrated broker reconciliation DB %s from schema v%d to v%d (added repair "
-        "attempts table %s)",
+        "migrated broker reconciliation DB %s from schema v%d to v%d (added "
+        "discrepancies.internal_revision and repair attempts table %s)",
         db_path,
         _MIGRATABLE_VERSION,
         SCHEMA_VERSION,
@@ -647,6 +725,7 @@ def record_reconciliation_run(run: ReconciliationRun, *, db_path: Path | None = 
                         else discrepancy.broker_error_code.value,
                         discrepancy.detail,
                         _iso(discrepancy.observed_at_utc),
+                        discrepancy.internal_revision,
                     ),
                 )
         except sqlite3.IntegrityError as exc:  # UNIQUE / CHECK / FK violation
@@ -676,6 +755,7 @@ def _restore_discrepancy(row: sqlite3.Row, run_id: str) -> OrderDiscrepancy:
             broker_error_code=None
             if row["broker_error_code"] is None
             else BrokerErrorCode(row["broker_error_code"]),
+            internal_revision=row["internal_revision"],
         )
     except (ValueError, TypeError) as exc:
         raise ReconciliationIntegrityError(
@@ -755,98 +835,205 @@ def list_reconciliation_runs(
         return ()
 
 
-# --- repair attempts (Issue #104) ---------------------------------------------
+# --- repair attempts: two-phase lifecycle (Issue #104) ------------------------
 
 
-def record_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None = None) -> None:
-    """Append one repair-attempt audit row (Issue #104).
-
-    Only APPLY-mode attempts are recordable: a dry-run pass has a
-    no-side-effect contract, so persisting its attempts would itself violate
-    it (and a ``would_apply`` outcome is refused for the same reason). A
-    missing DB file is a failure, not a trigger for implicit creation. The
-    run the attempt refers to must already be recorded (FK -> runs; also
-    pre-checked for a readable error). Re-recording a stored ``attempt_id``
-    raises :class:`RepairAttemptConflictError` and changes nothing.
-    ``attempt.audit_error`` is in-memory metadata and is never persisted.
-    """
-    if not isinstance(attempt, OrderRepairAttempt):
-        raise ReconciliationStoreError(f"attempt must be an OrderRepairAttempt, got {attempt!r}")
-    if attempt.mode is not RepairMode.APPLY:
-        raise ReconciliationStoreError(
-            f"only apply-mode repair attempts are recorded; got mode {attempt.mode.value!r} "
-            "(dry-run is a no-side-effect contract)"
-        )
+def _require_existing_db(db_path: Path | None) -> Path:
     db_path = Path(db_path) if db_path is not None else reconciliation_db_path()
     if not db_path.exists():
         raise ReconciliationStoreError(
             f"broker reconciliation DB at {db_path} does not exist; call "
             "init_reconciliation_db() first"
         )
+    return db_path
+
+
+def reserve_repair_attempt(
+    reservation: RepairAttemptReservation, *, db_path: Path | None = None
+) -> None:
+    """Persist the PENDING phase of one repair attempt (Issue #104).
+
+    Called BEFORE the attempt is evaluated or anything is written to the
+    execution order store, so the attempt id and its run / discrepancy
+    identity survive a crash at any later point. A missing DB file is a
+    failure, not a trigger for implicit creation. The run AND the exact
+    discrepancy the attempt acts on must already be recorded (composite
+    FK; also pre-checked for a readable error). A reused ``attempt_id``
+    raises :class:`RepairAttemptConflictError` and changes nothing --
+    BEFORE any state update could have happened.
+    """
+    if not isinstance(reservation, RepairAttemptReservation):
+        raise ReconciliationStoreError(
+            f"reservation must be a RepairAttemptReservation, got {reservation!r}"
+        )
+    db_path = _require_existing_db(db_path)
     record = (
-        attempt.attempt_id,
-        attempt.run_id,
-        attempt.mode.value,
-        attempt.target_type.value,
-        attempt.target_id,
-        attempt.execution_request_id,
-        attempt.client_order_id,
-        attempt.outcome.value,
+        reservation.attempt_id,
+        reservation.run_id,
+        RepairMode.APPLY.value,
+        ATTEMPT_STATUS_PENDING,
+        reservation.target_type.value,
+        reservation.target_id,
+        reservation.execution_request_id,
+        reservation.client_order_id,
         None
-        if attempt.reconciliation_internal_state is None
-        else attempt.reconciliation_internal_state.value,
+        if reservation.reconciliation_internal_state is None
+        else reservation.reconciliation_internal_state.value,
         None
-        if attempt.reconciliation_broker_state is None
-        else attempt.reconciliation_broker_state.value,
-        None if attempt.internal_state_before is None else attempt.internal_state_before.value,
-        None if attempt.internal_state_after is None else attempt.internal_state_after.value,
-        attempt.broker_order_id,
-        None if attempt.broker_error_code is None else attempt.broker_error_code.value,
-        attempt.detail,
-        None if attempt.observed_at_utc is None else _iso(attempt.observed_at_utc),
-        _iso(attempt.attempted_at_utc),
-        None if attempt.applied_at_utc is None else _iso(attempt.applied_at_utc),
+        if reservation.reconciliation_broker_state is None
+        else reservation.reconciliation_broker_state.value,
+        reservation.internal_revision,
+        reservation.detail,
+        None if reservation.observed_at_utc is None else _iso(reservation.observed_at_utc),
+        _iso(reservation.reserved_at_utc),
     )
     with _verified_txn(db_path) as connection:
         existing = connection.execute(
             f"SELECT attempt_id FROM {REPAIRS_TABLE} WHERE attempt_id = ?",
-            (attempt.attempt_id,),
+            (reservation.attempt_id,),
         ).fetchone()
         if existing is not None:
             raise RepairAttemptConflictError(
-                f"repair attempt {attempt.attempt_id!r} is already recorded; attempts are "
-                "appended under a new attempt_id, never overwritten"
+                f"repair attempt {reservation.attempt_id!r} is already reserved or "
+                "finalized; attempts are appended under a new attempt_id, never reused"
             )
-        run_exists = connection.execute(
-            f"SELECT run_id FROM {RUNS_TABLE} WHERE run_id = ?", (attempt.run_id,)
+        discrepancy_exists = connection.execute(
+            f"SELECT target_id FROM {DISCREPANCIES_TABLE} "
+            "WHERE run_id = ? AND target_type = ? AND target_id = ?",
+            (reservation.run_id, reservation.target_type.value, reservation.target_id),
         ).fetchone()
-        if run_exists is None:
+        if discrepancy_exists is None:
             raise ReconciliationStoreError(
-                f"repair attempt {attempt.attempt_id!r} refers to reconciliation run "
-                f"{attempt.run_id!r}, which is not recorded in this DB; repairs act on "
-                "recorded runs only"
+                f"repair attempt {reservation.attempt_id!r} refers to discrepancy "
+                f"({reservation.run_id!r}, {reservation.target_type.value!r}, "
+                f"{reservation.target_id!r}), which is not recorded in this DB; repairs "
+                "act on recorded observations only"
             )
         try:
             connection.execute(
-                f"INSERT INTO {REPAIRS_TABLE} ({', '.join(_REPAIR_COLUMNS)}) "
-                f"VALUES ({', '.join('?' for _ in _REPAIR_COLUMNS)})",
+                f"INSERT INTO {REPAIRS_TABLE} ({', '.join(_RESERVATION_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _RESERVATION_COLUMNS)})",
                 record,
             )
         except sqlite3.IntegrityError as exc:  # UNIQUE / CHECK / FK violation
             raise ReconciliationStoreError(
-                f"recording repair attempt {attempt.attempt_id!r} violates a DB "
+                f"reserving repair attempt {reservation.attempt_id!r} violates a DB "
                 f"constraint: {exc}"
             ) from exc
 
 
+def finalize_repair_attempt(attempt: OrderRepairAttempt, *, db_path: Path | None = None) -> None:
+    """Complete the reserved audit row with the attempt's outcome.
+
+    Compare-and-set protected: only a row that is still ``pending`` can be
+    finalized, and only by an attempt whose identity/anchor columns
+    (:data:`_ATTEMPT_IDENTITY_COLUMNS`) exactly equal the stored
+    reservation. Finalizing an already-finalized attempt raises
+    :class:`RepairAttemptConflictError` (a concurrent recovery may
+    legitimately have completed it first); an identity mismatch is
+    corruption and raises :class:`ReconciliationIntegrityError`. Only
+    APPLY-mode attempts exist in this DB; a ``would_apply`` outcome is
+    unrepresentable (dry-run persists nothing). ``attempt.audit_error`` is
+    in-memory metadata and is never persisted.
+    """
+    if not isinstance(attempt, OrderRepairAttempt):
+        raise ReconciliationStoreError(f"attempt must be an OrderRepairAttempt, got {attempt!r}")
+    if attempt.mode is not RepairMode.APPLY:
+        raise ReconciliationStoreError(
+            f"only apply-mode repair attempts are audited; got mode {attempt.mode.value!r} "
+            "(dry-run is a no-side-effect contract)"
+        )
+    db_path = _require_existing_db(db_path)
+    expected_identity = {
+        "run_id": attempt.run_id,
+        "mode": attempt.mode.value,
+        "target_type": attempt.target_type.value,
+        "target_id": attempt.target_id,
+        "execution_request_id": attempt.execution_request_id,
+        "client_order_id": attempt.client_order_id,
+        "reconciliation_internal_state": None
+        if attempt.reconciliation_internal_state is None
+        else attempt.reconciliation_internal_state.value,
+        "reconciliation_broker_state": None
+        if attempt.reconciliation_broker_state is None
+        else attempt.reconciliation_broker_state.value,
+        "internal_revision": attempt.internal_revision,
+        "observed_at_utc": None
+        if attempt.observed_at_utc is None
+        else _iso(attempt.observed_at_utc),
+        "reserved_at_utc": _iso(attempt.reserved_at_utc),
+    }
+    with _verified_txn(db_path) as connection:
+        row = connection.execute(
+            f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (attempt.attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise ReconciliationStoreError(
+                f"repair attempt {attempt.attempt_id!r} has no reservation; attempts are "
+                "reserved before they are finalized"
+            )
+        if row["status"] != ATTEMPT_STATUS_PENDING:
+            raise RepairAttemptConflictError(
+                f"repair attempt {attempt.attempt_id!r} is already finalized "
+                f"(outcome {row['outcome']!r}); an attempt is finalized exactly once"
+            )
+        mismatched = sorted(
+            column
+            for column in _ATTEMPT_IDENTITY_COLUMNS
+            if row[column] != expected_identity[column]
+        )
+        if mismatched:
+            raise ReconciliationIntegrityError(
+                f"finalize of repair attempt {attempt.attempt_id!r} does not match its "
+                f"stored reservation (differing: {', '.join(mismatched)}); refusing to "
+                "complete a foreign reservation"
+            )
+        try:
+            updated = connection.execute(
+                f"UPDATE {REPAIRS_TABLE} SET status = ?, outcome = ?, detail = ?, "
+                "internal_state_before = ?, internal_state_after = ?, broker_order_id = ?, "
+                "broker_error_code = ?, failure_code = ?, applied_at_utc = ? "
+                "WHERE attempt_id = ? AND status = ?",
+                (
+                    ATTEMPT_STATUS_FINALIZED,
+                    attempt.outcome.value,
+                    attempt.detail,
+                    None
+                    if attempt.internal_state_before is None
+                    else attempt.internal_state_before.value,
+                    None
+                    if attempt.internal_state_after is None
+                    else attempt.internal_state_after.value,
+                    attempt.broker_order_id,
+                    None if attempt.broker_error_code is None else attempt.broker_error_code.value,
+                    attempt.failure_code,
+                    None if attempt.applied_at_utc is None else _iso(attempt.applied_at_utc),
+                    attempt.attempt_id,
+                    ATTEMPT_STATUS_PENDING,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:  # CHECK violation
+            raise ReconciliationStoreError(
+                f"finalizing repair attempt {attempt.attempt_id!r} violates a DB "
+                f"constraint: {exc}"
+            ) from exc
+        if updated.rowcount != 1:  # defence in depth under BEGIN IMMEDIATE
+            raise RepairAttemptConflictError(
+                f"repair attempt {attempt.attempt_id!r} was finalized concurrently; an "
+                "attempt is finalized exactly once"
+            )
+
+
 def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
-    """Rebuild one attempt; the model re-runs every invariant, so an
-    out-of-band edited row fails loudly instead of being trusted."""
+    """Rebuild one FINALIZED attempt; the model re-runs every invariant, so
+    an out-of-band edited row fails loudly instead of being trusted."""
 
     def state(name):
         return None if row[name] is None else OrderState(row[name])
 
     try:
+        if row["status"] != ATTEMPT_STATUS_FINALIZED:
+            raise ValueError(f"attempt row carries status {row['status']!r}, not finalized")
         return OrderRepairAttempt(
             attempt_id=row["attempt_id"],
             run_id=row["run_id"],
@@ -855,17 +1042,19 @@ def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
             target_id=row["target_id"],
             outcome=RepairOutcome(row["outcome"]),
             detail=row["detail"],
-            attempted_at_utc=_parse_utc(row["attempted_at_utc"]),
+            reserved_at_utc=_parse_utc(row["reserved_at_utc"]),
             execution_request_id=row["execution_request_id"],
             client_order_id=row["client_order_id"],
             reconciliation_internal_state=state("reconciliation_internal_state"),
             reconciliation_broker_state=state("reconciliation_broker_state"),
+            internal_revision=row["internal_revision"],
             internal_state_before=state("internal_state_before"),
             internal_state_after=state("internal_state_after"),
             broker_order_id=row["broker_order_id"],
             broker_error_code=None
             if row["broker_error_code"] is None
             else BrokerErrorCode(row["broker_error_code"]),
+            failure_code=row["failure_code"],
             observed_at_utc=None
             if row["observed_at_utc"] is None
             else _parse_utc(row["observed_at_utc"]),
@@ -879,9 +1068,44 @@ def _restore_repair_attempt(row: sqlite3.Row) -> OrderRepairAttempt:
         ) from exc
 
 
+def _restore_reservation(row: sqlite3.Row) -> RepairAttemptReservation:
+    """Rebuild one PENDING reservation; strict, fail-closed."""
+
+    def state(name):
+        return None if row[name] is None else OrderState(row[name])
+
+    try:
+        if row["status"] != ATTEMPT_STATUS_PENDING:
+            raise ValueError(f"attempt row carries status {row['status']!r}, not pending")
+        if row["mode"] != RepairMode.APPLY.value:
+            raise ValueError(f"reservation carries mode {row['mode']!r}")
+        return RepairAttemptReservation(
+            attempt_id=row["attempt_id"],
+            run_id=row["run_id"],
+            target_type=ReconciliationTargetType(row["target_type"]),
+            target_id=row["target_id"],
+            reserved_at_utc=_parse_utc(row["reserved_at_utc"]),
+            detail=row["detail"],
+            execution_request_id=row["execution_request_id"],
+            client_order_id=row["client_order_id"],
+            reconciliation_internal_state=state("reconciliation_internal_state"),
+            reconciliation_broker_state=state("reconciliation_broker_state"),
+            internal_revision=row["internal_revision"],
+            observed_at_utc=None
+            if row["observed_at_utc"] is None
+            else _parse_utc(row["observed_at_utc"]),
+        )
+    except (ValueError, TypeError) as exc:
+        raise ReconciliationIntegrityError(
+            f"pending repair attempt row {row['attempt_id']!r} failed restore-time "
+            f"validation: {exc}"
+        ) from exc
+
+
 def get_repair_attempt(attempt_id: str, *, db_path: Path | None = None) -> OrderRepairAttempt | None:
-    """The stored repair attempt, or None. Missing DB / unknown id -> None;
-    the DB file is never created."""
+    """The stored FINALIZED repair attempt, or None (missing DB, unknown id,
+    or a still-pending reservation -- pending rows are listed by
+    :func:`list_pending_repair_attempts`). The DB file is never created."""
     if not isinstance(attempt_id, str) or not attempt_id.strip():
         raise ReconciliationStoreError(f"attempt_id must be a non-empty string, got {attempt_id!r}")
     db_path = Path(db_path) if db_path is not None else reconciliation_db_path()
@@ -890,36 +1114,62 @@ def get_repair_attempt(attempt_id: str, *, db_path: Path | None = None) -> Order
     try:
         with _verified_read(db_path) as connection:
             row = connection.execute(
-                f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ?", (attempt_id,)
+                f"SELECT * FROM {REPAIRS_TABLE} WHERE attempt_id = ? AND status = ?",
+                (attempt_id, ATTEMPT_STATUS_FINALIZED),
             ).fetchone()
             return None if row is None else _restore_repair_attempt(row)
     except ReadOnlyDbMissingError:
         return None
 
 
+def _list_attempt_rows(status: str, run_id: str | None, db_path: Path | None):
+    if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
+        raise ReconciliationStoreError(f"run_id must be a non-empty string or None, got {run_id!r}")
+    db_path = Path(db_path) if db_path is not None else reconciliation_db_path()
+    if not db_path.exists():
+        return None
+    where = "WHERE status = ?" + ("" if run_id is None else " AND run_id = ?")
+    parameters = (status,) if run_id is None else (status, run_id)
+    with _verified_read(db_path) as connection:
+        return connection.execute(
+            f"SELECT * FROM {REPAIRS_TABLE} {where} "
+            "ORDER BY reserved_at_utc ASC, attempt_id ASC",
+            parameters,
+        ).fetchall()
+
+
 def list_repair_attempts(
     *, run_id: str | None = None, db_path: Path | None = None
 ) -> tuple[OrderRepairAttempt, ...]:
-    """The stored repair attempts, oldest first (``attempted_at_utc``,
+    """The FINALIZED repair attempts, oldest first (``reserved_at_utc``,
     ``attempt_id`` as the tie-break so the order is total and stable),
     optionally restricted to one reconciliation run.
 
     Missing DB -> empty tuple, file never created.
     """
-    if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
-        raise ReconciliationStoreError(f"run_id must be a non-empty string or None, got {run_id!r}")
-    db_path = Path(db_path) if db_path is not None else reconciliation_db_path()
-    if not db_path.exists():
-        return ()
-    where = "" if run_id is None else " WHERE run_id = ?"
-    parameters = () if run_id is None else (run_id,)
     try:
-        with _verified_read(db_path) as connection:
-            rows = connection.execute(
-                f"SELECT * FROM {REPAIRS_TABLE}{where} "
-                "ORDER BY attempted_at_utc ASC, attempt_id ASC",
-                parameters,
-            ).fetchall()
-            return tuple(_restore_repair_attempt(row) for row in rows)
+        rows = _list_attempt_rows(ATTEMPT_STATUS_FINALIZED, run_id, db_path)
     except ReadOnlyDbMissingError:
         return ()
+    if rows is None:
+        return ()
+    return tuple(_restore_repair_attempt(row) for row in rows)
+
+
+def list_pending_repair_attempts(
+    *, run_id: str | None = None, db_path: Path | None = None
+) -> tuple[RepairAttemptReservation, ...]:
+    """The PENDING reservations (reserved but never finalized -- e.g. a
+    crashed repair pass), oldest first. These are the recovery work list:
+    the repair service finalizes each one under its ORIGINAL attempt id by
+    checking the execution order state history's structured provenance.
+
+    Missing DB -> empty tuple, file never created.
+    """
+    try:
+        rows = _list_attempt_rows(ATTEMPT_STATUS_PENDING, run_id, db_path)
+    except ReadOnlyDbMissingError:
+        return ()
+    if rows is None:
+        return ()
+    return tuple(_restore_reservation(row) for row in rows)

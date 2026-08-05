@@ -592,6 +592,9 @@ class BrokerOrderReconciliationService:
             client_order_id=row["client_order_id"],
             broker_order_id=broker_order_id,
             broker_error_code=broker_error_code,
+            # the order's revision at observation (Issue #104): repair
+            # refuses to act on this observation once the order changed
+            internal_revision=row["revision"],
         )
 
     def _now(self) -> datetime:

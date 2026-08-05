@@ -127,6 +127,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - `broker_order_id` TEXT NULL(変更時点の値)
 - `order_result_json` TEXT NULL(**snapshot anchor**。この観測を生んだ完全 `OrderResult`。state-only UNKNOWN と最初の pending 行のみ NULL)
 - `changed_at_utc` TEXT NOT NULL
+- `repair_attempt_id` TEXT NULL(schema v4 / Issue #104: **構造化 repair provenance**。reconciliation repair が適用した観測にのみ設定され、partial UNIQUE index `idx_execution_order_state_history_repair_attempt` により 1 attempt = 高々 1 行。provenance 付き行は snapshot 必須(復元時検証)。crash recovery はこの列で適用済み事実を判定する — reason 文字列は人間向け補助であり解析しない)
 
 ### 状態更新 API の契約
 
@@ -153,7 +154,8 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - **history に anchor された直前 snapshot を必ず `validate_order_result_update()` の old 側として使用**する(メモリ上のコピーは使わない)。stale な snapshot を根拠に、既知の fill・`filled_quantity` / `remaining_quantity`・`broker_order_id`・`updated_at_utc` を巻き戻すことは、**プロセス再起動直後であっても**不可能である。
 - 呼び出し側が `previous_result` を渡す場合、**anchored snapshot と完全一致するときのみ受理**する(呼び出し側の stale 前提を検出する)。
 - 遷移は snapshot との内容検証に加えて、**現在の追跡状態**(snapshot の後に state-only UNKNOWN が記録されていることがある)に対しても検証する。
-- `expected_current_state`(Issue #104、optional)を渡すと**原子的 compare-and-set** になる: 同一 `BEGIN IMMEDIATE` トランザクション内で読み直した現在状態がその状態と一致しなければ `ExecutionOrderStateConflictError` で拒否し、DB は無変更のまま rollback する。読み取り → 判定 → 書き込みの TOCTOU を閉じるための契約で、reconciliation repair が「別プロセスが先に適用済みの観測を same-state 再観測として二重記録してしまう」ことを防ぐ。省略時は従来どおり(same-state 再観測は許可・記録)。
+- `expected_current_state` / `expected_revision`(Issue #104、optional)を渡すと**原子的 compare-and-set** になる: 同一 `BEGIN IMMEDIATE` トランザクション内で読み直した現在状態 / **revision**(= 履歴行数。すべての書き込み — same-state 再観測・snapshot / broker_order_id / timestamp のみの更新を含む — で必ず 1 増える導出値。schema 列ではない)が一致しなければ `ExecutionOrderStateConflictError` で拒否し、DB は無変更のまま rollback する。**state だけの比較では same-state 更新(UNKNOWN → UNKNOWN 履歴追加・部分約定の増加・snapshot refresh)を検出できないため、repair は revision CAS を用いる**。省略時は従来どおり(same-state 再観測は許可・記録)。read API が返す行 dict には同一トランザクションで導出した `revision` キーが含まれる。
+- `repair_attempt_id`(Issue #104、optional)は追加される history 行に**構造化された repair provenance**として記録される(schema v4 列 + partial UNIQUE index)。1 つの repair attempt は DB 全体で高々 1 行しか commit できず、recovery は reason 文字列の解析ではなくこの列で「この attempt が適用済みか」を判定する。provenance 付き history 行は必ず完全 snapshot を伴う(復元時検証)。
 
 **`record_order_state`(state-only 経路)は UNKNOWN の記録専用**である。UNKNOWN は「完全な `OrderResult` を構造上取得できなかった」(submit / query の結果喪失、例: `BrokerTimeoutError`)ことを表す唯一の状態であるため、snapshot 無しで記録できるのはこれだけとする。他のすべての観測は Broker snapshot を伴うため `record_order_result` を通る。state-only UNKNOWN は保存済み snapshot に**触れない**ため、結果不明になる前に判明していた fill が後続の解決を検証し続ける。また state-only 更新は保存済み `broker_order_id` を**確認できるだけ**であり、新規導入・変更はできない(Broker ID は完全な `OrderResult` からのみ得られる)。
 
@@ -186,7 +188,8 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 ### schema 管理・読み取り経路
 
 - schema version は **v3**(v1 = PR #91 初版、v2 = r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加、v3 = Issue #76 で `signal_id` の UNIQUE index を追加)。
-- **v2 → v3 migration**(Issue #76): `init_db()` が「**完全な構造検証で v2 と一致した DB のみ**」を additive に migration する — 重複 `signal_id` の事前 scan → `CREATE UNIQUE INDEX` → version bump → **v3 の完全再検証** → COMMIT を**単一の `BEGIN IMMEDIATE` トランザクション**で行う。途中失敗は全体 rollback となり中途半端な schema は残らない。既存行は削除・書き換えされない。**既存データに重複 signal がある場合は明示的に失敗**し(重複の解消は人間の判断)、DB は無変更。v1 および v2 / v3 のどちらとも一致しない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
+- **v2 → v3 migration**(Issue #76): `init_db()` が「**完全な構造検証で v2 と一致した DB のみ**」を additive に migration する — 重複 `signal_id` の事前 scan → `CREATE UNIQUE INDEX` → version bump → **完全再検証** → COMMIT を**単一の `BEGIN IMMEDIATE` トランザクション**で行う。途中失敗は全体 rollback となり中途半端な schema は残らない。既存行は削除・書き換えされない。**既存データに重複 signal がある場合は明示的に失敗**し(重複の解消は人間の判断)、DB は無変更。
+- **v3 → v4 migration**(Issue #104): 完全一致した v3 DB のみを `init_db()` が additive に migration する — `ALTER TABLE ... ADD COLUMN repair_attempt_id`(SQLite は列を列リスト末尾へ挿入するため、migration 後の DDL は v4 参照 CREATE と token 正規化で一致)+ partial UNIQUE index + version bump + **完全再検証**を単一トランザクションで行う。既存 history 行は `repair_attempt_id = NULL` として読み戻される。v2 DB は v3 を経由して連鎖 migration される。v1 および migratable でない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 / v3 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
 - `init_db()` が schema を**新規作成するのは pristine な DB のみ**(PR #91 レビュー r2 Major 2): `sqlite_master` のオブジェクトが **0 件**かつ `user_version = 0`。**version だけが設定された DB・metadata だけが残った DB(`sqlite_sequence` 等)は新規 DB として扱わず**、DB を変更せずに失敗する。
 - 既存 schema の判定は**列名ではなく完全な構造検証**で行う(PR #91 レビュー r2 Minor 2 / r3 Major 1 / r3 Minor 1)。
   - **sqlite_master 全 object 集合の closed-world 検証(r3 Major 1)**: `type IN ('table','index')` の抽出ではなく、**全 type の object 集合**を pristine な参照 schema(in-memory)の集合と完全一致で比較する。許可される SQLite 内部 object は本 schema 自身が作るもの(AUTOINCREMENT の `sqlite_sequence`、UNIQUE 制約の `sqlite_autoindex_*`)だけを**明示的に**参照集合へ含める。**trigger・view・予期しないテーブル・予期しない index は type を問わずすべて失敗**である(trigger / view は store の背後で行を書き換え・削除できるため、存在自体を拒否する)。

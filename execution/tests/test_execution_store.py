@@ -1408,6 +1408,7 @@ def test_equivalent_ddl_with_quoted_identifiers_and_cosmetic_differences_is_acce
         "(order_state, updated_at_utc)",
         store._create_index_sql()[store._HISTORY_REQUEST_INDEX],
         f'create UNIQUE index "{store._SIGNAL_UNIQUE_INDEX}" on {store.ORDERS_TABLE} (signal_id)',
+        store._create_index_sql()[store._HISTORY_REPAIR_INDEX],
     ]
     _write_schema(db_path, orders_sql, history_sql, index_sqls)
     store.init_db(db_path)  # verification accepts the equivalent schema
@@ -1509,13 +1510,30 @@ def _raw_created_row(connection, request_id, signal_id):
     )
 
 
+def _downgrade_to_v3(db_path):
+    """Turn a freshly created v4 DB into a genuine released v3 DB: drop the
+    Issue #104 repair provenance index + column and stamp the v3 version.
+    Rows persist. Asserted faithful against the pristine v3 reference."""
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(f"DROP INDEX {store._HISTORY_REPAIR_INDEX}")
+        connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} DROP COLUMN repair_attempt_id")
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert store._schema_problems(connection, version=3) == []
+
+
 def _downgrade_to_v2(db_path):
-    """Turn a freshly created v3 DB into a genuine released v2 DB: drop the
-    Issue #76 unique signal index and stamp the v2 version. Rows persist."""
+    """Turn a freshly created v4 DB into a genuine released v2 DB: drop the
+    Issue #104 provenance objects and the Issue #76 unique signal index,
+    then stamp the v2 version. Rows persist."""
+    _downgrade_to_v3(db_path)
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(f"DROP INDEX {store._SIGNAL_UNIQUE_INDEX}")
-        connection.execute(f"PRAGMA user_version = {store._MIGRATABLE_VERSION}")
+        connection.execute("PRAGMA user_version = 2")
         connection.commit()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert store._schema_problems(connection, version=2) == []
 
 
 def test_duplicate_signal_id_is_a_conflict_and_creates_no_second_row(db_path):
@@ -1904,3 +1922,181 @@ def test_record_order_result_without_the_guard_keeps_the_existing_contract(db_pa
     )
     store.record_order_result("exec-1", refreshed, reason="re-observation", db_path=db_path)
     assert len(store.get_state_history("exec-1", db_path=db_path)) == history_len + 1
+
+
+# --- revision, structured repair provenance, v4 migration (Issue #104) --------
+
+
+def test_the_revision_counts_every_write_including_same_state_ones(db_path):
+    create_order(db_path)
+    assert store.get_execution_order("exec-1", db_path=db_path)["revision"] == 0
+    store.mark_submitting("exec-1", reason="submit attempt", changed_at_utc=at(1), db_path=db_path)
+    assert store.get_execution_order("exec-1", db_path=db_path)["revision"] == 1
+    store.record_order_result(
+        "exec-1", make_result(OrderState.ACCEPTED), reason="accepted", db_path=db_path
+    )
+    assert store.get_execution_order("exec-1", db_path=db_path)["revision"] == 2
+    # a same-state re-observation changes NO state text but still bumps
+    store.record_order_result(
+        "exec-1",
+        make_result(OrderState.ACCEPTED, updated_at=at(3)),
+        reason="re-observation",
+        db_path=db_path,
+    )
+    row = store.get_execution_order("exec-1", db_path=db_path)
+    assert (row["order_state"], row["revision"]) == ("accepted", 3)
+    assert len(store.get_state_history("exec-1", db_path=db_path)) == 3
+
+
+def test_record_order_result_with_a_stale_expected_revision_is_refused_atomically(db_path):
+    submit_and_accept(db_path)  # revision 2
+    history_before = store.get_state_history("exec-1", db_path=db_path)
+    before = db_path.read_bytes()
+
+    with pytest.raises(store.ExecutionOrderStateConflictError, match="revision"):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(),
+            reason="stale revision",
+            expected_current_state=OrderState.ACCEPTED,
+            expected_revision=1,
+            db_path=db_path,
+        )
+
+    assert db_path.read_bytes() == before
+    assert store.get_state_history("exec-1", db_path=db_path) == history_before
+
+
+def test_the_revision_cas_detects_a_same_state_change_the_state_cas_cannot(db_path):
+    """An ACCEPTED -> ACCEPTED re-observation between read and write leaves
+    the state text equal but must still refuse the conditional update."""
+    submit_and_accept(db_path)
+    observed_revision = store.get_execution_order("exec-1", db_path=db_path)["revision"]
+    # concurrent same-state write (timestamp-only refresh)
+    store.record_order_result(
+        "exec-1",
+        make_result(OrderState.ACCEPTED, updated_at=at(3)),
+        reason="concurrent same-state refresh",
+        db_path=db_path,
+    )
+
+    with pytest.raises(store.ExecutionOrderStateConflictError, match="revision"):
+        store.record_order_result(
+            "exec-1",
+            _filled_result(4),
+            reason="repair with a stale observation",
+            expected_current_state=OrderState.ACCEPTED,  # still matches!
+            expected_revision=observed_revision,          # this does not
+            db_path=db_path,
+        )
+    assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
+
+
+def test_expected_revision_must_be_a_non_negative_int(db_path):
+    submit_and_accept(db_path)
+    for bad in ("2", -1, True):
+        with pytest.raises(ValueError, match="expected_revision"):
+            store.record_order_result(
+                "exec-1", _filled_result(), reason="typed", expected_revision=bad, db_path=db_path
+            )
+
+
+def test_repair_provenance_is_recorded_structurally_on_the_history_row(db_path):
+    submit_and_accept(db_path)
+    store.record_order_result(
+        "exec-1",
+        _filled_result(),
+        reason="repair applied",
+        expected_current_state=OrderState.ACCEPTED,
+        expected_revision=2,
+        repair_attempt_id="attempt-xyz",
+        db_path=db_path,
+    )
+    history = store.get_state_history("exec-1", db_path=db_path)
+    assert history[-1]["repair_attempt_id"] == "attempt-xyz"
+    assert [h["repair_attempt_id"] for h in history[:-1]] == [None, None]
+
+
+def test_one_repair_attempt_id_commits_at_most_one_history_row(db_path):
+    """The partial UNIQUE index: reusing an attempt id -- even on another
+    order -- is refused and rolls the whole update back."""
+    submit_and_accept(db_path)
+    store.record_order_result(
+        "exec-1",
+        _filled_result(),
+        reason="repair applied",
+        repair_attempt_id="attempt-once",
+        db_path=db_path,
+    )
+    submit_and_accept(db_path, request_id="exec-2", broker_order_id="B-2")
+    before = store.get_state_history("exec-2", db_path=db_path)
+
+    with pytest.raises(store.ExecutionOrderConflictError, match="attempt-once"):
+        store.record_order_result(
+            "exec-2",
+            make_result(
+                OrderState.FILLED,
+                "exec-2",
+                broker_order_id="B-2",
+                filled="10",
+                fills=(fill("F-2", "10", 3),),
+                updated_at=at(3),
+            ),
+            reason="repair reusing an attempt id",
+            repair_attempt_id="attempt-once",
+            db_path=db_path,
+        )
+
+    assert store.get_state_history("exec-2", db_path=db_path) == before
+
+
+def test_a_history_row_with_provenance_but_no_snapshot_is_rejected_on_restore(db_path):
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"UPDATE {store.HISTORY_TABLE} SET repair_attempt_id = 'attempt-forged' "
+            "WHERE order_result_json IS NULL"
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError, match="repair provenance"):
+        store.get_execution_order("exec-1", db_path=db_path)
+
+
+def test_init_db_migrates_a_v3_db_in_place_and_keeps_rows_readable(db_path):
+    submit_and_accept(db_path)
+    _downgrade_to_v3(db_path)
+    rows_before = full_db_state(db_path)[store.ORDERS_TABLE]
+
+    store.init_db(db_path)
+
+    after = full_db_state(db_path)
+    assert after["user_version"] == store.SCHEMA_VERSION
+    assert any(name == store._HISTORY_REPAIR_INDEX for _, name, _, _ in after["schema"])
+    assert after[store.ORDERS_TABLE] == rows_before  # nothing deleted or rewritten
+    # pre-migration history rows read back with repair_attempt_id = NULL
+    history = store.get_state_history("exec-1", db_path=db_path)
+    assert {h["repair_attempt_id"] for h in history} == {None}
+    store.init_db(db_path)  # idempotent
+
+
+def test_reads_never_migrate_a_v3_db(db_path):
+    create_order(db_path)
+    _downgrade_to_v3(db_path)
+    before = full_db_state(db_path)
+    with pytest.raises(store.ExecutionSchemaError, match="init_db"):
+        store.get_execution_order("exec-1", db_path=db_path)
+    assert full_db_state(db_path) == before
+
+
+def test_a_failed_v3_to_v4_migration_rolls_back_to_the_untouched_file(db_path, monkeypatch):
+    create_order(db_path)
+    _downgrade_to_v3(db_path)
+    before = full_db_state(db_path)
+    monkeypatch.setattr(
+        store, "_HISTORY_REPAIR_INDEX_SQL", "CREATE UNIQUE INDEX broken ON missing_table (x)"
+    )
+
+    with pytest.raises((store.ExecutionStoreError, sqlite3.OperationalError)):
+        store.init_db(db_path)
+
+    assert full_db_state(db_path) == before

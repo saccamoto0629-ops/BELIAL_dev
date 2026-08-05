@@ -270,6 +270,7 @@ _HISTORY_COLUMNS: tuple[str, ...] = (
     "broker_order_id",
     "order_result_json",
     "changed_at_utc",
+    "repair_attempt_id",
 )
 REQUIRED_ORDER_COLUMNS: frozenset[str] = frozenset(_ORDER_COLUMNS)
 REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
@@ -282,8 +283,14 @@ REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
 # v3 (Issue #76): UNIQUE index on orders.signal_id (one source signal ->
 #     at most one execution request). Purely additive over v2; init_db
 #     migrates a verified v2 DB in place (see the module docstring).
-SCHEMA_VERSION = 3
-_MIGRATABLE_VERSION = 2
+# v4 (Issue #104): STRUCTURED repair provenance on the history table --
+#     ``repair_attempt_id`` (nullable) plus a partial UNIQUE index, so a
+#     reconciliation-repair application is attributable machine-readably
+#     (never by parsing the reason string) and one attempt can commit at
+#     most one history row. Purely additive over v3 (ALTER ADD COLUMN +
+#     index); init_db migrates verified v2 / v3 DBs in place.
+SCHEMA_VERSION = 4
+_MIGRATABLE_VERSIONS = (3, 2)  # newest first; v2 chains through v3
 
 # Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
 # match EXACTLY -- unknown fields are rejected, missing fields are rejected.
@@ -330,15 +337,17 @@ class ExecutionOrderConflictError(ExecutionStoreError):
 
 
 class ExecutionOrderStateConflictError(ExecutionStoreError):
-    """The order's CURRENT tracked state differs from the state the caller
-    conditioned the update on (Issue #104 compare-and-set guard).
+    """The order's CURRENT tracked state or revision differs from what the
+    caller conditioned the update on (Issue #104 compare-and-set guard).
 
-    Raised by :func:`record_order_result` when ``expected_current_state`` is
-    supplied and the row read INSIDE the write transaction no longer holds
-    that state -- i.e. another process advanced the order between the
-    caller's read and this update. The transaction is rolled back and the DB
-    is untouched; the caller re-reads and decides (typically: the same
-    outcome was already applied, or the observation is stale)."""
+    Raised by :func:`record_order_result` when ``expected_current_state`` /
+    ``expected_revision`` is supplied and the row read INSIDE the write
+    transaction no longer matches -- i.e. another process changed the order
+    (a state change OR a same-state write: revision counts every history
+    append) between the caller's read and this update. The transaction is
+    rolled back and the DB is untouched; the caller re-reads and decides
+    (typically: the same outcome was already applied, or the observation is
+    stale)."""
 
 
 def execution_db_path() -> Path:
@@ -404,8 +413,17 @@ def _create_orders_table_sql() -> str:
     """
 
 
-def _create_history_table_sql() -> str:
+# Shared between the v4 reference CREATE and the v3 -> v4 ALTER so a migrated
+# DB token-normalizes identically to a freshly created one (SQLite appends an
+# added column at the end of the column list).
+_HISTORY_REPAIR_COLUMN_DDL = (
+    "repair_attempt_id TEXT CHECK (repair_attempt_id IS NULL OR trim(repair_attempt_id) <> '')"
+)
+
+
+def _create_history_table_sql(*, version: int = SCHEMA_VERSION) -> str:
     states = _enum_values_sql(OrderState)
+    repair_column = f",\n            {_HISTORY_REPAIR_COLUMN_DDL}" if version >= 4 else ""
     return f"""
         CREATE TABLE {HISTORY_TABLE} (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -417,7 +435,7 @@ def _create_history_table_sql() -> str:
             reason TEXT NOT NULL CHECK (trim(reason) <> ''),
             broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
             order_result_json TEXT CHECK (order_result_json IS NULL OR trim(order_result_json) <> ''),
-            changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00')
+            changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00'){repair_column}
         )
     """
 
@@ -431,6 +449,13 @@ _SIGNAL_UNIQUE_INDEX = f"idx_{ORDERS_TABLE}_signal"
 _SIGNAL_UNIQUE_INDEX_SQL = (
     f"CREATE UNIQUE INDEX {_SIGNAL_UNIQUE_INDEX} ON {ORDERS_TABLE} (signal_id)"
 )
+# Issue #104: one repair attempt may commit AT MOST one history row -- the
+# partial UNIQUE index is the DB-level guard under the application logic.
+_HISTORY_REPAIR_INDEX = f"idx_{HISTORY_TABLE}_repair_attempt"
+_HISTORY_REPAIR_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX {_HISTORY_REPAIR_INDEX} ON {HISTORY_TABLE} "
+    "(repair_attempt_id) WHERE repair_attempt_id IS NOT NULL"
+)
 
 
 def _create_index_sql(*, version: int = SCHEMA_VERSION) -> dict[str, str]:
@@ -443,8 +468,10 @@ def _create_index_sql(*, version: int = SCHEMA_VERSION) -> dict[str, str]:
             "(execution_request_id, history_id)"
         ),
     }
-    if version >= SCHEMA_VERSION:
+    if version >= 3:
         index_sql[_SIGNAL_UNIQUE_INDEX] = _SIGNAL_UNIQUE_INDEX_SQL
+    if version >= 4:
+        index_sql[_HISTORY_REPAIR_INDEX] = _HISTORY_REPAIR_INDEX_SQL
     return index_sql
 
 
@@ -572,11 +599,11 @@ def _ddl_tokens(sql: str) -> tuple[str, ...]:
 
 
 def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
-    """Create the schema for ``version`` (v2 is used only as the in-memory
-    migration reference and by migration tests; real DBs are created at the
-    current version)."""
+    """Create the schema for ``version`` (v2 / v3 are used only as the
+    in-memory migration references and by migration tests; real DBs are
+    created at the current version)."""
     connection.execute(_create_orders_table_sql())
-    connection.execute(_create_history_table_sql())
+    connection.execute(_create_history_table_sql(version=version))
     for create_sql in _create_index_sql(version=version).values():
         connection.execute(create_sql)
     connection.execute(f"PRAGMA user_version = {version}")
@@ -683,11 +710,13 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
     """
     problems = _schema_problems(connection)
     if problems:
-        if not _schema_problems(connection, version=_MIGRATABLE_VERSION):
-            problems.append(
-                f"the DB is a valid v{_MIGRATABLE_VERSION} schema; run init_db() to "
-                f"migrate it to v{SCHEMA_VERSION} (reads never migrate)"
-            )
+        for candidate in _MIGRATABLE_VERSIONS:
+            if not _schema_problems(connection, version=candidate):
+                problems.append(
+                    f"the DB is a valid v{candidate} schema; run init_db() to "
+                    f"migrate it to v{SCHEMA_VERSION} (reads never migrate)"
+                )
+                break
         raise ExecutionSchemaError(
             f"execution DB at {db_path} failed schema verification; refusing to touch it: "
             + "; ".join(problems)
@@ -781,31 +810,50 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection, db_path: Path) -> None:
         connection.execute(_SIGNAL_UNIQUE_INDEX_SQL)
     except sqlite3.IntegrityError as exc:  # defence in depth under the scan
         raise ExecutionSchemaError(
-            f"cannot migrate execution DB at {db_path} to schema v{SCHEMA_VERSION}: "
+            f"cannot migrate execution DB at {db_path} to schema v3: "
             f"unique signal_id index creation failed: {exc} (nothing was changed)"
         ) from exc
+    connection.execute("PRAGMA user_version = 3")
+    _LOGGER.info(
+        "migrated execution DB %s from schema v2 to v3 (added unique signal_id index %s)",
+        db_path,
+        _SIGNAL_UNIQUE_INDEX,
+    )
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection, db_path: Path) -> None:
+    """Migrate a fully verified v3 schema to v4 inside the caller's
+    transaction (Issue #104): additive ``ALTER TABLE ... ADD COLUMN
+    repair_attempt_id`` on the history table (SQLite appends the column at
+    the end of the column list, exactly where the v4 reference CREATE
+    declares it, so the migrated DDL token-normalizes identically) plus the
+    partial UNIQUE index and the version bump. Existing rows are untouched
+    and read back with ``repair_attempt_id = NULL``."""
+    connection.execute(f"ALTER TABLE {HISTORY_TABLE} ADD COLUMN {_HISTORY_REPAIR_COLUMN_DDL}")
+    connection.execute(_HISTORY_REPAIR_INDEX_SQL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     _LOGGER.info(
-        "migrated execution DB %s from schema v%d to v%d (added unique signal_id index %s)",
+        "migrated execution DB %s from schema v3 to v%d (added history repair provenance "
+        "column and index %s)",
         db_path,
-        _MIGRATABLE_VERSION,
         SCHEMA_VERSION,
-        _SIGNAL_UNIQUE_INDEX,
+        _HISTORY_REPAIR_INDEX,
     )
 
 
 def init_db(db_path: Path | None = None) -> None:
     """Create the Issue #74 schema, verify an existing one, or migrate a
-    valid v2 schema to v3 (Issue #76); idempotent.
+    valid v2 / v3 schema to v4 (Issue #76 / #104); idempotent.
 
     - PRISTINE DB only (PR #91 review r2 Major 2): the schema is created only
       when ``sqlite_master`` holds ZERO objects AND ``user_version`` is 0. A
       version-only DB, a metadata-only DB (e.g. a stray ``sqlite_sequence``),
       or any other object present means this is NOT a fresh DB.
     - A DB that fully matches the CURRENT schema passes verification.
-    - A DB that fully matches the released v2 schema -- and ONLY such a DB --
-      is migrated in place (:func:`_migrate_v2_to_v3`): the migration, the
-      version bump and a full v3 re-verification commit in ONE transaction,
+    - A DB that fully matches a released migratable schema -- and ONLY such
+      a DB -- is migrated in place (:func:`_migrate_v2_to_v3` /
+      :func:`_migrate_v3_to_v4`; a v2 DB chains through v3): every step, the
+      version bumps and a full v4 re-verification commit in ONE transaction,
       so a failed migration leaves no half-migrated schema behind.
     - Anything else: a partial schema, a constraint-less lookalike, an
       unknown version, or a foreign table raises
@@ -830,11 +878,15 @@ def init_db(db_path: Path | None = None) -> None:
                 # the same closed-world verification before it is committed
                 _verify_schema(connection, db_path)
             elif _schema_problems(connection):
-                if _schema_problems(connection, version=_MIGRATABLE_VERSION):
-                    # neither a valid current nor a valid v2 schema: fail
-                    # with the full diagnosis, DB untouched
+                if not _schema_problems(connection, version=3):
+                    _migrate_v3_to_v4(connection, db_path)
+                elif not _schema_problems(connection, version=2):
+                    _migrate_v2_to_v3(connection, db_path)
+                    _migrate_v3_to_v4(connection, db_path)
+                else:
+                    # neither a valid current nor a valid migratable schema:
+                    # fail with the full diagnosis, DB untouched
                     _verify_schema(connection, db_path)
-                _migrate_v2_to_v3(connection, db_path)
                 # the migrated schema must pass full verification pre-COMMIT
                 _verify_schema(connection, db_path)
             connection.execute("COMMIT")
@@ -1048,6 +1100,21 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
             raise _integrity(request_id, f"history row {entry['history_id']}: {exc}") from exc
         if not isinstance(entry["reason"], str) or not entry["reason"].strip():
             raise _integrity(request_id, f"history row {entry['history_id']} has an empty reason")
+        repair_attempt_id = entry["repair_attempt_id"]
+        if repair_attempt_id is not None:
+            if not isinstance(repair_attempt_id, str) or not repair_attempt_id.strip():
+                raise _integrity(
+                    request_id,
+                    f"history row {entry['history_id']} carries an empty repair_attempt_id",
+                )
+            if entry["order_result_json"] is None:
+                # a repair application is always a full-snapshot observation
+                # recorded through record_order_result
+                raise _integrity(
+                    request_id,
+                    f"history row {entry['history_id']} claims repair provenance "
+                    f"{repair_attempt_id!r} but carries no order-result snapshot",
+                )
         if previous is None:
             if prev_state is not None or new_state is not OrderState.PENDING:
                 raise _integrity(
@@ -1178,6 +1245,14 @@ def _fetch_and_validate(
         return None
     row = dict(row)
     _validate_bundle(row, history)
+    # The order's REVISION (Issue #104): the count of history rows. Every
+    # write path appends exactly one history row (enforced by the pre-commit
+    # write-back validation), so the revision increments on EVERY change --
+    # state changes, same-state re-observations, snapshot/broker-id/timestamp
+    # updates alike -- without a schema column. It is derived inside the same
+    # transaction as the row, so callers get a consistent (row, revision)
+    # pair to condition a later compare-and-set on.
+    row["revision"] = len(history)
     return row, history
 
 
@@ -1375,7 +1450,7 @@ def create_execution_order(
             connection,
             request.execution_request_id,
             prior_history=[],
-            expected_row=record,
+            expected_row={**record, "revision": 0},
             expected_entry=None,
         )
     return created
@@ -1415,11 +1490,12 @@ def _append_history(
     broker_order_id: str | None,
     order_result_json: str | None,
     changed_at_utc: datetime,
+    repair_attempt_id: str | None = None,
 ) -> None:
     connection.execute(
         f"INSERT INTO {HISTORY_TABLE} "
         "(execution_request_id, previous_state, new_state, reason, broker_order_id, "
-        "order_result_json, changed_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "order_result_json, changed_at_utc, repair_attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             execution_request_id,
             None if previous_state is None else previous_state.value,
@@ -1428,6 +1504,7 @@ def _append_history(
             broker_order_id,
             order_result_json,
             _iso(changed_at_utc),
+            repair_attempt_id,
         ),
     )
 
@@ -1490,6 +1567,7 @@ def mark_submitting(
             order_state=OrderState.PENDING.value,
             last_state_reason=reason,
             updated_at_utc=_iso(changed_at_utc),
+            revision=row["revision"] + 1,
         )
         updated = _validate_writeback(
             connection,
@@ -1504,6 +1582,7 @@ def mark_submitting(
                 "broker_order_id": None,
                 "order_result_json": None,
                 "changed_at_utc": _iso(changed_at_utc),
+                "repair_attempt_id": None,
             },
         )
     return updated
@@ -1519,14 +1598,16 @@ def _apply_state_update(
     changed_at_utc: datetime,
     effective_broker_id: str | None,
     result_json: str | None,
+    repair_attempt_id: str | None = None,
 ) -> dict:
     """Shared tail of both update paths: phase derivation + current-row UPDATE
     + history INSERT (snapshot anchored on the history row too) + pre-commit
     write-back validation (:func:`_validate_writeback`), inside the caller's
     transaction. A UNIQUE violation (DB-wide ``broker_order_id``, PR #91
-    Major 3) surfaces as :class:`ExecutionOrderConflictError`; the caller's
-    transaction rolls back the whole update, history row included. Returns
-    the validated post-update row."""
+    Major 3, or a reused ``repair_attempt_id``, Issue #104) surfaces as
+    :class:`ExecutionOrderConflictError`; the caller's transaction rolls
+    back the whole update, history row included. Returns the validated
+    post-update row."""
     execution_request_id = row["execution_request_id"]
     current_state = OrderState(row["order_state"])
     phase = row["submission_phase"]
@@ -1557,12 +1638,14 @@ def _apply_state_update(
             broker_order_id=effective_broker_id,
             order_result_json=result_json,
             changed_at_utc=changed_at_utc,
+            repair_attempt_id=repair_attempt_id,
         )
     except sqlite3.IntegrityError as exc:
         raise ExecutionOrderConflictError(
             f"state update for execution order {execution_request_id!r} violates a "
             f"uniqueness constraint (broker_order_id {effective_broker_id!r} already "
-            f"assigned to another order?): {exc}"
+            f"assigned to another order, or repair_attempt_id {repair_attempt_id!r} "
+            f"already applied?): {exc}"
         ) from exc
     expected_row = dict(row)
     expected_row.update(
@@ -1572,6 +1655,7 @@ def _apply_state_update(
         last_state_reason=reason,
         last_order_result_json=keep_json,
         updated_at_utc=_iso(changed_at_utc),
+        revision=row["revision"] + 1,
     )
     return _validate_writeback(
         connection,
@@ -1586,6 +1670,7 @@ def _apply_state_update(
             "broker_order_id": effective_broker_id,
             "order_result_json": result_json,
             "changed_at_utc": _iso(changed_at_utc),
+            "repair_attempt_id": repair_attempt_id,
         },
     )
 
@@ -1677,6 +1762,8 @@ def record_order_result(
     reason: str,
     previous_result: OrderResult | None = None,
     expected_current_state: OrderState | None = None,
+    expected_revision: int | None = None,
+    repair_attempt_id: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Record a full broker ``OrderResult`` snapshot for this order.
@@ -1702,15 +1789,22 @@ def record_order_result(
       entry commit in ONE transaction; a DB-wide ``broker_order_id``
       uniqueness conflict rolls all of it back
       (:class:`ExecutionOrderConflictError`),
-    - ``expected_current_state`` (Issue #104, optional) makes the update a
-      COMPARE-AND-SET: the row's current ``order_state`` -- read inside this
-      same ``BEGIN IMMEDIATE`` transaction -- must be exactly that state, or
-      the update fails with :class:`ExecutionOrderStateConflictError` and the
-      DB stays untouched. This closes the read -> decide -> write TOCTOU
-      window for callers (reconciliation repair) that must not re-record an
-      observation another process already applied: without the guard, a
-      concurrent same-state re-observation would legally append a duplicate
-      history row.
+    - ``expected_current_state`` / ``expected_revision`` (Issue #104,
+      optional) make the update a COMPARE-AND-SET: the row's current
+      ``order_state`` and/or its REVISION (= history row count; increments
+      on EVERY write, same-state re-observations, snapshot / broker-id /
+      timestamp refreshes included) -- both read inside this same ``BEGIN
+      IMMEDIATE`` transaction -- must match exactly, or the update fails
+      with :class:`ExecutionOrderStateConflictError` and the DB stays
+      untouched. The revision guard closes the read -> decide -> write
+      TOCTOU window COMPLETELY: a state-only comparison cannot see a
+      concurrent same-state change (an UNKNOWN -> UNKNOWN record, a further
+      partial fill, a snapshot refresh), the revision can.
+    - ``repair_attempt_id`` (Issue #104, optional) records STRUCTURED repair
+      provenance on the appended history row. The partial UNIQUE index lets
+      one attempt commit at most one history row DB-wide, and recovery
+      attributes an applied repair by this column -- never by parsing the
+      human-readable reason string.
     """
     if not isinstance(result, OrderResult):
         raise ValueError(f"result must be an OrderResult, got {result!r}")
@@ -1721,11 +1815,28 @@ def record_order_result(
             f"expected_current_state must be an OrderState or None, got "
             f"{expected_current_state!r}"
         )
+    if expected_revision is not None and (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 0
+    ):
+        raise ValueError(
+            f"expected_revision must be a non-negative int or None, got {expected_revision!r}"
+        )
+    if repair_attempt_id is not None:
+        _require_non_empty_str(repair_attempt_id, "repair_attempt_id")
     _require_non_empty_str(reason, "reason")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
 
+        if expected_revision is not None and row["revision"] != expected_revision:
+            raise ExecutionOrderStateConflictError(
+                f"execution order {execution_request_id!r} is at revision "
+                f"{row['revision']}, not the expected {expected_revision}; the order "
+                "changed since it was observed, so the conditional update is refused "
+                "and nothing was changed"
+            )
         if expected_current_state is not None:
             current = None if row["order_state"] is None else OrderState(row["order_state"])
             if current is not expected_current_state:
@@ -1789,6 +1900,7 @@ def record_order_result(
             changed_at_utc=result.updated_at_utc,
             effective_broker_id=effective_broker_id,
             result_json=_result_to_json(result),
+            repair_attempt_id=repair_attempt_id,
         )
     return updated
 

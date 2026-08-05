@@ -502,9 +502,29 @@ def test_the_default_db_path_is_execution_owned_and_env_overridable(tmp_path, mo
 
 from execution.reconciliation_repair_models import (  # noqa: E402
     OrderRepairAttempt,
+    RepairAttemptReservation,
     RepairMode,
     RepairOutcome,
 )
+
+
+def sample_reservation(attempt_id="attempt-1", run_id="run-1", **overrides):
+    kwargs = dict(
+        attempt_id=attempt_id,
+        run_id=run_id,
+        target_type=ReconciliationTargetType.EXECUTION_ORDER,
+        target_id="exec-1",
+        reserved_at_utc=at(10),
+        detail="reserved: repair evaluation started",
+        execution_request_id="exec-1",
+        client_order_id="client-1",
+        reconciliation_internal_state=OrderState.PENDING,
+        reconciliation_broker_state=OrderState.FILLED,
+        internal_revision=1,
+        observed_at_utc=at(1),
+    )
+    kwargs.update(overrides)
+    return RepairAttemptReservation(**kwargs)
 
 
 def sample_attempt(attempt_id="attempt-1", run_id="run-1", **overrides) -> OrderRepairAttempt:
@@ -516,11 +536,12 @@ def sample_attempt(attempt_id="attempt-1", run_id="run-1", **overrides) -> Order
         target_id="exec-1",
         outcome=RepairOutcome.APPLIED,
         detail="the broker confirmed state 'filled'",
-        attempted_at_utc=at(10),
+        reserved_at_utc=at(10),
         execution_request_id="exec-1",
         client_order_id="client-1",
         reconciliation_internal_state=OrderState.PENDING,
         reconciliation_broker_state=OrderState.FILLED,
+        internal_revision=1,
         internal_state_before=OrderState.PENDING,
         internal_state_after=OrderState.FILLED,
         broker_order_id="B-1",
@@ -538,49 +559,99 @@ def recorded_run_db(tmp_path):
     return path
 
 
-def test_a_repair_attempt_round_trips_with_every_field(tmp_path):
+def test_a_reserved_then_finalized_attempt_round_trips_with_every_field(tmp_path):
     path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    assert store.list_pending_repair_attempts(db_path=path) == (sample_reservation(),)
+    assert store.get_repair_attempt("attempt-1", db_path=path) is None  # still pending
+
     original = sample_attempt()
-    store.record_repair_attempt(original, db_path=path)
+    store.finalize_repair_attempt(original, db_path=path)
+
     assert store.get_repair_attempt("attempt-1", db_path=path) == original
     assert store.list_repair_attempts(run_id="run-1", db_path=path) == (original,)
+    assert store.list_pending_repair_attempts(db_path=path) == ()
 
 
 def test_a_skipped_attempt_for_a_broker_only_target_round_trips(tmp_path):
     path = recorded_run_db(tmp_path)
-    skipped = sample_attempt(
+    broker_only_reservation = sample_reservation(
+        attempt_id="attempt-skip",
+        target_type=ReconciliationTargetType.BROKER_ORDER,
+        target_id="client-9",
+        execution_request_id=None,
+        client_order_id="client-9",
+        reconciliation_internal_state=None,
+        internal_revision=None,
+    )
+    store.reserve_repair_attempt(broker_only_reservation, db_path=path)
+    finalized = sample_attempt(
         attempt_id="attempt-skip",
         target_type=ReconciliationTargetType.BROKER_ORDER,
         target_id="client-9",
         outcome=RepairOutcome.SKIPPED,
         detail="broker-only orders are never adopted automatically",
+        failure_code="not_eligible_broker_only",
         execution_request_id=None,
         client_order_id="client-9",
         reconciliation_internal_state=None,
-        reconciliation_broker_state=OrderState.FILLED,
+        internal_revision=None,
         internal_state_before=None,
         internal_state_after=None,
-        broker_order_id="B-9",
+        broker_order_id=None,
         applied_at_utc=None,
     )
-    store.record_repair_attempt(skipped, db_path=path)
-    assert store.get_repair_attempt("attempt-skip", db_path=path) == skipped
+    store.finalize_repair_attempt(finalized, db_path=path)
+    assert store.get_repair_attempt("attempt-skip", db_path=path) == finalized
 
 
-def test_recording_the_same_attempt_id_twice_is_refused(tmp_path):
+def test_a_reused_attempt_id_is_refused_at_reservation_time(tmp_path):
     path = recorded_run_db(tmp_path)
-    store.record_repair_attempt(sample_attempt(), db_path=path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
     with pytest.raises(store.RepairAttemptConflictError):
-        store.record_repair_attempt(sample_attempt(), db_path=path)
-    assert len(store.list_repair_attempts(db_path=path)) == 1
+        store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.finalize_repair_attempt(sample_attempt(), db_path=path)
+    with pytest.raises(store.RepairAttemptConflictError):
+        store.reserve_repair_attempt(sample_reservation(), db_path=path)
 
 
-def test_an_attempt_for_an_unrecorded_run_is_refused(tmp_path):
-    path = db(tmp_path)
-    store.init_reconciliation_db(path)
-    with pytest.raises(store.ReconciliationStoreError, match="not recorded"):
-        store.record_repair_attempt(sample_attempt(run_id="run-ghost"), db_path=path)
+def test_double_finalize_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.finalize_repair_attempt(sample_attempt(), db_path=path)
+    with pytest.raises(store.RepairAttemptConflictError, match="finalized exactly once"):
+        store.finalize_repair_attempt(sample_attempt(), db_path=path)
+    # the stored outcome is untouched
+    assert store.get_repair_attempt("attempt-1", db_path=path) == sample_attempt()
+
+
+def test_finalize_without_a_reservation_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    with pytest.raises(store.ReconciliationStoreError, match="no reservation"):
+        store.finalize_repair_attempt(sample_attempt(), db_path=path)
     assert store.list_repair_attempts(db_path=path) == ()
+
+
+def test_finalize_with_a_mismatched_identity_is_refused_as_corruption(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    foreign = sample_attempt(client_order_id="client-somebody-else")
+    with pytest.raises(store.ReconciliationIntegrityError, match="client_order_id"):
+        store.finalize_repair_attempt(foreign, db_path=path)
+    # still pending, recoverable
+    assert len(store.list_pending_repair_attempts(db_path=path)) == 1
+
+
+def test_a_reservation_for_an_unrecorded_discrepancy_is_refused(tmp_path):
+    path = recorded_run_db(tmp_path)
+    with pytest.raises(store.ReconciliationStoreError, match="not recorded"):
+        store.reserve_repair_attempt(
+            sample_reservation(target_id="exec-ghost", execution_request_id="exec-ghost"),
+            db_path=path,
+        )
+    with pytest.raises(store.ReconciliationStoreError, match="not recorded"):
+        store.reserve_repair_attempt(sample_reservation(run_id="run-ghost"), db_path=path)
+    assert store.list_pending_repair_attempts(db_path=path) == ()
 
 
 def test_a_dry_run_attempt_is_never_persisted(tmp_path):
@@ -591,14 +662,16 @@ def test_a_dry_run_attempt_is_never_persisted(tmp_path):
         applied_at_utc=None,
     )
     with pytest.raises(store.ReconciliationStoreError, match="dry-run"):
-        store.record_repair_attempt(dry, db_path=path)
+        store.finalize_repair_attempt(dry, db_path=path)
     assert store.list_repair_attempts(db_path=path) == ()
 
 
-def test_recording_an_attempt_never_creates_a_missing_db(tmp_path):
+def test_repair_writes_never_create_a_missing_db(tmp_path):
     path = db(tmp_path)
     with pytest.raises(store.ReconciliationStoreError, match="init_reconciliation_db"):
-        store.record_repair_attempt(sample_attempt(), db_path=path)
+        store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    with pytest.raises(store.ReconciliationStoreError, match="init_reconciliation_db"):
+        store.finalize_repair_attempt(sample_attempt(), db_path=path)
     assert not path.exists()
 
 
@@ -606,38 +679,86 @@ def test_repair_reads_return_the_empty_default_for_a_missing_db(tmp_path):
     path = db(tmp_path)
     assert store.get_repair_attempt("attempt-1", db_path=path) is None
     assert store.list_repair_attempts(db_path=path) == ()
+    assert store.list_pending_repair_attempts(db_path=path) == ()
     assert not path.exists()
 
 
 def test_a_tampered_attempt_row_fails_restore_time_validation(tmp_path):
     path = recorded_run_db(tmp_path)
-    store.record_repair_attempt(sample_attempt(), db_path=path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.finalize_repair_attempt(sample_attempt(), db_path=path)
     with closing(sqlite3.connect(path)) as connection:
         connection.execute(
-            f"UPDATE {store.REPAIRS_TABLE} SET attempted_at_utc = 'garbage+00:00'"
+            f"UPDATE {store.REPAIRS_TABLE} SET reserved_at_utc = 'garbage+00:00'"
         )
         connection.commit()
     with pytest.raises(store.ReconciliationIntegrityError):
         store.get_repair_attempt("attempt-1", db_path=path)
 
 
+def test_a_malformed_pending_row_fails_closed(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            f"UPDATE {store.REPAIRS_TABLE} SET reserved_at_utc = 'garbage+00:00'"
+        )
+        connection.commit()
+    with pytest.raises(store.ReconciliationIntegrityError):
+        store.list_pending_repair_attempts(db_path=path)
+
+
 def test_attempts_survive_a_process_restart(tmp_path):
     path = recorded_run_db(tmp_path)
-    store.record_repair_attempt(sample_attempt(), db_path=path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    store.finalize_repair_attempt(sample_attempt(), db_path=path)
+    store.reserve_repair_attempt(sample_reservation(attempt_id="attempt-2"), db_path=path)
     store._REFERENCE_SCHEMA_CACHE = None  # rebuild the reference like a fresh import
     assert store.get_repair_attempt("attempt-1", db_path=path) == sample_attempt()
+    assert store.list_pending_repair_attempts(db_path=path) == (
+        sample_reservation(attempt_id="attempt-2"),
+    )
+
+
+def test_internal_revision_round_trips_on_discrepancies(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    with_revision = sample_run(
+        "run-rev",
+        discrepancies=(
+            OrderDiscrepancy(
+                discrepancy_type=DiscrepancyType.IN_FLIGHT_BROKER_FILLED,
+                target_type=ReconciliationTargetType.EXECUTION_ORDER,
+                target_id="exec-1",
+                resolution_category=ResolutionCategory.AUTO_REPAIR_CANDIDATE,
+                observed_at_utc=at(1),
+                detail="broker reports filled, transition is legal",
+                internal_state=OrderState.PENDING,
+                broker_state=OrderState.FILLED,
+                client_order_id="client-1",
+                broker_order_id="B-1",
+                internal_revision=3,
+            ),
+        ),
+    )
+    store.record_reconciliation_run(with_revision, db_path=path)
+    restored = store.get_reconciliation_run("run-rev", db_path=path)
+    assert restored.discrepancies[0].internal_revision == 3
 
 
 # --- v1 -> v2 migration (Issue #104) ------------------------------------------
 
 
 def downgrade_to_v1(path):
-    """Rebuild the exact released v1 file: the v1 tables are byte-identical
-    between the versions, so dropping the additive v2 objects is a faithful
-    downgrade (asserted against the pristine v1 reference)."""
+    """Rebuild the exact released v1 file: drop the additive v2 objects and
+    the discrepancies revision column (asserted against the pristine v1
+    reference)."""
     with closing(sqlite3.connect(path)) as connection:
         connection.execute(f"DROP INDEX {store._REPAIRS_RUN_INDEX}")
         connection.execute(f"DROP TABLE {store.REPAIRS_TABLE}")
+        connection.execute(
+            f"ALTER TABLE {store.DISCREPANCIES_TABLE} DROP COLUMN internal_revision"
+        )
         connection.execute(f"PRAGMA user_version = {store._MIGRATABLE_VERSION}")
         connection.commit()
     with closing(sqlite3.connect(path)) as connection:
@@ -658,7 +779,12 @@ def test_init_migrates_a_valid_v1_db_and_keeps_every_row(tmp_path):
         }
     assert version == store.SCHEMA_VERSION
     assert store.REPAIRS_TABLE in tables
-    assert store.get_reconciliation_run("run-1", db_path=path) == sample_run()
+    restored = store.get_reconciliation_run("run-1", db_path=path)
+    # pre-migration rows read back with internal_revision = NULL
+    assert {d.internal_revision for d in restored.discrepancies} == {None}
+    assert [d.target_id for d in restored.discrepancies] == [
+        d.target_id for d in sample_run().discrepancies
+    ]
     assert store.list_repair_attempts(db_path=path) == ()
     # idempotent: a second init only verifies
     store.init_reconciliation_db(path)
@@ -674,7 +800,7 @@ def test_reads_and_writes_never_migrate_a_v1_db(tmp_path):
     with pytest.raises(store.ReconciliationSchemaError):
         store.record_reconciliation_run(sample_run("run-2"), db_path=path)
     with pytest.raises(store.ReconciliationSchemaError):
-        store.record_repair_attempt(sample_attempt(), db_path=path)
+        store.reserve_repair_attempt(sample_reservation(), db_path=path)
 
     assert path.read_bytes() == before
 
