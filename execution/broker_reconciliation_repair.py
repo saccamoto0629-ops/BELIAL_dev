@@ -66,13 +66,19 @@ Pending reservations are enumerated from the audit DB:
 - LEASE STILL VALID -> untouched. No takeover, no finalize, no broker
   query, no execution-DB change: a live worker owns it.
 - LEASE EXPIRED -> fenced takeover: (a) the EXECUTION-DB fence is bumped to
-  ``generation + 1`` first (this is the takeover mutex -- of any number of
-  concurrent recovery workers exactly one wins; losers change neither
-  fence nor claim), then (b) the reconciliation-DB claim is taken over by
-  atomic CAS (owner / claim execution id replaced, generation incremented,
-  lease extended). The new generation is now the only token the execution
-  DB accepts; a resurrected old worker can neither commit nor finalize.
-  Then, under the new claim:
+  ``generation + 1`` FIRST, so the old generation loses its ability to
+  commit before anything is re-evaluated (losers of that race write
+  nothing), then (b) the reconciliation-DB claim is taken over by atomic
+  CAS (owner / claim execution id replaced, generation incremented, lease
+  extended). **The claim CAS -- not the fence -- is the mutex**: exactly one
+  worker wins it, and the fence is the generation BARRIER that its winner
+  needs. That separation is what makes the takeover restartable: the two
+  cross-DB commits are not atomic, so a worker can die after arming the
+  fence and before claiming. The fence it left behind is an ORPHAN at the
+  target generation and is ADOPTED by the next worker (verified to name
+  this attempt at this generation) instead of stranding the attempt as
+  pending forever. A resurrected old worker can neither commit nor
+  finalize -- it holds a lower generation. Then, under the new claim:
   - the execution history's STRUCTURED provenance (``repair_attempt_id``)
     already names this attempt -> the state update committed before the
     crash; finalize ``applied`` under the ORIGINAL attempt id.
@@ -404,16 +410,21 @@ class BrokerOrderReconciliationRepairService:
 
         - lease still valid -> UNTOUCHED (no takeover, no finalize, no
           broker query, no execution-DB change): a live worker owns it.
-        - lease expired -> fenced takeover (execution-DB fence bumped to
-          ``generation + 1`` FIRST -- the takeover mutex; exactly one of any
-          number of concurrent recovery workers wins, losers change
-          nothing), then the reconciliation-DB claim CAS. Under the new
-          claim: a history row whose STRUCTURED ``repair_attempt_id``
-          equals the reservation's id proves the state update committed ->
-          finalize ``applied`` under the ORIGINAL attempt id; otherwise the
-          attempt is RE-EVALUATED in full (fresh broker query, eligibility,
-          fenced commit) as the new legitimate owner -- recovery never
-          invents a ``failed`` verdict without that re-evaluation.
+        - lease expired -> fenced takeover: the execution-DB fence is bumped
+          to ``generation + 1`` FIRST (so the old generation can no longer
+          commit; losers of that race write nothing), then the
+          reconciliation-DB claim CAS -- **the mutex** -- elects exactly one
+          owner among any number of concurrent recovery workers. A fence
+          left at the target generation by a worker that died before its
+          claim CAS is an ORPHAN and is adopted (see
+          :meth:`_adoptable_fence`), so a half-finished takeover can always
+          be restarted. Under the new claim: a history row whose STRUCTURED
+          ``repair_attempt_id`` equals the reservation's id proves the state
+          update committed -> finalize ``applied`` under the ORIGINAL
+          attempt id; otherwise the attempt is RE-EVALUATED in full (fresh
+          broker query, eligibility, fenced commit) as the new legitimate
+          owner -- recovery never invents a ``failed`` verdict without that
+          re-evaluation.
 
         Recovery is fail-closed: a reservation whose source run /
         discrepancy has been deleted or tampered with is refused with
@@ -431,9 +442,10 @@ class BrokerOrderReconciliationRepairService:
                 self._owner_id, _new_claim_execution_id(), reservation.generation + 1
             )
             if reservation.execution_request_id is not None:
-                # Fence FIRST (the takeover mutex): after this, the old
-                # generation can no longer commit -- and of concurrent
-                # recovery workers only the fence winner proceeds.
+                # Fence FIRST: the old generation must lose its ability to
+                # commit BEFORE this worker re-evaluates anything. The fence
+                # is a generation BARRIER, not the mutex -- the claim CAS
+                # below elects the single winner.
                 try:
                     execution_store.register_repair_fence(
                         reservation.execution_request_id,
@@ -445,7 +457,25 @@ class BrokerOrderReconciliationRepairService:
                         db_path=self._execution_db_path,
                     )
                 except ExecutionRepairFenceConflictError:
-                    continue  # another worker holds a newer fence; not ours
+                    # A fence at or beyond our target generation exists. Two
+                    # cases, and only one of them is ours to abandon:
+                    #
+                    # - beyond it -> another worker legitimately advanced
+                    #   past this generation; not ours.
+                    # - exactly AT our target generation -> a takeover that
+                    #   committed its fence and then DIED before its claim
+                    #   CAS (the two cross-DB commits are not atomic). That
+                    #   fence is ORPHANED: no audit claim backs it. Adopting
+                    #   it is safe and required -- it is precisely the
+                    #   barrier we wanted, the claim CAS still elects exactly
+                    #   one owner, and refusing it would strand the attempt
+                    #   as pending forever (PR #107 re-review r3 P1).
+                    if not self._adoptable_fence(
+                        reservation.execution_request_id,
+                        reservation.attempt_id,
+                        new_claim.generation,
+                    ):
+                        continue
                 except execution_store.ExecutionOrderNotFoundError:
                     pass  # no order -> nothing to fence; the claim CAS decides
             try:
@@ -467,6 +497,33 @@ class BrokerOrderReconciliationRepairService:
         return tuple(recovered)
 
     # --- recovery helpers ---------------------------------------------------
+
+    def _adoptable_fence(
+        self, execution_request_id: str, attempt_id: str, generation: int
+    ) -> bool:
+        """Is the order's fence an ORPHAN left at exactly ``generation``?
+
+        True only when the stored fence names THIS attempt at THIS
+        generation -- i.e. a takeover whose fence commit landed but whose
+        claim CAS did not (the two cross-DB commits cannot be made atomic).
+        Adopting it writes nothing: it is already exactly the barrier this
+        generation needs, the reconciliation claim CAS still elects the
+        single owner, and ``record_order_result`` re-verifies the same
+        (attempt id, generation) pair inside its own transaction. Any other
+        fence -- a newer generation, a different attempt, none at all, or an
+        unreadable execution DB -- is not ours.
+        """
+        try:
+            fence = execution_store.get_repair_fence(
+                execution_request_id, db_path=self._execution_db_path
+            )
+        except ExecutionStoreError:
+            return False  # fail-closed: never guess about the fence
+        return (
+            fence is not None
+            and fence["repair_attempt_id"] == attempt_id
+            and fence["generation"] == generation
+        )
 
     def _verified_source(
         self, reservation: RepairAttemptReservation
@@ -934,15 +991,35 @@ class BrokerOrderReconciliationRepairService:
             detail=reason,
         )
         try:
-            execution_store.register_repair_fence(
-                request_id,
-                repair_attempt_id=attempt_id,
-                generation=claim.generation,
-                owner_id=claim.owner_id,
-                claim_execution_id=claim.claim_execution_id,
-                registered_at_utc=applied_attempt.reserved_at_utc,
-                db_path=self._execution_db_path,
-            )
+            try:
+                execution_store.register_repair_fence(
+                    request_id,
+                    repair_attempt_id=attempt_id,
+                    generation=claim.generation,
+                    owner_id=claim.owner_id,
+                    claim_execution_id=claim.claim_execution_id,
+                    registered_at_utc=applied_attempt.reserved_at_utc,
+                    db_path=self._execution_db_path,
+                )
+            except ExecutionRepairFenceConflictError:
+                # Arming failed. It is still ours iff the stored fence is
+                # already the exact barrier this claim needs -- the case
+                # where a takeover armed the fence and then died before its
+                # claim CAS, and THIS worker subsequently won that claim
+                # (PR #107 re-review r3 P1). Anything else means the claim
+                # was fenced out (a later takeover, or a newer attempt now
+                # owns the order).
+                if not self._adoptable_fence(request_id, attempt_id, claim.generation):
+                    return make(
+                        outcome=RepairOutcome.CONFLICT,
+                        failure_code=RepairFailureCode.CLAIM_LOST,
+                        before=current,
+                        detail=(
+                            "the repair fencing token was superseded before the commit "
+                            "(the claim was taken over or a newer attempt owns the order); "
+                            "nothing was changed by this worker"
+                        ),
+                    )
             execution_store.record_order_result(
                 request_id,
                 fresh,
@@ -954,17 +1031,16 @@ class BrokerOrderReconciliationRepairService:
                 db_path=self._execution_db_path,
             )
         except ExecutionRepairFenceConflictError:
-            # the claim was fenced out (a takeover after lease expiry, or a
-            # newer attempt now owns the order): typed lost claim, nothing
-            # was changed by this worker
+            # rejected INSIDE the update transaction: the fence moved between
+            # arming and the commit -- typed lost claim, nothing was changed
             return make(
                 outcome=RepairOutcome.CONFLICT,
-                failure_code=RepairFailureCode.CLAIM_LOST,
+                failure_code=RepairFailureCode.REPAIR_FENCE_CONFLICT,
                 before=current,
                 detail=(
-                    "the repair fencing token was superseded before the commit "
-                    "(the claim was taken over or a newer attempt owns the order); "
-                    "nothing was changed by this worker"
+                    "the execution store rejected the update because the order's repair "
+                    "fence names a different attempt or generation; the transaction "
+                    "rolled back and nothing was changed"
                 ),
             )
         except ExecutionOrderStateConflictError:

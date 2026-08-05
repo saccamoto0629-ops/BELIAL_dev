@@ -153,12 +153,14 @@ owner A / generation 1 の遅延 finalize は claim CAS で拒否される
 5. takeover 後、旧 generation の commit は ExecutionRepairFenceConflictError で全 rollback
 ```
 
-takeover の順序は **fence を先、claim CAS を後**にする(fence 登録が実質の takeover mutex になり、claim を取れなかった worker が Execution 側を先に動かすことがない)。
+takeover の順序は **fence を先、claim CAS を後**にする(旧 generation が commit できなくなってから初めて再評価を始めるため)。ただし **mutex は claim CAS の方**であり、fence は「どの generation なら commit してよいか」の barrier にすぎない。
+
+**孤立 fence の adoption(再入可能な takeover)**: 2 つの cross-DB commit(fence 更新 → claim CAS)は原子化できないので、fence を更新した直後にプロセスが停止すると「fence = generation N+1 / 監査 claim = generation N」という不一致が残る。この fence は**どの claim にも裏付けられていない孤立 fence**であり、次の worker が(自分の attempt ID と目標 generation に**完全一致する場合に限り**)そのまま **adopt** する — 何も書き換えずに claim CAS へ進み、勝者だけが commit する。adopt を認めないと、その attempt は「fence は N+1 なので登録できない / claim は N のままなので誰も進めない」という状態で**永久に pending のまま回収不能**になる(PR #107 再レビュー r3 の P1 指摘)。adopt の条件は「同一 attempt ID かつ同一 generation」だけで、より新しい generation・別 attempt・fence 不在・Execution DB 読み取り失敗はいずれも adopt せず(fail-closed)、fence を追い越された worker が barrier をすり抜ける余地はない。
 
 **recovery 契約**(`recover_pending_attempts()`): pending reservation を列挙し、**lease が有効なものは一切触らない**(finalize しない・takeover しない・Broker 照会しない・Execution DB を変更しない)。lease 期限切れのものだけを次の順で処理する。
 
-1. Execution DB の fence を `generation + 1` へ bump(敗者はここで typed conflict を受けて離脱する)。
-2. reconciliation DB の claim を同じ generation へ CAS で takeover。
+1. Execution DB の fence を `generation + 1` へ bump(敗者は typed conflict を受け、**孤立 fence だった場合のみ** adopt して次へ進む。それ以外は何も書かずに離脱する)。
+2. reconciliation DB の claim を同じ generation へ CAS で takeover(**ここが単一勝者を決める**)。
 3. state history の**構造化 provenance 列 `repair_attempt_id` / `repair_generation`**(reason 文字列の解析はしない)を確認。
 4. 既に適用済みなら**元の attempt ID のまま** `applied` へ finalize(commit 済みの状態・broker ID・broker 時刻で確定)。
 5. 未適用なら、新 generation の正当な owner として **fresh Broker 再照会 + eligibility 再検証を最初からやり直す**(適用できるなら applied、できないならその理由の typed outcome)。
@@ -245,6 +247,7 @@ clock の呼び出しは **pass 開始 / attempt ごとの claim / attempt ご�
 - 状態更新(execution orders DB)と repair 監査(reconciliation DB)は別ファイルであり単一トランザクションにできない。分散トランザクション風の実装は行わず、**claim(監査)→ fenced commit(orders)→ finalize(監査)** という outbox 型の明示リカバリ設計とする。全 crash 窓が回収可能:
   - claim 前 = 痕跡なし・無変更。
   - claim 後〜commit 前 = pending が残り、lease 期限後に recovery が takeover して**評価をやり直す**(Broker 再照会 + eligibility 再検証)。
+  - **takeover の途中(fence 更新後〜claim CAS 前)** = 孤立 fence が残るが、次の recovery が adopt して同じ generation で継続する(pending が回収不能になる窓は無い)。
   - commit 後〜finalize 前 = pending + history の構造化 provenance(`repair_attempt_id` / `repair_generation`)が残り、recovery が**元 attempt ID のまま `applied` 確定**(元の attempt ID・outcome・Broker 時刻は失われない)。
 - finalize 失敗時は attempt に `audit_error` を付けて返す + ERROR ログ(`ReconciliationRepairResult.has_audit_failures` で機械検出)。中途半端な内部状態は残らない(store 側は全 rollback)。
 - 更新途中の DB 障害は store のトランザクションが全 rollback し、attempt は `failed`(= 注文状態が無変更だと確定した場合のみの分類)として finalize される。

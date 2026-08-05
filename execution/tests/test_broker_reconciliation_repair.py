@@ -1519,6 +1519,145 @@ def test_a_crash_before_the_state_update_is_resumed_by_recovery_not_failed(paths
     assert pending(reconciliation_db) == ()
 
 
+def test_a_recovery_death_between_the_fence_and_the_claim_is_resumable(paths, monkeypatch):
+    """PR #107 re-review r3 P1: the two cross-DB commits of a takeover (fence
+    bump, then claim CAS) can be split by a process death, leaving the
+    execution fence one generation AHEAD of the audit claim. A later recovery
+    -- with a DIFFERENT claim identity -- must still converge: the fence
+    accepts re-registration at the target generation and the claim CAS (the
+    real mutex) elects it. The attempt must never be stranded as pending."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-40", "run-40")
+    import execution.broker_reconciliation_repair as repair_module
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed after the fence commit")
+
+    # 1) the live attempt crashes before its state update
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-40")
+    monkeypatch.undo()
+
+    # 2) the FIRST recovery dies between the fence bump and the claim CAS
+    monkeypatch.setattr(repair_module, "claim_repair_attempt", crash)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+
+    orphan = execution_store.get_repair_fence("exec-40", db_path=execution_db)
+    assert orphan["generation"] == 2  # fence advanced
+    assert only(pending(reconciliation_db)).generation == 1  # claim did not
+    orphan_claim = orphan["claim_execution_id"]
+
+    # 3) a fresh recovery process (new claim identity) must complete the work
+    recovery_broker = QueryOnlyBroker(broker)
+    recovered = recovery_service(recovery_broker, paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert (entry.attempt_id, entry.outcome, entry.generation) == (
+        "crash-1",
+        RepairOutcome.APPLIED,
+        2,
+    )
+    assert recovery_broker.query_count == 1  # it really re-evaluated
+    assert order_state(execution_db, "exec-40")[0] == "filled"
+    history = execution_store.get_state_history("exec-40", db_path=execution_db)
+    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 2
+    assert pending(reconciliation_db) == ()  # nothing stranded
+    stored = only(finalized(reconciliation_db, "run-40"))
+    assert (stored.attempt_id, stored.outcome) == ("crash-1", RepairOutcome.APPLIED)
+    # the ORPHANED fence row was adopted, not rewritten: it is a generation
+    # barrier (the commit check compares attempt id + generation), while the
+    # audit row remains the authority on who owns the attempt
+    fence = execution_store.get_repair_fence("exec-40", db_path=execution_db)
+    assert (fence["generation"], fence["claim_execution_id"]) == (2, orphan_claim)
+    assert stored.claim_execution_id != orphan_claim  # a different, live claim finalized
+
+
+def test_only_this_attempts_own_generation_is_adoptable(paths, monkeypatch):
+    """Adoption is deliberately narrow: ONLY a fence naming this attempt at
+    exactly this generation counts (an orphan). A newer generation, another
+    attempt's fence, or no fence at all is never adopted -- so a fenced-out
+    worker can never talk its way past the barrier."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-42", "run-42")
+    service = repair_service(QueryOnlyBroker(broker), paths, prefix="probe")
+
+    execution_store.register_repair_fence(
+        "exec-42",
+        repair_attempt_id="attempt-someone-else",
+        generation=2,
+        owner_id="other-worker",
+        claim_execution_id="claim-other",
+        registered_at_utc=REPAIR_AT,
+        db_path=execution_db,
+    )
+
+    assert service._adoptable_fence("exec-42", "attempt-mine", 2) is False  # other attempt
+    assert service._adoptable_fence("exec-42", "attempt-someone-else", 1) is False  # older
+    assert service._adoptable_fence("exec-42", "attempt-someone-else", 3) is False  # newer
+    assert service._adoptable_fence("exec-42", "attempt-someone-else", 2) is True
+    assert service._adoptable_fence("exec-ghost", "attempt-mine", 1) is False  # no fence
+
+
+
+def test_a_recovery_death_after_the_claim_strands_nothing_for_the_next_generation(
+    paths, monkeypatch
+):
+    """The other side of the same cross-DB window: the takeover's claim CAS
+    committed but the process died before the execution update. The claim
+    holder's own lease now protects it; once THAT lease expires the next
+    recovery takes generation 3 and completes the work."""
+    execution_db, reconciliation_db = paths
+    broker = seeded_candidate(paths, "exec-41", "run-41")
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        repair_service(QueryOnlyBroker(broker), paths, prefix="crash").repair(run_id="run-41")
+    # the first recovery claims (generation 2) and then dies before committing
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+
+    claimed = only(pending(reconciliation_db))
+    assert claimed.generation == 2  # the claim is durable
+    # while ITS lease is valid, nobody may take over
+    untouched = BrokerOrderReconciliationRepairService(
+        broker=QueryOnlyBroker(broker),
+        execution_db_path=execution_db,
+        reconciliation_db_path=reconciliation_db,
+        owner_id="worker-early",
+        lease_duration_seconds=LEASE_SECONDS,
+        clock=lambda: RECOVERY_AT,  # still inside generation 2's lease
+    ).recover_pending_attempts()
+    assert untouched == ()
+    assert only(pending(reconciliation_db)).generation == 2
+
+    later = BrokerOrderReconciliationRepairService(
+        broker=QueryOnlyBroker(broker),
+        execution_db_path=execution_db,
+        reconciliation_db_path=reconciliation_db,
+        owner_id="worker-late",
+        lease_duration_seconds=LEASE_SECONDS,
+        clock=lambda: RECOVERY_AT + timedelta(days=1),
+    ).recover_pending_attempts()
+
+    entry = only(later)
+    assert (entry.attempt_id, entry.outcome, entry.generation) == (
+        "crash-1",
+        RepairOutcome.APPLIED,
+        3,
+    )
+    assert order_state(execution_db, "exec-41")[0] == "filled"
+    history = execution_store.get_state_history("exec-41", db_path=execution_db)
+    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 3
+    assert pending(reconciliation_db) == ()
+
+
 def test_a_finalize_failure_after_the_commit_is_recovered_under_the_same_id(paths, monkeypatch):
     execution_db, reconciliation_db = paths
     broker = seeded_candidate(paths, "exec-33", "run-33")
