@@ -142,6 +142,8 @@ reconciliation DB の claim を `record_order_result()` のトランザクショ
 
 fencing token は `RepairFenceToken`(attempt id / generation / takeover id / owner / claim execution id)という**1 つの identity オブジェクト**として扱う。reconciliation DB の durable takeover intent がこれを生成し、fence 登録と状態更新の両方が同じオブジェクトを提示する。
 
+`register_repair_fence()` は成功時に **commit した fence 行を読み戻した** `InstalledRepairFence`(order ID + token + 更新時刻)を返す。呼び出し側の引数をそのまま echo するのではなく**この store が実際に保持している値**なので、reconciliation 側はそれを `TakeoverFenceProof` として提示し、intent の identity と attempt 自身の order に一致するかを自分の transaction で検証できる(r5 レビュー)。
+
 `register_repair_fence(token=...)` の規則(すべて単一 `BEGIN IMMEDIATE` 内):
 
 | 現在の fence | 要求 | 結果 |

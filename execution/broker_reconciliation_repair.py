@@ -183,6 +183,8 @@ from execution.reconciliation_repair_models import (
     RepairOutcome,
     RepairTakeoverIntent,
     TakeoverBlockedReason,
+    TakeoverCancelReason,
+    TakeoverFenceProof,
     TakeoverIntentStatus,
 )
 from execution.reconciliation_store import (
@@ -192,8 +194,10 @@ from execution.reconciliation_store import (
     RepairClaimLostError,
     TakeoverIntentConflictError,
     TakeoverIntentStateError,
-    advance_takeover_intent,
+    TakeoverProtocolInvariantError,
     block_takeover_intent,
+    cancel_takeover_intent,
+    complete_takeover_intent,
     create_takeover_intent,
     finalize_repair_attempt,
     renew_takeover_intent_lease,
@@ -204,6 +208,8 @@ from execution.reconciliation_store import (
     insert_blocked_takeover_intent,
     list_pending_repair_attempts,
     list_takeover_intents,
+    mark_takeover_claim_promoted,
+    mark_takeover_fence_installed,
     promote_repair_claim,
     reserve_repair_attempt,
 )
@@ -397,6 +403,9 @@ class BrokerOrderReconciliationRepairService:
         self._lease_duration = timedelta(seconds=lease_duration_seconds)
         self._clock = clock
         self._attempt_id_factory = attempt_id_factory or _default_attempt_id
+        # the proof returned by the LAST successful fence installation of
+        # this pass (see _install_fence); never read across attempts
+        self._last_fence_proof: TakeoverFenceProof | None = None
 
     # --- public API ---------------------------------------------------------
 
@@ -595,18 +604,25 @@ class BrokerOrderReconciliationRepairService:
             return self._block_without_active_intent(
                 reservation, now, reason=reason, detail=detail
             )
-        intent = self._prepare_intent(reservation, now)
-        if intent is None:
+        prepared, problem = self._prepare_intent(reservation, now)
+        if problem is not None:
+            reason, detail = problem
+            return self._block_without_active_intent(
+                reservation, now, reason=reason, detail=detail
+            )
+        if prepared is None:
             return None  # another worker won the intent insert; it owns this now
-        return self._drive_takeover(reservation, intent, now)
+        return self._drive_takeover(reservation, prepared, now)
 
     def _prepare_intent(
         self, reservation: RepairAttemptReservation, now: datetime
-    ) -> RepairTakeoverIntent | None:
+    ) -> tuple[RepairTakeoverIntent | None, tuple[TakeoverBlockedReason, str] | None]:
         """Step 1: mint ONE identity and commit it durably.
 
-        Returns None when another worker won the insert (its intent is
-        active and freshly leased, so this worker changes nothing)."""
+        Returns ``(intent, None)`` on success, ``(None, None)`` when another
+        worker legitimately won the insert, and ``(None, problem)`` when the
+        conflict is NOT a healthy race. A conflict is never swallowed
+        blindly (r5 review): the DB is re-read and classified."""
         candidate = RepairTakeoverIntent(
             takeover_id=_new_takeover_id(),
             repair_attempt_id=reservation.attempt_id,
@@ -621,11 +637,93 @@ class BrokerOrderReconciliationRepairService:
             created_at_utc=now,
         )
         try:
-            return create_takeover_intent(
-                candidate, observed_at_utc=now, db_path=self._reconciliation_db_path
+            return (
+                create_takeover_intent(
+                    candidate, observed_at_utc=now, db_path=self._reconciliation_db_path
+                ),
+                None,
             )
-        except (TakeoverIntentConflictError, RepairAttemptConflictError):
-            return None
+        except RepairAttemptConflictError:
+            # the attempt was finalized between the pending snapshot and now:
+            # there is simply nothing left to take over
+            return None, None
+        except TakeoverIntentConflictError:
+            return None, self._classify_intent_conflict(reservation)
+
+    def _classify_intent_conflict(
+        self, reservation: RepairAttemptReservation
+    ) -> tuple[TakeoverBlockedReason, str] | None:
+        """Why could this intent not be created? (r5 review)
+
+        A HEALTHY race -- another worker's active intent for the same source
+        claim, or an attempt that has meanwhile been finalized -- yields None
+        (back off). Anything else is a protocol inconsistency that must be
+        reported and parked, never converted into a silent empty result:
+
+        - a TERMINAL intent (completed / cancelled) for this generation
+          while the attempt is STILL PENDING: the takeover claims to be over
+          but the work is not, and the unique index would keep every later
+          recovery from starting a new one -- the exact silent-stop the r5
+          review reproduced;
+        - an active intent whose source identity is not this claim;
+        - an unreadable / inconsistent intent set.
+        """
+        try:
+            intents = list_takeover_intents(
+                attempt_id=reservation.attempt_id, db_path=self._reconciliation_db_path
+            )
+            stored = get_repair_attempt(
+                reservation.attempt_id, db_path=self._reconciliation_db_path
+            )
+        except ReconciliationStoreError as exc:
+            return (
+                TakeoverBlockedReason.PROTOCOL_CORRUPT,
+                (
+                    "the attempt's takeover intents could not be re-read after a creation "
+                    f"conflict ({type(exc).__name__}); the takeover is parked"
+                ),
+            )
+        if stored is not None:
+            return None  # finalized meanwhile: the conflict was harmless
+        for intent in intents:
+            if not intent.is_active or intent.source_generation != reservation.generation:
+                continue
+            if (
+                intent.source_owner_id == reservation.owner_id
+                and intent.source_claim_execution_id == reservation.claim_execution_id
+            ):
+                return None  # healthy race: the winner owns this claim
+            return (
+                TakeoverBlockedReason.INTENT_SOURCE_MISMATCH,
+                (
+                    f"active takeover intent {intent.takeover_id} claims to replace a "
+                    "different claim than the one this attempt actually holds"
+                ),
+            )
+        for intent in intents:
+            if (
+                intent.source_generation == reservation.generation
+                and intent.status
+                in (TakeoverIntentStatus.COMPLETED, TakeoverIntentStatus.CANCELLED)
+            ):
+                return (
+                    TakeoverBlockedReason.TERMINAL_INTENT_WITH_PENDING_ATTEMPT,
+                    (
+                        f"takeover intent {intent.takeover_id} is {intent.status.value} for "
+                        f"generation {intent.source_generation} while repair attempt "
+                        f"{reservation.attempt_id} is still PENDING at that generation "
+                        f"(claim {reservation.claim_execution_id}, owner "
+                        f"{reservation.owner_id}, takeover {reservation.takeover_id}); the "
+                        "takeover cannot be restarted and needs manual intervention"
+                    ),
+                )
+        return (
+            TakeoverBlockedReason.PROTOCOL_CORRUPT,
+            (
+                "a takeover intent for this claim could not be created and no active or "
+                "terminal intent explains the conflict"
+            ),
+        )
 
     def _drive_takeover(
         self,
@@ -657,9 +755,9 @@ class BrokerOrderReconciliationRepairService:
             problem = self._install_fence(reservation, intent, now)
             if problem is not None:
                 return self._block_intent(reservation, intent, now, *problem)
-            intent = advance_takeover_intent(
+            intent = mark_takeover_fence_installed(
                 intent,
-                to_status=TakeoverIntentStatus.FENCE_INSTALLED,
+                fence_proof=self._last_fence_proof,
                 at_utc=now,
                 db_path=self._reconciliation_db_path,
             )
@@ -701,11 +799,10 @@ class BrokerOrderReconciliationRepairService:
                     ),
                 )
             if intent.status is TakeoverIntentStatus.FENCE_INSTALLED:
-                intent = advance_takeover_intent(
-                    intent,
-                    to_status=TakeoverIntentStatus.CLAIM_PROMOTED,
-                    at_utc=now,
-                    db_path=self._reconciliation_db_path,
+                # the store re-reads the promoted claim in the SAME
+                # transaction: the status can never run ahead of it
+                intent = mark_takeover_claim_promoted(
+                    intent, at_utc=now, db_path=self._reconciliation_db_path
                 )
 
         if reservation.takeover_id != intent.takeover_id:
@@ -723,11 +820,10 @@ class BrokerOrderReconciliationRepairService:
         attempt = self._resume_claimed_attempt(run, discrepancy, reservation, claim)
         attempt = self._finalize(attempt)
         try:
-            advance_takeover_intent(
-                intent,
-                to_status=TakeoverIntentStatus.COMPLETED,
-                at_utc=now,
-                db_path=self._reconciliation_db_path,
+            # completes ONLY if the attempt is really finalized under this
+            # intent's identity (verified in the store's transaction)
+            complete_takeover_intent(
+                intent, at_utc=now, db_path=self._reconciliation_db_path
             )
         except (TakeoverIntentStateError, ReconciliationStoreError) as exc:
             # The work is done and audited; the intent stays active and the
@@ -750,19 +846,31 @@ class BrokerOrderReconciliationRepairService:
     ) -> tuple[TakeoverBlockedReason, str] | None:
         """Step 2: install the intent's identity as the order's fence.
 
-        Returns None on success (including the idempotent retry of an
-        identical token) or the (reason, detail) of a blocking mismatch. A
-        broker-only target has no order to fence -- the claim promotion
-        alone carries the takeover."""
+        On success the PROOF the order store returned (the committed fence
+        row, not this caller's arguments) is kept for the status update --
+        the reconciliation store verifies it against the intent and against
+        the attempt's own execution order. Returns None on success
+        (including the idempotent retry of an identical token) or the
+        (reason, detail) of a blocking mismatch. A broker-only target has no
+        order to fence -- the claim promotion alone carries the takeover."""
+        self._last_fence_proof = None
         if reservation.execution_request_id is None:
             return None
         token = _Claim.from_intent(intent).fence_token(reservation.attempt_id)
         try:
-            execution_store.register_repair_fence(
+            installed = execution_store.register_repair_fence(
                 reservation.execution_request_id,
                 token=token,
                 registered_at_utc=now,
                 db_path=self._execution_db_path,
+            )
+            self._last_fence_proof = TakeoverFenceProof(
+                execution_request_id=installed.execution_request_id,
+                repair_attempt_id=installed.token.repair_attempt_id,
+                generation=installed.token.generation,
+                takeover_id=installed.token.takeover_id,
+                owner_id=installed.token.owner_id,
+                claim_execution_id=installed.token.claim_execution_id,
             )
             return None
         except ExecutionRepairFenceConflictError:
@@ -1092,9 +1200,19 @@ class BrokerOrderReconciliationRepairService:
         else:
             return None
         try:
-            advance_takeover_intent(
-                intent, to_status=target, at_utc=now, db_path=self._reconciliation_db_path
-            )
+            # both closures re-verify the attempt row in their own
+            # transaction, so neither can run ahead of the real outcome
+            if target is TakeoverIntentStatus.COMPLETED:
+                complete_takeover_intent(
+                    intent, at_utc=now, db_path=self._reconciliation_db_path
+                )
+            else:
+                cancel_takeover_intent(
+                    intent,
+                    reason=TakeoverCancelReason.ATTEMPT_FINALIZED_BY_SOURCE_CLAIM,
+                    at_utc=now,
+                    db_path=self._reconciliation_db_path,
+                )
         except (TakeoverIntentStateError, ReconciliationStoreError) as exc:
             self._safe_log_sanitized_exception(
                 "closing the takeover intent of a finalized attempt failed",

@@ -204,6 +204,7 @@ class RepairFailureCode(enum.Enum):
     CLAIM_INTENT_MISMATCH = "claim_intent_mismatch"
     FENCE_INTENT_MISMATCH = "fence_intent_mismatch"
     TAKEOVER_PROTOCOL_CORRUPT = "takeover_protocol_corrupt"
+    TERMINAL_INTENT_WITH_PENDING_ATTEMPT = "terminal_intent_with_pending_attempt"
 
 
 class TakeoverIntentStatus(enum.Enum):
@@ -223,7 +224,8 @@ class TakeoverIntentStatus(enum.Enum):
     ``CANCELLED``       -- the takeover became UNNECESSARY before it took
     effect: the attempt was finalized by the claim this intent meant to
     replace (a slow-but-alive worker finished first). Nothing is wrong, the
-    intent simply never applies -- terminal, and never resumed.
+    intent simply never applies -- terminal, and never resumed. A
+    :class:`TakeoverCancelReason` is mandatory.
     ``BLOCKED``         -- the protocol found a state it must not resolve
     automatically; a reason code and the observed generations / identities
     are stored. Never resumed automatically.
@@ -273,6 +275,66 @@ ALLOWED_INTENT_TRANSITIONS: dict[TakeoverIntentStatus, frozenset[TakeoverIntentS
 }
 
 
+class TakeoverCancelReason(enum.Enum):
+    """Why a takeover became UNNECESSARY before it took effect -- CLOSED set.
+
+    ``ATTEMPT_FINALIZED_BY_SOURCE_CLAIM`` -- the claim this intent meant to
+    replace finalized the attempt itself (a slow-but-alive worker won the
+    race). Nothing is wrong: the takeover simply never applies. A cancelled
+    intent is terminal and is never resumed; the attempt is finalized, so no
+    further takeover of it is possible either.
+    """
+
+    ATTEMPT_FINALIZED_BY_SOURCE_CLAIM = "attempt_finalized_by_source_claim"
+
+
+@dataclass(frozen=True)
+class TakeoverFenceProof:
+    """Evidence that the execution fence carries an intent's identity.
+
+    The reconciliation store cannot read the ORDER store inside its own
+    transaction (separate SQLite files), so ``fence_installed`` is proved by
+    a value the ORDER store RETURNS after committing the fence
+    (``execution_store.register_repair_fence`` ->
+    ``InstalledRepairFence``), converted here by the service. The
+    reconciliation store then verifies -- inside its own transaction -- that
+    the proof names exactly this intent's identity AND the attempt's own
+    execution order, so a proof for another attempt, another generation or
+    another execution is refused.
+
+    This is a marker, not the last line of defence: ``claim_promoted`` and
+    ``completed`` are verified against the REAL attempt row (same DB, same
+    transaction), so a forged proof can never carry an intent past the
+    fence-installed marker.
+    """
+
+    execution_request_id: str
+    repair_attempt_id: str
+    generation: int
+    takeover_id: str
+    owner_id: str
+    claim_execution_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "execution_request_id",
+            "repair_attempt_id",
+            "takeover_id",
+            "owner_id",
+            "claim_execution_id",
+        ):
+            _require_non_empty_str(getattr(self, name), name)
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 2
+        ):
+            raise ValueError(
+                f"generation must be an int >= 2 (a takeover generation), got "
+                f"{self.generation!r}"
+            )
+
+
 class TakeoverBlockedReason(enum.Enum):
     """Why a takeover was parked for a human -- CLOSED set (r4 review).
 
@@ -289,6 +351,7 @@ class TakeoverBlockedReason(enum.Enum):
     MULTIPLE_ACTIVE_INTENTS = "multiple_active_intents"
     INTENT_SOURCE_MISMATCH = "intent_source_mismatch"
     ATTEMPT_ALREADY_FINALIZED = "attempt_already_finalized"
+    TERMINAL_INTENT_WITH_PENDING_ATTEMPT = "terminal_intent_with_pending_attempt"
     PROTOCOL_CORRUPT = "protocol_corrupt"
 
 
@@ -303,6 +366,9 @@ BLOCKED_REASON_FAILURE_CODES: dict[TakeoverBlockedReason, RepairFailureCode] = {
     TakeoverBlockedReason.INTENT_SOURCE_MISMATCH: RepairFailureCode.TAKEOVER_IDENTITY_MISMATCH,
     TakeoverBlockedReason.ATTEMPT_ALREADY_FINALIZED: (
         RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT
+    ),
+    TakeoverBlockedReason.TERMINAL_INTENT_WITH_PENDING_ATTEMPT: (
+        RepairFailureCode.TERMINAL_INTENT_WITH_PENDING_ATTEMPT
     ),
     TakeoverBlockedReason.PROTOCOL_CORRUPT: RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
 }
@@ -382,9 +448,21 @@ _ALLOWED_FAILURE_CODES: dict[RepairOutcome, frozenset[RepairFailureCode]] = {
             RepairFailureCode.CLAIM_INTENT_MISMATCH,
             RepairFailureCode.FENCE_INTENT_MISMATCH,
             RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT,
+            RepairFailureCode.TERMINAL_INTENT_WITH_PENDING_ATTEMPT,
         }
     ),
 }
+
+#: The finalized outcomes a takeover intent may be COMPLETED with. A takeover
+#: completes when its attempt reached ANY finalized verdict under the intent's
+#: identity -- but never while the attempt is still pending, and never for
+#: ``would_apply`` (dry-run, never persisted) or ``blocked`` (which leaves the
+#: attempt pending by definition).
+COMPLETABLE_TAKEOVER_OUTCOMES: frozenset[RepairOutcome] = frozenset(
+    outcome
+    for outcome in RepairOutcome
+    if outcome not in (RepairOutcome.WOULD_APPLY, RepairOutcome.BLOCKED)
+)
 
 
 def _require_optional_revision(value, field_name: str) -> None:
@@ -451,6 +529,7 @@ class RepairTakeoverIntent:
     cancelled_at_utc: datetime | None = None
     blocked_at_utc: datetime | None = None
     blocked_reason: TakeoverBlockedReason | None = None
+    cancelled_reason: TakeoverCancelReason | None = None
     observed_claim_generation: int | None = None
     observed_fence_generation: int | None = None
     observed_fence_identity: str | None = None
@@ -528,6 +607,15 @@ class RepairTakeoverIntent:
             raise ValueError("completed_at_utc must be set exactly for completed intents")
         if (self.status is TakeoverIntentStatus.CANCELLED) != (self.cancelled_at_utc is not None):
             raise ValueError("cancelled_at_utc must be set exactly for cancelled intents")
+        if (self.status is TakeoverIntentStatus.CANCELLED) != (self.cancelled_reason is not None):
+            raise ValueError("cancelled_reason must be set exactly for cancelled intents")
+        if self.cancelled_reason is not None and not isinstance(
+            self.cancelled_reason, TakeoverCancelReason
+        ):
+            raise ValueError(
+                f"cancelled_reason must be a TakeoverCancelReason or None, got "
+                f"{self.cancelled_reason!r}"
+            )
         reached_fence = self.status in (
             TakeoverIntentStatus.FENCE_INSTALLED,
             TakeoverIntentStatus.CLAIM_PROMOTED,

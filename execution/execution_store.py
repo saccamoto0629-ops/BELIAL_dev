@@ -444,6 +444,27 @@ class RepairFenceToken:
         )
 
 
+@dataclass(frozen=True)
+class InstalledRepairFence:
+    """What :func:`register_repair_fence` COMMITTED -- read back inside its
+    own transaction (Issue #104 re-review r5).
+
+    Returning the stored row (rather than echoing the caller's arguments)
+    makes the reconciliation side's ``fence_installed`` marker provable
+    against something the ORDER store actually holds. It carries the order
+    the fence belongs to plus the exact identity that owns it."""
+
+    execution_request_id: str
+    token: RepairFenceToken
+    updated_at_utc: datetime
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.execution_request_id, "execution_request_id")
+        if not isinstance(self.token, RepairFenceToken):
+            raise ValueError(f"token must be a RepairFenceToken, got {self.token!r}")
+        _require_utc(self.updated_at_utc, "updated_at_utc")
+
+
 class ExecutionOrderStateConflictError(ExecutionStoreError):
     """The order's CURRENT tracked state or revision differs from what the
     caller conditioned the update on (Issue #104 compare-and-set guard).
@@ -2137,8 +2158,12 @@ def register_repair_fence(
     token: RepairFenceToken,
     registered_at_utc: datetime,
     db_path: Path | None = None,
-) -> None:
+) -> InstalledRepairFence:
     """Install the order's repair fencing token -- atomically (r4 review).
+
+    Returns the fence as COMMITTED (read back inside this transaction), so
+    the caller can prove the installation to the reconciliation side rather
+    than asserting it (r5 review).
 
     The token comes from the reconciliation DB's durable takeover intent (or,
     at generation 1, from the attempt's original claim), so installing it is
@@ -2191,7 +2216,8 @@ def register_repair_fence(
         if fence is not None and fence["repair_attempt_id"] == token.repair_attempt_id:
             stored_identity = tuple(fence[column] for column in _FENCE_IDENTITY_COLUMNS)
             if stored_identity == token.identity():
-                return  # idempotent: this exact execution already holds it
+                # idempotent: this exact execution already holds it
+                return _installed_fence(fence)
             if fence["generation"] != token.generation - 1:
                 raise ExecutionRepairFenceConflictError(
                     f"repair fence for execution order {execution_request_id!r} is held at "
@@ -2223,7 +2249,7 @@ def register_repair_fence(
                 f"VALUES ({', '.join('?' for _ in _FENCE_COLUMNS)})",
                 record,
             )
-            return
+            return _installed_fence(_fence_row(connection, execution_request_id))
         updated = connection.execute(
             f"UPDATE {FENCES_TABLE} SET repair_attempt_id = ?, generation = ?, "
             "takeover_id = ?, owner_id = ?, claim_execution_id = ?, updated_at_utc = ? "
@@ -2235,6 +2261,29 @@ def register_repair_fence(
                 f"repair fence for execution order {execution_request_id!r} could not be "
                 "updated; the claim was lost and nothing was changed"
             )
+        return _installed_fence(_fence_row(connection, execution_request_id))
+
+
+def _fence_row(connection: sqlite3.Connection, execution_request_id: str):
+    return connection.execute(
+        f"SELECT * FROM {FENCES_TABLE} WHERE execution_request_id = ?",
+        (execution_request_id,),
+    ).fetchone()
+
+
+def _installed_fence(row) -> InstalledRepairFence:
+    """The COMMITTED fence row as a typed proof (never the caller's input)."""
+    return InstalledRepairFence(
+        execution_request_id=row["execution_request_id"],
+        token=RepairFenceToken(
+            repair_attempt_id=row["repair_attempt_id"],
+            generation=row["generation"],
+            owner_id=row["owner_id"],
+            claim_execution_id=row["claim_execution_id"],
+            takeover_id=row["takeover_id"],
+        ),
+        updated_at_utc=_parse_utc(row["updated_at_utc"]),
+    )
 
 
 def get_repair_fence(execution_request_id: str, *, db_path: Path | None = None) -> dict | None:
