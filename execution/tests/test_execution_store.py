@@ -2267,10 +2267,12 @@ def test_get_repair_fence_read_contract(db_path, tmp_path):
     assert store.get_repair_fence("exec-1", db_path=db_path) is None  # no fence yet
 
 
-def test_concurrent_installs_of_the_same_token_all_succeed_without_drift(db_path):
-    """Genuinely concurrent: a restarted protocol may install ITS OWN token
-    from several threads (retries). Every call succeeds idempotently and the
-    row never drifts -- while a foreign execution racing them is refused."""
+def test_concurrent_installs_never_let_two_identities_share_a_generation(db_path):
+    """Genuinely concurrent: four threads retry ONE execution's token while a
+    fifth presents a foreign identity for the same generation. Whichever
+    identity reaches the slot first owns it exclusively -- every thread
+    holding it succeeds idempotently, every thread holding the other is
+    refused, and the row never drifts between identities."""
     submit_and_accept(db_path)
     _fence(db_path, "exec-1", token("attempt-f", 1))
     ours = token("attempt-f", 2, claim="claim-2", takeover="tk-1")
@@ -2280,8 +2282,8 @@ def test_concurrent_installs_of_the_same_token_all_succeed_without_drift(db_path
     outcomes = [None] * workers
 
     def install(index):
-        barrier.wait()
         chosen = foreign if index == workers - 1 else ours
+        barrier.wait()
         try:
             _fence(db_path, "exec-1", chosen, at_utc=at(10 + index))
             outcomes[index] = "installed"
@@ -2294,10 +2296,16 @@ def test_concurrent_installs_of_the_same_token_all_succeed_without_drift(db_path
     for thread in threads:
         thread.join()
 
-    assert outcomes[-1] == "conflict"  # the foreign execution never gets in
-    assert set(outcomes[:-1]) == {"installed"}
     fence = store.get_repair_fence("exec-1", db_path=db_path)
-    assert tuple(fence[column] for column in store._FENCE_IDENTITY_COLUMNS) == ours.identity()
+    stored_identity = tuple(fence[column] for column in store._FENCE_IDENTITY_COLUMNS)
+    assert stored_identity in (ours.identity(), foreign.identity())
+    winner_is_ours = stored_identity == ours.identity()
+    for index, outcome in enumerate(outcomes):
+        presented_ours = index != workers - 1
+        expected = "installed" if presented_ours == winner_is_ours else "conflict"
+        assert outcome == expected, (index, outcomes, stored_identity)
+    # the losing identity never touched the row, whichever side it was
+    assert fence["generation"] == 2
 
 
 def test_init_db_migrates_a_v3_db_in_place_and_keeps_rows_readable(db_path):

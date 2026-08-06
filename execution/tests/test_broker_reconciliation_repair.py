@@ -2269,6 +2269,77 @@ def test_an_old_worker_that_finishes_first_cancels_the_takeover(paths, monkeypat
     assert len([h for h in history if h["repair_attempt_id"]]) == 1
 
 
+def test_a_stale_intent_read_never_blocks_a_healthy_concurrent_takeover(paths, monkeypatch):
+    """CI regression (10-worker race): a worker may read "no active intent"
+    just BEFORE a competitor commits its intent, and read the order's fence
+    just AFTER that competitor installs it. The fence is then ahead of the
+    claim while -- to this worker's stale eyes -- no intent explains it.
+
+    That must NOT be parked as an unaccountable fence: the fence's takeover
+    id belongs to a DURABLE intent of this attempt, so the worker simply
+    backs off and the healthy takeover continues."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-60", "run-60", monkeypatch)
+    # worker A: intent committed and fence installed, then killed
+    crash_after(monkeypatch, "advance_takeover_intent", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(
+            QueryOnlyBroker(broker), paths, owner="worker-a"
+        ).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = only(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    )
+    fence_before = execution_store.get_repair_fence("exec-60", db_path=execution_db)
+    assert (fence_before["generation"], fence_before["takeover_id"]) == (2, intent.takeover_id)
+
+    # worker B with a STALE view: its intent read happens before A's commit
+    import execution.broker_reconciliation_repair as repair_module
+
+    real_lookup = repair_module.get_active_takeover_intent
+    stale = {"pending": True}
+
+    def stale_lookup(*args, **kwargs):
+        if stale.pop("pending", None):
+            return None  # the read that raced A's insert
+        return real_lookup(*args, **kwargs)
+
+    monkeypatch.setattr(repair_module, "get_active_takeover_intent", stale_lookup)
+    recovery_broker = QueryOnlyBroker(broker)
+
+    recovered = recovery_service(
+        recovery_broker, paths, owner="worker-b"
+    ).recover_pending_attempts()
+
+    assert recovered == ()  # backs off; never a BLOCKED verdict
+    assert blocked_intents(reconciliation_db, "crash-1") == []
+    assert (
+        len(
+            reconciliation_store.list_takeover_intents(
+                attempt_id="crash-1", db_path=reconciliation_db
+            )
+        )
+        == 1
+    )
+    assert execution_store.get_repair_fence("exec-60", db_path=execution_db) == fence_before
+    assert recovery_broker.query_count == 0
+    monkeypatch.undo()
+
+    # and the takeover still completes normally afterwards
+    finished = only(
+        recovery_service(
+            QueryOnlyBroker(broker), paths, clock=lambda: RESTART_AT
+        ).recover_pending_attempts()
+    )
+    assert (finished.outcome, finished.takeover_id) == (
+        RepairOutcome.APPLIED,
+        intent.takeover_id,
+    )
+    assert order_state(execution_db, "exec-60")[0] == "filled"
+
+
 @pytest.mark.parametrize("workers", [2, 10])
 def test_concurrent_workers_join_one_abandoned_intent(paths, monkeypatch, workers):
     """An abandoned (lease-expired) intent is resumed by N barrier-aligned

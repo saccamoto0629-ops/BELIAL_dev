@@ -796,10 +796,21 @@ class BrokerOrderReconciliationRepairService:
     def _fence_precondition(
         self, reservation: RepairAttemptReservation
     ) -> tuple[TakeoverBlockedReason, str] | None:
-        """Before minting a NEW intent: is the order's fence consistent with
-        this attempt's claim? A fence at or beyond the generation we are
-        about to create means a protocol ran that we have no durable intent
-        for -- never silently overwritten, always parked."""
+        """Before minting a NEW intent: can the order's fence be ACCOUNTED FOR?
+
+        A fence beyond this attempt's claim generation is only acceptable
+        when some durable intent of this attempt owns it -- the fence's
+        ``takeover_id`` must appear in the attempt's intent history. That
+        criterion is deliberately about DURABLE state, not about "is an
+        intent active right now": a concurrent worker may commit its intent
+        and install its fence between two reads here, and mistaking that for
+        an unaccountable fence would block a perfectly healthy takeover
+        (observed as a 10-worker race in CI). When the fence IS explained,
+        this returns None and the atomic steps that follow -- intent
+        creation, fence install, claim promotion -- decide the outcome.
+
+        Only a fence whose takeover id no intent knows is parked.
+        """
         if reservation.execution_request_id is None:
             return None
         fence = self._read_fence(reservation.execution_request_id)
@@ -808,6 +819,14 @@ class BrokerOrderReconciliationRepairService:
         target = reservation.generation + 1
         if fence["generation"] < target:
             return None
+        known = {
+            intent.takeover_id
+            for intent in list_takeover_intents(
+                attempt_id=reservation.attempt_id, db_path=self._reconciliation_db_path
+            )
+        }
+        if fence["takeover_id"] in known:
+            return None  # a durable intent owns this fence; not unaccountable
         reason = (
             TakeoverBlockedReason.FENCE_AHEAD
             if fence["generation"] > target

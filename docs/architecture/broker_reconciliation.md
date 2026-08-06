@@ -218,6 +218,8 @@ pending reservation を列挙し、次のように処理する。
 | blocked intent が同 generation に存在 | **自動処理しない**。typed `BLOCKED` を返すだけ(新しい行も generation も増えない) |
 | 安全に収束できない状態 | 下記のとおり durable に `blocked` へ |
 
+**「説明できない fence」の判定**は、`fence.takeover_id` が **その attempt の intent 履歴(active / terminal を問わず)に存在するか**で行う。「今 active な intent があるか」では判定しない — 並行 worker が intent を commit して fence を install する瞬間を跨いで読むと、健全な takeover を誤って blocked にしてしまうため(10 worker の CI レースで顕在化)。説明できる fence の場合はそのまま原子的な各段階(intent 作成 / fence install / claim promotion)へ進み、それらの CAS が結果を決める。
+
 **blocked にする状態**(黙って `continue` しない): Execution fence が intent の target generation より先行 / fence が別 attempt・別 takeover・別 claim・別 owner / active intent が無いのに fence だけ先行 / active intent が複数 / claim が intent の target を追い越している / intent の source が現在 claim と不一致 / finalized attempt に別 identity の active intent が残っている / intent status が unknown。いずれも **intent 行へ reason code と observed 値(claim generation・fence generation・fence identity)と `blocked_at_utc` を保存**し、呼び出し側へ `RepairOutcome.BLOCKED` + `RepairFailureCode`(`fence_ahead` / `fence_intent_mismatch` / `takeover_intent_missing` / `claim_intent_mismatch` / `multiple_active_intents` / `takeover_identity_mismatch` / `takeover_protocol_corrupt`)を返す。**blocked の間は Broker 照会も Execution 更新も行わない**(attempt は pending のまま人手の判断を待つ)。
 
 処理を継続できる場合は、state history の**構造化 provenance 列 `repair_attempt_id` / `repair_generation`**(reason 文字列の解析はしない)を確認し、既に適用済みなら**元の attempt ID のまま** `applied` へ finalize、未適用なら**新 owner として fresh Broker 再照会 + eligibility 再検証を最初からやり直す**。**「history に無い」だけを根拠に `failed` へ確定することはしない。**
