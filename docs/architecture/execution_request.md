@@ -142,7 +142,9 @@ reconciliation DB の claim を `record_order_result()` のトランザクショ
 
 fencing token は `RepairFenceToken`(attempt id / generation / takeover id / owner / claim execution id)という**1 つの identity オブジェクト**として扱う。reconciliation DB の durable takeover intent がこれを生成し、fence 登録と状態更新の両方が同じオブジェクトを提示する。
 
-`register_repair_fence()` は成功時に **commit した fence 行を読み戻した** `InstalledRepairFence`(order ID + token + 更新時刻)を返す。呼び出し側の引数をそのまま echo するのではなく**この store が実際に保持している値**なので、reconciliation 側はそれを `TakeoverFenceProof` として提示し、intent の identity と attempt 自身の order に一致するかを自分の transaction で検証できる(r5 レビュー)。
+`register_repair_fence()` は成功時に **commit した fence 行を読み戻した** `InstalledRepairFence`(order ID + token + 更新時刻)を返す。呼び出し側の引数をそのまま echo するのではなく**この store が実際に保持している値**なので、生成された瞬間においては真である。ただしこれは **観測値であって権限ではない**: reconciliation 側へ「fence を設置した証明」として持ち回すことはしない(r6 レビュー)。in-memory のオブジェクトを持てる者はそれを捏造することもできるからである。
+
+reconciliation 側が `fence_installed` を記録するときは、`mark_takeover_fence_installed(execution_db_path=...)` が **この store の `get_repair_fence()` を自分で呼び、commit 済み fence 行を read して** intent の identity 6 項目と突き合わせる。行がない・identity が違う・store が読めない場合は遷移せず typed 例外になる。したがって fence に関する信頼の起点は、常にこの store に commit された行そのものである。
 
 `register_repair_fence(token=...)` の規則(すべて単一 `BEGIN IMMEDIATE` 内):
 

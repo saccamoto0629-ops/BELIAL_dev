@@ -116,7 +116,6 @@ from execution.reconciliation_repair_models import (
     COMPLETABLE_TAKEOVER_OUTCOMES,
     TakeoverBlockedReason,
     TakeoverCancelReason,
-    TakeoverFenceProof,
     TakeoverIntentStatus,
 )
 from execution.sqlite_ro import ReadOnlyDbMissingError, connect_read_only
@@ -1502,65 +1501,107 @@ def _require_claim_matches_intent(row: sqlite3.Row, intent: RepairTakeoverIntent
 def mark_takeover_fence_installed(
     intent: RepairTakeoverIntent,
     *,
-    fence_proof: TakeoverFenceProof | None,
+    execution_db_path: Path,
     at_utc: datetime,
     db_path: Path | None = None,
 ) -> RepairTakeoverIntent:
     """Record that the EXECUTION fence carries this intent's identity.
 
-    ``fence_proof`` is what the order store RETURNED after committing the
-    fence (``register_repair_fence`` -> ``InstalledRepairFence``), converted
-    by the service. Inside this transaction it must name exactly this
-    intent's identity AND the attempt's OWN execution order; a proof for
-    another attempt, generation, execution or order is refused. An attempt
-    with no execution order (a broker-only target) has no fence to install
-    and must pass ``None`` -- and conversely, an attempt that HAS an order
-    may not skip the proof.
+    SUBSTANCE CHECK (r6 review Blocker): this function READS THE COMMITTED
+    FENCE ROW from the execution order store itself
+    (:func:`execution_store.get_repair_fence` -- the owning store's own
+    read API, never re-implemented SQL here) and compares the full identity:
 
-    This marker is deliberately not the last line of defence: the following
-    steps verify the REAL claim row, so a forged proof cannot carry an
-    intent past this point.
+        execution_request_id / repair_attempt_id / generation /
+        takeover_id / owner_id / claim_execution_id
+
+    against this intent's target identity AND the attempt's OWN execution
+    order. **No caller-supplied value is accepted as evidence** that a fence
+    exists: a value object built in Python proves nothing about durable
+    state, so there is no ``proof`` parameter at all. ``execution_db_path``
+    is CONFIGURATION (which order store this deployment uses), not
+    evidence -- a caller able to point at a different store could equally
+    well write the real one.
+
+    An attempt with no execution order (a broker-only target) has no fence
+    to install and is accepted without one; an attempt that HAS an order
+    must have the matching row committed.
+
+    TOCTOU: the fence contract is monotonic (a generation never rolls back,
+    a generation is never re-pointed at a different identity of the same
+    attempt, and a finalized fence is never re-armed), so a fence observed
+    at this identity can afterwards only stay as it is or be replaced by a
+    DIFFERENT attempt taking the order over. The latter cannot forge this
+    intent's identity, and the eventual ``record_order_result`` re-verifies
+    the fence inside its own transaction -- so a takeover that races a new
+    attempt loses at the commit, never writes wrongly.
     """
     _require_utc_argument(at_utc, "at_utc")
-    if fence_proof is not None and not isinstance(fence_proof, TakeoverFenceProof):
+    if execution_db_path is None:
         raise ReconciliationStoreError(
-            f"fence_proof must be a TakeoverFenceProof or None, got {fence_proof!r}"
+            "execution_db_path is required: the fence is verified against the execution "
+            "order store's committed row, never against a caller-supplied value"
         )
+    execution_db_path = Path(execution_db_path)
     db_path = _require_existing_db(db_path)
     with _verified_txn(db_path) as connection:
         stored = _verified_intent_row(connection, intent)
         current = TakeoverIntentStatus(stored["status"])
         attempt = _attempt_row_for_intent(connection, intent)
         expected_order = attempt["execution_request_id"]
-        if (fence_proof is None) != (expected_order is None):
-            raise TakeoverProtocolInvariantError(
-                f"repair attempt {intent.repair_attempt_id!r} "
-                + (
-                    f"has execution order {expected_order!r}, so its fence installation "
-                    "must be proved"
-                    if expected_order is not None
-                    else "has no execution order, so there is no fence to prove"
-                )
-            )
-        if fence_proof is not None:
-            expected = TakeoverFenceProof(
-                execution_request_id=expected_order,
-                repair_attempt_id=intent.repair_attempt_id,
-                generation=intent.target_generation,
-                takeover_id=intent.takeover_id,
-                owner_id=intent.target_owner_id,
-                claim_execution_id=intent.target_claim_execution_id,
-            )
-            if fence_proof != expected:
-                raise TakeoverIdentityMismatchError(
-                    f"the fence proof presented for takeover intent "
-                    f"{intent.takeover_id!r} does not name this intent's identity on "
-                    f"execution order {expected_order!r}; the status is not advanced"
-                )
+        if expected_order is not None:
+            _require_committed_fence(intent, expected_order, execution_db_path)
         if current is TakeoverIntentStatus.FENCE_INSTALLED:
             return _restore_intent(stored)  # idempotent retry after a crash
         return _advance_status(
             connection, intent, current, TakeoverIntentStatus.FENCE_INSTALLED, at_utc
+        )
+
+
+def _require_committed_fence(
+    intent: RepairTakeoverIntent, execution_request_id: str, execution_db_path: Path
+) -> None:
+    """The order store must ALREADY hold this intent's identity as its fence.
+
+    Read through the execution store's own read API so this module never
+    duplicates that schema knowledge. A missing row, an unreadable store or
+    any identity difference refuses the transition (the caller's
+    reconciliation transaction rolls back untouched). Raw
+    :class:`sqlite3.Error` is caught alongside the typed store errors: a
+    corrupt order file must become a typed protocol failure here, not a
+    DB-layer exception that the surrounding transaction re-labels as
+    reconciliation schema corruption."""
+    from execution import execution_store  # local: keeps the import graph acyclic
+
+    try:
+        fence = execution_store.get_repair_fence(
+            execution_request_id, db_path=execution_db_path
+        )
+    except (execution_store.ExecutionStoreError, sqlite3.Error) as exc:
+        raise TakeoverProtocolInvariantError(
+            f"the execution order store could not be read to verify the repair fence of "
+            f"{execution_request_id!r} ({type(exc).__name__}); takeover intent "
+            f"{intent.takeover_id!r} is not advanced"
+        ) from exc
+    if fence is None:
+        raise TakeoverProtocolInvariantError(
+            f"execution order {execution_request_id!r} has no committed repair fence; "
+            f"takeover intent {intent.takeover_id!r} may not be marked fence_installed"
+        )
+    expected = {
+        "execution_request_id": execution_request_id,
+        "repair_attempt_id": intent.repair_attempt_id,
+        "generation": intent.target_generation,
+        "takeover_id": intent.takeover_id,
+        "owner_id": intent.target_owner_id,
+        "claim_execution_id": intent.target_claim_execution_id,
+    }
+    mismatched = sorted(column for column, value in expected.items() if fence[column] != value)
+    if mismatched:
+        raise TakeoverIdentityMismatchError(
+            f"the committed repair fence of execution order {execution_request_id!r} does "
+            f"not carry takeover intent {intent.takeover_id!r} (differing: "
+            f"{', '.join(mismatched)}); the intent is not advanced"
         )
 
 
@@ -1823,7 +1864,14 @@ def block_takeover_intent(
 
     Idempotent: an intent already blocked keeps its ORIGINAL reason and
     timestamps (the first diagnosis is the real one) and is returned as
-    stored. A completed intent is never blocked."""
+    stored. A completed intent is never blocked.
+
+    The ``observed_*`` arguments are caller-supplied DIAGNOSTICS, not
+    evidence: they are written verbatim into columns an operator reads and
+    grant no authority whatsoever. Blocking is the fail-closed direction --
+    it stops the protocol and leaves the attempt pending -- so an untrue
+    observation can only ever make a human look, never move a claim, a
+    fence or an order (r6 review cross-check)."""
     if not isinstance(reason, TakeoverBlockedReason):
         raise ReconciliationStoreError(
             f"reason must be a TakeoverBlockedReason, got {reason!r}"

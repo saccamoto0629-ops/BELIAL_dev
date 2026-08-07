@@ -288,53 +288,6 @@ class TakeoverCancelReason(enum.Enum):
     ATTEMPT_FINALIZED_BY_SOURCE_CLAIM = "attempt_finalized_by_source_claim"
 
 
-@dataclass(frozen=True)
-class TakeoverFenceProof:
-    """Evidence that the execution fence carries an intent's identity.
-
-    The reconciliation store cannot read the ORDER store inside its own
-    transaction (separate SQLite files), so ``fence_installed`` is proved by
-    a value the ORDER store RETURNS after committing the fence
-    (``execution_store.register_repair_fence`` ->
-    ``InstalledRepairFence``), converted here by the service. The
-    reconciliation store then verifies -- inside its own transaction -- that
-    the proof names exactly this intent's identity AND the attempt's own
-    execution order, so a proof for another attempt, another generation or
-    another execution is refused.
-
-    This is a marker, not the last line of defence: ``claim_promoted`` and
-    ``completed`` are verified against the REAL attempt row (same DB, same
-    transaction), so a forged proof can never carry an intent past the
-    fence-installed marker.
-    """
-
-    execution_request_id: str
-    repair_attempt_id: str
-    generation: int
-    takeover_id: str
-    owner_id: str
-    claim_execution_id: str
-
-    def __post_init__(self) -> None:
-        for name in (
-            "execution_request_id",
-            "repair_attempt_id",
-            "takeover_id",
-            "owner_id",
-            "claim_execution_id",
-        ):
-            _require_non_empty_str(getattr(self, name), name)
-        if (
-            isinstance(self.generation, bool)
-            or not isinstance(self.generation, int)
-            or self.generation < 2
-        ):
-            raise ValueError(
-                f"generation must be an int >= 2 (a takeover generation), got "
-                f"{self.generation!r}"
-            )
-
-
 class TakeoverBlockedReason(enum.Enum):
     """Why a takeover was parked for a human -- CLOSED set (r4 review).
 

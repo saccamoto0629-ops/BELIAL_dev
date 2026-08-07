@@ -67,7 +67,6 @@ from execution.reconciliation_repair_models import (
     RepairOutcome,
     TakeoverBlockedReason,
     TakeoverCancelReason,
-    TakeoverFenceProof,
     TakeoverIntentStatus,
 )
 
@@ -2443,22 +2442,13 @@ def test_store_api_cannot_walk_an_intent_forward_without_the_real_work(paths, mo
             at_utc=RESTART_AT,
             db_path=reconciliation_db,
         )
-    # fence_installed without a proof, or with a FOREIGN proof
+    # fence_installed while the order carries NO committed fence at all
     with pytest.raises(reconciliation_store.TakeoverProtocolInvariantError):
         reconciliation_store.mark_takeover_fence_installed(
-            intent, fence_proof=None, at_utc=RESTART_AT, db_path=reconciliation_db
-        )
-    forged = TakeoverFenceProof(
-        execution_request_id="exec-70",
-        repair_attempt_id="crash-1",
-        generation=intent.target_generation,
-        takeover_id="tk-forged",
-        owner_id=intent.target_owner_id,
-        claim_execution_id=intent.target_claim_execution_id,
-    )
-    with pytest.raises(reconciliation_store.TakeoverIdentityMismatchError):
-        reconciliation_store.mark_takeover_fence_installed(
-            intent, fence_proof=forged, at_utc=RESTART_AT, db_path=reconciliation_db
+            intent,
+            execution_db_path=execution_db,
+            at_utc=RESTART_AT,
+            db_path=reconciliation_db,
         )
 
     # nothing moved: the intent, the claim and the order are untouched
@@ -2967,12 +2957,223 @@ def test_leaked_adapter_exception_text_never_reaches_logs_or_audit(paths, caplog
     assert "RuntimeError" in emitted  # the class name IS logged
 
 
+# --- r6 review: the fence_installed marker reads the COMMITTED row -----------
+#
+# The Blocker: the marker used to accept a caller-built ``TakeoverFenceProof``.
+# A caller could hand over a proof matching the intent perfectly, walk the
+# intent to fence_installed and promote the claim to generation 2 while the
+# EXECUTION fence still sat at generation 1 -- the two stores disagreeing
+# about who owns the order is exactly the split identity the fence exists to
+# prevent. The parameter is gone; the store re-reads the order store's own
+# committed row instead.
+
+
+def test_a_crash_between_the_fence_commit_and_its_marker_resumes_on_the_real_row(
+    paths, monkeypatch
+):
+    """Kill the worker AFTER the fence is committed but BEFORE the marker.
+    The restart has no in-memory proof left -- it can only re-read the row
+    the dead worker committed, and that is enough to resume the SAME
+    takeover to a normal applied repair."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-80", "run-80", monkeypatch)
+    crash_after(monkeypatch, "mark_takeover_fence_installed", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+
+    intent = intent_of(reconciliation_db)
+    assert intent.status is TakeoverIntentStatus.PREPARED  # the marker never ran
+    fence = execution_store.get_repair_fence("exec-80", db_path=execution_db)
+    assert fence["takeover_id"] == intent.takeover_id  # but the fence IS committed
+    assert fence["generation"] == intent.target_generation
+
+    restarted = repair_service(
+        QueryOnlyBroker(broker), paths, prefix="restart", owner="worker-restarted",
+        clock=lambda: RESTART_AT,
+    ).recover_pending_attempts()
+
+    entry = only(restarted)
+    assert entry.outcome is RepairOutcome.APPLIED
+    assert entry.takeover_id == intent.takeover_id  # the SAME takeover, not a new one
+    assert intent_of(reconciliation_db).status is TakeoverIntentStatus.COMPLETED
+    assert order_state(execution_db, "exec-80")[0] == "filled"
+    assert pending(reconciliation_db) == ()
+
+
+def test_a_fence_replaced_between_install_and_marker_blocks_instead_of_marking(
+    paths, monkeypatch
+):
+    """The window a caller-supplied proof could never see: the install
+    SUCCEEDS, then another attempt takes the order over before the marker
+    reads it. An in-memory proof would still say "installed"; re-reading the
+    committed row sees the truth and parks the takeover."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-81", "run-81", monkeypatch)
+    import execution.broker_reconciliation_repair as repair_module
+
+    real_register = execution_store.register_repair_fence
+
+    def register_then_lose_the_order(*args, **kwargs):
+        installed = real_register(*args, **kwargs)
+        force_fence(  # a DIFFERENT attempt takes the order over right here
+            execution_db,
+            "exec-81",
+            attempt_id="attempt-newer",
+            generation=1,
+            takeover=None,
+            claim="claim-newer",
+        )
+        return installed
+
+    monkeypatch.setattr(
+        repair_module.execution_store, "register_repair_fence", register_then_lose_the_order
+    )
+
+    recovery_broker = QueryOnlyBroker(broker)
+    recovered = recovery_service(recovery_broker, paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.FENCE_INTENT_MISMATCH
+    assert recovery_broker.query_count == 0  # never queried under a foreign fence
+    assert order_state(execution_db, "exec-81")[0] == "unknown"  # and never written
+
+    intent = only(blocked_intents(reconciliation_db, "crash-1"))
+    assert intent.blocked_reason is TakeoverBlockedReason.FENCE_IDENTITY_MISMATCH
+    assert only(pending(reconciliation_db)).generation == 1  # the claim never moved
+
+
+def test_a_fence_that_ran_ahead_between_install_and_marker_blocks_as_ahead(
+    paths, monkeypatch
+):
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-82", "run-82", monkeypatch)
+    import execution.broker_reconciliation_repair as repair_module
+
+    real_register = execution_store.register_repair_fence
+
+    def register_then_run_ahead(*args, **kwargs):
+        installed = real_register(*args, **kwargs)
+        force_fence(
+            execution_db,
+            "exec-82",
+            attempt_id="crash-1",
+            generation=5,
+            takeover="tk-far-ahead",
+            claim="claim-far-ahead",
+        )
+        return installed
+
+    monkeypatch.setattr(
+        repair_module.execution_store, "register_repair_fence", register_then_run_ahead
+    )
+
+    recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.FENCE_AHEAD
+    assert only(blocked_intents(reconciliation_db, "crash-1")).blocked_reason is (
+        TakeoverBlockedReason.FENCE_AHEAD
+    )
+    assert only(pending(reconciliation_db)).generation == 1
+
+
+def test_an_unreadable_order_store_parks_the_takeover_instead_of_marking_it(
+    paths, monkeypatch
+):
+    """A fence that cannot be READ is not a fence that is INSTALLED."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-83", "run-83", monkeypatch)
+    import execution.broker_reconciliation_repair as repair_module
+
+    real_register = execution_store.register_repair_fence
+
+    def register_then_corrupt(*args, **kwargs):
+        installed = real_register(*args, **kwargs)
+        execution_db.write_bytes(b"this is not a database")
+        return installed
+
+    monkeypatch.setattr(
+        repair_module.execution_store, "register_repair_fence", register_then_corrupt
+    )
+
+    recovered = recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+
+    entry = only(recovered)
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code is RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT
+    assert only(pending(reconciliation_db)).generation == 1
+
+
+def test_ten_restarts_over_a_foreign_fence_keep_reporting_the_same_blocked(
+    paths, monkeypatch
+):
+    """No silent empty tuple, no growing pile of intents: the same durable
+    diagnosis is reported on every restart."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-84", "run-84", monkeypatch)
+    force_fence(
+        execution_db,
+        "exec-84",
+        attempt_id="crash-1",
+        generation=4,
+        takeover="tk-nobody-knows",
+        claim="claim-nobody-knows",
+    )
+    before = execution_db.read_bytes()
+
+    for run in range(10):
+        entry = only(
+            repair_service(
+                QueryOnlyBroker(broker),
+                paths,
+                prefix=f"restart-{run}",
+                owner=f"worker-{run}",
+                clock=lambda: RESTART_AT,
+            ).recover_pending_attempts()
+        )
+        assert entry.outcome is RepairOutcome.BLOCKED
+        assert entry.failure_code is RepairFailureCode.FENCE_AHEAD
+
+    assert len(
+        reconciliation_store.list_takeover_intents(
+            attempt_id="crash-1", db_path=reconciliation_db
+        )
+    ) == 1
+    assert only(pending(reconciliation_db)).generation == 1
+    assert execution_db.read_bytes() == before
+
+
+def test_the_repair_module_hands_no_fence_evidence_to_the_reconciliation_store():
+    """Structural: the service may not reintroduce a proof-like argument.
+
+    ``mark_takeover_fence_installed`` takes the order store's PATH (which
+    store to read) and never a value describing what is in it."""
+    import inspect
+
+    signature = inspect.signature(reconciliation_store.mark_takeover_fence_installed)
+    assert set(signature.parameters) == {
+        "intent",
+        "execution_db_path",
+        "at_utc",
+        "db_path",
+    }
+    source = (REPO_ROOT / "execution" / "broker_reconciliation_repair.py").read_text(
+        encoding="utf-8"
+    )
+    assert "TakeoverFenceProof" not in source
+    assert "fence_proof" not in source
+
+
 @pytest.mark.parametrize(
     "name",
     [
         "create_takeover_intent",
         "get_active_takeover_intent",
         "register_repair_fence",
+        "get_repair_fence",
         "promote_repair_claim",
         "mark_takeover_fence_installed",
         "mark_takeover_claim_promoted",

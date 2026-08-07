@@ -450,9 +450,13 @@ class InstalledRepairFence:
     own transaction (Issue #104 re-review r5).
 
     Returning the stored row (rather than echoing the caller's arguments)
-    makes the reconciliation side's ``fence_installed`` marker provable
-    against something the ORDER store actually holds. It carries the order
-    the fence belongs to plus the exact identity that owns it."""
+    is what makes this value TRUE at the moment it is produced. It is still
+    only an OBSERVATION for logging and tests: it is never passed on as
+    authorization. The reconciliation side proves ``fence_installed`` by
+    re-reading this store's committed row itself inside its own transaction
+    (r6 review) -- an in-memory object cannot stand in for durable state,
+    because whoever holds the object could equally well have fabricated
+    it."""
 
     execution_request_id: str
     token: RepairFenceToken
@@ -2014,6 +2018,12 @@ def record_order_result(
       The partial UNIQUE index additionally lets one attempt commit at most
       one history row DB-wide, and recovery attributes an applied repair by
       the history's provenance columns -- never by parsing the reason string.
+
+      The token is an ASSERTION the caller must satisfy, never evidence it
+      supplies: it can only ever narrow what this call may write, since the
+      value it is checked against is the committed fence row read here (r6
+      review). No caller-supplied object anywhere in the repair protocol is
+      accepted as proof that a durable write happened.
     """
     if not isinstance(result, OrderResult):
         raise ValueError(f"result must be an OrderResult, got {result!r}")

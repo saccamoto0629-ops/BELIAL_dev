@@ -142,6 +142,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -184,7 +185,6 @@ from execution.reconciliation_repair_models import (
     RepairTakeoverIntent,
     TakeoverBlockedReason,
     TakeoverCancelReason,
-    TakeoverFenceProof,
     TakeoverIntentStatus,
 )
 from execution.reconciliation_store import (
@@ -192,6 +192,7 @@ from execution.reconciliation_store import (
     ReconciliationStoreError,
     RepairAttemptConflictError,
     RepairClaimLostError,
+    TakeoverIdentityMismatchError,
     TakeoverIntentConflictError,
     TakeoverIntentStateError,
     TakeoverProtocolInvariantError,
@@ -403,9 +404,6 @@ class BrokerOrderReconciliationRepairService:
         self._lease_duration = timedelta(seconds=lease_duration_seconds)
         self._clock = clock
         self._attempt_id_factory = attempt_id_factory or _default_attempt_id
-        # the proof returned by the LAST successful fence installation of
-        # this pass (see _install_fence); never read across attempts
-        self._last_fence_proof: TakeoverFenceProof | None = None
 
     # --- public API ---------------------------------------------------------
 
@@ -755,12 +753,10 @@ class BrokerOrderReconciliationRepairService:
             problem = self._install_fence(reservation, intent, now)
             if problem is not None:
                 return self._block_intent(reservation, intent, now, *problem)
-            intent = mark_takeover_fence_installed(
-                intent,
-                fence_proof=self._last_fence_proof,
-                at_utc=now,
-                db_path=self._reconciliation_db_path,
-            )
+            marked = self._mark_fence_installed(reservation, intent, now)
+            if isinstance(marked, tuple):
+                return self._block_intent(reservation, intent, now, *marked)
+            intent = marked
         elif intent.status is TakeoverIntentStatus.FENCE_INSTALLED:
             # re-assert the SAME token (idempotent) so a crash between the
             # fence commit and the status update cannot leave them apart
@@ -846,31 +842,23 @@ class BrokerOrderReconciliationRepairService:
     ) -> tuple[TakeoverBlockedReason, str] | None:
         """Step 2: install the intent's identity as the order's fence.
 
-        On success the PROOF the order store returned (the committed fence
-        row, not this caller's arguments) is kept for the status update --
-        the reconciliation store verifies it against the intent and against
-        the attempt's own execution order. Returns None on success
-        (including the idempotent retry of an identical token) or the
-        (reason, detail) of a blocking mismatch. A broker-only target has no
-        order to fence -- the claim promotion alone carries the takeover."""
-        self._last_fence_proof = None
+        This step only WRITES; it produces no evidence for the status
+        update. Whether the fence really carries this intent's identity is
+        decided later by ``mark_takeover_fence_installed``, which re-reads
+        the COMMITTED fence row from the order store itself (r6 review).
+        Returns None on success (including the idempotent retry of an
+        identical token) or the (reason, detail) of a blocking mismatch. A
+        broker-only target has no order to fence -- the claim promotion
+        alone carries the takeover."""
         if reservation.execution_request_id is None:
             return None
         token = _Claim.from_intent(intent).fence_token(reservation.attempt_id)
         try:
-            installed = execution_store.register_repair_fence(
+            execution_store.register_repair_fence(
                 reservation.execution_request_id,
                 token=token,
                 registered_at_utc=now,
                 db_path=self._execution_db_path,
-            )
-            self._last_fence_proof = TakeoverFenceProof(
-                execution_request_id=installed.execution_request_id,
-                repair_attempt_id=installed.token.repair_attempt_id,
-                generation=installed.token.generation,
-                takeover_id=installed.token.takeover_id,
-                owner_id=installed.token.owner_id,
-                claim_execution_id=installed.token.claim_execution_id,
             )
             return None
         except ExecutionRepairFenceConflictError:
@@ -898,6 +886,55 @@ class BrokerOrderReconciliationRepairService:
                     "the execution store could not be asked about this order's repair "
                     f"fence ({type(exc).__name__}); the takeover is parked instead of "
                     "proceeding blind"
+                ),
+            )
+
+    def _mark_fence_installed(
+        self,
+        reservation: RepairAttemptReservation,
+        intent: RepairTakeoverIntent,
+        now: datetime,
+    ) -> RepairTakeoverIntent | tuple[TakeoverBlockedReason, str]:
+        """Step 3: record that the fence really carries this identity.
+
+        The service hands over NO evidence: the reconciliation store opens
+        its own transaction and reads the COMMITTED fence row from the
+        execution order store, so a service bug (or any other caller) cannot
+        talk the intent into ``fence_installed`` (r6 review). A mismatch is
+        not a crash but a parked takeover, so an operator sees the
+        inconsistency instead of a traceback.
+        """
+        try:
+            return mark_takeover_fence_installed(
+                intent,
+                execution_db_path=self._execution_db_path,
+                at_utc=now,
+                db_path=self._reconciliation_db_path,
+            )
+        except TakeoverIdentityMismatchError:
+            order_id = reservation.execution_request_id
+            fence = None if order_id is None else self._read_fence(order_id)
+            observed = "absent or unreadable" if fence is None else _describe_fence(fence)
+            reason = (
+                TakeoverBlockedReason.FENCE_AHEAD
+                if fence is not None and fence["generation"] > intent.target_generation
+                else TakeoverBlockedReason.FENCE_IDENTITY_MISMATCH
+            )
+            return (
+                reason,
+                (
+                    "the order's committed repair fence does not carry this takeover "
+                    f"identity (intent {intent.takeover_id} targets generation "
+                    f"{intent.target_generation}; the fence is {observed})"
+                ),
+            )
+        except TakeoverProtocolInvariantError as exc:
+            return (
+                TakeoverBlockedReason.PROTOCOL_CORRUPT,
+                (
+                    "the order's committed repair fence could not be confirmed for "
+                    f"this takeover ({type(exc).__name__}); the intent stays at "
+                    "prepared instead of claiming a fence it cannot see"
                 ),
             )
 
@@ -950,11 +987,17 @@ class BrokerOrderReconciliationRepairService:
         )
 
     def _read_fence(self, execution_request_id: str) -> dict | None:
+        """The order's committed fence, or None when it cannot be read.
+
+        Used only to DESCRIBE an inconsistency in a blocked report, so an
+        unreadable store degrades to "unknown" instead of raising. Raw
+        ``sqlite3.Error`` is caught too: a corrupt order file must not turn
+        a typed blocked report into a DB-layer traceback."""
         try:
             return execution_store.get_repair_fence(
                 execution_request_id, db_path=self._execution_db_path
             )
-        except ExecutionStoreError:
+        except (ExecutionStoreError, sqlite3.Error):
             return None
 
     # --- blocked reporting --------------------------------------------------

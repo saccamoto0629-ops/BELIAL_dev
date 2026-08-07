@@ -4,16 +4,25 @@ All DBs live under pytest's tmp_path. No network, no Discord, no S3, no
 sleep, no real orders anywhere in this suite.
 """
 
+import dataclasses
+import pathlib
 import sqlite3
 import threading
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from broker.broker_models import BrokerErrorCode, OrderState
-from execution import reconciliation_store as store
+from broker.broker_models import (
+    BrokerErrorCode,
+    OrderSide,
+    OrderState,
+    OrderType,
+)
+from execution import execution_store, reconciliation_store as store
+from execution.execution_models import ExecutionRequest
 from execution.reconciliation_models import (
     DiscrepancyType,
     OrderDiscrepancy,
@@ -510,7 +519,6 @@ from execution.reconciliation_repair_models import (  # noqa: E402
     RepairTakeoverIntent,
     TakeoverBlockedReason,
     TakeoverCancelReason,
-    TakeoverFenceProof,
     TakeoverIntentStatus,
 )
 
@@ -800,25 +808,80 @@ def prepared(path, intent=None, *, observed=None):
     )
 
 
-def fence_proof(intent=None, *, execution_request_id="exec-1", **overrides):
+def execution_db(tmp_path, *, request_id="exec-1"):
+    """A REAL execution order store holding one order (no fence yet).
+
+    ``mark_takeover_fence_installed`` reads the committed fence row out of
+    this store, so these tests must own a genuine one -- a stub would test
+    the stub, not the trust boundary (r6 review).
+    """
+    path = pathlib.Path(tmp_path) / "execution_orders.sqlite3"
+    if execution_store.get_execution_order(request_id, db_path=path) is not None:
+        return path  # idempotent: several helpers may ask for the same store
+    execution_store.create_execution_order(
+        ExecutionRequest(
+            execution_request_id=request_id,
+            signal_id=f"sig-{request_id}",
+            strategy_id="strat-1",
+            symbol="XAUUSD",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("1"),
+            requested_at_utc=at(0),
+        ),
+        client_order_id=f"client-{request_id}",
+        created_at_utc=at(0),
+        db_path=path,
+    )
+    return path
+
+
+def install_fence(exec_path, intent=None, *, request_id="exec-1", **overrides):
+    """Commit a real fence row for ``intent``'s identity (or a variant)."""
     intent = intent or sample_intent()
     kwargs = dict(
-        execution_request_id=execution_request_id,
         repair_attempt_id=intent.repair_attempt_id,
         generation=intent.target_generation,
-        takeover_id=intent.takeover_id,
         owner_id=intent.target_owner_id,
         claim_execution_id=intent.target_claim_execution_id,
+        takeover_id=intent.takeover_id,
     )
     kwargs.update(overrides)
-    return TakeoverFenceProof(**kwargs)
+    return execution_store.register_repair_fence(
+        request_id,
+        token=execution_store.RepairFenceToken(**kwargs),
+        registered_at_utc=at(1300),
+        db_path=exec_path,
+    )
 
 
-def fence_installed(path, intent=None, *, at_utc=None, proof=None):
+def fenced_db(tmp_path, intent=None, **overrides):
+    """An execution store whose committed fence already carries the intent."""
+    path = execution_db(tmp_path)
+    install_fence(path, intent, **overrides)
+    return path
+
+
+def fenced_for(path, intent):
+    """The execution store next to ``path``, fenced at ``intent``'s identity.
+
+    Created on demand so the many intent-lifecycle tests below keep reading
+    like reconciliation-store tests, while the fence they rely on is a real
+    committed row rather than an assertion.
+    """
+    exec_path = pathlib.Path(path).parent / "execution_orders.sqlite3"
+    if not exec_path.exists():
+        execution_db(pathlib.Path(path).parent)
+    if execution_store.get_repair_fence("exec-1", db_path=exec_path) is None:
+        install_fence(exec_path, intent)
+    return exec_path
+
+
+def fence_installed(path, intent=None, *, at_utc=None, execution_db_path=None):
     intent = intent or sample_intent()
     return store.mark_takeover_fence_installed(
         intent,
-        fence_proof=proof if proof is not None else fence_proof(intent),
+        execution_db_path=execution_db_path or fenced_for(path, intent),
         at_utc=at_utc or at(1301),
         db_path=path,
     )
@@ -1052,10 +1115,12 @@ def test_a_transition_by_a_foreign_identity_is_refused(tmp_path):
         {"repair_attempt_id": "attempt-other"},
     ):
         foreign = sample_intent(**override)
+        # the execution store is never even opened: the intent identity is
+        # checked first, so a path that does not exist is enough here
         with pytest.raises(store.TakeoverIntentStateError, match="does not match"):
             store.mark_takeover_fence_installed(
                 foreign,
-                fence_proof=fence_proof(foreign),
+                execution_db_path=tmp_path / "never-opened.sqlite3",
                 at_utc=at(1301),
                 db_path=path,
             )
@@ -1067,7 +1132,10 @@ def test_a_transition_on_an_unknown_intent_is_refused(tmp_path):
     ghost = sample_intent(takeover_id="tk-ghost")
     with pytest.raises(store.TakeoverIntentStateError, match="not recorded"):
         store.mark_takeover_fence_installed(
-            ghost, fence_proof=fence_proof(ghost), at_utc=at(1301), db_path=path
+            ghost,
+            execution_db_path=tmp_path / "never-opened.sqlite3",
+            at_utc=at(1301),
+            db_path=path,
         )
 
 
@@ -1307,6 +1375,195 @@ def test_intent_reads_return_defaults_for_a_missing_db(tmp_path):
     assert store.get_active_takeover_intent("attempt-1", db_path=missing) is None
     assert store.list_takeover_intents(db_path=missing) == ()
     assert not missing.exists()
+
+
+# --- r6 review: fence_installed is proved by the COMMITTED fence row ----------
+#
+# The Blocker: the transition used to trust a caller-supplied
+# ``TakeoverFenceProof``. Anyone holding the store API could build a value
+# object matching the intent exactly and walk the intent to
+# ``fence_installed`` (and from there to a promoted generation-2 claim)
+# while the execution fence still sat at generation 1 -- a split identity.
+# The parameter is gone; these tests pin that the ONLY thing that can move
+# the status is a row committed in the execution order store.
+
+
+@dataclasses.dataclass(frozen=True)
+class PerfectFakeFenceProof:
+    """A field-for-field correct forgery of the deleted proof object.
+
+    Every value matches the intent exactly -- which is precisely why a value
+    object can never be evidence: matching the intent is trivial for anyone
+    holding the intent."""
+
+    execution_request_id: str
+    repair_attempt_id: str
+    generation: int
+    takeover_id: str
+    owner_id: str
+    claim_execution_id: str
+
+
+def perfect_fake(intent):
+    return PerfectFakeFenceProof(
+        execution_request_id="exec-1",
+        repair_attempt_id=intent.repair_attempt_id,
+        generation=intent.target_generation,
+        takeover_id=intent.takeover_id,
+        owner_id=intent.target_owner_id,
+        claim_execution_id=intent.target_claim_execution_id,
+    )
+
+
+def test_no_evidence_argument_exists_to_forge(tmp_path):
+    """The trust boundary is closed by REMOVAL: there is no parameter that
+    accepts a claim about the fence, so a field-perfect forgery has nowhere
+    to go. Every plausible spelling is a TypeError, not a slow path."""
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    fake = perfect_fake(intent)
+    for keyword in ("fence_proof", "proof", "installed_fence", "fence", "evidence"):
+        with pytest.raises(TypeError):
+            store.mark_takeover_fence_installed(
+                intent,
+                **{keyword: fake},
+                execution_db_path=execution_db(tmp_path),
+                at_utc=at(1301),
+                db_path=path,
+            )
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+    assert intent.status is TakeoverIntentStatus.PREPARED
+
+
+def test_a_field_perfect_forgery_cannot_stand_in_for_a_missing_fence(tmp_path):
+    """The forgery is CORRECT about the intent and WRONG about the world:
+    the order store holds no fence at all, so the transition is refused."""
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    exec_path = execution_db(tmp_path)
+    assert perfect_fake(intent).takeover_id == intent.takeover_id  # a flawless forgery
+    assert execution_store.get_repair_fence("exec-1", db_path=exec_path) is None
+    with pytest.raises(store.TakeoverProtocolInvariantError, match="no committed repair fence"):
+        fence_installed(path, intent, execution_db_path=exec_path)
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+    assert only_pending(path).generation == 1  # and the claim never moves
+
+
+def test_a_missing_execution_store_never_advances_the_intent(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    with pytest.raises(store.TakeoverProtocolInvariantError):
+        fence_installed(path, intent, execution_db_path=tmp_path / "absent.sqlite3")
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+
+
+def test_an_unreadable_execution_store_never_advances_the_intent(tmp_path):
+    """A corrupt order store is a reason to STOP, not to assume a fence."""
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    broken = tmp_path / "broken.sqlite3"
+    broken.write_bytes(b"not a database at all")
+    with pytest.raises(store.TakeoverProtocolInvariantError):
+        fence_installed(path, intent, execution_db_path=broken)
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+
+
+@pytest.mark.parametrize(
+    "override,column",
+    [
+        ({"repair_attempt_id": "attempt-other"}, "repair_attempt_id"),
+        ({"generation": 3}, "generation"),
+        ({"takeover_id": "tk-other"}, "takeover_id"),
+        ({"owner_id": "owner-other"}, "owner_id"),
+        ({"claim_execution_id": "claim-other"}, "claim_execution_id"),
+    ],
+    ids=["attempt", "generation", "takeover", "owner", "claim-execution"],
+)
+def test_every_identity_column_of_the_committed_fence_is_compared(
+    tmp_path, override, column
+):
+    """One differing column is enough: the fence belongs to somebody else."""
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    exec_path = fenced_db(tmp_path, intent, **override)
+    with pytest.raises(store.TakeoverIdentityMismatchError, match=column):
+        fence_installed(path, intent, execution_db_path=exec_path)
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+    assert only_pending(path).generation == 1
+
+
+def test_a_fence_still_at_the_source_generation_never_advances_the_intent(tmp_path):
+    """The pre-takeover fence (generation 1, the claim being replaced) is a
+    perfectly valid row -- for somebody else."""
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    exec_path = execution_db(tmp_path)
+    install_fence(
+        exec_path,
+        intent,
+        generation=intent.source_generation,
+        owner_id=intent.source_owner_id,
+        claim_execution_id=intent.source_claim_execution_id,
+        takeover_id=None,
+    )
+    with pytest.raises(store.TakeoverIdentityMismatchError, match="generation"):
+        fence_installed(path, intent, execution_db_path=exec_path)
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+
+
+def test_a_fence_of_another_order_is_not_this_attempts_fence(tmp_path):
+    """The order to look at comes from the ATTEMPT ROW, never from the
+    caller: a fence installed on a different order proves nothing."""
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    exec_path = execution_db(tmp_path)
+    execution_store.create_execution_order(
+        ExecutionRequest(
+            execution_request_id="exec-elsewhere",
+            signal_id="sig-elsewhere",
+            strategy_id="strat-1",
+            symbol="XAUUSD",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("1"),
+            requested_at_utc=at(0),
+        ),
+        client_order_id="client-elsewhere",
+        created_at_utc=at(0),
+        db_path=exec_path,
+    )
+    install_fence(exec_path, intent, request_id="exec-elsewhere")
+    with pytest.raises(store.TakeoverProtocolInvariantError, match="no committed repair fence"):
+        fence_installed(path, intent, execution_db_path=exec_path)
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == intent
+
+
+def test_marking_fence_installed_is_idempotent_over_many_retries(tmp_path):
+    path = reserved_db(tmp_path)
+    intent = prepared(path)
+    exec_path = fenced_db(tmp_path, intent)
+    first = fence_installed(path, intent, execution_db_path=exec_path)
+    for _ in range(10):
+        assert fence_installed(path, intent, execution_db_path=exec_path) == first
+    assert first.status is TakeoverIntentStatus.FENCE_INSTALLED
+    assert store.get_active_takeover_intent("attempt-1", db_path=path) == first
+
+
+def test_a_broker_only_attempt_has_no_fence_to_prove(tmp_path):
+    """No execution order -> no fence exists to read; the claim promotion
+    alone carries the takeover, so the transition is allowed WITHOUT one."""
+    path = reserved_db(
+        tmp_path,
+        target_type=ReconciliationTargetType.BROKER_ORDER,
+        target_id="client-9",
+        client_order_id="client-9",
+        execution_request_id=None,
+        internal_revision=None,
+        reconciliation_internal_state=None,
+    )
+    intent = prepared(path)
+    marked = fence_installed(path, intent, execution_db_path=execution_db(tmp_path))
+    assert marked.status is TakeoverIntentStatus.FENCE_INSTALLED
 
 
 # --- v1 -> v2 migration (Issue #104) ------------------------------------------

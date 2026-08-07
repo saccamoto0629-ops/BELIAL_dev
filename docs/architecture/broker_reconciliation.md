@@ -183,7 +183,7 @@ prepared → fence_installed → claim_promoted → completed
 
 | API | 遷移先 | 同一 transaction 内で検証する実体 |
 |---|---|---|
-| `mark_takeover_fence_installed(fence_proof=...)` | `fence_installed` | Execution store が **commit 済み fence を読み戻して返した** `InstalledRepairFence` 由来の proof が、この intent の identity 5 要素**かつ attempt 自身の execution order** を指すこと(order を持たない broker-only target は proof なしが必須。逆に order を持つ attempt は proof を省略できない) |
+| `mark_takeover_fence_installed(execution_db_path=...)` | `fence_installed` | **Execution DB の commit 済み fence 行を、この API 自身が読む**(`execution_store.get_repair_fence()`)。読んだ行の `execution_request_id` / `repair_attempt_id` / `generation` / `takeover_id` / `owner_id` / `claim_execution_id` が、intent の target identity **かつ attempt 行自身の execution order** と完全一致すること。呼び出し側から evidence を受け取る引数は存在しない(r6 レビュー) |
 | `mark_takeover_claim_promoted()` | `claim_promoted` | repair attempt が **pending** で、`generation` / `takeover_id` / `owner_id` / `claim_execution_id` がすべて intent の target identity と一致すること |
 | `complete_takeover_intent()` | `completed` | repair attempt が **finalized** で、`outcome` と `finalized_at_utc` を持ち、outcome が `COMPLETABLE_TAKEOVER_OUTCOMES`(`would_apply` と `blocked` 以外の全 outcome)に属し、identity 4 要素が一致すること |
 | `cancel_takeover_intent(reason=...)` | `cancelled` | repair attempt が **置換対象の source claim** で finalize されていること(この intent の identity で finalize されていたら cancel ではない) |
@@ -193,12 +193,58 @@ prepared → fence_installed → claim_promoted → completed
 
 typed 例外: `TakeoverProtocolInvariantError`(基底)/ `TakeoverClaimNotPromotedError` / `TakeoverIdentityMismatchError`。
 
+### 呼び出し側が渡す値は「権限」ではない(再レビュー r6)
+
+r5 まで `fence_installed` への遷移は、呼び出し側が組み立てた `TakeoverFenceProof`(ただの frozen dataclass)を「fence 設置の証明」として信用していた。intent を持っている者なら intent と完全一致する proof を作るのは自明であり、これは
+
+- `prepared → fence_installed` を通し、
+- そのまま claim を generation 2 へ promotion させ、
+- しかし Execution fence は generation 1 のまま
+
+という **identity 分裂**(2 つの store が「誰が order を持っているか」で食い違う)を許した。fence はまさにこれを防ぐために存在するので、Blocker である。
+
+**修正の方針は「検証の強化」ではなく「trust boundary からの削除」**である。proof を渡す引数そのものを廃止し(`TakeoverFenceProof` は削除)、遷移 API が **source of truth である Execution DB の永続 fence 行を自分で read** する。`execution_db_path` は「どの order store を見るか」という **configuration** であって evidence ではない(別の store を指せる呼び出し側は、そもそも本物の store に書ける)。
+
+API 内部の順序:
+
+1. Reconciliation DB の transaction を開始する
+2. intent 行を read し、caller が渡した intent と identity が一致することを確認する(`_verified_intent_row`)
+3. attempt 行を read し、**その行の** `execution_request_id` を得る(caller が指定した order ではない)
+4. `execution_store.get_repair_fence()` で **commit 済み fence 行**を read する(SQL を再実装しない)
+5. fence 行と intent target identity を 6 項目で完全比較する
+6. 一致したときだけ `fence_installed` へ遷移する
+7. 不一致・行なし・store が読めない場合は status を動かさず rollback し、typed 例外を返す
+
+| 観測した状態 | 結果 |
+|---|---|
+| fence 行なし(未設置 / 別 order にしかない) | `TakeoverProtocolInvariantError` → service は `takeover_protocol_corrupt` で BLOCKED |
+| identity のいずれか 1 項目が不一致(古い generation・別 takeover・別 owner・別 claim・別 attempt を含む) | `TakeoverIdentityMismatchError`(差分列名を列挙)→ `fence_intent_mismatch` で BLOCKED |
+| fence が intent より先の generation | 同上 → `fence_ahead` で BLOCKED |
+| order store が壊れている / 読めない(`sqlite3.Error` を含む) | `TakeoverProtocolInvariantError` → `takeover_protocol_corrupt` で BLOCKED |
+| attempt が execution order を持たない(broker-only) | fence は存在し得ないので fence なしで遷移可 |
+| すでに `fence_installed` | 実体を再確認したうえで冪等に return(crash 後の再試行) |
+
+TOCTOU について: fence contract は単調である(generation は巻き戻らない / 同一 generation が別 identity へ張り替えられることはない / finalize 済み fence は再武装されない)。したがって「この identity の fence を観測した」あとに起こり得るのは **そのまま維持されるか、別の attempt が order を奪うか**のどちらかだけで、この intent の identity を後から偽造することはできない。さらに最終的な `record_order_result()` が **自分の transaction 内で** fence を再検証するため、新しい attempt と競合した takeover は commit で敗北する(誤った書き込みにはならない)。read と遷移が同一 reconciliation transaction 内にあることで、read 後に intent 側の status だけが横取りされることもない。
+
+同じ観点で protocol 全体を横断確認した結果:
+
+| 呼び出し側が渡す値 | 扱い |
+|---|---|
+| `TakeoverFenceProof` | **削除**(唯一「durable write の証明」として信用されていた値) |
+| `RepairFenceToken`(`record_order_result` / `register_repair_fence`) | evidence ではなく **assertion**。同一 transaction 内で commit 済み fence 行と突き合わせ、書ける範囲を狭めるだけ |
+| `InstalledRepairFence`(`register_repair_fence` の戻り値) | commit 済み行の **観測値**。log / test 用であり、権限として持ち回さない |
+| `RepairTakeoverIntent`(全 intent API の第 1 引数) | lookup key + identity 主張。必ず stored 行と突き合わせる |
+| `OrderRepairAttempt`(`finalize_repair_attempt`) | reservation 行の identity 列 + claim 4 要素と突き合わせる |
+| `block_*` の `observed_*` | 人間が読む **診断値**のみ。blocked は fail-closed 方向なので claim / fence / order を動かさない |
+| `observed_at_utc` / `at_utc`(clock) | 入力であって durable fact の証明ではない。早すぎる takeover は fence と CAS で敗北するだけで、誤った書き込みにはならない |
+
+
 ### cross-DB protocol(8 段階・各段階から restart 可能)
 
 ```text
 1. reconciliation DB : intent を prepared で durable commit
 2. execution DB      : その identity を fence として install(同一 token は冪等)
-3. reconciliation DB : intent → fence_installed
+3. reconciliation DB : intent → fence_installed(このとき Execution DB の fence 行を read して検証)
 4. reconciliation DB : claim を intent の identity へ promotion(CAS・冪等)
 5. reconciliation DB : intent → claim_promoted
 6. 処理              : Broker 再照会 + eligibility + fencing された Execution 更新
@@ -207,6 +253,8 @@ typed 例外: `TakeoverProtocolInvariantError`(基底)/ `TakeoverClaimNotPromote
 ```
 
 どの段階の間でプロセスが落ちても、次の worker は **active intent を読み出し**、`takeover_id` / `target_owner_id` / `target_claim_execution_id` / `target_generation` を**そのまま**使って続きから再開する(新しい identity を作らない)。intent の lease が切れている場合は、まずその lease を原子的 CAS で取り直すため、**再開者も 1 人だけ**になる。
+
+段階 2 と 3 の間で落ちた場合、再開した worker には前の worker が持っていた in-memory の値は何も残っていない。それでよい: 段階 3 は commit 済み fence 行を read して判断するので、**死んだ worker が commit した事実だけ**から同じ takeover を再開できる(r6 レビュー)。
 
 ### identity の完全一致(fencing)
 
