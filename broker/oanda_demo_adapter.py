@@ -740,10 +740,25 @@ class OandaDemoAdapter:
             for side_key, side in (("long", PositionSide.LONG), ("short", PositionSide.SHORT)):
                 side_entry = entry.get(side_key)
                 if not isinstance(side_entry, Mapping):
-                    continue
+                    # Fail-closed (Issue #105 review): a missing or non-object
+                    # side is a malformed RESPONSE, not a flat side.
+                    # Reconciliation consumes this listing, and silently
+                    # skipping would turn broker data this adapter could not
+                    # interpret into a fabricated "no position" observation.
+                    raise BrokerCommunicationError(
+                        f"broker positions entry carries no {side_key} side object"
+                    )
+                # No default: a side without 'units' is malformed, never flat.
                 units = _parse_decimal(
-                    side_entry.get("units", "0"), f"position.{side_key}.units"
+                    side_entry.get("units"), f"position.{side_key}.units"
                 )
+                if (side is PositionSide.LONG and units < 0) or (
+                    side is PositionSide.SHORT and units > 0
+                ):
+                    raise BrokerCommunicationError(
+                        f"broker position {side_key} side carries units with the "
+                        "opposite sign"
+                    )
                 if units == 0:
                     continue
                 try:

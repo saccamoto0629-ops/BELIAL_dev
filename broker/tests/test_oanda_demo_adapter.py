@@ -1726,3 +1726,53 @@ def test_adapter_satisfies_the_trade_listing_protocols_but_not_order_listing():
     assert isinstance(adapter, TradeListingBroker)
     assert isinstance(adapter, ClosedTradeListingBroker)
     assert not isinstance(adapter, OrderListingBroker)
+
+
+# --- positions: malformed entries fail closed (Issue #105 review) -------------
+
+def position_entry(**overrides):
+    entry = {
+        "instrument": "USD_JPY",
+        "long": {"units": "7", "averagePrice": "155.100"},
+        "short": {"units": "0"},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_get_positions_malformed_side_structures_fail_closed():
+    """Reconciliation consumes this listing: a side this adapter cannot
+    interpret must reject the WHOLE listing, never degrade to 'flat side' --
+    that would fabricate a position-missing observation from broken data."""
+    missing_long = position_entry()
+    del missing_long["long"]
+    missing_units = position_entry(long={"averagePrice": "155.100"})
+    for entry in (
+        missing_long,                                # side key absent
+        position_entry(short="junk"),                # side is not an object
+        position_entry(long=None),                   # side is null
+        missing_units,                               # units field absent
+        position_entry(long={"units": None}),        # units is null
+        position_entry(long={"units": 7}),           # units is not a string
+        position_entry(long={"units": "not-a-number"}),
+    ):
+        adapter, _ = make_adapter((200, {"positions": [entry]}))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_positions()
+
+
+def test_get_positions_wrong_sign_units_fail_closed():
+    for entry in (
+        position_entry(long={"units": "-3", "averagePrice": "155.100"}),
+        position_entry(short={"units": "2", "averagePrice": "155.100"}),
+    ):
+        adapter, _ = make_adapter((200, {"positions": [entry]}))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_positions()
+
+
+def test_get_positions_flat_sides_are_still_no_positions():
+    adapter, _ = make_adapter(
+        (200, {"positions": [position_entry(long={"units": "0"}, short={"units": "0"})]})
+    )
+    assert adapter.get_positions() == ()
