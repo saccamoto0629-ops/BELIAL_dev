@@ -344,6 +344,8 @@ def test_reconcile_only_broker_poisons_every_mutating_operation():
 
 
 def test_reconcile_only_broker_mirrors_the_inner_capabilities():
+    import inspect
+
     from broker.broker_interface import (
         Broker,
         ClosedTradeListingBroker,
@@ -356,6 +358,12 @@ def test_reconcile_only_broker_mirrors_the_inner_capabilities():
     assert isinstance(full, OrderListingBroker)
     assert isinstance(full, TradeListingBroker)
     assert isinstance(full, ClosedTradeListingBroker)
+    # Python >= 3.12 checks runtime protocols via inspect.getattr_static
+    # (ignoring __getattr__), so the mirrored capabilities must be STATICALLY
+    # visible -- asserted explicitly so a 3.11 run catches a regression to
+    # dynamic delegation too.
+    for name in ("list_orders", "get_open_trades", "get_closed_trades"):
+        assert callable(inspect.getattr_static(full, name))
 
     class MinimalBroker:
         def submit_order(self, request): ...

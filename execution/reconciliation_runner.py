@@ -83,14 +83,30 @@ class ReconcileOnlyBroker:
     detection-only contract. ``get_account_state`` raises too -- reconciliation
     never needs account data, so none is fetched (and none can leak into
     output). The optional listing capabilities (``list_orders`` /
-    ``get_open_trades`` / ``get_closed_trades``) delegate via ``__getattr__``
-    exactly when the wrapped broker provides them, so the facade satisfies
-    the same optional Protocols as the broker it wraps and no capability is
-    fabricated.
+    ``get_open_trades`` / ``get_closed_trades``) are mirrored as INSTANCE
+    attributes exactly when the wrapped broker provides them, so the facade
+    satisfies the same optional Protocols as the broker it wraps and no
+    capability is fabricated. Instance attributes (not ``__getattr__``
+    delegation) on purpose: since Python 3.12 a ``runtime_checkable``
+    Protocol ``isinstance`` check uses ``inspect.getattr_static``, which
+    deliberately ignores ``__getattr__`` -- statically bound methods are
+    seen by both the 3.11 and 3.12+ semantics.
     """
 
     def __init__(self, inner):
         self._inner = inner
+        from broker.broker_interface import (
+            ClosedTradeListingBroker,
+            OrderListingBroker,
+            TradeListingBroker,
+        )
+
+        if isinstance(inner, OrderListingBroker):
+            self.list_orders = inner.list_orders
+        if isinstance(inner, TradeListingBroker):
+            self.get_open_trades = inner.get_open_trades
+        if isinstance(inner, ClosedTradeListingBroker):
+            self.get_closed_trades = inner.get_closed_trades
 
     def submit_order(self, request):
         raise ReconcileOnlyViolationError(
@@ -112,11 +128,6 @@ class ReconcileOnlyBroker:
 
     def get_positions(self):
         return self._inner.get_positions()
-
-    def __getattr__(self, name):
-        if name in ("list_orders", "get_open_trades", "get_closed_trades"):
-            return getattr(self._inner, name)
-        raise AttributeError(name)
 
 
 def _build_parser() -> argparse.ArgumentParser:
