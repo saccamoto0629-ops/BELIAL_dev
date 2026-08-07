@@ -87,6 +87,7 @@ no-side-effect guarantee.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -98,7 +99,13 @@ from broker.broker_models import BrokerErrorCode, OrderState
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
 from execution.reconciliation_models import (
     DiscrepancyType,
+    ORDER_DISCREPANCY_TYPES,
+    ORDER_TARGET_TYPES,
     OrderDiscrepancy,
+    POSITION_DISCREPANCY_TYPES,
+    POSITION_TARGET_TYPES,
+    PositionDiscrepancy,
+    PositionReconciliationSummary,
     ReconciliationMode,
     ReconciliationRun,
     ReconciliationTargetType,
@@ -130,6 +137,7 @@ RUNS_TABLE = "broker_reconciliation_runs"
 DISCREPANCIES_TABLE = "broker_reconciliation_discrepancies"
 REPAIRS_TABLE = "broker_reconciliation_repair_attempts"
 TAKEOVER_INTENTS_TABLE = "broker_reconciliation_repair_takeover_intents"
+POSITION_DISCREPANCIES_TABLE = "broker_reconciliation_position_discrepancies"
 
 # v1: initial Issue #103 schema (runs + discrepancies).
 # v2 (Issue #104): + broker_reconciliation_repair_attempts (two-phase repair
@@ -142,8 +150,17 @@ TAKEOVER_INTENTS_TABLE = "broker_reconciliation_repair_takeover_intents"
 #     verified v1 DB in place (see the module docstring). Both v2 tables are
 #     introduced by the same unreleased change, so there is no intermediate
 #     released version between them to migrate from.
-SCHEMA_VERSION = 2
-_MIGRATABLE_VERSION = 1
+# v3 (Issue #105): + broker_reconciliation_position_discrepancies (the
+#     position / trade / transaction / SL / TP detection records; MANUAL
+#     REVIEW only by CHECK — no repair path exists for this domain) and the
+#     position-domain summary columns on the runs table. Additive over v2
+#     (ALTER ADD COLUMN + one new table + index); the Issue #103/#104 table
+#     DDL is byte-identical to v2 — the order-domain CHECK constraints are
+#     generated from the frozen ORDER_* subsets, not from the grown enums.
+SCHEMA_VERSION = 3
+# Exactly released prior versions are migratable, newest first; migration is
+# applied stepwise (v1 -> v2 -> v3) inside one transaction.
+_MIGRATABLE_VERSIONS = (2, 1)
 
 # Repair attempt lifecycle statuses (Issue #104): a row is INSERTed as
 # ``pending`` (the reservation) and completed exactly once to ``finalized``.
@@ -157,6 +174,34 @@ _RUN_COLUMNS: tuple[str, ...] = (
     "finished_at_utc",
     "checked_order_count",
     "broker_listing_error",
+    # v3 (Issue #105): the position-domain summary. All NULL exactly when
+    # the run did not reconcile the position domain (order-only runs and
+    # rows stored before v3).
+    "checked_position_count",
+    "checked_trade_count",
+    "checked_closed_trade_count",
+    "internal_exposure_error",
+    "position_listing_error",
+    "trade_listing_error",
+    "closed_trade_listing_error",
+    "excluded_symbols_json",
+)
+_POSITION_DISCREPANCY_COLUMNS: tuple[str, ...] = (
+    "run_id",
+    "discrepancy_type",
+    "target_type",
+    "target_id",
+    "resolution_category",
+    "symbol",
+    "internal_value",
+    "broker_value",
+    "execution_request_id",
+    "client_order_id",
+    "broker_trade_id",
+    "protection_order_id",
+    "broker_transaction_ids_json",
+    "detail",
+    "observed_at_utc",
 )
 _DISCREPANCY_COLUMNS: tuple[str, ...] = (
     "run_id",
@@ -370,11 +415,44 @@ def _enum_values_sql(values) -> str:
     return "', '".join(sorted(v.value for v in values))
 
 
-def _create_runs_table_sql() -> str:
-    """Full current schema for the run rows. The CHECKs mirror the
+# Shared between the v3 reference CREATE and the v2 -> v3 ALTERs so a
+# migrated DB token-normalizes identically to a freshly created one (SQLite
+# appends an added column at the end of the column list). Order matters and
+# is part of the schema. Column-level CHECKs only: ALTER TABLE ADD COLUMN
+# cannot introduce table-level constraints, so cross-column coherence (all
+# eight NULL together or the three counts NOT NULL together) is enforced by
+# the model and the restore path instead.
+_RUN_POSITION_COLUMN_DDLS: tuple[str, ...] = (
+    "checked_position_count INTEGER "
+    "CHECK (checked_position_count IS NULL OR checked_position_count >= 0)",
+    "checked_trade_count INTEGER "
+    "CHECK (checked_trade_count IS NULL OR checked_trade_count >= 0)",
+    "checked_closed_trade_count INTEGER "
+    "CHECK (checked_closed_trade_count IS NULL OR checked_closed_trade_count >= 0)",
+    "internal_exposure_error TEXT "
+    "CHECK (internal_exposure_error IS NULL OR trim(internal_exposure_error) <> '')",
+    "position_listing_error TEXT "
+    "CHECK (position_listing_error IS NULL OR trim(position_listing_error) <> '')",
+    "trade_listing_error TEXT "
+    "CHECK (trade_listing_error IS NULL OR trim(trade_listing_error) <> '')",
+    "closed_trade_listing_error TEXT "
+    "CHECK (closed_trade_listing_error IS NULL OR trim(closed_trade_listing_error) <> '')",
+    "excluded_symbols_json TEXT "
+    "CHECK (excluded_symbols_json IS NULL OR trim(excluded_symbols_json) <> '')",
+)
+
+
+def _create_runs_table_sql(*, version: int = SCHEMA_VERSION) -> str:
+    """Full schema for the run rows at ``version``. The CHECKs mirror the
     ``ReconciliationRun`` invariants as a second guard (known mode, UTC
-    suffix, non-negative count, non-empty listing error when present)."""
+    suffix, non-negative count, non-empty listing error when present). v3
+    appends the position-domain summary columns (Issue #105)."""
     modes = _enum_values_sql(ReconciliationMode)
+    position_columns = (
+        "".join(f",\n            {ddl}" for ddl in _RUN_POSITION_COLUMN_DDLS)
+        if version >= 3
+        else ""
+    )
     return f"""
         CREATE TABLE {RUNS_TABLE} (
             run_id TEXT PRIMARY KEY NOT NULL CHECK (trim(run_id) <> ''),
@@ -383,7 +461,7 @@ def _create_runs_table_sql() -> str:
             finished_at_utc TEXT NOT NULL CHECK (finished_at_utc LIKE '%+00:00'),
             checked_order_count INTEGER NOT NULL CHECK (checked_order_count >= 0),
             broker_listing_error TEXT
-                CHECK (broker_listing_error IS NULL OR trim(broker_listing_error) <> '')
+                CHECK (broker_listing_error IS NULL OR trim(broker_listing_error) <> ''){position_columns}
         ) WITHOUT ROWID
     """
 
@@ -401,8 +479,12 @@ def _create_discrepancies_table_sql(*, version: int = SCHEMA_VERSION) -> str:
     mirror the ``OrderDiscrepancy`` invariants: known enum members only, and
     the ``query_failed`` category is used exactly for the ``query_failure``
     kind (which is also the only kind carrying a broker error code)."""
-    types = _enum_values_sql(DiscrepancyType)
-    targets = _enum_values_sql(ReconciliationTargetType)
+    # ORDER-domain subsets, NOT the full enums (Issue #105): the position
+    # domain grew DiscrepancyType / ReconciliationTargetType, and this
+    # table's DDL must stay byte-identical to the released v2 definition so
+    # existing DBs keep verifying without a rebuild.
+    types = _enum_values_sql(ORDER_DISCREPANCY_TYPES)
+    targets = _enum_values_sql(ORDER_TARGET_TYPES)
     categories = _enum_values_sql(ResolutionCategory)
     states = _enum_values_sql(OrderState)
     codes = _enum_values_sql(BrokerErrorCode)
@@ -448,7 +530,10 @@ def _create_repairs_table_sql() -> str:
     outcome. The composite FK pins every attempt to the exact discrepancy
     it acted on (the discrepancies table's UNIQUE (run_id, target_type,
     target_id) is the parent key)."""
-    targets = _enum_values_sql(ReconciliationTargetType)
+    # ORDER-domain target subset (Issue #105): repair covers order states
+    # only, and the released v2 DDL must stay unchanged (see the
+    # discrepancies table).
+    targets = _enum_values_sql(ORDER_TARGET_TYPES)
     states = _enum_values_sql(OrderState)
     codes = _enum_values_sql(BrokerErrorCode)
     failure_codes = _enum_values_sql(RepairFailureCode)  # closed set, generated
@@ -618,6 +703,53 @@ def _create_takeover_intents_table_sql() -> str:
     """
 
 
+def _create_position_discrepancies_table_sql() -> str:
+    """Position-domain discrepancy rows (Issue #105): position / trade /
+    transaction-evidenced close / stop loss / take profit detections.
+
+    A SEPARATE table on purpose: the Issue #103 order-discrepancy table is
+    OrderState-typed and its DDL is frozen (see ``_create_discrepancies_table_sql``),
+    while these records carry rendered observation values. The CHECKs mirror
+    the ``PositionDiscrepancy`` invariants; ``resolution_category`` admits
+    ONLY ``manual_review`` — the DB itself refuses to store a position-domain
+    discrepancy as an auto-repair candidate (Issue #105 fail-safe), and the
+    Issue #104 repair service never reads this table. Uniqueness is per
+    (run, kind, target): one target may legitimately carry several kinds in
+    one run (an SL and a TP finding on the same order)."""
+    types = _enum_values_sql(POSITION_DISCREPANCY_TYPES)
+    targets = _enum_values_sql(POSITION_TARGET_TYPES)
+    manual_review = ResolutionCategory.MANUAL_REVIEW.value
+    execution_target = ReconciliationTargetType.EXECUTION_ORDER.value
+    return f"""
+        CREATE TABLE {POSITION_DISCREPANCIES_TABLE} (
+            discrepancy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL
+                REFERENCES {RUNS_TABLE} (run_id)
+                CHECK (trim(run_id) <> ''),
+            discrepancy_type TEXT NOT NULL CHECK (discrepancy_type IN ('{types}')),
+            target_type TEXT NOT NULL CHECK (target_type IN ('{targets}')),
+            target_id TEXT NOT NULL CHECK (trim(target_id) <> ''),
+            resolution_category TEXT NOT NULL CHECK (resolution_category = '{manual_review}'),
+            symbol TEXT NOT NULL CHECK (trim(symbol) <> ''),
+            internal_value TEXT CHECK (internal_value IS NULL OR trim(internal_value) <> ''),
+            broker_value TEXT CHECK (broker_value IS NULL OR trim(broker_value) <> ''),
+            execution_request_id TEXT
+                CHECK (execution_request_id IS NULL OR trim(execution_request_id) <> ''),
+            client_order_id TEXT CHECK (client_order_id IS NULL OR trim(client_order_id) <> ''),
+            broker_trade_id TEXT CHECK (broker_trade_id IS NULL OR trim(broker_trade_id) <> ''),
+            protection_order_id TEXT
+                CHECK (protection_order_id IS NULL OR trim(protection_order_id) <> ''),
+            broker_transaction_ids_json TEXT
+                CHECK (broker_transaction_ids_json IS NULL
+                       OR trim(broker_transaction_ids_json) <> ''),
+            detail TEXT NOT NULL CHECK (trim(detail) <> ''),
+            observed_at_utc TEXT NOT NULL CHECK (observed_at_utc LIKE '%+00:00'),
+            UNIQUE (run_id, discrepancy_type, target_type, target_id),
+            CHECK ((target_type = '{execution_target}') = (execution_request_id IS NOT NULL))
+        )
+    """
+
+
 _DISCREPANCIES_RUN_INDEX = f"idx_{DISCREPANCIES_TABLE}_run"
 _REPAIRS_RUN_INDEX = f"idx_{REPAIRS_TABLE}_run"
 _REPAIRS_RUN_INDEX_SQL = (
@@ -667,21 +799,30 @@ def _create_index_sql() -> str:
     )
 
 
+_POSITION_DISCREPANCIES_RUN_INDEX = f"idx_{POSITION_DISCREPANCIES_TABLE}_run"
+_POSITION_DISCREPANCIES_RUN_INDEX_SQL = (
+    f"CREATE INDEX {_POSITION_DISCREPANCIES_RUN_INDEX} ON {POSITION_DISCREPANCIES_TABLE} "
+    "(run_id, discrepancy_id)"
+)
+
+
 def _tables_for(version: int) -> tuple[str, ...]:
     tables = [RUNS_TABLE, DISCREPANCIES_TABLE]
-    if version >= SCHEMA_VERSION:
+    if version >= 2:
         tables.extend((REPAIRS_TABLE, TAKEOVER_INTENTS_TABLE))
+    if version >= 3:
+        tables.append(POSITION_DISCREPANCIES_TABLE)
     return tuple(tables)
 
 
 def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
-    """Create the schema for ``version`` (v1 is used only as the in-memory
-    migration reference and by migration tests; real DBs are created at the
+    """Create the schema for ``version`` (v1/v2 are used only as in-memory
+    migration references and by migration tests; real DBs are created at the
     current version)."""
-    connection.execute(_create_runs_table_sql())
+    connection.execute(_create_runs_table_sql(version=version))
     connection.execute(_create_discrepancies_table_sql(version=version))
     connection.execute(_create_index_sql())
-    if version >= SCHEMA_VERSION:
+    if version >= 2:
         connection.execute(_create_repairs_table_sql())
         connection.execute(_REPAIRS_RUN_INDEX_SQL)
         connection.execute(_create_takeover_intents_table_sql())
@@ -689,6 +830,9 @@ def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERS
         connection.execute(_INTENT_GENERATION_INDEX_SQL)
         connection.execute(_INTENT_BLOCKED_INDEX_SQL)
         connection.execute(_INTENT_ATTEMPT_INDEX_SQL)
+    if version >= 3:
+        connection.execute(_create_position_discrepancies_table_sql())
+        connection.execute(_POSITION_DISCREPANCIES_RUN_INDEX_SQL)
     connection.execute(f"PRAGMA user_version = {version}")
 
 
@@ -783,12 +927,14 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
     :func:`init_reconciliation_db` migrates); the error says so explicitly."""
     problems = _schema_problems(connection)
     if problems:
-        if not _schema_problems(connection, version=_MIGRATABLE_VERSION):
-            problems.append(
-                f"the DB is a valid v{_MIGRATABLE_VERSION} schema; run "
-                f"init_reconciliation_db() to migrate it to v{SCHEMA_VERSION} "
-                "(reads never migrate)"
-            )
+        for migratable in _MIGRATABLE_VERSIONS:
+            if not _schema_problems(connection, version=migratable):
+                problems.append(
+                    f"the DB is a valid v{migratable} schema; run "
+                    f"init_reconciliation_db() to migrate it to v{SCHEMA_VERSION} "
+                    "(reads never migrate)"
+                )
+                break
         raise ReconciliationSchemaError(
             f"broker reconciliation DB at {db_path} failed schema verification; "
             "refusing to touch it: " + "; ".join(problems)
@@ -885,32 +1031,54 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection, db_path: Path) -> None:
     connection.execute(_INTENT_GENERATION_INDEX_SQL)
     connection.execute(_INTENT_BLOCKED_INDEX_SQL)
     connection.execute(_INTENT_ATTEMPT_INDEX_SQL)
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    connection.execute("PRAGMA user_version = 2")
     _LOGGER.info(
-        "migrated broker reconciliation DB %s from schema v%d to v%d (added "
+        "migrated broker reconciliation DB %s from schema v1 to v2 (added "
         "discrepancies.internal_revision, repair attempts table %s and its "
         "durable takeover intents)",
         db_path,
-        _MIGRATABLE_VERSION,
-        SCHEMA_VERSION,
         REPAIRS_TABLE,
+    )
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection, db_path: Path) -> None:
+    """Migrate a fully verified v2 schema to v3 inside the caller's
+    transaction (Issue #105): additive ``ALTER TABLE ... ADD COLUMN`` for
+    the position-domain summary columns on the runs table (existing rows
+    read back all-NULL = "the position domain was not reconciled"), plus the
+    position-discrepancies table, its index and the version bump. Existing
+    rows are untouched; nothing is deleted or rewritten. The caller
+    re-verifies the complete v3 schema before COMMIT; any failure rolls back
+    to the untouched v2 file."""
+    for column_ddl in _RUN_POSITION_COLUMN_DDLS:
+        connection.execute(f"ALTER TABLE {RUNS_TABLE} ADD COLUMN {column_ddl}")
+    connection.execute(_create_position_discrepancies_table_sql())
+    connection.execute(_POSITION_DISCREPANCIES_RUN_INDEX_SQL)
+    connection.execute("PRAGMA user_version = 3")
+    _LOGGER.info(
+        "migrated broker reconciliation DB %s from schema v2 to v3 (added the "
+        "position-domain run summary columns and table %s)",
+        db_path,
+        POSITION_DISCREPANCIES_TABLE,
     )
 
 
 def init_reconciliation_db(db_path: Path | None = None) -> None:
     """Create the current schema, verify an existing one, or migrate a valid
-    v1 schema to v2 (Issue #104); idempotent.
+    released schema (v1 per Issue #104, v2 per Issue #105) in place;
+    idempotent.
 
     Same pristine rule as ``execution_store.init_db`` /
     ``SQLiteSafetyDecisionStore.initialize``: creation happens only when
     ``sqlite_master`` is empty AND ``user_version`` is 0. A DB that fully
     matches the CURRENT schema passes verification unchanged. A DB that
-    fully matches the released v1 schema -- and ONLY such a DB -- is
-    migrated in place (:func:`_migrate_v1_to_v2`); the migration, the
-    version bump and a full v2 re-verification commit in ONE transaction, so
-    a failed migration leaves no half-migrated schema behind. Any other
-    content fails with :class:`ReconciliationSchemaError` WITHOUT modifying
-    the file (no auto-completion, no silent rebuild).
+    fully matches EXACTLY one released prior schema -- and ONLY such a DB --
+    is migrated in place, stepwise (:func:`_migrate_v1_to_v2` then
+    :func:`_migrate_v2_to_v3`); the migrations, the version bumps and a full
+    current-schema re-verification commit in ONE transaction, so a failed
+    migration leaves no half-migrated schema behind. Any other content fails
+    with :class:`ReconciliationSchemaError` WITHOUT modifying the file (no
+    auto-completion, no silent rebuild).
     """
     db_path = Path(db_path) if db_path is not None else reconciliation_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -928,11 +1096,15 @@ def init_reconciliation_db(db_path: Path | None = None) -> None:
                         )
                     _create_schema(connection)
                 elif _schema_problems(connection):
-                    if _schema_problems(connection, version=_MIGRATABLE_VERSION):
-                        # neither a valid current nor a valid v1 schema: fail
-                        # with the full diagnosis, DB untouched
+                    if not _schema_problems(connection, version=2):
+                        _migrate_v2_to_v3(connection, db_path)
+                    elif not _schema_problems(connection, version=1):
+                        _migrate_v1_to_v2(connection, db_path)
+                        _migrate_v2_to_v3(connection, db_path)
+                    else:
+                        # neither a valid current nor a valid released prior
+                        # schema: fail with the full diagnosis, DB untouched
                         _verify_schema(connection, db_path)
-                    _migrate_v1_to_v2(connection, db_path)
                 _verify_schema(connection, db_path)
                 connection.execute("COMMIT")
             except Exception:
@@ -961,6 +1133,7 @@ def record_reconciliation_run(run: ReconciliationRun, *, db_path: Path | None = 
             f"broker reconciliation DB at {db_path} does not exist; call "
             "init_reconciliation_db() first"
         )
+    summary = run.position_summary
     run_record = (
         run.run_id,
         run.mode.value,
@@ -968,6 +1141,14 @@ def record_reconciliation_run(run: ReconciliationRun, *, db_path: Path | None = 
         _iso(run.finished_at_utc),
         run.checked_order_count,
         run.broker_listing_error,
+        None if summary is None else summary.checked_position_count,
+        None if summary is None else summary.checked_trade_count,
+        None if summary is None else summary.checked_closed_trade_count,
+        None if summary is None else summary.internal_exposure_error,
+        None if summary is None else summary.position_listing_error,
+        None if summary is None else summary.trade_listing_error,
+        None if summary is None else summary.closed_trade_listing_error,
+        None if summary is None else _encode_string_tuple(summary.excluded_symbols),
     )
     with _verified_txn(db_path) as connection:
         existing = connection.execute(
@@ -1006,6 +1187,29 @@ def record_reconciliation_run(run: ReconciliationRun, *, db_path: Path | None = 
                         discrepancy.internal_revision,
                     ),
                 )
+            for discrepancy in run.position_discrepancies:
+                connection.execute(
+                    f"INSERT INTO {POSITION_DISCREPANCIES_TABLE} "
+                    f"({', '.join(_POSITION_DISCREPANCY_COLUMNS)}) "
+                    f"VALUES ({', '.join('?' for _ in _POSITION_DISCREPANCY_COLUMNS)})",
+                    (
+                        run.run_id,
+                        discrepancy.discrepancy_type.value,
+                        discrepancy.target_type.value,
+                        discrepancy.target_id,
+                        discrepancy.resolution_category.value,
+                        discrepancy.symbol,
+                        discrepancy.internal_value,
+                        discrepancy.broker_value,
+                        discrepancy.execution_request_id,
+                        discrepancy.client_order_id,
+                        discrepancy.broker_trade_id,
+                        discrepancy.protection_order_id,
+                        _encode_string_tuple(discrepancy.broker_transaction_ids),
+                        discrepancy.detail,
+                        _iso(discrepancy.observed_at_utc),
+                    ),
+                )
         except sqlite3.IntegrityError as exc:  # UNIQUE / CHECK / FK violation
             raise ReconciliationStoreError(
                 f"recording reconciliation run {run.run_id!r} violates a DB constraint: {exc}"
@@ -1013,6 +1217,34 @@ def record_reconciliation_run(run: ReconciliationRun, *, db_path: Path | None = 
 
 
 # --- read paths ---------------------------------------------------------------
+
+
+def _encode_string_tuple(values: tuple[str, ...]) -> str | None:
+    """Compact ASCII JSON array for a tuple of ids; empty -> NULL (the
+    columns carry a non-blank CHECK, and NULL keeps "nothing to store"
+    distinguishable without an empty-array sentinel)."""
+    if not values:
+        return None
+    return json.dumps(list(values), ensure_ascii=True, separators=(",", ":"))
+
+
+def _decode_string_tuple(text: str | None, context: str) -> tuple[str, ...]:
+    """Inverse of :func:`_encode_string_tuple`; anything but NULL or a JSON
+    array of non-empty strings fails restore (fail-closed, like every other
+    stored value)."""
+    if text is None:
+        return ()
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        raise ReconciliationIntegrityError(f"{context} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, list) or not all(
+        isinstance(item, str) and item.strip() for item in parsed
+    ):
+        raise ReconciliationIntegrityError(
+            f"{context} must be a JSON array of non-empty strings, got {text!r}"
+        )
+    return tuple(parsed)
 
 
 def _restore_discrepancy(row: sqlite3.Row, run_id: str) -> OrderDiscrepancy:
@@ -1042,12 +1274,107 @@ def _restore_discrepancy(row: sqlite3.Row, run_id: str) -> OrderDiscrepancy:
         ) from exc
 
 
+def _restore_position_discrepancy(row: sqlite3.Row, run_id: str) -> PositionDiscrepancy:
+    """Rebuild one position-domain discrepancy (Issue #105); the model
+    re-runs every invariant, so an out-of-band edited row fails loudly."""
+    try:
+        return PositionDiscrepancy(
+            discrepancy_type=DiscrepancyType(row["discrepancy_type"]),
+            target_type=ReconciliationTargetType(row["target_type"]),
+            target_id=row["target_id"],
+            resolution_category=ResolutionCategory(row["resolution_category"]),
+            observed_at_utc=_parse_utc(row["observed_at_utc"]),
+            detail=row["detail"],
+            symbol=row["symbol"],
+            internal_value=row["internal_value"],
+            broker_value=row["broker_value"],
+            execution_request_id=row["execution_request_id"],
+            client_order_id=row["client_order_id"],
+            broker_trade_id=row["broker_trade_id"],
+            protection_order_id=row["protection_order_id"],
+            broker_transaction_ids=_decode_string_tuple(
+                row["broker_transaction_ids_json"],
+                f"position discrepancy row {row['discrepancy_id']} broker_transaction_ids",
+            ),
+        )
+    except (ValueError, TypeError) as exc:
+        raise ReconciliationIntegrityError(
+            f"position discrepancy row {row['discrepancy_id']} of reconciliation run "
+            f"{run_id!r} failed restore-time validation: {exc}"
+        ) from exc
+
+
+def _restore_position_summary(
+    row: sqlite3.Row, run_id: str
+) -> PositionReconciliationSummary | None:
+    """Rebuild the run's position-domain summary (Issue #105).
+
+    All summary columns NULL -> None ("the position domain was not
+    reconciled": order-only runs and rows stored before schema v3). Any
+    other NULL mix is corruption and fails restore -- coherence cannot live
+    in a table CHECK because the columns arrive via ``ALTER TABLE`` on
+    migrated DBs."""
+    values = {
+        name: row[name]
+        for name in (
+            "checked_position_count",
+            "checked_trade_count",
+            "checked_closed_trade_count",
+            "internal_exposure_error",
+            "position_listing_error",
+            "trade_listing_error",
+            "closed_trade_listing_error",
+            "excluded_symbols_json",
+        )
+    }
+    if all(value is None for value in values.values()):
+        return None
+    counts = (
+        values["checked_position_count"],
+        values["checked_trade_count"],
+        values["checked_closed_trade_count"],
+    )
+    if any(count is None for count in counts):
+        raise ReconciliationIntegrityError(
+            f"reconciliation run {run_id!r} carries a partially NULL position summary "
+            f"({values!r}); a run either reconciled the position domain (all three "
+            "checked counts present) or did not (all summary columns NULL)"
+        )
+    try:
+        return PositionReconciliationSummary(
+            checked_position_count=values["checked_position_count"],
+            checked_trade_count=values["checked_trade_count"],
+            checked_closed_trade_count=values["checked_closed_trade_count"],
+            internal_exposure_error=values["internal_exposure_error"],
+            position_listing_error=values["position_listing_error"],
+            trade_listing_error=values["trade_listing_error"],
+            closed_trade_listing_error=values["closed_trade_listing_error"],
+            excluded_symbols=_decode_string_tuple(
+                values["excluded_symbols_json"],
+                f"reconciliation run {run_id!r} excluded_symbols",
+            ),
+        )
+    except (ValueError, TypeError) as exc:
+        raise ReconciliationIntegrityError(
+            f"reconciliation run {run_id!r} position summary failed restore-time "
+            f"validation: {exc}"
+        ) from exc
+
+
 def _restore_run(connection: sqlite3.Connection, row: sqlite3.Row) -> ReconciliationRun:
     run_id = row["run_id"]
     discrepancies = tuple(
         _restore_discrepancy(entry, run_id)
         for entry in connection.execute(
             f"SELECT * FROM {DISCREPANCIES_TABLE} WHERE run_id = ? ORDER BY discrepancy_id ASC",
+            (run_id,),
+        ).fetchall()
+    )
+    position_discrepancies = tuple(
+        _restore_position_discrepancy(entry, run_id)
+        for entry in connection.execute(
+            f"SELECT * FROM {POSITION_DISCREPANCIES_TABLE} WHERE run_id = ? "
+            "ORDER BY discrepancy_id ASC",
             (run_id,),
         ).fetchall()
     )
@@ -1060,6 +1387,8 @@ def _restore_run(connection: sqlite3.Connection, row: sqlite3.Row) -> Reconcilia
             checked_order_count=row["checked_order_count"],
             discrepancies=discrepancies,
             broker_listing_error=row["broker_listing_error"],
+            position_discrepancies=position_discrepancies,
+            position_summary=_restore_position_summary(row, run_id),
         )
     except (ValueError, TypeError) as exc:
         raise ReconciliationIntegrityError(

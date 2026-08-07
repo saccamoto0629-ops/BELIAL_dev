@@ -1,11 +1,13 @@
-"""Broker reconciliation -- DIFFERENCE DETECTION ONLY (Issue #103).
+"""Broker reconciliation -- DIFFERENCE DETECTION ONLY (Issues #103 / #105).
 
-*** READ-ONLY. This service compares BELIAL's internal order state against
-the broker's and CLASSIFIES what it finds. It never updates an internal
-order state, never submits an order and never cancels one -- the broker is
-used through query operations exclusively (``get_order`` /
-``list_orders``). Repairing what a run finds is Issue #104; positions /
-trades / SL / TP are Issue #105. ***
+*** READ-ONLY. This service compares BELIAL's internal state against the
+broker's and CLASSIFIES what it finds. It never updates an internal order
+state, never submits an order and never cancels one -- the broker is used
+through query operations exclusively (``get_order`` / ``list_orders`` /
+``get_positions`` / ``get_open_trades`` / ``get_closed_trades``). Repairing
+what a run finds is Issue #104 and covers ORDER STATES ONLY; the position /
+trade / SL / TP scope added by Issue #105 is detection + MANUAL_REVIEW
+classification with NO repair path at all. ***
 
 What a run compares
 -------------------
@@ -88,15 +90,25 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
-from broker.broker_interface import Broker, OrderListingBroker
+from broker.broker_interface import (
+    Broker,
+    ClosedTradeListingBroker,
+    OrderListingBroker,
+    TradeListingBroker,
+)
 from broker.broker_models import (
     BrokerError,
     BrokerErrorCode,
     BrokerInvalidRequestError,
     BrokerOrderNotFoundError,
+    ClosedTradeInfo,
     OrderResult,
+    OrderSide,
     OrderState,
+    PositionInfo,
+    PositionSide,
     TERMINAL_ORDER_STATES,
+    TradeInfo,
     validate_order_result_update,
     validate_order_state_transition,
 )
@@ -106,6 +118,8 @@ from execution.execution_store import ExecutionStoreError
 from execution.reconciliation_models import (
     DiscrepancyType,
     OrderDiscrepancy,
+    PositionDiscrepancy,
+    PositionReconciliationSummary,
     ReconciliationMode,
     ReconciliationRun,
     ReconciliationTargetType,
@@ -170,12 +184,23 @@ class BrokerOrderReconciliationService:
 
     # --- public API ---------------------------------------------------------
 
-    def detect(self, *, run_id: str) -> ReconciliationRun:
+    def detect(
+        self, *, run_id: str, include_position_scope: bool = False
+    ) -> ReconciliationRun:
         """Compare both sides and return the classified run. NO persistence.
 
         Reads the execution order store read-only and asks the broker query
         operations only. Used on its own when a caller wants the comparison
         without an audit row (and by :meth:`run` before recording).
+
+        ``include_position_scope`` (Issue #105) additionally reconciles the
+        position domain — positions / open trades / SL / TP / closed-trade
+        evidence — recording MANUAL_REVIEW-only :class:`PositionDiscrepancy`
+        records and a :class:`PositionReconciliationSummary` on the run. It
+        stays False by default so Issue #103 order-only callers keep their
+        exact behavior. The position scope is detection-only like everything
+        else here: broker enumerations are the only queries it adds, and
+        every failure degrades to a summary error, never to a guessed state.
         """
         _require_non_empty_str(run_id, "run_id")
         started_at = self._now()
@@ -184,6 +209,11 @@ class BrokerOrderReconciliationService:
         rows = execution_store.list_reconciliation_orders(db_path=self._execution_db_path)
         for row in rows:
             discrepancies.extend(self._reconcile_internal_order(row))
+
+        position_summary: PositionReconciliationSummary | None = None
+        position_discrepancies: tuple[PositionDiscrepancy, ...] = ()
+        if include_position_scope:
+            position_summary, position_discrepancies = self._reconcile_position_scope(rows)
 
         broker_orders, listing_error = self._list_broker_orders()
         if listing_error is None:
@@ -216,11 +246,15 @@ class BrokerOrderReconciliationService:
             checked_order_count=len(rows),
             discrepancies=tuple(discrepancies),
             broker_listing_error=listing_error,
+            position_discrepancies=position_discrepancies,
+            position_summary=position_summary,
         )
         self._log_run(run)
         return run
 
-    def run(self, *, run_id: str) -> ReconciliationRun:
+    def run(
+        self, *, run_id: str, include_position_scope: bool = False
+    ) -> ReconciliationRun:
         """:meth:`detect` plus the audit record (return value + log + DB).
 
         Requires ``reconciliation_db_path``; the audit DB is initialized
@@ -233,7 +267,7 @@ class BrokerOrderReconciliationService:
                 "run() records the reconciliation result; construct the service with "
                 "reconciliation_db_path=... (or call detect() for a non-persisting run)"
             )
-        result = self.detect(run_id=run_id)
+        result = self.detect(run_id=run_id, include_position_scope=include_position_scope)
         init_reconciliation_db(self._reconciliation_db_path)
         record_reconciliation_run(result, db_path=self._reconciliation_db_path)
         return result
@@ -511,6 +545,773 @@ class BrokerOrderReconciliationService:
             f"(differing: {', '.join(mismatches)})"
         )
 
+    # --- position / trade / SL / TP scope (Issue #105) ------------------------
+    #
+    # DETECTION ONLY, MANUAL REVIEW ONLY. The position domain has no repair
+    # path: every discrepancy built here is ResolutionCategory.MANUAL_REVIEW
+    # (the model and the store CHECK both enforce it), broker-only positions
+    # and trades are never adopted, internal-only exposure is never closed,
+    # and SL / TP orders are never created or changed. Matching is ID-based
+    # exclusively -- the broker-reported client_order_id on a trade, or the
+    # trade id appearing among an order's recorded broker fill ids -- never
+    # by time or price proximity. Anything that cannot be matched UNIQUELY,
+    # and any symbol whose internal exposure is indeterminate (an UNKNOWN
+    # order outcome, an unreadable snapshot), is surfaced for manual review
+    # or excluded fail-safe instead of being guessed at.
+
+    def _reconcile_position_scope(
+        self, rows: list[dict]
+    ) -> tuple[PositionReconciliationSummary, tuple[PositionDiscrepancy, ...]]:
+        """Compare internal exposure expectations against the broker's
+        positions / open trades / closed-trade evidence. Read-only."""
+        discrepancies: dict[
+            tuple[DiscrepancyType, ReconciliationTargetType, str], PositionDiscrepancy
+        ] = {}
+
+        def add(discrepancy: PositionDiscrepancy) -> None:
+            # One record per (kind, target); a later duplicate observation of
+            # the same finding (e.g. per-trade SL checks of an order whose
+            # fills opened several trades) does not pile up rows.
+            key = (
+                discrepancy.discrepancy_type,
+                discrepancy.target_type,
+                discrepancy.target_id,
+            )
+            discrepancies.setdefault(key, discrepancy)
+
+        exposure = self._derive_internal_exposure(rows)
+        excluded = exposure["excluded_symbols"]
+
+        positions, position_listing_error = self._list_broker_positions()
+        checked_position_count = 0
+        if position_listing_error is None:
+            checked_position_count = self._compare_positions(
+                exposure, positions, excluded, add
+            )
+
+        open_trades, trade_listing_error = self._list_broker_open_trades()
+        checked_trade_count = 0
+        open_matched_order_ids: set[str] = set()
+        open_trade_ids: set[str] = set()
+        if trade_listing_error is None:
+            checked_trade_count = len(open_trades)
+            open_trade_ids = {trade.trade_id for trade in open_trades}
+            open_matched_order_ids = self._compare_open_trades(
+                exposure, open_trades, excluded, add
+            )
+
+        closed_trades, closed_trade_listing_error = self._list_broker_closed_trades(
+            open_trades_available=trade_listing_error is None
+        )
+        checked_closed_trade_count = 0
+        if closed_trade_listing_error is None:
+            checked_closed_trade_count = len(closed_trades)
+            self._compare_closed_trades(
+                exposure,
+                closed_trades,
+                open_trade_ids,
+                open_matched_order_ids,
+                excluded,
+                add,
+            )
+
+        summary = PositionReconciliationSummary(
+            checked_position_count=checked_position_count,
+            checked_trade_count=checked_trade_count,
+            checked_closed_trade_count=checked_closed_trade_count,
+            internal_exposure_error=exposure["internal_error"],
+            position_listing_error=position_listing_error,
+            trade_listing_error=trade_listing_error,
+            closed_trade_listing_error=closed_trade_listing_error,
+            excluded_symbols=tuple(sorted(excluded)),
+        )
+        return summary, tuple(discrepancies.values())
+
+    def _derive_internal_exposure(self, rows: list[dict]) -> dict:
+        """Derive what BELIAL expects broker-side, from internal records ONLY.
+
+        Per order: the signed filled quantity (BUY positive, SELL negative),
+        taken from the stored ``OrderResult`` snapshot. Netting them per
+        symbol yields the expected per-symbol exposure -- an internal SELL
+        that closed an internal BUY nets to zero, so "closed inside BELIAL"
+        needs no separate close record.
+
+        Fail-safe exclusions (never guessed): an order whose outcome is
+        UNKNOWN, whose snapshot cannot be read, or whose fill amount cannot
+        be established (PARTIALLY_FILLED / CANCELLED without a stored
+        snapshot) makes its SYMBOL's expectation indeterminate; the symbol
+        is excluded from every exposure comparison and reported in the run
+        summary. ID indexes are still built for such orders -- identity
+        matching is exact evidence and unaffected by amount indeterminacy.
+        """
+        net: dict[str, Decimal] = {}
+        excluded_symbols: set[str] = set()
+        by_client: dict[str, dict] = {}
+        by_fill: dict[str, list[dict]] = {}
+        infos: dict[str, dict] = {}
+        read_failures: list[str] = []
+
+        for row in rows:
+            request_id = row["execution_request_id"]
+            symbol = row["symbol"]
+            state = OrderState(row["order_state"])
+            result = None
+            result_readable = True
+            try:
+                result = execution_store.load_order_result(
+                    request_id, db_path=self._execution_db_path
+                )
+            except ExecutionStoreError as exc:
+                result_readable = False
+                read_failures.append(
+                    f"{request_id}: {type(exc).__name__}"
+                )
+
+            filled: Decimal | None
+            if not result_readable:
+                filled = None  # unreadable snapshot: amount unknowable
+            elif state is OrderState.UNKNOWN:
+                # An unconfirmed outcome may carry unobserved fills; any
+                # stored snapshot is not trusted as the final amount.
+                filled = None
+            elif result is not None:
+                filled = result.filled_quantity
+            elif state in (OrderState.PENDING, OrderState.ACCEPTED, OrderState.REJECTED):
+                filled = Decimal(0)  # these states REQUIRE filled == 0
+            elif state is OrderState.FILLED:
+                filled = Decimal(row["quantity"])  # FILLED requires filled == requested
+            else:
+                # PARTIALLY_FILLED / CANCELLED without a snapshot: the fill
+                # amount is unknowable from state alone.
+                filled = None
+
+            info = {
+                "row": row,
+                "state": state,
+                "result": result,
+                "filled": filled,
+            }
+            infos[request_id] = info
+            by_client[row["client_order_id"]] = info
+            if result is not None:
+                for fill in result.fills:
+                    by_fill.setdefault(fill.fill_id, []).append(info)
+
+            if filled is None:
+                excluded_symbols.add(symbol)
+            elif filled > 0:
+                signed = filled if row["side"] == OrderSide.BUY.value else -filled
+                net[symbol] = net.get(symbol, Decimal(0)) + signed
+
+        internal_error = None
+        if read_failures:
+            internal_error = (
+                f"{len(read_failures)} execution-store snapshot read(s) failed "
+                f"({'; '.join(sorted(read_failures))}); the affected symbols were "
+                "excluded from the exposure comparison and nothing was inferred"
+            )
+        return {
+            "net": net,
+            "excluded_symbols": excluded_symbols,
+            "by_client": by_client,
+            "by_fill": by_fill,
+            "infos": infos,
+            "internal_error": internal_error,
+        }
+
+    def _compare_positions(
+        self,
+        exposure: dict,
+        positions: tuple[PositionInfo, ...],
+        excluded: set[str],
+        add,
+    ) -> int:
+        """Presence comparison per (symbol, side) aggregate; quantity
+        comparison is deliberately out of Issue #105's minimum scope (the
+        per-trade checks carry the finer granularity)."""
+        observed_at = self._now()
+        expected: dict[tuple[str, PositionSide], Decimal] = {}
+        for symbol, value in exposure["net"].items():
+            if symbol in excluded or value == 0:
+                continue
+            side = PositionSide.LONG if value > 0 else PositionSide.SHORT
+            expected[(symbol, side)] = abs(value)
+        broker_keys = {(entry.symbol, entry.side): entry for entry in positions}
+
+        checked = {
+            key for key in set(expected) | set(broker_keys) if key[0] not in excluded
+        }
+        for symbol, side in sorted(expected, key=lambda k: (k[0], k[1].value)):
+            if (symbol, side) in broker_keys:
+                continue
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=DiscrepancyType.POSITION_MISSING_ON_BROKER,
+                    target_type=ReconciliationTargetType.POSITION,
+                    target_id=f"{symbol}:{side.value}",
+                    resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                    observed_at_utc=observed_at,
+                    detail=(
+                        f"BELIAL's filled orders expect a {side.value} exposure of "
+                        f"{expected[(symbol, side)]} on {symbol}, but the broker reports no "
+                        "such position; the internal records are NOT changed and nothing is "
+                        "closed or re-opened automatically"
+                    ),
+                    symbol=symbol,
+                    internal_value=f"{side.value} {expected[(symbol, side)]}",
+                )
+            )
+        for symbol, side in sorted(broker_keys, key=lambda k: (k[0], k[1].value)):
+            if (symbol, side) in expected or symbol in excluded:
+                continue
+            entry = broker_keys[(symbol, side)]
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=DiscrepancyType.BROKER_ONLY_POSITION,
+                    target_type=ReconciliationTargetType.POSITION,
+                    target_id=f"{symbol}:{side.value}",
+                    resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                    observed_at_utc=observed_at,
+                    detail=(
+                        f"the broker holds a {side.value} position of {entry.quantity} on "
+                        f"{symbol} that no internal filled order accounts for; adopting a "
+                        "broker-side position as an internal one is never automatic"
+                    ),
+                    symbol=symbol,
+                    broker_value=f"{side.value} {entry.quantity}",
+                )
+            )
+        return len(checked)
+
+    def _compare_open_trades(
+        self,
+        exposure: dict,
+        open_trades: tuple[TradeInfo, ...],
+        excluded: set[str],
+        add,
+    ) -> set[str]:
+        """Match every broker open trade to at most one internal order by ID
+        evidence; classify the unmatched and the ambiguous; run the
+        per-trade SL/TP checks for unique matches. Returns the ids of
+        internal orders that have at least one open trade."""
+        observed_at = self._now()
+        matched_order_ids: set[str] = set()
+        for trade in sorted(open_trades, key=lambda t: t.trade_id):
+            candidates = self._match_order_candidates(
+                exposure, trade.client_order_id, trade.trade_id
+            )
+            if len(candidates) == 1:
+                info = candidates[0]
+                matched_order_ids.add(info["row"]["execution_request_id"])
+                self._check_matched_open_trade(info, trade, observed_at, add)
+                continue
+            if len(candidates) > 1:
+                candidate_ids = sorted(
+                    info["row"]["execution_request_id"] for info in candidates
+                )
+                add(
+                    PositionDiscrepancy(
+                        discrepancy_type=DiscrepancyType.TRADE_MATCH_AMBIGUOUS,
+                        target_type=ReconciliationTargetType.BROKER_TRADE,
+                        target_id=trade.trade_id,
+                        resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                        observed_at_utc=observed_at,
+                        detail=(
+                            f"broker trade {trade.trade_id} matches more than one internal "
+                            f"order by ID evidence ({', '.join(candidate_ids)}); an ambiguous "
+                            "match is never resolved by guessing"
+                        ),
+                        symbol=trade.symbol,
+                        broker_value=f"open {trade.side.value} {trade.quantity}",
+                        client_order_id=trade.client_order_id,
+                        broker_trade_id=trade.trade_id,
+                    )
+                )
+                continue
+            if trade.symbol in excluded:
+                # The symbol has internal orders whose outcome/fills are
+                # unresolved: this trade may belong to one of them, so it is
+                # NOT classified broker-only.
+                add(
+                    PositionDiscrepancy(
+                        discrepancy_type=DiscrepancyType.TRADE_MATCH_AMBIGUOUS,
+                        target_type=ReconciliationTargetType.BROKER_TRADE,
+                        target_id=trade.trade_id,
+                        resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                        observed_at_utc=observed_at,
+                        detail=(
+                            f"broker trade {trade.trade_id} matches no internal order by ID "
+                            f"evidence, but {trade.symbol} has internal orders with "
+                            "unresolved outcomes (UNKNOWN state or unreadable snapshot); "
+                            "the trade may belong to one of them, so it is held for manual "
+                            "review instead of being classified broker-only"
+                        ),
+                        symbol=trade.symbol,
+                        broker_value=f"open {trade.side.value} {trade.quantity}",
+                        client_order_id=trade.client_order_id,
+                        broker_trade_id=trade.trade_id,
+                    )
+                )
+                continue
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=DiscrepancyType.BROKER_ONLY_TRADE,
+                    target_type=ReconciliationTargetType.BROKER_TRADE,
+                    target_id=trade.trade_id,
+                    resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                    observed_at_utc=observed_at,
+                    detail=(
+                        f"the broker holds open trade {trade.trade_id} on {trade.symbol} "
+                        "that no internal order accounts for (no client_order_id match, no "
+                        "recorded fill id match); adopting a broker-side trade as an "
+                        "internal one is never automatic"
+                    ),
+                    symbol=trade.symbol,
+                    broker_value=f"open {trade.side.value} {trade.quantity}",
+                    client_order_id=trade.client_order_id,
+                    broker_trade_id=trade.trade_id,
+                )
+            )
+        return matched_order_ids
+
+    def _check_matched_open_trade(
+        self, info: dict, trade: TradeInfo, observed_at: datetime, add
+    ) -> None:
+        """Per-trade checks for a UNIQUELY matched internal order: internal
+        terminal-without-fill vs. an open trade, then the SL/TP intent
+        comparison. Nothing here mutates anything anywhere."""
+        row = info["row"]
+        state: OrderState = info["state"]
+        filled = info["filled"]
+
+        internally_closed = state is OrderState.REJECTED or (
+            state is OrderState.CANCELLED and filled is not None and filled == 0
+        )
+        if internally_closed:
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=DiscrepancyType.INTERNAL_CLOSED_BROKER_OPEN,
+                    target_type=ReconciliationTargetType.EXECUTION_ORDER,
+                    target_id=row["execution_request_id"],
+                    resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                    observed_at_utc=observed_at,
+                    detail=(
+                        f"BELIAL records this order as {state.value} with no fills, but the "
+                        f"broker holds open trade {trade.trade_id} bound to it by ID "
+                        "evidence; the broker-side trade is never closed automatically and "
+                        "the internal record is not changed"
+                    ),
+                    symbol=row["symbol"],
+                    internal_value=state.value,
+                    broker_value=f"open {trade.side.value} {trade.quantity}",
+                    execution_request_id=row["execution_request_id"],
+                    client_order_id=row["client_order_id"],
+                    broker_trade_id=trade.trade_id,
+                )
+            )
+            return
+
+        self._check_protection(
+            info,
+            trade,
+            observed_at,
+            add,
+            intent_text=row["stop_loss_price"],
+            observed=trade.stop_loss,
+            missing_type=DiscrepancyType.STOP_LOSS_MISSING,
+            mismatch_type=DiscrepancyType.STOP_LOSS_PRICE_MISMATCH,
+            reference_type=DiscrepancyType.STOP_LOSS_REFERENCE_MISMATCH,
+            unexpected_type=DiscrepancyType.STOP_LOSS_UNEXPECTED,
+            label="stop loss",
+        )
+        self._check_protection(
+            info,
+            trade,
+            observed_at,
+            add,
+            intent_text=row["take_profit_price"],
+            observed=trade.take_profit,
+            missing_type=DiscrepancyType.TAKE_PROFIT_MISSING,
+            mismatch_type=DiscrepancyType.TAKE_PROFIT_PRICE_MISMATCH,
+            reference_type=DiscrepancyType.TAKE_PROFIT_REFERENCE_MISMATCH,
+            unexpected_type=DiscrepancyType.TAKE_PROFIT_UNEXPECTED,
+            label="take profit",
+        )
+
+    def _check_protection(
+        self,
+        info: dict,
+        trade: TradeInfo,
+        observed_at: datetime,
+        add,
+        *,
+        intent_text: str | None,
+        observed,
+        missing_type: DiscrepancyType,
+        mismatch_type: DiscrepancyType,
+        reference_type: DiscrepancyType,
+        unexpected_type: DiscrepancyType,
+        label: str,
+    ) -> None:
+        """Compare one protection intent (the execution order's stored
+        SL/TP price) against the broker-reported protection order.
+
+        Prices are compared as exact ``Decimal`` values (the repository's
+        existing price convention: canonical Decimal strings, no float, no
+        rounding tolerance introduced here). Detection only -- a missing or
+        differing protection order is NEVER re-created or modified.
+        """
+        row = info["row"]
+        intent = None if intent_text is None else Decimal(intent_text)
+        common = dict(
+            target_type=ReconciliationTargetType.EXECUTION_ORDER,
+            target_id=row["execution_request_id"],
+            resolution_category=ResolutionCategory.MANUAL_REVIEW,
+            observed_at_utc=observed_at,
+            symbol=row["symbol"],
+            execution_request_id=row["execution_request_id"],
+            client_order_id=row["client_order_id"],
+            broker_trade_id=trade.trade_id,
+        )
+        if intent is not None and observed is None:
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=missing_type,
+                    detail=(
+                        f"the execution request intends a {label} at {intent}, but broker "
+                        f"trade {trade.trade_id} carries no {label} order; the protection "
+                        "order is never created automatically"
+                    ),
+                    internal_value=str(intent),
+                    **common,
+                )
+            )
+            return
+        if intent is None and observed is not None:
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=unexpected_type,
+                    detail=(
+                        f"broker trade {trade.trade_id} carries a {label} order at "
+                        f"{observed.price} that the execution request never intended; the "
+                        "protection order is never cancelled or changed automatically"
+                    ),
+                    broker_value=str(observed.price),
+                    protection_order_id=observed.order_id,
+                    **common,
+                )
+            )
+            return
+        if intent is None and observed is None:
+            return
+        if observed.price != intent:
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=mismatch_type,
+                    detail=(
+                        f"the execution request intends a {label} at {intent}, but broker "
+                        f"trade {trade.trade_id} carries {label} order {observed.order_id} "
+                        f"at {observed.price} (exact Decimal comparison); the protection "
+                        "order is never modified automatically"
+                    ),
+                    internal_value=str(intent),
+                    broker_value=str(observed.price),
+                    protection_order_id=observed.order_id,
+                    **common,
+                )
+            )
+        if observed.trade_id is not None and observed.trade_id != trade.trade_id:
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=reference_type,
+                    detail=(
+                        f"{label} order {observed.order_id} attached to broker trade "
+                        f"{trade.trade_id} references trade {observed.trade_id} instead; "
+                        "the reference is never rewired automatically"
+                    ),
+                    internal_value=trade.trade_id,
+                    broker_value=observed.trade_id,
+                    protection_order_id=observed.order_id,
+                    **common,
+                )
+            )
+
+    def _compare_closed_trades(
+        self,
+        exposure: dict,
+        closed_trades: tuple[ClosedTradeInfo, ...],
+        open_trade_ids: set[str],
+        open_matched_order_ids: set[str],
+        excluded: set[str],
+        add,
+    ) -> None:
+        """Use broker closed-trade / transaction evidence to detect "closed
+        on the broker while BELIAL still expects the exposure".
+
+        Emitted only when ALL of these hold for a uniquely matched order:
+        the symbol's expectation is determinate, the order contributed
+        exposure, no open trade is bound to the order, and the symbol still
+        nets to an expected exposure in the order's direction (an internal
+        offsetting order that closed the exposure inside BELIAL nets it to
+        zero -- then the broker-side close is EXPECTED and nothing is
+        flagged). Absence from the closed listing is never read as "not
+        closed", and unmatched closed trades are historical broker facts
+        outside Issue #105's scope."""
+        observed_at = self._now()
+        net = exposure["net"]
+        for closed in sorted(closed_trades, key=lambda t: t.trade_id):
+            if closed.trade_id in open_trade_ids:
+                continue  # still open broker-side; not close evidence
+            candidates = self._match_order_candidates(
+                exposure, closed.client_order_id, closed.trade_id
+            )
+            if len(candidates) > 1:
+                candidate_ids = sorted(
+                    info["row"]["execution_request_id"] for info in candidates
+                )
+                add(
+                    PositionDiscrepancy(
+                        discrepancy_type=DiscrepancyType.TRADE_MATCH_AMBIGUOUS,
+                        target_type=ReconciliationTargetType.BROKER_TRADE,
+                        target_id=closed.trade_id,
+                        resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                        observed_at_utc=observed_at,
+                        detail=(
+                            f"broker closed trade {closed.trade_id} matches more than one "
+                            f"internal order by ID evidence ({', '.join(candidate_ids)}); "
+                            "an ambiguous match is never resolved by guessing"
+                        ),
+                        symbol=closed.symbol,
+                        broker_value=f"closed {closed.side.value} {closed.quantity}",
+                        client_order_id=closed.client_order_id,
+                        broker_trade_id=closed.trade_id,
+                    )
+                )
+                continue
+            if not candidates:
+                continue
+            info = candidates[0]
+            row = info["row"]
+            request_id = row["execution_request_id"]
+            symbol = row["symbol"]
+            filled = info["filled"]
+            if symbol in excluded or filled is None or filled == 0:
+                continue
+            if request_id in open_matched_order_ids:
+                continue  # the order still has an open trade broker-side
+            order_direction = (
+                PositionSide.LONG
+                if row["side"] == OrderSide.BUY.value
+                else PositionSide.SHORT
+            )
+            if closed.side is not order_direction:
+                continue  # the closed trade is not the exposure this order opened
+            symbol_net = net.get(symbol, Decimal(0))
+            expected_side = (
+                PositionSide.LONG
+                if symbol_net > 0
+                else PositionSide.SHORT
+                if symbol_net < 0
+                else None
+            )
+            if expected_side is not order_direction:
+                continue  # BELIAL already nets this exposure to zero (or opposite)
+            transaction_note = (
+                f" (closing transaction(s): {', '.join(closed.closing_transaction_ids)})"
+                if closed.closing_transaction_ids
+                else ""
+            )
+            add(
+                PositionDiscrepancy(
+                    discrepancy_type=DiscrepancyType.BROKER_CLOSED_INTERNAL_OPEN,
+                    target_type=ReconciliationTargetType.EXECUTION_ORDER,
+                    target_id=request_id,
+                    resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                    observed_at_utc=observed_at,
+                    detail=(
+                        f"the broker closed trade {closed.trade_id} bound to this order by "
+                        f"ID evidence{transaction_note}, but BELIAL still expects a "
+                        f"{order_direction.value} exposure of {abs(symbol_net)} on {symbol}; "
+                        "the internal records are NOT changed and the broker-side fact is "
+                        "surfaced for manual review"
+                    ),
+                    symbol=symbol,
+                    internal_value=f"open {order_direction.value} {abs(symbol_net)}",
+                    broker_value=f"closed {closed.side.value} {closed.quantity}",
+                    execution_request_id=request_id,
+                    client_order_id=row["client_order_id"],
+                    broker_trade_id=closed.trade_id,
+                    broker_transaction_ids=closed.closing_transaction_ids,
+                )
+            )
+
+    @staticmethod
+    def _match_order_candidates(
+        exposure: dict, client_order_id: str | None, trade_id: str
+    ) -> list[dict]:
+        """The internal orders a broker trade matches by ID evidence: the
+        trade's broker-reported client_order_id, or the trade id appearing
+        among an order's recorded fill ids. Exact-ID only; returns every
+        candidate so the caller can distinguish unique / none / ambiguous."""
+        candidates: dict[str, dict] = {}
+        if client_order_id is not None:
+            info = exposure["by_client"].get(client_order_id)
+            if info is not None:
+                candidates[info["row"]["execution_request_id"]] = info
+        for info in exposure["by_fill"].get(trade_id, ()):
+            candidates[info["row"]["execution_request_id"]] = info
+        return [candidates[key] for key in sorted(candidates)]
+
+    def _list_broker_positions(
+        self,
+    ) -> tuple[tuple[PositionInfo, ...], str | None]:
+        """``(positions, error)``; the error marks the position comparison as
+        "not performed" (fail-closed), mirroring ``_list_broker_orders``."""
+        try:
+            positions = self._broker.get_positions()
+            if not isinstance(positions, tuple):
+                raise TypeError(
+                    "Broker.get_positions() must return a tuple, got "
+                    f"{type(positions).__name__}"
+                )
+            for entry in positions:
+                if not isinstance(entry, PositionInfo):
+                    raise TypeError(
+                        "Broker.get_positions() entries must be PositionInfo, got "
+                        f"{type(entry).__name__}"
+                    )
+            keys = [(entry.symbol, entry.side) for entry in positions]
+            duplicates = sorted(
+                f"{symbol}:{side.value}"
+                for (symbol, side), count in Counter(keys).items()
+                if count > 1
+            )
+            if duplicates:
+                return (
+                    (),
+                    "broker position enumeration is ambiguous: duplicate (symbol, side) "
+                    f"entries {duplicates!r}; positions were NOT checked",
+                )
+        except BrokerError as exc:
+            return (
+                (),
+                f"listing broker positions failed ({type(exc).__name__}: {exc}); "
+                "positions were NOT checked",
+            )
+        except Exception as exc:
+            return (
+                (),
+                "listing broker positions violated the Broker error/return contract "
+                f"({type(exc).__name__}); positions were NOT checked",
+            )
+        return positions, None
+
+    def _list_broker_open_trades(
+        self,
+    ) -> tuple[tuple[TradeInfo, ...], str | None]:
+        """``(open trades, error)``; the optional ``TradeListingBroker``
+        capability, handled exactly like ``OrderListingBroker``."""
+        if not isinstance(self._broker, TradeListingBroker):
+            return (
+                (),
+                f"{type(self._broker).__name__} does not implement TradeListingBroker; "
+                "open trades and SL/TP state were NOT checked",
+            )
+        try:
+            trades = self._broker.get_open_trades()
+            if not isinstance(trades, tuple):
+                raise TypeError(
+                    "TradeListingBroker.get_open_trades() must return a tuple, got "
+                    f"{type(trades).__name__}"
+                )
+            for entry in trades:
+                if not isinstance(entry, TradeInfo):
+                    raise TypeError(
+                        "TradeListingBroker.get_open_trades() entries must be TradeInfo, "
+                        f"got {type(entry).__name__}"
+                    )
+            duplicate_ids = sorted(
+                trade_id
+                for trade_id, count in Counter(t.trade_id for t in trades).items()
+                if count > 1
+            )
+            if duplicate_ids:
+                return (
+                    (),
+                    "broker open-trade enumeration is ambiguous: duplicate trade ids "
+                    f"{duplicate_ids!r}; open trades and SL/TP state were NOT checked",
+                )
+        except BrokerError as exc:
+            return (
+                (),
+                f"listing broker open trades failed ({type(exc).__name__}: {exc}); open "
+                "trades and SL/TP state were NOT checked",
+            )
+        except Exception as exc:
+            return (
+                (),
+                "listing broker open trades violated the Broker error/return contract "
+                f"({type(exc).__name__}); open trades and SL/TP state were NOT checked",
+            )
+        return trades, None
+
+    def _list_broker_closed_trades(
+        self, *, open_trades_available: bool
+    ) -> tuple[tuple[ClosedTradeInfo, ...], str | None]:
+        """``(closed trades, error)``; the optional
+        ``ClosedTradeListingBroker`` capability. Requires the OPEN trade
+        listing: without it, "no longer open" cannot be established and any
+        close conclusion would be a guess."""
+        if not isinstance(self._broker, ClosedTradeListingBroker):
+            return (
+                (),
+                f"{type(self._broker).__name__} does not implement "
+                "ClosedTradeListingBroker; closed-trade evidence was NOT checked",
+            )
+        if not open_trades_available:
+            return (
+                (),
+                "closed-trade evidence was NOT checked: the open-trade listing is "
+                "unavailable, so 'no longer open broker-side' cannot be established",
+            )
+        try:
+            trades = self._broker.get_closed_trades()
+            if not isinstance(trades, tuple):
+                raise TypeError(
+                    "ClosedTradeListingBroker.get_closed_trades() must return a tuple, "
+                    f"got {type(trades).__name__}"
+                )
+            for entry in trades:
+                if not isinstance(entry, ClosedTradeInfo):
+                    raise TypeError(
+                        "ClosedTradeListingBroker.get_closed_trades() entries must be "
+                        f"ClosedTradeInfo, got {type(entry).__name__}"
+                    )
+            duplicate_ids = sorted(
+                trade_id
+                for trade_id, count in Counter(t.trade_id for t in trades).items()
+                if count > 1
+            )
+            if duplicate_ids:
+                return (
+                    (),
+                    "broker closed-trade enumeration is ambiguous: duplicate trade ids "
+                    f"{duplicate_ids!r}; closed-trade evidence was NOT checked",
+                )
+        except BrokerError as exc:
+            return (
+                (),
+                f"listing broker closed trades failed ({type(exc).__name__}: {exc}); "
+                "closed-trade evidence was NOT checked",
+            )
+        except Exception as exc:
+            return (
+                (),
+                "listing broker closed trades violated the Broker error/return contract "
+                f"({type(exc).__name__}); closed-trade evidence was NOT checked",
+            )
+        return trades, None
+
     # --- broker-side enumeration --------------------------------------------
 
     def _list_broker_orders(self) -> tuple[tuple[OrderResult, ...], str | None]:
@@ -626,11 +1427,61 @@ class BrokerOrderReconciliationService:
                 else discrepancy.broker_error_code.value,
                 discrepancy.detail,
             )
+        for discrepancy in run.position_discrepancies:
+            _LOGGER.warning(
+                "reconciliation position-domain discrepancy: run_id=%s type=%s "
+                "target_type=%s target_id=%s symbol=%s internal=%s broker=%s "
+                "execution_request_id=%s client_order_id=%s broker_trade_id=%s "
+                "protection_order_id=%s broker_transaction_ids=%s resolution=%s detail=%s",
+                run.run_id,
+                discrepancy.discrepancy_type.value,
+                discrepancy.target_type.value,
+                discrepancy.target_id,
+                discrepancy.symbol,
+                discrepancy.internal_value,
+                discrepancy.broker_value,
+                discrepancy.execution_request_id,
+                discrepancy.client_order_id,
+                discrepancy.broker_trade_id,
+                discrepancy.protection_order_id,
+                list(discrepancy.broker_transaction_ids),
+                discrepancy.resolution_category.value,
+                discrepancy.detail,
+            )
         if run.broker_listing_error is not None:
             _LOGGER.warning(
                 "reconciliation run %s could not enumerate broker orders: %s",
                 run.run_id,
                 run.broker_listing_error,
+            )
+        summary = run.position_summary
+        if summary is not None:
+            for label, error in (
+                ("derive internal exposure", summary.internal_exposure_error),
+                ("enumerate broker positions", summary.position_listing_error),
+                ("enumerate broker open trades", summary.trade_listing_error),
+                ("enumerate broker closed trades", summary.closed_trade_listing_error),
+            ):
+                if error is not None:
+                    _LOGGER.warning(
+                        "reconciliation run %s could not %s: %s", run.run_id, label, error
+                    )
+            if summary.excluded_symbols:
+                _LOGGER.warning(
+                    "reconciliation run %s excluded symbols from the exposure comparison "
+                    "(unresolved internal outcomes, nothing inferred): %s",
+                    run.run_id,
+                    list(summary.excluded_symbols),
+                )
+            _LOGGER.info(
+                "reconciliation run %s position scope: checked_positions=%d "
+                "checked_trades=%d checked_closed_trades=%d position_discrepancies=%d "
+                "(all manual_review by construction)",
+                run.run_id,
+                summary.checked_position_count,
+                summary.checked_trade_count,
+                summary.checked_closed_trade_count,
+                len(run.position_discrepancies),
             )
         counts = run.resolution_counts()
         _LOGGER.info(

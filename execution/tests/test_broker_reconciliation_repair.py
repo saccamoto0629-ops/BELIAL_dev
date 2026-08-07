@@ -3815,6 +3815,19 @@ def _downgrade_reconciliation_db_to_v1(path):
     from contextlib import closing
 
     with closing(sqlite3.connect(path)) as connection:
+        # v3 -> v2 (Issue #105 additions) ...
+        connection.execute(
+            f"DROP INDEX {reconciliation_store._POSITION_DISCREPANCIES_RUN_INDEX}"
+        )
+        connection.execute(
+            f"DROP TABLE {reconciliation_store.POSITION_DISCREPANCIES_TABLE}"
+        )
+        for column_ddl in reconciliation_store._RUN_POSITION_COLUMN_DDLS:
+            column_name = column_ddl.split(" ", 1)[0]
+            connection.execute(
+                f"ALTER TABLE {reconciliation_store.RUNS_TABLE} DROP COLUMN {column_name}"
+            )
+        # ... then v2 -> v1 (Issue #104 additions)
         connection.execute(f"DROP INDEX {reconciliation_store._INTENT_ACTIVE_INDEX}")
         connection.execute(f"DROP INDEX {reconciliation_store._INTENT_ATTEMPT_INDEX}")
         connection.execute(f"DROP TABLE {reconciliation_store.TAKEOVER_INTENTS_TABLE}")
@@ -3824,9 +3837,7 @@ def _downgrade_reconciliation_db_to_v1(path):
             f"ALTER TABLE {reconciliation_store.DISCREPANCIES_TABLE} "
             "DROP COLUMN internal_revision"
         )
-        connection.execute(
-            f"PRAGMA user_version = {reconciliation_store._MIGRATABLE_VERSION}"
-        )
+        connection.execute("PRAGMA user_version = 1")
         connection.commit()
 
 

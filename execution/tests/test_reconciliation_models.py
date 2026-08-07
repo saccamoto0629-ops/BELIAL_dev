@@ -10,7 +10,11 @@ import pytest
 from broker.broker_models import BrokerErrorCode, OrderState
 from execution.reconciliation_models import (
     DiscrepancyType,
+    ORDER_DISCREPANCY_TYPES,
+    ORDER_TARGET_TYPES,
     OrderDiscrepancy,
+    POSITION_DISCREPANCY_TYPES,
+    POSITION_TARGET_TYPES,
     ReconciliationMode,
     ReconciliationRun,
     ReconciliationTargetType,
@@ -54,7 +58,9 @@ def run(**overrides) -> ReconciliationRun:
 
 
 def test_discrepancy_types_cover_the_issue_103_cases():
-    assert {t.value for t in DiscrepancyType} == {
+    # The ORDER-domain vocabulary is frozen (Issue #103); Issue #105 added
+    # position-domain members to the same axis without touching it.
+    assert {t.value for t in ORDER_DISCREPANCY_TYPES} == {
         "in_flight_broker_filled",
         "in_flight_broker_cancelled",
         "in_flight_broker_rejected",
@@ -64,6 +70,26 @@ def test_discrepancy_types_cover_the_issue_103_cases():
         "state_mismatch",
         "query_failure",
     }
+    assert {t.value for t in POSITION_DISCREPANCY_TYPES} == {
+        "position_missing_on_broker",
+        "broker_only_position",
+        "broker_only_trade",
+        "trade_match_ambiguous",
+        "broker_closed_internal_open",
+        "internal_closed_broker_open",
+        "stop_loss_missing",
+        "take_profit_missing",
+        "stop_loss_price_mismatch",
+        "take_profit_price_mismatch",
+        "stop_loss_reference_mismatch",
+        "take_profit_reference_mismatch",
+        "stop_loss_unexpected",
+        "take_profit_unexpected",
+    }
+    # The two subsets partition the full enum: every member belongs to
+    # exactly one domain.
+    assert ORDER_DISCREPANCY_TYPES | POSITION_DISCREPANCY_TYPES == frozenset(DiscrepancyType)
+    assert not ORDER_DISCREPANCY_TYPES & POSITION_DISCREPANCY_TYPES
 
 
 def test_resolution_categories_separate_auto_manual_and_query_failure():
@@ -75,7 +101,18 @@ def test_resolution_categories_separate_auto_manual_and_query_failure():
 
 
 def test_target_types_and_the_single_detection_only_mode():
-    assert {t.value for t in ReconciliationTargetType} == {"execution_order", "broker_order"}
+    assert {t.value for t in ORDER_TARGET_TYPES} == {"execution_order", "broker_order"}
+    assert {t.value for t in POSITION_TARGET_TYPES} == {
+        "execution_order",
+        "position",
+        "broker_trade",
+    }
+    assert {t.value for t in ReconciliationTargetType} == {
+        "execution_order",
+        "broker_order",
+        "position",
+        "broker_trade",
+    }
     assert [m.value for m in ReconciliationMode] == ["detection_only"]
 
 

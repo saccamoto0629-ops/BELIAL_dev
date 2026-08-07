@@ -110,6 +110,20 @@ jobs:
           python -c "import json; data=json.load(open('shadow-report.json', encoding='ascii')); assert data['count'] == 2, data"
           python -m execution.shadow_report --shadow-db "$RUNNER_TEMP/shadow-ci/shadow_results.sqlite3" --decision-db "$RUNNER_TEMP/shadow-ci/safety_gate_decisions.sqlite3" --orphan-decisions
 
+      # Issue #105: the manual reconciliation CLI contract -- reconcile-only,
+      # FakeBroker path only in CI (no OANDA credentials, no network; the
+      # oanda-demo branch is covered by env-refusal tests in pytest). dry-run
+      # must create nothing; a recorded run must append exactly one audit run.
+      - name: Run manual reconciliation CLI (dry-run + recorded run)
+        run: |
+          set -e
+          python -m execution.reconciliation_runner --broker fake --dry-run --data-dir "$RUNNER_TEMP/recon-ci" --now 2026-01-01T00:00:00+00:00 --run-id recon-ci-dry --json > recon-dry.json
+          python -c "import json; data=json.load(open('recon-dry.json', encoding='ascii')); assert data['dry_run'] and data['recorded_to'] is None, data"
+          test ! -e "$RUNNER_TEMP/recon-ci" || { echo "dry-run must not create DB files"; exit 1; }
+          python -m execution.reconciliation_runner --broker fake --data-dir "$RUNNER_TEMP/recon-ci" --now 2026-01-01T00:00:00+00:00 --run-id recon-ci-1 --json > recon-run.json
+          python -c "import json; data=json.load(open('recon-run.json', encoding='ascii')); assert data['run_id'] == 'recon-ci-1' and data['position_scope'] is not None, data"
+          test -f "$RUNNER_TEMP/recon-ci/broker_reconciliation.sqlite3"
+
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
       # the same rule; Issue #75 adds the Safety Gate modules; Issue #77 adds
@@ -136,6 +150,13 @@ jobs:
           python -c "from execution.strict_json import load_strict_json_file"
           python -c "from execution.shadow_runner import main"
           python -c "from execution.shadow_report import main"
+          python -c "from broker.broker_interface import TradeListingBroker, ClosedTradeListingBroker"
+          python -c "from broker.broker_models import TradeInfo, ClosedTradeInfo, ProtectionOrderInfo"
+          python -c "from execution.reconciliation_models import OrderDiscrepancy, PositionDiscrepancy, ReconciliationRun"
+          python -c "from execution import reconciliation_store"
+          python -c "from execution.broker_reconciliation import BrokerOrderReconciliationService"
+          python -c "from execution.broker_reconciliation_repair import BrokerOrderReconciliationRepairService"
+          python -c "from execution.reconciliation_runner import main"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot
@@ -203,3 +224,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "json report failed" }
           python -c "import json; data=json.load(open('shadow-report.json', encoding='ascii')); assert data['count'] == 2, data"
           if ($LASTEXITCODE -ne 0) { throw "json parse failed" }
+
+      # Issue #105: the reconciliation CLI keeps its exit-code and dry-run
+      # contracts on the Windows ANSI-codepage console too (PYTHONUTF8 is
+      # deliberately NOT set). FakeBroker only: no secrets, no network.
+      - name: Run manual reconciliation CLI (Windows)
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m execution.reconciliation_runner --broker fake --dry-run --data-dir "$env:RUNNER_TEMP/recon-ci" --now 2026-01-01T00:00:00+00:00 --run-id recon-ci-dry
+          if ($LASTEXITCODE -ne 0) { throw "reconciliation dry-run failed" }
+          if (Test-Path "$env:RUNNER_TEMP/recon-ci") { throw "dry-run must not create DB files" }
+          python -m execution.reconciliation_runner --broker fake --data-dir "$env:RUNNER_TEMP/recon-ci" --now 2026-01-01T00:00:00+00:00 --run-id recon-ci-1 --json > recon-run.json
+          if ($LASTEXITCODE -ne 0) { throw "reconciliation run failed" }
+          python -c "import json; data=json.load(open('recon-run.json', encoding='ascii')); assert data['run_id'] == 'recon-ci-1', data"
+          if ($LASTEXITCODE -ne 0) { throw "reconciliation json parse failed" }

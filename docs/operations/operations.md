@@ -38,7 +38,7 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む(v3 で通知 outbox テーブル `paper_execution_notifications` を追加)。dry-run では作成・migration せず、本体+WAL/SHM の snapshot コピーに対する読み取り専用スキーマ確認のみ行う(実 DB へ接続しない) |
 | `EXECUTION_ORDER_DB_PATH` | `execution/data/execution_orders.sqlite3` | 将来の Live Execution 用 Execution Order DB のパス上書き(`execution/execution_store.py`、Issue #74)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Live Execution runner 未実装。テストは `tmp_path` を使用) |
 | `SAFETY_GATE_DECISION_DB_PATH` | `execution/data/safety_gate_decisions.sqlite3` | 将来の Live Execution 用 Safety Gate 判定監査 DB のパス上書き(`execution/safety_store.py`、Issue #75)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Live Execution runner 未実装。テストは `tmp_path` を使用) |
-| `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(scheduler / 常駐 Bot への組み込みは未実装。テストは `tmp_path` を使用) |
+| `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。schema v3(Issue #105)は position / trade / SL・TP 検出記録テーブル(`manual_review` のみ許可)と run の position summary 列を additive に追加(migration は v1 → v2 → v3 の段階適用、`init_reconciliation_db()` のみ)。**この DB を作成・更新する運用導線は手動 reconciliation CLI(`python -m execution.reconciliation_runner`。Issue #105、下記 CLI 節)だけであり**、scheduler / 常駐 Bot への組み込みは未実装(テストは `tmp_path` を使用) |
 | `OANDA_API_TOKEN` | empty | OANDA Demo Adapter(`broker/oanda_demo_adapter.py`、Issue #79)の API token。**Demo(fxpractice)口座のトークンのみ**。環境変数でのみ渡し、ログ・例外・docs へ実値を書かない。**運用導線からこの Adapter を起動するプロセスは現時点で存在しない**(Execution 統合は未実装。opt-in の実 API テストのみが使用) |
 | `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない |
 | `OANDA_API_URL` | `https://api-fxpractice.oanda.com` | OANDA Demo Adapter の接続先。**Demo endpoint のみ許可(allowlist)**。Live endpoint(`fxtrade` を含む host)やその他の URL を指定すると構築時に fail-closed で起動拒否。HTTP redirect は追従しない(3xx は共通エラー化)ため、応答によって Demo endpoint 外へ接続が逸れることもない |
@@ -255,6 +255,30 @@ python paper_signal_bot.py
 ```
 
 1周期の処理(`run_once`)と常駐ループ(`run_service`)は分離されており、`--once` は sleep せず1周期だけ実行する。`--dry-run` は SQLite保存・Discord送信・state更新・logfile作成など永続的副作用を一切行わず(console-only logger)、使用予定の入力・target candle timestamp・生成結果・no-signal・skip理由・重複判定のみをログ出力する。
+
+### 手動 Broker reconciliation(Issue #105)
+
+`python -m execution.reconciliation_runner` は、内部記録と Broker 状態(注文 + position / trade / SL・TP)を **reconcile-only** で照合する手動 CLI。**注文送信・キャンセル・close・SL / TP 作成/変更・口座状態照会は構造的に不可能**(渡した Broker を submit / cancel / account が無条件 raise する facade で包む)であり、内部注文・position 状態も一切変更しない(検出専用サービスのみを使う)。
+
+```bash
+# OANDA Demo 口座との手動照合(要 OANDA_API_TOKEN / OANDA_ACCOUNT_ID。
+# Demo 以外の OANDA_API_URL は adapter の allowlist が構築時に拒否 → exit 2)
+python -m execution.reconciliation_runner --broker oanda-demo
+
+# 照合のみ(reconciliation DB を作成・migration・書き込みしない)
+python -m execution.reconciliation_runner --broker oanda-demo --dry-run
+
+# 機械可読出力(pure ASCII JSON)/ 注文スコープのみ / 配線確認用の空 FakeBroker
+python -m execution.reconciliation_runner --broker oanda-demo --json
+python -m execution.reconciliation_runner --broker oanda-demo --orders-only
+python -m execution.reconciliation_runner --broker fake --dry-run
+```
+
+- exit code: **0** = 差分・部分失敗なし / **1** = 差分または部分失敗(照合できなかった列挙を含む)/ **2** = usage・設定エラー(Demo 以外の endpoint 拒否・credential 欠落を含む)。
+- 既定では run を reconciliation DB(`BROKER_RECONCILIATION_DB_PATH`)へ append する(`init_reconciliation_db()` は冪等)。`--run-id` 省略時は一意な ID を自動生成し、既存 run_id の再記録は拒否される。
+- **token / account id / endpoint は出力・ログへ一切出ない**(接続表示は定数ラベル `demo / oanda-demo` のみ。設定エラー文言は環境変数名のみを含み値を echo しない)。
+- 検出結果は要確認(`manual_review`)分類の記録であり、**この CLI から自動修復は起動しない**。order スコープの修復(Issue #104)はサービス API の明示呼び出しのみ。
+- 通常 CI・pytest から実 Demo API へは接続しない(CI は `--broker fake` 経路のみ実行)。
 
 ### Paper Signal 日次集計レポート(Issue #47)
 

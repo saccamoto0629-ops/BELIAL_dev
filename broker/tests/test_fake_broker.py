@@ -790,3 +790,82 @@ def test_list_orders_places_no_order_and_records_no_call():
     broker.list_orders()
 
     assert (len(broker.submitted_requests), len(broker.cancel_requests)) == (submits, cancels)
+
+
+# --- open / closed trade fixtures (Issue #105) --------------------------------
+
+TRADE_TIME = datetime(2026, 1, 5, tzinfo=timezone.utc)
+
+
+def make_trade(trade_id="T-1", **overrides):
+    kwargs = dict(
+        trade_id=trade_id,
+        symbol="USD_JPY",
+        side=m.PositionSide.LONG,
+        quantity=Decimal("10"),
+        open_price=Decimal("150.5"),
+        opened_at_utc=TRADE_TIME,
+        retrieved_at_utc=TRADE_TIME,
+    )
+    kwargs.update(overrides)
+    return m.TradeInfo(**kwargs)
+
+
+def make_closed_trade(trade_id="T-1", **overrides):
+    kwargs = dict(
+        trade_id=trade_id,
+        symbol="USD_JPY",
+        side=m.PositionSide.LONG,
+        quantity=Decimal("10"),
+        open_price=Decimal("150.5"),
+        opened_at_utc=TRADE_TIME,
+        closed_at_utc=TRADE_TIME,
+        retrieved_at_utc=TRADE_TIME,
+    )
+    kwargs.update(overrides)
+    return m.ClosedTradeInfo(**kwargs)
+
+
+def test_trades_default_to_empty_and_are_pinned_by_the_hooks():
+    broker = fb.FakeBroker()
+    assert broker.get_open_trades() == ()
+    assert broker.get_closed_trades() == ()
+
+    open_trades = (make_trade("T-1"), make_trade("T-2"))
+    closed_trades = (make_closed_trade("T-9", closing_transaction_ids=("900",)),)
+    broker.set_open_trades(open_trades)
+    broker.set_closed_trades(list(closed_trades))
+
+    assert broker.get_open_trades() == open_trades
+    assert broker.get_closed_trades() == closed_trades
+
+
+def test_trade_hooks_validate_their_entries_eagerly():
+    broker = fb.FakeBroker()
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_open_trades("not-a-collection")
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_open_trades((make_trade(), "junk"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_closed_trades((make_trade(),))  # open TradeInfo in the closed hook
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.set_closed_trades(({"trade_id": "T-1"},))
+
+
+def test_trade_hooks_allow_duplicate_ids_for_ambiguity_testing():
+    """Reconciliation must handle an ambiguous broker enumeration
+    fail-closed; the test double therefore allows injecting one."""
+    broker = fb.FakeBroker()
+    broker.set_open_trades((make_trade("T-1"), make_trade("T-1")))
+    assert len(broker.get_open_trades()) == 2
+
+
+def test_trade_getters_place_no_order_and_record_no_call():
+    broker = fb.FakeBroker()
+    broker.submit_order(make_request("c-1"))
+    submits, cancels = len(broker.submitted_requests), len(broker.cancel_requests)
+
+    broker.get_open_trades()
+    broker.get_closed_trades()
+
+    assert (len(broker.submitted_requests), len(broker.cancel_requests)) == (submits, cancels)

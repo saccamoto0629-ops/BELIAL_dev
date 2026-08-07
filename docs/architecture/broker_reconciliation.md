@@ -1,14 +1,14 @@
-# Broker Reconciliation — 差分検出と安全な注文状態修復(Issue #103 / #104)
+# Broker Reconciliation — 差分検出と安全な注文状態修復(Issue #103 / #104 / #105)
 
-BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出基盤**(Issue #103)と、そのうち安全に確定できる注文状態だけを内部へ冪等に反映する**修復サービス**(Issue #104)。実装は `execution/`(`reconciliation_models.py` / `reconciliation_repair_models.py` / `reconciliation_store.py` / `broker_reconciliation.py` / `broker_reconciliation_repair.py`)にある。
+BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出基盤**(Issue #103)と、そのうち安全に確定できる注文状態だけを内部へ冪等に反映する**修復サービス**(Issue #104)、および照合範囲を position / trade / transaction / SL・TP へ広げた **position スコープ検出**(Issue #105)。実装は `execution/`(`reconciliation_models.py` / `reconciliation_repair_models.py` / `reconciliation_store.py` / `broker_reconciliation.py` / `broker_reconciliation_repair.py` / `reconciliation_runner.py`)にある。
 
 > **重要な位置づけ**
 >
-> - **検出サービスは検出専用(detection only)である。** 内部注文状態を変更しない・Broker へ注文を送信しない・Broker 注文をキャンセルしない。Broker へは**照会系操作のみ**(`get_order` / `list_orders`)を発行する。
+> - **検出サービスは検出専用(detection only)である。** 内部注文状態を変更しない・Broker へ注文を送信しない・Broker 注文をキャンセルしない。Broker へは**照会系操作のみ**(`get_order` / `list_orders` / `get_positions` / `get_open_trades` / `get_closed_trades`)を発行する。
 > - **修復サービスが変更できるのは BELIAL 内部の注文状態だけであり、必ず既存の注文状態機械を経由する。** Broker への write 操作(submit / cancel / replace / close)は一切行わず、Broker へは `get_order` のみを発行する。SQL の直接 UPDATE も行わない(唯一の書き込み経路は `execution_store.record_order_result`。AST 検査で固定)。
-> - position / trade / SL・TP の照合と OANDA Demo による手動照合は **Issue #105** の責務であり、未実装。
-> - scheduler・常駐 Bot への組み込みは行っていない。実行はサービス API の明示的な呼び出しのみ。
-> - 注文状態の唯一の正は既存の `broker.OrderState` と `validate_order_state_transition()` / `validate_order_result_update()`([Broker Interface](broker_interface.md)、Issue #73)。本基盤は**注文状態 Enum・遷移表を新設・緩和しない**。
+> - **position / trade / transaction / SL・TP の照合(Issue #105)は検出 + `manual_review` 分類のみで、修復経路が存在しない。** position 系 discrepancy はモデル不変条件と DB CHECK の両方で `manual_review` 固定であり、修復サービスは order discrepancy(`run.discrepancies`)しか読まないため、position 系記録は構造的に修復へ到達できない。Broker 側のみの position / trade の自動採用・内部のみ position の自動 close・SL / TP の自動再作成・変更は行わない。
+> - scheduler・常駐 Bot への組み込みは行っていない。実行はサービス API の明示的な呼び出し、または手動 CLI(`python -m execution.reconciliation_runner`。Issue #105)のみ。
+> - 注文状態の唯一の正は既存の `broker.OrderState` と `validate_order_state_transition()` / `validate_order_result_update()`([Broker Interface](broker_interface.md)、Issue #73)。本基盤は**注文状態 Enum・遷移表を新設・緩和しない**(position ドメインにも並行状態機械を導入しない — 観測値は文字列レンダリングで記録される監査情報である)。
 
 ```python
 from execution.broker_reconciliation import BrokerOrderReconciliationService
@@ -23,7 +23,8 @@ from execution import reconciliation_store
 ```text
 BrokerOrderReconciliationService         ← execution/broker_reconciliation.py(検出)
    ├─ read-only → execution_store(execution_orders.sqlite3)
-   ├─ query-only → Broker interface(get_order / list_orders)
+   ├─ query-only → Broker interface(get_order / list_orders /
+   │               get_positions / get_open_trades / get_closed_trades)
    └─ append   → reconciliation_store(broker_reconciliation.sqlite3)
 
 BrokerOrderReconciliationRepairService   ← execution/broker_reconciliation_repair.py(修復)
@@ -43,12 +44,16 @@ BrokerOrderReconciliationRepairService   ← execution/broker_reconciliation_rep
 
 | モデル | 内容 |
 |---|---|
-| `ReconciliationRun` | 1 回の照合結果: `run_id` / `mode` / 開始・終了時刻 / `checked_order_count`(比較した内部注文数)/ `discrepancies` / `broker_listing_error` |
-| `OrderDiscrepancy` | 1 件の差分: 種別 / 対象種別 / 対象 ID / resolution category / 観測時刻 / 判定理由(`detail`)/ 内部観測状態 / Broker 観測状態 / `client_order_id` / `broker_order_id` / `broker_error_code` |
+| `ReconciliationRun` | 1 回の照合結果: `run_id` / `mode` / 開始・終了時刻 / `checked_order_count`(比較した内部注文数)/ `discrepancies` / `broker_listing_error`。Issue #105 で `position_discrepancies` / `position_summary` を追加(`position_summary=None` = その run は position スコープを照合していない。order-only run と v3 以前の保存行) |
+| `OrderDiscrepancy` | 1 件の注文差分: 種別 / 対象種別 / 対象 ID / resolution category / 観測時刻 / 判定理由(`detail`)/ 内部観測状態 / Broker 観測状態 / `client_order_id` / `broker_order_id` / `broker_error_code` |
+| `PositionDiscrepancy`(Issue #105) | 1 件の position ドメイン差分(position / trade / transaction 由来 close / SL / TP): 種別 / 対象種別 / 対象 ID / **`manual_review` 固定**の resolution category / 観測時刻 / `detail` / `symbol` / 観測値の文字列レンダリング(`internal_value` / `broker_value`)/ 対応 ID 群(`execution_request_id` / `client_order_id` / `broker_trade_id` / `protection_order_id` / `broker_transaction_ids`) |
+| `PositionReconciliationSummary`(Issue #105) | position スコープが**何を見たか**: `checked_position_count` / `checked_trade_count` / `checked_closed_trade_count`、および「照合しなかった」ことを明示する列挙エラー(`internal_exposure_error` / `position_listing_error` / `trade_listing_error` / `closed_trade_listing_error`)と fail-safe 除外シンボル(`excluded_symbols`) |
 | `ReconciliationMode` | `detection_only` のみ。run 行へ保存し、「その run が何を許されていたか」をコードのバージョンから推測させない |
-| `ReconciliationTargetType` | `execution_order`(`target_id` = `execution_request_id`)/ `broker_order`(`target_id` = `client_order_id`。内部 ID が存在しない Broker 側のみの注文) |
+| `ReconciliationTargetType` | `execution_order`(`target_id` = `execution_request_id`)/ `broker_order`(`target_id` = `client_order_id`。内部 ID が存在しない Broker 側のみの注文)。Issue #105 で `position`(`target_id` = `"<symbol>:<side>"`)/ `broker_trade`(`target_id` = Broker trade id)を追加 |
 
-`checked_order_count` があるため「差分 0 件」と「そもそも 1 件も見ていない」を区別できる。`has_partial_failures` は対象別 `query_failure` または列挙失敗/未対応の有無から導出し、一部だけ未確認の run を完全成功として表示しないための機械可読フラグである。
+`checked_order_count` があるため「差分 0 件」と「そもそも 1 件も見ていない」を区別できる。`has_partial_failures` は対象別 `query_failure`・列挙失敗/未対応・position スコープの列挙/導出失敗・除外シンボルの有無から導出し、一部だけ未確認の run を完全成功として表示しないための機械可読フラグである。
+
+**enum の分割(Issue #105)**: `DiscrepancyType` / `ReconciliationTargetType` は 1 本の軸のまま拡張し、`ORDER_DISCREPANCY_TYPES` / `POSITION_DISCREPANCY_TYPES`(および `ORDER_TARGET_TYPES` / `POSITION_TARGET_TYPES`)の凍結サブセットで 2 つのドメインへ分割する。order 系 discrepancy テーブルの CHECK 制約は**フル enum ではなくこのサブセットから生成**されるため、enum が育っても既存テーブルの DDL はリリース済み v2 とバイト同一に保たれる(既存 DB の再構築なし)。`OrderDiscrepancy` は position 系の種別を、`PositionDiscrepancy` は order 系の種別を、それぞれ構築時に拒否する。
 
 ### discrepancy type
 
@@ -101,6 +106,58 @@ Broker 側にのみ存在する注文は、照会だけでは観測できない(
 - Issue #73 の `Broker` Protocol は**5 操作のまま変更していない**(テストで固定)。既存実装(FakeBroker / OANDA Demo Adapter / 将来の Adapter)は無変更で `Broker` を満たし続ける = **後方互換**。
 - FakeBroker は既に保持している注文レコードを決定的順序(`client_order_id` 昇順)で返す `list_orders()` を実装する。新しい scripting API は増やしていない。
 - 列挙非対応の Broker(現時点の OANDA Demo Adapter を含む)では、上記のとおり `broker_listing_error` に「未確認」を記録する。
+
+## Position / Trade / Transaction / SL・TP 照合(Issue #105)
+
+`detect(run_id=..., include_position_scope=True)` / `run(run_id=..., include_position_scope=True)` で有効化する **position スコープ**。既定は `False` で、Issue #103 の order-only 呼び出しは挙動が一切変わらない。スコープの原則は「**差分検出 → discrepancy 記録 → `manual_review` 分類**」であり、このドメインには自動修復・自動採用・自動 close・SL / TP の自動再作成が**存在しない**(モデル・DB CHECK・修復サービスの入力経路の 3 層で構造的に保証)。
+
+### 内部期待の導出(内部記録のみから)
+
+内部側の position 期待は execution order store の記録**のみ**から導出する: 各注文の約定数量(保存済み `OrderResult` スナップショット)を BUY 正 / SELL 負で符号化し、シンボルごとにネットする。内部の反対売買で相殺された exposure はネット 0 になるため、Broker 側 close は「期待どおり」となり誤検出しない。**fail-safe 除外**: 結果が UNKNOWN の注文・スナップショットを読めない注文・状態だけでは約定量を確定できない注文(スナップショットなしの PARTIALLY_FILLED / CANCELLED)があるシンボルは期待が不定となり、exposure 比較から除外して `excluded_symbols` に記録する(推測しない)。ID インデックス(client_order_id / fill id)は除外注文についても構築する — 同一性照合は正確な ID 証拠であり、数量の不定性と無関係のため。
+
+### ID ベースの対応付け(時刻・価格では推測しない)
+
+Broker trade と内部注文の対応付けは **ID 証拠のみ**: (1) Broker が trade に報告する `client_order_id`、(2) trade id が注文の記録済み fill id(= Broker 約定 transaction id)に一致すること。0 件一致は `broker_only_trade`(そのシンボルに未確定注文があれば `trade_match_ambiguous`)、2 件以上一致は `trade_match_ambiguous` — **曖昧一致は決して推測で解決しない**。時刻・価格の近さによるマッチングは行わない。
+
+### 検出する差分(position ドメインの discrepancy type)
+
+| 種別 | 対象 | 意味 |
+|---|---|---|
+| `position_missing_on_broker` | `position` | 内部の filled 注文は exposure を期待するが、Broker に該当 (symbol, side) の position がない |
+| `broker_only_position` | `position` | Broker にのみ position が存在する(自動採用しない) |
+| `broker_only_trade` | `broker_trade` | Broker にのみ open trade が存在する(自動採用しない) |
+| `trade_match_ambiguous` | `broker_trade` | ID 証拠で一意に対応付けられない(複数一致、または該当シンボルに未確定注文がある) |
+| `broker_closed_internal_open` | `execution_order` | Broker の closed trade / closing transaction 証拠により Broker 側 close 済みだが、内部はまだ exposure を期待している |
+| `internal_closed_broker_open` | `execution_order` | 内部は約定なしの終端(REJECTED / fill 0 の CANCELLED)だが、Broker はその注文に紐づく open trade を保持している |
+| `stop_loss_missing` / `take_profit_missing` | `execution_order` | 内部 intent(`execution_orders.stop_loss_price` / `take_profit_price`)があるのに Broker trade に protection order がない |
+| `stop_loss_price_mismatch` / `take_profit_price_mismatch` | `execution_order` | protection order の価格が intent と不一致(**Decimal の値等価比較**。float 比較・丸め許容は導入しない) |
+| `stop_loss_reference_mismatch` / `take_profit_reference_mismatch` | `execution_order` | protection order の trade 参照(back-reference)が対象 trade と不一致 |
+| `stop_loss_unexpected` / `take_profit_unexpected` | `execution_order` | 内部 intent がないのに Broker trade に protection order が付いている |
+
+resolution category は**全種別で `manual_review` 固定**(モデル不変条件 + DB CHECK)。SL / TP の内部 intent は `execution_orders` の `stop_loss_price` / `take_profit_price`(= `ExecutionRequest` の intent。Issue #74)であり、SL / TP は broker boundary の submit を越えない(Issue #73 契約は不変)。
+
+### Broker capability(optional Protocol の追加)
+
+`OrderListingBroker` と同じ流儀で `broker/broker_interface.py` に 2 つの optional Protocol を追加した: `TradeListingBroker`(`get_open_trades() -> tuple[TradeInfo, ...]`)/ `ClosedTradeListingBroker`(`get_closed_trades() -> tuple[ClosedTradeInfo, ...]`)。`Broker` Protocol は 5 操作のまま不変。position 照会は既存の `Broker.get_positions()` を使う。capability 非対応・列挙失敗・列挙の重複 ID(曖昧)は、それぞれ summary の `*_listing_error` に「未確認」として記録し、**「差分なし」とは決して読ませない**。closed trade 照合は open trade 列挙が成功した場合のみ実行する(open 列挙なしには「もう open でない」を確立できないため)。closed 列挙は Broker 側で有界(直近分)でありうるため、**closed 一覧に無いことを「close されていない」とは読まない**(証拠としてのみ使う)。
+
+### 照会失敗時の fail-closed
+
+position スコープの Broker 照会はすべて列挙であり、失敗は run-level(summary の `*_listing_error`)に記録して該当ドメインの比較を**まるごとスキップ**する。execution store のスナップショット読み取り失敗は `internal_exposure_error` + シンボル除外。いずれの場合も**内部状態は一切変更されず、discrepancy を捏造しない**(SL 状態が取れない ≠ SL missing)。
+
+### 冪等性
+
+order スコープと同一の run 単位 append 方針。同じ状態で何度照合しても、内部 position / order 状態は変わらず(検出サービスに書き込み経路がない)、run ごとに独立した記録が append され、同一 run 内の重複は `UNIQUE (run_id, discrepancy_type, target_type, target_id)` で排除される(1 注文の複数 trade から同じ SL 所見が出ても 1 行)。
+
+### 手動 reconciliation CLI(`python -m execution.reconciliation_runner`)
+
+Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `ReconcileOnlyBroker` facade で包み、`submit_order` / `cancel_order` / `get_account_state` は**無条件に raise** する(検出サービス自体の detection-only 契約に対する defense in depth。口座情報は取得すらしない)。
+
+- `--broker oanda-demo`: `OANDA_API_TOKEN` / `OANDA_ACCOUNT_ID` / `OANDA_API_URL` から OANDA Demo Adapter(Issue #79)を構築する。**Demo 以外の endpoint は Adapter の構築時 allowlist で fail-closed に拒否**され、CLI は usage error(exit 2)で停止する。Safety Gate の `BROKER_TYPE_BY_MODE` には登録しない(submit 経路は開放されない)。token / account id / endpoint はログ・出力へ一切出さない(出力は定数ラベル `demo / oanda-demo` のみ)。
+- `--broker fake`: 空の in-memory FakeBroker(配線・dry-run 検証用。ネットワークなし)。
+- `--dry-run`: 比較と報告のみ。reconciliation DB を作成・migration・書き込みしない。省略時は `run()`(冪等 init + append)。
+- `--orders-only`: Issue #103 スコープに限定。`--run-id` / `--now` / `--json`(pure ASCII)/ `--execution-db` / `--reconciliation-db` / `--data-dir` は他の execution CLI と同じ流儀。
+- exit code: 0 = 差分・部分失敗なし / 1 = 差分または部分失敗あり(実行時失敗を含む)/ 2 = usage・設定エラー(非 Demo 拒否を含む)。
+- 通常 CI・pytest は実 Demo API へ接続しない(FakeBroker 経路 + 環境変数による拒否テスト + monkeypatch した offline adapter のみ。実 API 試験は従来どおり `BELIAL_RUN_OANDA_DEMO_API_TESTS=1` の opt-in スイートに分離)。
 
 ## 自動修復(Issue #104、`broker_reconciliation_repair.py`)
 
@@ -489,17 +546,18 @@ clock の呼び出しは **pass 開始 / attempt ごとの claim / attempt ご�
 
 独立 DB `execution/data/broker_reconciliation.sqlite3`(既定。`BROKER_RECONCILIATION_DB_PATH` で上書き。相対パスは `execution/` 基準)。所有コンポーネントは `execution/` のみ。他 store と同居しない理由は既存 store と同じ(各 store が closed-world で schema を検証するため)。加えて、reconciliation 専用 DB に**注文テーブルが存在しない**こと自体が「この store が注文状態を書き換えられない」構造的保証になる。repair 監査行(Issue #104)を第 5 の DB に分けず**この同一 DB に置く**のは、観測と修復が同じ broker-reconciliation コンポーネントの 2 つの監査系列であり、attempt 行から run 行への実 FK を張れるため。
 
-### schema(version 2)
+### schema(version 3)
 
 | テーブル | 列 |
 |---|---|
-| `broker_reconciliation_runs`(WITHOUT ROWID) | `run_id`(PK)/ `mode` / `started_at_utc` / `finished_at_utc` / `checked_order_count` / `broker_listing_error` |
+| `broker_reconciliation_runs`(WITHOUT ROWID) | `run_id`(PK)/ `mode` / `started_at_utc` / `finished_at_utc` / `checked_order_count` / `broker_listing_error`。v3(Issue #105)で position スコープ summary 列を追加: `checked_position_count` / `checked_trade_count` / `checked_closed_trade_count` / `internal_exposure_error` / `position_listing_error` / `trade_listing_error` / `closed_trade_listing_error` / `excluded_symbols_json`(8 列とも nullable。**全列 NULL ⇔ その run は position スコープ未照合** — v3 以前の行と order-only run。部分 NULL は復元時に `ReconciliationIntegrityError`) |
+| `broker_reconciliation_position_discrepancies`(Issue #105 / v3) | `discrepancy_id`(PK AUTOINCREMENT)/ `run_id`(FK → runs)/ `discrepancy_type`(position 系サブセットのみ)/ `target_type`(`execution_order` / `position` / `broker_trade`)/ `target_id` / **`resolution_category`(CHECK で `manual_review` のみ許可)** / `symbol` / `internal_value` / `broker_value` / `execution_request_id`(`execution_order` 対象と 1:1)/ `client_order_id` / `broker_trade_id` / `protection_order_id` / `broker_transaction_ids_json`(close 証拠の transaction id 群。ASCII JSON 配列)/ `detail` / `observed_at_utc`。`UNIQUE (run_id, discrepancy_type, target_type, target_id)`(1 対象が SL と TP の両所見を持てるため、order 系と異なり種別込みの一意性) |
 | `broker_reconciliation_discrepancies` | `discrepancy_id`(PK AUTOINCREMENT)/ `run_id`(FK → runs)/ `discrepancy_type` / `target_type` / `target_id` / `resolution_category` / `internal_state` / `broker_state` / `client_order_id` / `broker_order_id` / `broker_error_code` / `detail` / `observed_at_utc` / `internal_revision`(v2 / Issue #104: 観測時点の注文 revision。v1 由来の行は NULL = 自動修復対象外)。同一 run の `(target_type, target_id)` は UNIQUE |
 | `broker_reconciliation_repair_attempts`(WITHOUT ROWID、Issue #104 / v2) | `attempt_id`(PK)/ `run_id`(FK → runs)/ `mode` / **`status`(pending / finalized)** / `target_type` / `target_id`(**複合 FK → discrepancies の UNIQUE key** = attempt は必ず実在する観測へ紐づく)/ **claim: `owner_id` / `claim_execution_id` / `generation`(≥ 1)/ `lease_expires_at_utc` / `last_claimed_at_utc`** / `execution_request_id` / `client_order_id` / `reconciliation_internal_state` / `reconciliation_broker_state` / `internal_revision` / `internal_state_before` / `internal_state_after` / `outcome`(pending 中は NULL)/ `broker_order_id` / `broker_error_code` / `failure_code` / `detail` / `observed_at_utc` / `reserved_at_utc` / **`broker_state_updated_at_utc`**(旧 `applied_at_utc`)/ **`finalized_at_utc`** |
 
 | `broker_reconciliation_repair_takeover_intents`(WITHOUT ROWID、Issue #104 / v2) | `takeover_id`(PK)/ `repair_attempt_id`(FK → repairs)/ `source_generation` / `target_generation` / `source_owner_id` / `source_claim_execution_id` / `target_owner_id` / `target_claim_execution_id` / `lease_expires_at_utc` / `status` / `created_at_utc` / `fence_installed_at_utc` / `claim_promoted_at_utc` / `completed_at_utc` / `cancelled_at_utc` / `blocked_at_utc` / `blocked_reason` / `observed_claim_generation` / `observed_fence_generation` / `observed_fence_identity`。`UNIQUE (repair_attempt_id, source_generation)` |
 
-index: `idx_broker_reconciliation_discrepancies_run (run_id, discrepancy_id)`、`idx_broker_reconciliation_repair_attempts_run (run_id, status, reserved_at_utc, attempt_id)`(pending 列挙 = recovery の work list がこの index で引ける)、`idx_..._takeover_intents_active (repair_attempt_id) WHERE status IN ('prepared','fence_installed','claim_promoted')`(**active intent は attempt ごとに高々 1 件**を DB が保証)、`idx_..._takeover_intents_attempt (repair_attempt_id, source_generation, takeover_id)`。CHECK 制約がモデル不変条件を二重化する(既知 enum 値のみ、UTC 接尾辞、非負カウント / revision、`query_failure` ⇔ `query_failed` ⇔ `broker_error_code IS NOT NULL`、attempt 側は `mode = 'apply'` のみ・`would_apply` 非永続・`(status='pending') ⇔ (outcome IS NULL)`・pending 行は outcome 系列 NULL・finalized 行は `applied` ⇔ `broker_state_updated_at_utc`・`applied`/`already_applied` ⇔ `internal_state_after` ⇔ `failure_code IS NULL`・`query_failed` ⇔ `broker_error_code`)。
+index: `idx_broker_reconciliation_discrepancies_run (run_id, discrepancy_id)`、`idx_broker_reconciliation_position_discrepancies_run (run_id, discrepancy_id)`(v3)、`idx_broker_reconciliation_repair_attempts_run (run_id, status, reserved_at_utc, attempt_id)`(pending 列挙 = recovery の work list がこの index で引ける)、`idx_..._takeover_intents_active (repair_attempt_id) WHERE status IN ('prepared','fence_installed','claim_promoted')`(**active intent は attempt ごとに高々 1 件**を DB が保証)、`idx_..._takeover_intents_attempt (repair_attempt_id, source_generation, takeover_id)`。CHECK 制約がモデル不変条件を二重化する(既知 enum 値のみ、UTC 接尾辞、非負カウント / revision、`query_failure` ⇔ `query_failed` ⇔ `broker_error_code IS NOT NULL`、attempt 側は `mode = 'apply'` のみ・`would_apply` 非永続・`(status='pending') ⇔ (outcome IS NULL)`・pending 行は outcome 系列 NULL・finalized 行は `applied` ⇔ `broker_state_updated_at_utc`・`applied`/`already_applied` ⇔ `internal_state_after` ⇔ `failure_code IS NULL`・`query_failed` ⇔ `broker_error_code`)。
 
 claim 列の CHECK: `generation >= 1`、`owner_id` / `claim_execution_id` / `lease_expires_at_utc` / `last_claimed_at_utc` は **NOT NULL**(APPLY モードの行しか存在しないため、pending / finalized を問わず claim は必須 = 「どの実行がこの結果を確定させたか」が監査に残る)、UTC 接尾辞必須、`(status='finalized') ⇔ (finalized_at_utc IS NOT NULL)`、`failure_code` は **`RepairFailureCode` から生成した値一覧**の `IN (...)`(手書きの重複なし)。malformed な lease / generation・非 UTC・unknown failure code は書き込み時に CHECK で、読み取り時にモデル不変条件で **fail-closed** に落ちる。
 
@@ -521,7 +579,7 @@ pending 行だけが例外的に **claim 列のみ** in-place 更新される(`c
 
 ### migration / 初期化
 
-`init_reconciliation_db()` は**冪等**で、pristine な DB(`sqlite_master` 0 件かつ `user_version` 0)にのみ schema を作成し、現行 schema の既存 DB は closed-world 検証のみを行う(既存行は無変更)。**v1 → v2 migration(Issue #104)**: **リリース済み v1 と完全一致した DB のみ**を単一トランザクションで additive に migration する(`ALTER TABLE discrepancies ADD COLUMN internal_revision` — SQLite は列をテーブル制約の前・列リスト末尾へ挿入するため migration 後の DDL は v2 参照 CREATE と token 正規化で一致 — → repair テーブル + index → **takeover intents テーブル + 2 index** → version bump → v2 完全再検証 → COMMIT。途中失敗は全 rollback で v1 ファイル無変更。既存 discrepancy 行は `internal_revision = NULL` で読み戻され自動修復対象外)。**repair 監査テーブルと takeover intents テーブルは同じ未リリース変更(v2)で導入されるため、両者の間に中間バージョンは存在しない**(v1 → v2 の 1 段階で両方が作られる)。v1 由来の DB に pending attempt は存在しえないので、**既存行から intent を捏造することはない**(intent は常に本物の takeover からのみ生まれる)。**読み取り経路は migration しない**(v1 DB は `init_reconciliation_db()` を指すエラーで拒否 = dry-run / read-only の無副作用契約を維持)。それ以外(partial schema・制約欠損 lookalike・trigger / view・他コンポーネントの DB)は **DB を変更せず**明示的に失敗する。読み取りは true read-only 接続(`execution/sqlite_ro.py`)で行い、存在しない DB を作成しない。復元時はモデル不変条件で厳格に再検証する(帯域外改竄・malformed pending 行は `ReconciliationIntegrityError` で fail-closed)。
+`init_reconciliation_db()` は**冪等**で、pristine な DB(`sqlite_master` 0 件かつ `user_version` 0)にのみ schema を作成し、現行 schema の既存 DB は closed-world 検証のみを行う(既存行は無変更)。migration は**リリース済みの前バージョンと完全一致した DB のみ**を対象に、単一トランザクション内で**段階的に**適用する(v1 → v2 → v3。各段階は additive、最後に現行 schema の完全再検証、途中失敗は全 rollback で元ファイル無変更)。**v2 → v3 migration(Issue #105)**: runs テーブルへの position summary 8 列の `ALTER TABLE ... ADD COLUMN`(共有 DDL 定数により migration 後の DDL は v3 参照 CREATE と token 正規化で一致)+ position discrepancies テーブル + index + version bump。既存 run 行は summary 全列 NULL(= position スコープ未照合)で読み戻され、既存の order discrepancy / repair attempt / takeover intent 行は無変更。order 系テーブルの DDL は v2 と同一のまま(CHECK は凍結サブセットから生成)なので、v2 → v3 でテーブル再構築は発生しない。**v1 → v2 migration(Issue #104)**: **リリース済み v1 と完全一致した DB のみ**を単一トランザクションで additive に migration する(`ALTER TABLE discrepancies ADD COLUMN internal_revision` — SQLite は列をテーブル制約の前・列リスト末尾へ挿入するため migration 後の DDL は v2 参照 CREATE と token 正規化で一致 — → repair テーブル + index → **takeover intents テーブル + 2 index** → version bump → v2 完全再検証 → COMMIT。途中失敗は全 rollback で v1 ファイル無変更。既存 discrepancy 行は `internal_revision = NULL` で読み戻され自動修復対象外)。**repair 監査テーブルと takeover intents テーブルは同じ未リリース変更(v2)で導入されるため、両者の間に中間バージョンは存在しない**(v1 → v2 の 1 段階で両方が作られる)。v1 由来の DB に pending attempt は存在しえないので、**既存行から intent を捏造することはない**(intent は常に本物の takeover からのみ生まれる)。**読み取り経路は migration しない**(v1 DB は `init_reconciliation_db()` を指すエラーで拒否 = dry-run / read-only の無副作用契約を維持)。それ以外(partial schema・制約欠損 lookalike・trigger / view・他コンポーネントの DB)は **DB を変更せず**明示的に失敗する。読み取りは true read-only 接続(`execution/sqlite_ro.py`)で行い、存在しない DB を作成しない。復元時はモデル不変条件で厳格に再検証する(帯域外改竄・malformed pending 行は `ReconciliationIntegrityError` で fail-closed)。
 
 ## 記録先(3 系統)
 
@@ -541,6 +599,8 @@ service = BrokerOrderReconciliationService(
 )
 run = service.run(run_id="recon-2026-08-04T00:00Z")   # 検出 + ログ + DB 記録
 run = service.detect(run_id="...")                    # 検出 + ログのみ(DB 無副作用)
+run = service.run(run_id="...", include_position_scope=True)   # Issue #105: position / trade / SL・TP スコープを含める
+run = service.detect(run_id="...", include_position_scope=True)
 
 repairer = BrokerOrderReconciliationRepairService(
     broker=broker,                                   # Broker(get_order のみ使用)
@@ -557,12 +617,12 @@ recovered = repairer.recover_pending_attempts()                         # lease 
 
 `detect()` は reconciliation DB を作成しない(dry-run 的な確認に使える)。`run()` は `init_reconciliation_db()`(冪等)の後に append する。`repair()` は**保存済み run のみ**を入力とし、APPLY モードでは既存 DB を検証(必要なら v1 → v2 migration)してから処理する(DB が存在しなければエラー。新規作成はしない)。run-level 停止時は `ReconciliationRepairRunError.attempts` に完了済み attempt が添付される(監査 DB からも取得可能)。`recover_pending_attempts()` は **lease が切れた pending だけ**を対象にするので、live な repair pass と同時に走らせても安全である(何度呼んでも、回収済み = finalized の attempt には二度と触れない)。
 
-## 非スコープ(Issue #104 時点)
+## 非スコープ(Issue #105 時点)
 
-position / trade / transaction / SL・TP の照合、OANDA Demo Adapter を使った手動照合(Issue #105)、Broker への注文送信・キャンセル・replace・close(修復は内部 DB のみ)、Broker 側のみの注文の自動採用、Broker に存在しない内部 position の自動 close、SL / TP 注文の再作成、Broker 状態の推測、無条件の自動決済、scheduler / 常駐 Bot への組み込み、Live 接続解禁。
+Broker への注文送信・キャンセル・replace・close(修復は内部 DB のみ)、Broker 側のみの注文・position・trade の自動採用、Broker に存在しない内部 position の自動 close、SL / TP 注文の自動再作成・自動変更、Broker 状態の推測(照会失敗・曖昧一致からの状態確定を含む)、無条件の自動決済、position / trade / SL・TP ドメインへの修復拡張(検出 + `manual_review` のみ)、scheduler / 常駐 Bot への組み込み、Live 接続解禁、position 数量レベルの不一致検出(presence 比較のみ。per-trade 検査が細粒度を担う)。
 
 claim / takeover まわりの非スコープ: **処理中の lease heartbeat**(固定 lease + `broker_timeout < lease_duration` の構築時検証で代替。intent の lease は「再開の排他」としてのみ CAS で取り直す)、hung worker の強制中断(lease 期限切れによる takeover のみ)、worker 間の分散ロックサービス、blocked からの自動復旧(人手の判断が要る)、intent / fence 行の GC(監査証跡として保持)。
 
 ## テスト
 
-`execution/tests/test_reconciliation_models.py` / `test_reconciliation_repair_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py` / `test_broker_reconciliation_repair.py`、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker のみで、外部通信・Discord・実 DB 更新は発生しない。
+`execution/tests/test_reconciliation_models.py` / `test_reconciliation_repair_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py` / `test_broker_reconciliation_repair.py` / `test_position_reconciliation.py`(Issue #105)/ `test_reconciliation_runner_cli.py`(Issue #105 CLI)、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py` / `test_broker_models.py` / `test_oanda_demo_adapter.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker(OANDA は fake transport / offline stub)のみで、外部通信・Discord・実 DB 更新は発生しない。

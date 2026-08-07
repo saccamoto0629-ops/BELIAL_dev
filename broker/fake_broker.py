@@ -46,6 +46,7 @@ from .broker_models import (
     BrokerInvalidRequestError,
     BrokerOrderNotFoundError,
     BrokerTimeoutError,
+    ClosedTradeInfo,
     Fill,
     OrderRequest,
     OrderResult,
@@ -53,6 +54,7 @@ from .broker_models import (
     OrderType,
     PositionInfo,
     TERMINAL_ORDER_STATES,
+    TradeInfo,
     validate_order_result_update,
     weighted_average_price,
 )
@@ -248,6 +250,11 @@ class FakeBroker:
         self._cancel_scripts: dict[str, CancelScript] = {}
         self._orders: dict[str, OrderResult] = {}
         self._positions: tuple[PositionInfo, ...] = ()
+        # Issue #105: pinned open/closed trade snapshots for position /
+        # trade / SL / TP reconciliation tests. Like positions, they are
+        # static test fixtures — never derived from submitted orders.
+        self._open_trades: tuple[TradeInfo, ...] = ()
+        self._closed_trades: tuple[ClosedTradeInfo, ...] = ()
         self.submitted_requests: list[OrderRequest] = []
         # Issue #77: every cancel ATTEMPT is recorded (like submitted_requests
         # records every submit attempt), so tests can assert call counts even
@@ -297,6 +304,40 @@ class FakeBroker:
                     f"every positions entry must be a PositionInfo, got {entry!r}"
                 )
         self._positions = tuple(positions)
+
+    def set_open_trades(self, trades: tuple[TradeInfo, ...] | list[TradeInfo]) -> None:
+        """Pin the open-trade snapshot returned by ``get_open_trades``.
+
+        Issue #105: duplicates are deliberately NOT rejected here — the
+        reconciliation service must handle an ambiguous broker enumeration
+        fail-closed, and tests need to inject one to prove it.
+        """
+        if not isinstance(trades, (tuple, list)):
+            raise BrokerInvalidRequestError(
+                f"trades must be a tuple or list, got {type(trades).__name__}"
+            )
+        for entry in trades:
+            if not isinstance(entry, TradeInfo):
+                raise BrokerInvalidRequestError(
+                    f"every trades entry must be a TradeInfo, got {entry!r}"
+                )
+        self._open_trades = tuple(trades)
+
+    def set_closed_trades(
+        self, trades: tuple[ClosedTradeInfo, ...] | list[ClosedTradeInfo]
+    ) -> None:
+        """Pin the closed-trade snapshot returned by ``get_closed_trades``
+        (Issue #105; duplicate injection allowed, see ``set_open_trades``)."""
+        if not isinstance(trades, (tuple, list)):
+            raise BrokerInvalidRequestError(
+                f"trades must be a tuple or list, got {type(trades).__name__}"
+            )
+        for entry in trades:
+            if not isinstance(entry, ClosedTradeInfo):
+                raise BrokerInvalidRequestError(
+                    f"every trades entry must be a ClosedTradeInfo, got {entry!r}"
+                )
+        self._closed_trades = tuple(trades)
 
     def set_account_state(self, state: AccountState) -> None:
         if not isinstance(state, AccountState):
@@ -502,6 +543,16 @@ class FakeBroker:
 
     def get_positions(self) -> tuple[PositionInfo, ...]:
         return self._positions
+
+    def get_open_trades(self) -> tuple[TradeInfo, ...]:
+        """The pinned open-trade snapshot (Issue #105,
+        ``TradeListingBroker`` capability). Read-only."""
+        return self._open_trades
+
+    def get_closed_trades(self) -> tuple[ClosedTradeInfo, ...]:
+        """The pinned closed-trade snapshot (Issue #105,
+        ``ClosedTradeListingBroker`` capability). Read-only."""
+        return self._closed_trades
 
     def get_account_state(self) -> AccountState:
         return self._account_state
