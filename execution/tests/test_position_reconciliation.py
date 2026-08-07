@@ -847,6 +847,83 @@ def test_closed_trade_with_cross_side_id_match_is_ambiguous_not_silently_skipped
     assert run.has_partial_failures or run.position_discrepancies
 
 
+def test_open_trade_with_fill_match_but_foreign_client_id_is_ambiguous(paths):
+    """A fill-id hit whose REPORTED client id belongs to no internal order
+    is contradictory identifier evidence (PR #108 re-review 2): upstream
+    sees only one candidate, so the conflict must be caught here -- no SL/TP
+    comparison may run off it."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(
+        execution_db,
+        broker,
+        "req-1",
+        stop_loss_price=Decimal("2390"),
+        take_profit_price=Decimal("2420"),
+    )
+    broker.set_positions((position(),))
+    broker.set_open_trades(
+        (
+            open_trade(
+                result.fills[0].fill_id,  # matches req-1 by recorded fill id
+                client_order_id="client-someone-else",  # ... but names nobody
+            ),
+        )
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    assert only_types(run) == ["trade_match_ambiguous"]
+    (found,) = run.position_discrepancies
+    assert found.client_order_id == "client-someone-else"
+    assert "client_order_id" in found.detail
+    assert found.resolution_category is ResolutionCategory.MANUAL_REVIEW
+
+
+def test_closed_trade_with_fill_match_but_foreign_client_id_confirms_no_close(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(execution_db, broker, "req-1")
+    broker.set_positions((position(),))
+    broker.set_closed_trades(
+        (
+            closed_trade(
+                result.fills[0].fill_id, client_order_id="client-someone-else"
+            ),
+        )
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    assert by_type(run, DiscrepancyType.BROKER_CLOSED_INTERNAL_OPEN) == []
+    (found,) = by_type(run, DiscrepancyType.TRADE_MATCH_AMBIGUOUS)
+    assert "client_order_id" in found.detail
+
+
+def test_coherent_client_id_and_fill_id_evidence_still_matches(paths):
+    """The positive control for the identity checks: a trade carrying BOTH
+    the order's client id and its fill id, on the same symbol and side, is
+    still a match and still produces the SL/TP finding."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(
+        execution_db, broker, "req-1", stop_loss_price=Decimal("2390")
+    )
+    broker.set_positions((position(),))
+    broker.set_open_trades(
+        (
+            open_trade(
+                result.fills[0].fill_id, client_order_id=client_id("req-1")
+            ),
+        )
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    assert only_types(run) == ["stop_loss_missing"]
+    assert by_type(run, DiscrepancyType.TRADE_MATCH_AMBIGUOUS) == []
+
+
 def test_identity_conflict_classification_is_stable_across_repeated_runs(paths):
     execution_db, _ = paths
     broker = FakeBroker(default_fill_price=FILL_PRICE)

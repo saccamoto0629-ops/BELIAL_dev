@@ -803,7 +803,7 @@ class BrokerOrderReconciliationService:
             if len(candidates) == 1:
                 info = candidates[0]
                 conflict = self._matched_trade_identity_conflict(
-                    info["row"], trade.symbol, trade.side
+                    info["row"], trade.symbol, trade.side, trade.client_order_id
                 )
                 if conflict is not None:
                     # ID evidence points at this order, but the trade's own
@@ -1125,7 +1125,7 @@ class BrokerOrderReconciliationService:
             symbol = row["symbol"]
             filled = info["filled"]
             conflict = self._matched_trade_identity_conflict(
-                row, closed.symbol, closed.side
+                row, closed.symbol, closed.side, closed.client_order_id
             )
             if conflict is not None:
                 # ID evidence points at this order, but the closed trade's own
@@ -1203,19 +1203,37 @@ class BrokerOrderReconciliationService:
 
     @staticmethod
     def _matched_trade_identity_conflict(
-        row: dict, trade_symbol: str, trade_side: PositionSide
+        row: dict,
+        trade_symbol: str,
+        trade_side: PositionSide,
+        trade_client_order_id: str | None,
     ) -> str | None:
         """Whether a trade matched by ID evidence CONTRADICTS the matched
         order's own identity (PR #108 re-review).
 
-        A trade opened by an order shares the order's instrument and
-        direction (BUY -> long, SELL -> short). A matching client id / fill
-        id combined with a different symbol or an opposite side is
-        contradictory evidence -- a malformed response or a stale / reused
-        identifier -- and must never be treated as a unique match: no close
+        A trade opened by an order shares the order's ``client_order_id``
+        (when the broker reports one), its instrument and its direction
+        (BUY -> long, SELL -> short). Evidence that matches on one axis
+        while contradicting another -- a fill id hit whose reported client
+        id belongs to no internal order, a different symbol, an opposite
+        side -- is contradictory: a malformed response or a stale / reused
+        identifier. It must never be treated as a unique match: no close
         confirmation, no SL/TP comparison against the wrong instrument.
-        Returns the human-readable contradiction, or None when coherent."""
+        Returns the human-readable contradiction, or None when coherent.
+
+        A client id identifying a DIFFERENT internal order is already
+        ambiguous upstream (two candidates); this check additionally covers
+        a present client id that identifies no internal order at all, which
+        upstream cannot see."""
         problems: list[str] = []
+        if (
+            trade_client_order_id is not None
+            and trade_client_order_id != row["client_order_id"]
+        ):
+            problems.append(
+                f"trade client_order_id {trade_client_order_id!r} != order "
+                f"client_order_id {row['client_order_id']!r}"
+            )
         if trade_symbol != row["symbol"]:
             problems.append(
                 f"trade symbol {trade_symbol!r} != order symbol {row['symbol']!r}"
