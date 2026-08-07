@@ -1566,13 +1566,30 @@ def test_a_broker_only_attempt_has_no_fence_to_prove(tmp_path):
     assert marked.status is TakeoverIntentStatus.FENCE_INSTALLED
 
 
-# --- v1 -> v2 migration (Issue #104) ------------------------------------------
+# --- v1/v2 -> v3 migration (Issues #104 / #105) -------------------------------
+
+
+def downgrade_to_v2(path):
+    """Rebuild the exact released v2 file: drop the additive v3 objects and
+    the runs position-summary columns (asserted against the pristine v2
+    reference)."""
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(f"DROP INDEX {store._POSITION_DISCREPANCIES_RUN_INDEX}")
+        connection.execute(f"DROP TABLE {store.POSITION_DISCREPANCIES_TABLE}")
+        for column_ddl in store._RUN_POSITION_COLUMN_DDLS:
+            column_name = column_ddl.split(" ", 1)[0]
+            connection.execute(f"ALTER TABLE {store.RUNS_TABLE} DROP COLUMN {column_name}")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+    with closing(sqlite3.connect(path)) as connection:
+        assert store._schema_problems(connection, version=2) == []
 
 
 def downgrade_to_v1(path):
-    """Rebuild the exact released v1 file: drop the additive v2 objects and
-    the discrepancies revision column (asserted against the pristine v1
+    """Rebuild the exact released v1 file: drop the additive v2/v3 objects
+    and the discrepancies revision column (asserted against the pristine v1
     reference)."""
+    downgrade_to_v2(path)
     with closing(sqlite3.connect(path)) as connection:
         connection.execute(f"DROP INDEX {store._INTENT_ACTIVE_INDEX}")
         connection.execute(f"DROP INDEX {store._INTENT_ATTEMPT_INDEX}")
@@ -1582,10 +1599,10 @@ def downgrade_to_v1(path):
         connection.execute(
             f"ALTER TABLE {store.DISCREPANCIES_TABLE} DROP COLUMN internal_revision"
         )
-        connection.execute(f"PRAGMA user_version = {store._MIGRATABLE_VERSION}")
+        connection.execute("PRAGMA user_version = 1")
         connection.commit()
     with closing(sqlite3.connect(path)) as connection:
-        assert store._schema_problems(connection, version=store._MIGRATABLE_VERSION) == []
+        assert store._schema_problems(connection, version=1) == []
 
 
 def test_init_migrates_a_valid_v1_db_and_keeps_every_row(tmp_path):
@@ -1641,7 +1658,7 @@ def test_a_failed_migration_rolls_back_to_the_untouched_v1_file(tmp_path, monkey
 
     assert path.read_bytes() == before
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == store._MIGRATABLE_VERSION
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
 
 
 def test_a_v1_lookalike_with_extra_objects_is_not_migrated(tmp_path):
@@ -1654,3 +1671,216 @@ def test_a_v1_lookalike_with_extra_objects_is_not_migrated(tmp_path):
     with pytest.raises(store.ReconciliationSchemaError, match="unexpected"):
         store.init_reconciliation_db(path)
     assert path.read_bytes() == before
+
+
+# --- v2 -> v3 migration and position-domain persistence (Issue #105) ----------
+
+from execution.reconciliation_models import (  # noqa: E402
+    PositionDiscrepancy,
+    PositionReconciliationSummary,
+)
+
+
+def sample_position_discrepancies() -> tuple[PositionDiscrepancy, ...]:
+    return (
+        PositionDiscrepancy(
+            discrepancy_type=DiscrepancyType.POSITION_MISSING_ON_BROKER,
+            target_type=ReconciliationTargetType.POSITION,
+            target_id="XAUUSD:long",
+            resolution_category=ResolutionCategory.MANUAL_REVIEW,
+            observed_at_utc=at(1),
+            detail="expected exposure absent broker-side",
+            symbol="XAUUSD",
+            internal_value="long 10",
+        ),
+        PositionDiscrepancy(
+            discrepancy_type=DiscrepancyType.BROKER_CLOSED_INTERNAL_OPEN,
+            target_type=ReconciliationTargetType.EXECUTION_ORDER,
+            target_id="exec-1",
+            resolution_category=ResolutionCategory.MANUAL_REVIEW,
+            observed_at_utc=at(2),
+            detail="closed broker-side per transactions 900/901",
+            symbol="XAUUSD",
+            internal_value="open long 10",
+            broker_value="closed long 10",
+            execution_request_id="exec-1",
+            client_order_id="client-1",
+            broker_trade_id="T-1",
+            broker_transaction_ids=("900", "901"),
+        ),
+        PositionDiscrepancy(
+            discrepancy_type=DiscrepancyType.STOP_LOSS_PRICE_MISMATCH,
+            target_type=ReconciliationTargetType.EXECUTION_ORDER,
+            target_id="exec-2",
+            resolution_category=ResolutionCategory.MANUAL_REVIEW,
+            observed_at_utc=at(3),
+            detail="SL differs from the stored intent",
+            symbol="XAUUSD",
+            internal_value="2390",
+            broker_value="2389.5",
+            execution_request_id="exec-2",
+            broker_trade_id="T-2",
+            protection_order_id="SL-1",
+        ),
+    )
+
+
+def sample_position_summary(**overrides) -> PositionReconciliationSummary:
+    kwargs = dict(
+        checked_position_count=2,
+        checked_trade_count=3,
+        checked_closed_trade_count=1,
+        trade_listing_error=None,
+        excluded_symbols=("EUR_USD",),
+    )
+    kwargs.update(overrides)
+    return PositionReconciliationSummary(**kwargs)
+
+
+def sample_position_run(run_id="run-p1") -> ReconciliationRun:
+    return sample_run(
+        run_id,
+        position_discrepancies=sample_position_discrepancies(),
+        position_summary=sample_position_summary(),
+    )
+
+
+def test_position_domain_run_round_trips_with_every_field(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    run = sample_position_run()
+    store.record_reconciliation_run(run, db_path=path)
+
+    restored = store.get_reconciliation_run("run-p1", db_path=path)
+
+    assert restored == run
+    assert restored.position_summary.excluded_symbols == ("EUR_USD",)
+    assert restored.position_discrepancies[1].broker_transaction_ids == ("900", "901")
+
+
+def test_order_only_runs_restore_with_no_position_summary(tmp_path):
+    path = recorded_run_db(tmp_path)
+    restored = store.get_reconciliation_run("run-1", db_path=path)
+    assert restored.position_summary is None
+    assert restored.position_discrepancies == ()
+
+
+def test_position_rows_are_rejected_as_auto_repair_by_the_db_check(tmp_path):
+    """The DB itself refuses a position-domain row classified as anything
+    but manual_review (Issue #105 fail-safe, second guard behind the model)."""
+    path = recorded_run_db(tmp_path)
+    with closing(sqlite3.connect(path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO {store.POSITION_DISCREPANCIES_TABLE} "
+                "(run_id, discrepancy_type, target_type, target_id, resolution_category, "
+                "symbol, broker_value, detail, observed_at_utc) "
+                "VALUES ('run-1', 'broker_only_trade', 'broker_trade', 'T-1', "
+                "'auto_repair_candidate', 'XAUUSD', 'open long 1', 'x', "
+                "'2026-07-20T12:00:00+00:00')"
+            )
+
+
+def test_init_migrates_a_valid_v2_db_and_keeps_every_row(tmp_path):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v2(path)
+
+    store.init_reconciliation_db(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert version == store.SCHEMA_VERSION == 3
+    assert store.POSITION_DISCREPANCIES_TABLE in tables
+    restored = store.get_reconciliation_run("run-1", db_path=path)
+    # pre-migration rows read back as "position domain not reconciled"
+    assert restored.position_summary is None
+    assert restored.position_discrepancies == ()
+    assert [d.target_id for d in restored.discrepancies] == [
+        d.target_id for d in sample_run().discrepancies
+    ]
+    # idempotent: a second init only verifies
+    store.init_reconciliation_db(path)
+    # and the migrated DB accepts new position-domain runs
+    store.record_reconciliation_run(sample_position_run("run-p2"), db_path=path)
+    assert (
+        store.get_reconciliation_run("run-p2", db_path=path).position_summary
+        is not None
+    )
+
+
+def test_reads_and_writes_never_migrate_a_v2_db(tmp_path):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v2(path)
+    before = path.read_bytes()
+
+    with pytest.raises(store.ReconciliationSchemaError, match="init_reconciliation_db"):
+        store.get_reconciliation_run("run-1", db_path=path)
+    with pytest.raises(store.ReconciliationSchemaError):
+        store.record_reconciliation_run(sample_run("run-2"), db_path=path)
+
+    assert path.read_bytes() == before
+
+
+def test_a_failed_v2_to_v3_migration_rolls_back_to_the_untouched_v2_file(
+    tmp_path, monkeypatch
+):
+    path = recorded_run_db(tmp_path)
+    downgrade_to_v2(path)
+    before = path.read_bytes()
+    monkeypatch.setattr(
+        store,
+        "_POSITION_DISCREPANCIES_RUN_INDEX_SQL",
+        "CREATE INDEX broken ON missing_table (x)",
+    )
+
+    with pytest.raises(store.ReconciliationStoreError):
+        store.init_reconciliation_db(path)
+
+    assert path.read_bytes() == before
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_migration_preserves_v2_repair_attempt_rows(tmp_path):
+    path = recorded_run_db(tmp_path)
+    store.reserve_repair_attempt(sample_reservation(), db_path=path)
+    downgrade_to_v2(path)
+
+    store.init_reconciliation_db(path)
+
+    assert store.list_pending_repair_attempts(db_path=path) == (sample_reservation(),)
+
+
+def test_a_partially_null_position_summary_fails_restore(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    store.record_reconciliation_run(sample_position_run(), db_path=path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            f"UPDATE {store.RUNS_TABLE} SET checked_trade_count = NULL "
+            "WHERE run_id = 'run-p1'"
+        )
+        connection.commit()
+
+    with pytest.raises(store.ReconciliationIntegrityError, match="partially NULL"):
+        store.get_reconciliation_run("run-p1", db_path=path)
+
+
+def test_corrupt_transaction_id_json_fails_restore(tmp_path):
+    path = db(tmp_path)
+    store.init_reconciliation_db(path)
+    store.record_reconciliation_run(sample_position_run(), db_path=path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            f"UPDATE {store.POSITION_DISCREPANCIES_TABLE} "
+            "SET broker_transaction_ids_json = 'not json' "
+            "WHERE broker_transaction_ids_json IS NOT NULL"
+        )
+        connection.commit()
+
+    with pytest.raises(store.ReconciliationIntegrityError, match="JSON"):
+        store.get_reconciliation_run("run-p1", db_path=path)

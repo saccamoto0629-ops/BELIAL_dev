@@ -724,3 +724,86 @@ def test_connection_identity_requires_non_empty_stripped_strings():
         m.BrokerConnectionIdentity(mode=" fake", target="fake")
     with pytest.raises(m.BrokerInvalidRequestError):
         m.BrokerConnectionIdentity(mode="fake", target="fake ")
+
+
+# --- ProtectionOrderInfo / TradeInfo SL-TP / ClosedTradeInfo (Issue #105) -----
+
+def make_trade(**overrides):
+    kwargs = dict(
+        trade_id="T-1",
+        symbol="USD_JPY",
+        side=m.PositionSide.LONG,
+        quantity=Decimal("10"),
+        open_price=Decimal("150.5"),
+        opened_at_utc=UTC_NOW,
+        retrieved_at_utc=UTC_NOW,
+    )
+    kwargs.update(overrides)
+    return m.TradeInfo(**kwargs)
+
+
+def make_closed_trade(**overrides):
+    kwargs = dict(
+        trade_id="T-1",
+        symbol="USD_JPY",
+        side=m.PositionSide.LONG,
+        quantity=Decimal("10"),
+        open_price=Decimal("150.5"),
+        opened_at_utc=UTC_NOW,
+        closed_at_utc=UTC_NOW + timedelta(minutes=1),
+        retrieved_at_utc=UTC_NOW + timedelta(minutes=2),
+    )
+    kwargs.update(overrides)
+    return m.ClosedTradeInfo(**kwargs)
+
+
+def test_protection_order_info_validates_id_price_and_optional_trade_reference():
+    info = m.ProtectionOrderInfo(order_id="SL-1", price=Decimal("149.5"), trade_id="T-1")
+    assert info.trade_id == "T-1"
+    assert m.ProtectionOrderInfo(order_id="SL-1", price=Decimal("1")).trade_id is None
+    for bad in ("", "  ", None, 7):
+        with pytest.raises(m.BrokerInvalidRequestError):
+            m.ProtectionOrderInfo(order_id=bad, price=Decimal("1"))
+    for bad_price in (Decimal("0"), Decimal("-1"), Decimal("NaN"), 1.5, "1"):
+        with pytest.raises(m.BrokerInvalidRequestError):
+            m.ProtectionOrderInfo(order_id="SL-1", price=bad_price)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        m.ProtectionOrderInfo(order_id="SL-1", price=Decimal("1"), trade_id="  ")
+
+
+def test_trade_info_optional_issue_105_fields_default_to_absent():
+    trade = make_trade()
+    assert trade.client_order_id is None
+    assert trade.stop_loss is None
+    assert trade.take_profit is None
+
+
+def test_trade_info_validates_the_issue_105_fields():
+    protection = m.ProtectionOrderInfo(order_id="SL-1", price=Decimal("149.5"))
+    trade = make_trade(client_order_id="c-1", stop_loss=protection)
+    assert trade.stop_loss.order_id == "SL-1"
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_trade(client_order_id="  ")
+    for field_name in ("stop_loss", "take_profit"):
+        with pytest.raises(m.BrokerInvalidRequestError):
+            make_trade(**{field_name: "not-a-protection-order"})
+
+
+def test_closed_trade_info_validates_shape_and_transaction_ids():
+    closed = make_closed_trade(closing_transaction_ids=("900", "901"), client_order_id="c-1")
+    assert closed.closing_transaction_ids == ("900", "901")
+    assert make_closed_trade().closing_transaction_ids == ()
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(closing_transaction_ids=["900"])  # list, not tuple
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(closing_transaction_ids=("900", "900"))  # duplicates
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(closing_transaction_ids=("900", " "))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(quantity=Decimal("0"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(side="long")
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(closed_at_utc=UTC_NOW.replace(tzinfo=None))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        make_closed_trade(client_order_id="")

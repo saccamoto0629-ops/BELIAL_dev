@@ -92,6 +92,7 @@ from .broker_models import (
     BrokerOrderNotFoundError,
     BrokerRateLimitError,
     BrokerTimeoutError,
+    ClosedTradeInfo,
     Fill,
     OrderRequest,
     OrderResult,
@@ -100,6 +101,7 @@ from .broker_models import (
     OrderType,
     PositionInfo,
     PositionSide,
+    ProtectionOrderInfo,
     TradeInfo,
     weighted_average_price,
 )
@@ -738,10 +740,25 @@ class OandaDemoAdapter:
             for side_key, side in (("long", PositionSide.LONG), ("short", PositionSide.SHORT)):
                 side_entry = entry.get(side_key)
                 if not isinstance(side_entry, Mapping):
-                    continue
+                    # Fail-closed (Issue #105 review): a missing or non-object
+                    # side is a malformed RESPONSE, not a flat side.
+                    # Reconciliation consumes this listing, and silently
+                    # skipping would turn broker data this adapter could not
+                    # interpret into a fabricated "no position" observation.
+                    raise BrokerCommunicationError(
+                        f"broker positions entry carries no {side_key} side object"
+                    )
+                # No default: a side without 'units' is malformed, never flat.
                 units = _parse_decimal(
-                    side_entry.get("units", "0"), f"position.{side_key}.units"
+                    side_entry.get("units"), f"position.{side_key}.units"
                 )
+                if (side is PositionSide.LONG and units < 0) or (
+                    side is PositionSide.SHORT and units > 0
+                ):
+                    raise BrokerCommunicationError(
+                        f"broker position {side_key} side carries units with the "
+                        "opposite sign"
+                    )
                 if units == 0:
                     continue
                 try:
@@ -850,6 +867,13 @@ class OandaDemoAdapter:
                         open_price=_parse_decimal(entry.get("price"), "trade.price"),
                         opened_at_utc=_parse_utc_time(entry.get("openTime"), "trade.openTime"),
                         retrieved_at_utc=retrieved_at,
+                        client_order_id=self._trade_client_id(entry),
+                        stop_loss=self._protection_order(
+                            entry.get("stopLossOrder"), "trade.stopLossOrder"
+                        ),
+                        take_profit=self._protection_order(
+                            entry.get("takeProfitOrder"), "trade.takeProfitOrder"
+                        ),
                     )
                 )
             except (ValueError, BrokerInvalidRequestError) as exc:
@@ -859,6 +883,122 @@ class OandaDemoAdapter:
                     self._redact(f"broker trade violated common-model invariants: {exc}")
                 ) from None
         return tuple(trades)
+
+    def get_closed_trades(self) -> tuple[ClosedTradeInfo, ...]:
+        """Return recently closed trades of the demo account as common models
+        (Issue #105, ``ClosedTradeListingBroker`` capability; read-only).
+
+        Uses ``GET /v3/accounts/{id}/trades?state=CLOSED`` with the maximum
+        page size OANDA allows for one request. The result is therefore
+        BOUNDED (the most recent closed trades) — reconciliation treats it
+        as evidence to enrich a detection, never as a complete history, and
+        absence from this listing never means "not closed".
+        """
+        status, payload = self._request(
+            "GET",
+            f"/v3/accounts/{self._config.account_id}/trades?state=CLOSED&count=500",
+        )
+        if status != 200:
+            raise BrokerCommunicationError(
+                self._message(f"closed-trade lookup failed with HTTP status {status}", payload)
+            )
+        raw_trades = payload.get("trades")
+        if not isinstance(raw_trades, list):
+            raise BrokerCommunicationError("broker response carried no trades list")
+        retrieved_at = self._now()
+        trades: list[ClosedTradeInfo] = []
+        for entry in raw_trades:
+            if not isinstance(entry, Mapping):
+                raise BrokerCommunicationError("broker trades entry is not an object")
+            trade_id = entry.get("id")
+            if not isinstance(trade_id, str) or not trade_id.strip():
+                raise BrokerCommunicationError("broker trades entry carries no id")
+            instrument = entry.get("instrument")
+            if not isinstance(instrument, str) or not instrument.strip():
+                raise BrokerCommunicationError("broker trades entry carries no instrument")
+            units = _parse_decimal(entry.get("initialUnits"), "trade.initialUnits")
+            if units == 0:
+                raise BrokerCommunicationError("broker closed trade carries zero initial units")
+            raw_closing_ids = entry.get("closingTransactionIDs", [])
+            if not isinstance(raw_closing_ids, list) or not all(
+                isinstance(item, str) and item.strip() for item in raw_closing_ids
+            ):
+                raise BrokerCommunicationError(
+                    "broker closed trade carries a malformed closingTransactionIDs list"
+                )
+            try:
+                trades.append(
+                    ClosedTradeInfo(
+                        trade_id=trade_id,
+                        symbol=instrument,
+                        side=PositionSide.LONG if units > 0 else PositionSide.SHORT,
+                        quantity=abs(units),
+                        open_price=_parse_decimal(entry.get("price"), "trade.price"),
+                        opened_at_utc=_parse_utc_time(entry.get("openTime"), "trade.openTime"),
+                        closed_at_utc=_parse_utc_time(entry.get("closeTime"), "trade.closeTime"),
+                        retrieved_at_utc=retrieved_at,
+                        closing_transaction_ids=tuple(raw_closing_ids),
+                        client_order_id=self._trade_client_id(entry),
+                    )
+                )
+            except (ValueError, BrokerInvalidRequestError) as exc:
+                raise BrokerCommunicationError(
+                    self._redact(f"broker closed trade violated common-model invariants: {exc}")
+                ) from None
+        return tuple(trades)
+
+    def _trade_client_id(self, entry: Mapping) -> str | None:
+        """The caller-side id the broker reports on a trade, if any.
+
+        OANDA reports it as ``clientExtensions.id`` ON THE TRADE (set via
+        trade client extensions, which this adapter does not send today) —
+        absent for trades opened by this adapter's submits. Absence is
+        ``None``; a PRESENT but malformed structure is a malformed response
+        and fails closed instead of degrading to "no id".
+        """
+        raw = entry.get("clientExtensions")
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise BrokerCommunicationError("broker trade clientExtensions is not an object")
+        client_id = raw.get("id")
+        if client_id is None:
+            return None
+        if not isinstance(client_id, str) or not client_id.strip():
+            raise BrokerCommunicationError(
+                "broker trade clientExtensions carries a malformed id"
+            )
+        return client_id
+
+    def _protection_order(self, raw, field_name: str) -> ProtectionOrderInfo | None:
+        """Translate a trade-attached SL/TP order object (Issue #105).
+
+        Absent -> ``None`` (the broker reports no protection order). A
+        PRESENT but malformed object — no id, unparsable price — is a
+        malformed response and fails closed; it never degrades to "no
+        protection order", because that would fabricate an SL/TP-missing
+        observation from a response this adapter could not interpret.
+        """
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise BrokerCommunicationError(f"broker {field_name} is not an object")
+        order_id = raw.get("id")
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise BrokerCommunicationError(f"broker {field_name} carries no id")
+        trade_ref = raw.get("tradeID")
+        if trade_ref is not None and (not isinstance(trade_ref, str) or not trade_ref.strip()):
+            raise BrokerCommunicationError(f"broker {field_name} carries a malformed tradeID")
+        try:
+            return ProtectionOrderInfo(
+                order_id=order_id,
+                price=_parse_decimal(raw.get("price"), f"{field_name}.price"),
+                trade_id=trade_ref,
+            )
+        except (ValueError, BrokerInvalidRequestError) as exc:
+            raise BrokerCommunicationError(
+                self._redact(f"broker {field_name} violated common-model invariants: {exc}")
+            ) from None
 
     def get_tradable_instruments(self) -> tuple[str, ...]:
         """Return the instrument names tradable on the demo account (sorted).

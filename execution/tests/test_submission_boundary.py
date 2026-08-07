@@ -28,6 +28,15 @@ SUBMIT_ORDER_ALLOWED = {
     "execution/live_submission.py",
     "execution/tests/test_broker_reconciliation.py",
     "execution/tests/test_broker_reconciliation_repair.py",
+    # Issue #105: seeds the FakeBroker with the broker-side state a
+    # position/trade/SL-TP reconciliation run observes (fixture, not a
+    # production path -- the position scope is detection-only and every
+    # test there drives the service through a poisoned facade).
+    "execution/tests/test_position_reconciliation.py",
+    # Issue #105: the CLI suite seeds fixtures the same way AND pins that
+    # the ReconcileOnlyBroker facade RAISES on submit/cancel (the assertion
+    # itself must call the poisoned method).
+    "execution/tests/test_reconciliation_runner_cli.py",
 }
 
 # Broker CANCELLATION has no production caller at all: the cancel Execution
@@ -39,6 +48,8 @@ CANCEL_ORDER_ALLOWED = {
     "broker/tests",
     "execution/tests/test_broker_reconciliation.py",
     "execution/tests/test_broker_reconciliation_repair.py",
+    # Issue #105: pins that ReconcileOnlyBroker.cancel_order RAISES.
+    "execution/tests/test_reconciliation_runner_cli.py",
 }
 
 # The only files that may CALL <something>.to_order_request(...):

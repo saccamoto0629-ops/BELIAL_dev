@@ -40,7 +40,14 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from .broker_models import AccountState, OrderRequest, OrderResult, PositionInfo
+from .broker_models import (
+    AccountState,
+    ClosedTradeInfo,
+    OrderRequest,
+    OrderResult,
+    PositionInfo,
+    TradeInfo,
+)
 
 
 @runtime_checkable
@@ -112,6 +119,52 @@ class OrderListingBroker(Protocol):
 
     def list_orders(self) -> tuple[OrderResult, ...]:
         """Return a snapshot of every order the broker currently knows about.
+
+        Raises the same typed ``BrokerError`` subclasses as the other query
+        operations when the enumeration itself fails.
+        """
+        ...
+
+
+@runtime_checkable
+class TradeListingBroker(Protocol):
+    """OPTIONAL capability: enumerate the OPEN TRADES the broker holds.
+
+    Same design as ``OrderListingBroker`` (Issue #103): NOT an extra method
+    on ``Broker`` — the five Issue #73 operations stay the boundary every
+    implementation must provide. Position / trade / SL / TP reconciliation
+    (Issue #105) needs the per-trade view (including the protection orders
+    the broker reports as attached); an implementation that cannot provide
+    it simply does not satisfy this Protocol, and reconciliation REPORTS
+    that the trade-side check could not run instead of concluding "no
+    trades exist".
+
+    Read-only by contract: listing observes and must never place, modify or
+    cancel anything — in particular it must never create or change a stop
+    loss / take profit order.
+    """
+
+    def get_open_trades(self) -> tuple[TradeInfo, ...]:
+        """Return a snapshot of every open trade the broker currently holds.
+
+        Raises the same typed ``BrokerError`` subclasses as the other query
+        operations when the enumeration itself fails.
+        """
+        ...
+
+
+@runtime_checkable
+class ClosedTradeListingBroker(Protocol):
+    """OPTIONAL capability: enumerate recently CLOSED trades.
+
+    Issue #105 uses this as EVIDENCE for "closed on the broker while BELIAL
+    still expects the exposure" — the returned set may be bounded by the
+    broker (recent trades only), so reconciliation must never read absence
+    from this listing as "not closed". Read-only by contract.
+    """
+
+    def get_closed_trades(self) -> tuple[ClosedTradeInfo, ...]:
+        """Return a snapshot of the closed trades the broker reports.
 
         Raises the same typed ``BrokerError`` subclasses as the other query
         operations when the enumeration itself fails.

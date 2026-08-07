@@ -212,3 +212,37 @@ def test_order_listing_is_a_separate_optional_protocol():
 
 def test_fake_broker_additionally_satisfies_the_order_listing_protocol():
     assert isinstance(fake_broker.FakeBroker(), broker_interface.OrderListingBroker)
+
+
+def test_trade_listing_protocols_are_separate_optional_capabilities():
+    """Issue #105: trade / closed-trade enumeration follows the Issue #103
+    ``OrderListingBroker`` pattern -- additive optional Protocols, never new
+    methods on the five-operation ``Broker``."""
+    for protocol, method in (
+        (broker_interface.TradeListingBroker, "get_open_trades"),
+        (broker_interface.ClosedTradeListingBroker, "get_closed_trades"),
+    ):
+        defined = {
+            name for name in vars(protocol)
+            if not name.startswith("_") and callable(getattr(protocol, name))
+        }
+        assert defined == {method}
+        assert method not in vars(broker_interface.Broker)
+
+    class FiveOperationBroker:
+        def submit_order(self, request): ...
+        def cancel_order(self, client_order_id): ...
+        def get_order(self, client_order_id): ...
+        def get_positions(self): ...
+        def get_account_state(self): ...
+
+    minimal = FiveOperationBroker()
+    assert isinstance(minimal, broker_interface.Broker)
+    assert not isinstance(minimal, broker_interface.TradeListingBroker)
+    assert not isinstance(minimal, broker_interface.ClosedTradeListingBroker)
+
+
+def test_fake_broker_satisfies_the_trade_listing_protocols():
+    broker = fake_broker.FakeBroker()
+    assert isinstance(broker, broker_interface.TradeListingBroker)
+    assert isinstance(broker, broker_interface.ClosedTradeListingBroker)

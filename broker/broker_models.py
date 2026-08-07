@@ -669,6 +669,31 @@ class PositionInfo:
 
 
 @dataclass(frozen=True)
+class ProtectionOrderInfo:
+    """One broker-side PROTECTION ORDER (stop loss or take profit) attached
+    to a trade (Issue #105).
+
+    Observation-only vocabulary for reconciliation: it describes what the
+    broker reports as attached to a trade — it is never used to CREATE or
+    MODIFY a protection order (SL/TP never cross the submit boundary,
+    Issue #73/#74 contract). ``trade_id`` is the trade the protection order
+    itself claims to protect (the broker-side back-reference); ``None`` when
+    the broker response does not carry one. Prices stay exact ``Decimal``
+    values — no rounding or quantization is introduced here.
+    """
+
+    order_id: str
+    price: Decimal
+    trade_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.order_id, "order_id")
+        _require_positive_decimal(self.price, "price")
+        if self.trade_id is not None:
+            _require_non_empty_str(self.trade_id, "trade_id")
+
+
+@dataclass(frozen=True)
 class TradeInfo:
     """One broker-side OPEN TRADE snapshot (broker-agnostic, Issue #79).
 
@@ -677,6 +702,15 @@ class TradeInfo:
     separate vocabularies — adapters may expose either without merging them.
     ``opened_at_utc`` is the broker-reported open time, ``retrieved_at_utc``
     is when the adapter observed the snapshot.
+
+    Issue #105 additions (all optional, observation-only):
+
+    - ``client_order_id`` — the caller-side identifier the broker reports on
+      the trade (e.g. client extensions), when it reports one. Used by
+      reconciliation for ID-based matching; never synthesized.
+    - ``stop_loss`` / ``take_profit`` — the protection orders the broker
+      reports as attached to this trade. ``None`` means the broker reports
+      none; it never means "unknown" (a failed query raises instead).
     """
 
     trade_id: str
@@ -686,6 +720,9 @@ class TradeInfo:
     open_price: Decimal
     opened_at_utc: datetime
     retrieved_at_utc: datetime
+    client_order_id: str | None = None
+    stop_loss: ProtectionOrderInfo | None = None
+    take_profit: ProtectionOrderInfo | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.trade_id, "trade_id")
@@ -696,6 +733,66 @@ class TradeInfo:
         _require_positive_decimal(self.open_price, "open_price")
         _require_utc(self.opened_at_utc, "opened_at_utc")
         _require_utc(self.retrieved_at_utc, "retrieved_at_utc")
+        if self.client_order_id is not None:
+            _require_non_empty_str(self.client_order_id, "client_order_id")
+        for name in ("stop_loss", "take_profit"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, ProtectionOrderInfo):
+                raise BrokerInvalidRequestError(
+                    f"{name} must be a ProtectionOrderInfo or None, got {value!r}"
+                )
+
+
+@dataclass(frozen=True)
+class ClosedTradeInfo:
+    """One broker-side CLOSED TRADE snapshot (broker-agnostic, Issue #105).
+
+    Deliberately a separate vocabulary from :class:`TradeInfo`: a closed
+    trade is historical evidence ("this exposure existed and the broker
+    closed it"), carrying the close time and the broker transaction ids that
+    closed it. Reconciliation uses it to detect "closed on the broker while
+    BELIAL still expects the exposure" — it is evidence to ENRICH a
+    detection, never a state to adopt.
+
+    ``closing_transaction_ids`` may be empty when the broker reports no
+    transaction references; entries must be unique, non-empty ids.
+    ``quantity`` is the initially opened quantity (broker-reported).
+    """
+
+    trade_id: str
+    symbol: str
+    side: PositionSide
+    quantity: Decimal
+    open_price: Decimal
+    opened_at_utc: datetime
+    closed_at_utc: datetime
+    retrieved_at_utc: datetime
+    closing_transaction_ids: tuple[str, ...] = ()
+    client_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.trade_id, "trade_id")
+        _require_non_empty_str(self.symbol, "symbol")
+        if not isinstance(self.side, PositionSide):
+            raise BrokerInvalidRequestError(f"side must be a PositionSide, got {self.side!r}")
+        _require_positive_decimal(self.quantity, "quantity")
+        _require_positive_decimal(self.open_price, "open_price")
+        _require_utc(self.opened_at_utc, "opened_at_utc")
+        _require_utc(self.closed_at_utc, "closed_at_utc")
+        _require_utc(self.retrieved_at_utc, "retrieved_at_utc")
+        if not isinstance(self.closing_transaction_ids, tuple):
+            raise BrokerInvalidRequestError(
+                "closing_transaction_ids must be a tuple, got "
+                f"{type(self.closing_transaction_ids).__name__}"
+            )
+        for entry in self.closing_transaction_ids:
+            _require_non_empty_str(entry, "closing_transaction_ids entry")
+        if len(set(self.closing_transaction_ids)) != len(self.closing_transaction_ids):
+            raise BrokerInvalidRequestError(
+                f"closing_transaction_ids must be unique, got {self.closing_transaction_ids!r}"
+            )
+        if self.client_order_id is not None:
+            _require_non_empty_str(self.client_order_id, "client_order_id")
 
 
 def safe_account_reference(account_id: str | None) -> str | None:

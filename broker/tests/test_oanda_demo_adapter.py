@@ -1559,3 +1559,220 @@ def test_the_whole_translation_path_runs_with_sockets_disabled(monkeypatch):
     adapter.get_account_state()
     adapter.get_tradable_instruments()
     adapter.connection_identity()
+
+
+# --- open trades: client id + SL/TP translation (Issue #105) ------------------
+
+def open_trade_entry(**overrides):
+    entry = {
+        "id": "T-1",
+        "instrument": "USD_JPY",
+        "currentUnits": "4",
+        "price": "155.200",
+        "openTime": "2026-01-02T03:00:00Z",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_get_open_trades_translates_client_id_and_protection_orders():
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "trades": [
+                    open_trade_entry(
+                        clientExtensions={"id": "c-1"},
+                        stopLossOrder={"id": "SL-1", "price": "150.000", "tradeID": "T-1"},
+                        takeProfitOrder={"id": "TP-1", "price": "160.000", "tradeID": "T-9"},
+                    )
+                ]
+            },
+        )
+    )
+    (trade,) = adapter.get_open_trades()
+    assert trade.client_order_id == "c-1"
+    assert trade.stop_loss == m.ProtectionOrderInfo(
+        order_id="SL-1", price=Decimal("150.000"), trade_id="T-1"
+    )
+    assert trade.take_profit == m.ProtectionOrderInfo(
+        order_id="TP-1", price=Decimal("160.000"), trade_id="T-9"
+    )
+
+
+def test_get_open_trades_absent_extensions_and_protections_map_to_none():
+    adapter, _ = make_adapter((200, {"trades": [open_trade_entry()]}))
+    (trade,) = adapter.get_open_trades()
+    assert trade.client_order_id is None
+    assert trade.stop_loss is None
+    assert trade.take_profit is None
+
+
+def test_get_open_trades_protection_without_trade_reference_maps_to_none_reference():
+    adapter, _ = make_adapter(
+        (200, {"trades": [open_trade_entry(stopLossOrder={"id": "SL-1", "price": "1.5"})]})
+    )
+    (trade,) = adapter.get_open_trades()
+    assert trade.stop_loss.trade_id is None
+
+
+def test_get_open_trades_malformed_protection_orders_fail_closed():
+    """A PRESENT but uninterpretable SL/TP object must never degrade to
+    "no protection order" -- that would fabricate an SL/TP-missing
+    observation for reconciliation."""
+    for stop_loss in (
+        "not-an-object",
+        {},  # no id
+        {"id": "SL-1"},  # no price
+        {"id": "SL-1", "price": "not-a-number"},
+        {"id": "SL-1", "price": "0"},
+        {"id": "SL-1", "price": "1.5", "tradeID": "  "},
+        {"id": "  ", "price": "1.5"},
+    ):
+        adapter, _ = make_adapter(
+            (200, {"trades": [open_trade_entry(stopLossOrder=stop_loss)]})
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_open_trades()
+
+
+def test_get_open_trades_malformed_client_extensions_fail_closed():
+    for extensions in ("not-an-object", {"id": "  "}, {"id": 7}):
+        adapter, _ = make_adapter(
+            (200, {"trades": [open_trade_entry(clientExtensions=extensions)]})
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_open_trades()
+    adapter, _ = make_adapter(
+        (200, {"trades": [open_trade_entry(clientExtensions={"tag": "x"})]})
+    )
+    (trade,) = adapter.get_open_trades()
+    assert trade.client_order_id is None  # extensions without an id: no id reported
+
+
+# --- closed trades (Issue #105) -----------------------------------------------
+
+def closed_trade_entry(**overrides):
+    entry = {
+        "id": "T-7",
+        "instrument": "USD_JPY",
+        "initialUnits": "-4",
+        "price": "155.200",
+        "openTime": "2026-01-02T03:00:00Z",
+        "closeTime": "2026-01-02T04:00:00Z",
+        "closingTransactionIDs": ["900", "901"],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_get_closed_trades_translates_the_closed_listing():
+    adapter, transport = make_adapter((200, {"trades": [closed_trade_entry()]}))
+    (closed,) = adapter.get_closed_trades()
+    url = transport.calls[0]["url"]
+    assert f"/v3/accounts/{ACCOUNT}/trades?state=CLOSED" in url
+    assert isinstance(closed, m.ClosedTradeInfo)
+    assert closed.trade_id == "T-7"
+    assert closed.side is m.PositionSide.SHORT
+    assert closed.quantity == Decimal("4")
+    assert closed.closed_at_utc == datetime(2026, 1, 2, 4, 0, 0, tzinfo=timezone.utc)
+    assert closed.closing_transaction_ids == ("900", "901")
+    assert closed.client_order_id is None
+    assert closed.retrieved_at_utc == NOW
+
+
+def test_get_closed_trades_missing_transaction_list_maps_to_empty():
+    entry = closed_trade_entry()
+    del entry["closingTransactionIDs"]
+    adapter, _ = make_adapter((200, {"trades": [entry]}))
+    (closed,) = adapter.get_closed_trades()
+    assert closed.closing_transaction_ids == ()
+
+
+def test_get_closed_trades_malformed_responses_are_communication_errors():
+    for scripted in (
+        (200, {}),
+        (200, {"trades": ["junk"]}),
+        (200, {"trades": [closed_trade_entry(initialUnits="0")]}),
+        (200, {"trades": [closed_trade_entry(closingTransactionIDs="900")]}),
+        (200, {"trades": [closed_trade_entry(closingTransactionIDs=["900", "  "])]}),
+        (200, {"trades": [closed_trade_entry(closingTransactionIDs=["900", 901])]}),
+        (200, {"trades": [closed_trade_entry(closeTime=None)]}),
+        (500, {}),
+    ):
+        adapter, _ = make_adapter(scripted)
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_closed_trades()
+
+
+def test_trade_listings_never_leak_the_credentials_in_errors():
+    for call in ("get_open_trades", "get_closed_trades"):
+        adapter, _ = make_adapter((500, {"errorMessage": f"boom {TOKEN} {ACCOUNT}"}))
+        with pytest.raises(m.BrokerCommunicationError) as exc_info:
+            getattr(adapter, call)()
+        text = str(exc_info.value)
+        assert TOKEN not in text
+        assert ACCOUNT not in text
+
+
+def test_adapter_satisfies_the_trade_listing_protocols_but_not_order_listing():
+    from broker.broker_interface import (
+        ClosedTradeListingBroker,
+        OrderListingBroker,
+        TradeListingBroker,
+    )
+
+    adapter, _ = make_adapter()
+    assert isinstance(adapter, TradeListingBroker)
+    assert isinstance(adapter, ClosedTradeListingBroker)
+    assert not isinstance(adapter, OrderListingBroker)
+
+
+# --- positions: malformed entries fail closed (Issue #105 review) -------------
+
+def position_entry(**overrides):
+    entry = {
+        "instrument": "USD_JPY",
+        "long": {"units": "7", "averagePrice": "155.100"},
+        "short": {"units": "0"},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_get_positions_malformed_side_structures_fail_closed():
+    """Reconciliation consumes this listing: a side this adapter cannot
+    interpret must reject the WHOLE listing, never degrade to 'flat side' --
+    that would fabricate a position-missing observation from broken data."""
+    missing_long = position_entry()
+    del missing_long["long"]
+    missing_units = position_entry(long={"averagePrice": "155.100"})
+    for entry in (
+        missing_long,                                # side key absent
+        position_entry(short="junk"),                # side is not an object
+        position_entry(long=None),                   # side is null
+        missing_units,                               # units field absent
+        position_entry(long={"units": None}),        # units is null
+        position_entry(long={"units": 7}),           # units is not a string
+        position_entry(long={"units": "not-a-number"}),
+    ):
+        adapter, _ = make_adapter((200, {"positions": [entry]}))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_positions()
+
+
+def test_get_positions_wrong_sign_units_fail_closed():
+    for entry in (
+        position_entry(long={"units": "-3", "averagePrice": "155.100"}),
+        position_entry(short={"units": "2", "averagePrice": "155.100"}),
+    ):
+        adapter, _ = make_adapter((200, {"positions": [entry]}))
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_positions()
+
+
+def test_get_positions_flat_sides_are_still_no_positions():
+    adapter, _ = make_adapter(
+        (200, {"positions": [position_entry(long={"units": "0"}, short={"units": "0"})]})
+    )
+    assert adapter.get_positions() == ()
