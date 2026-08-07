@@ -766,6 +766,106 @@ def test_a_trade_matching_two_orders_is_ambiguous_never_guessed(paths):
     assert found.resolution_category is ResolutionCategory.MANUAL_REVIEW
 
 
+def test_open_trade_with_cross_symbol_id_match_is_ambiguous_not_reconciled(paths):
+    """ID evidence pointing at an order of a DIFFERENT instrument is
+    contradictory (PR #108 re-review): no SL/TP comparison runs against the
+    wrong symbol, and the trade is neither broker-only nor matched."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(
+        execution_db,
+        broker,
+        "req-1",
+        stop_loss_price=Decimal("2390"),
+        take_profit_price=Decimal("2420"),
+    )
+    broker.set_positions((position(),))  # the XAUUSD expectation is satisfied
+    broker.set_open_trades(
+        (open_trade(result.fills[0].fill_id, symbol="EUR_USD"),)
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    assert only_types(run) == ["trade_match_ambiguous"]
+    (found,) = run.position_discrepancies
+    assert found.target_id == result.fills[0].fill_id
+    assert found.symbol == "EUR_USD"  # the broker-observed identity
+    assert "req-1" in found.detail and "contradicts" in found.detail
+    assert found.resolution_category is ResolutionCategory.MANUAL_REVIEW
+
+
+def test_open_trade_with_cross_side_id_match_is_ambiguous_not_reconciled(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(
+        execution_db, broker, "req-1", stop_loss_price=Decimal("2390")
+    )
+    broker.set_positions((position(),))
+    broker.set_open_trades(
+        (open_trade(result.fills[0].fill_id, side=PositionSide.SHORT),)
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    # no stop_loss_missing is fabricated from a contradictory match
+    assert only_types(run) == ["trade_match_ambiguous"]
+
+
+def test_closed_trade_with_cross_symbol_id_match_never_confirms_a_close(paths):
+    """A closed trade whose ID evidence matches an order but whose symbol
+    differs must not produce broker_closed_internal_open (a false close
+    confirmation); it is surfaced as ambiguous instead."""
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(execution_db, broker, "req-1")
+    broker.set_positions((position(),))  # exposure still open broker-side
+    broker.set_closed_trades(
+        (closed_trade(result.fills[0].fill_id, symbol="EUR_USD"),)
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    assert by_type(run, DiscrepancyType.BROKER_CLOSED_INTERNAL_OPEN) == []
+    (found,) = by_type(run, DiscrepancyType.TRADE_MATCH_AMBIGUOUS)
+    assert found.target_id == result.fills[0].fill_id
+    assert "close evidence" in found.detail
+
+
+def test_closed_trade_with_cross_side_id_match_is_ambiguous_not_silently_skipped(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(execution_db, broker, "req-1")
+    broker.set_positions((position(),))
+    broker.set_closed_trades(
+        (closed_trade(result.fills[0].fill_id, side=PositionSide.SHORT),)
+    )
+
+    run = detect(QueryOnlyBroker(broker), paths)
+
+    assert by_type(run, DiscrepancyType.BROKER_CLOSED_INTERNAL_OPEN) == []
+    assert by_type(run, DiscrepancyType.TRADE_MATCH_AMBIGUOUS)
+    assert run.has_partial_failures or run.position_discrepancies
+
+
+def test_identity_conflict_classification_is_stable_across_repeated_runs(paths):
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    result = seed_agreeing_order(execution_db, broker, "req-1")
+    broker.set_positions((position(),))
+    broker.set_open_trades(
+        (open_trade(result.fills[0].fill_id, symbol="EUR_USD"),)
+    )
+    facade = QueryOnlyBroker(broker)
+    before = db_bytes(execution_db)
+
+    first = detect(facade, paths, run_id="run-1")
+    second = detect(facade, paths, run_id="run-2")
+
+    assert only_types(first) == ["trade_match_ambiguous"]
+    assert first.position_discrepancies == second.position_discrepancies
+    assert db_bytes(execution_db) == before
+
+
 def test_unmatched_trade_on_a_symbol_with_unknown_orders_is_not_broker_only(paths):
     execution_db, _ = paths
     broker = FakeBroker()

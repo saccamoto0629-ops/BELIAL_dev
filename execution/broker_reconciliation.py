@@ -802,6 +802,35 @@ class BrokerOrderReconciliationService:
             )
             if len(candidates) == 1:
                 info = candidates[0]
+                conflict = self._matched_trade_identity_conflict(
+                    info["row"], trade.symbol, trade.side
+                )
+                if conflict is not None:
+                    # ID evidence points at this order, but the trade's own
+                    # identity contradicts it (PR #108 re-review): NOT a
+                    # unique match. Nothing is derived from it -- no SL/TP
+                    # comparison against the wrong instrument, no
+                    # internal-closed finding, no broker-only claim.
+                    add(
+                        PositionDiscrepancy(
+                            discrepancy_type=DiscrepancyType.TRADE_MATCH_AMBIGUOUS,
+                            target_type=ReconciliationTargetType.BROKER_TRADE,
+                            target_id=trade.trade_id,
+                            resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                            observed_at_utc=observed_at,
+                            detail=(
+                                f"broker trade {trade.trade_id} matches internal order "
+                                f"{info['row']['execution_request_id']} by ID evidence but "
+                                f"contradicts its identity ({conflict}); contradictory "
+                                "evidence is never resolved by guessing"
+                            ),
+                            symbol=trade.symbol,
+                            broker_value=f"open {trade.side.value} {trade.quantity}",
+                            client_order_id=trade.client_order_id,
+                            broker_trade_id=trade.trade_id,
+                        )
+                    )
+                    continue
                 matched_order_ids.add(info["row"]["execution_request_id"])
                 self._check_matched_open_trade(info, trade, observed_at, add)
                 continue
@@ -1095,6 +1124,35 @@ class BrokerOrderReconciliationService:
             request_id = row["execution_request_id"]
             symbol = row["symbol"]
             filled = info["filled"]
+            conflict = self._matched_trade_identity_conflict(
+                row, closed.symbol, closed.side
+            )
+            if conflict is not None:
+                # ID evidence points at this order, but the closed trade's own
+                # identity contradicts it (PR #108 re-review): never accepted
+                # as close evidence -- a cross-symbol or cross-side record
+                # must not produce a false close confirmation, and a silent
+                # skip would hide the contradiction.
+                add(
+                    PositionDiscrepancy(
+                        discrepancy_type=DiscrepancyType.TRADE_MATCH_AMBIGUOUS,
+                        target_type=ReconciliationTargetType.BROKER_TRADE,
+                        target_id=closed.trade_id,
+                        resolution_category=ResolutionCategory.MANUAL_REVIEW,
+                        observed_at_utc=observed_at,
+                        detail=(
+                            f"broker closed trade {closed.trade_id} matches internal "
+                            f"order {request_id} by ID evidence but contradicts its "
+                            f"identity ({conflict}); contradictory evidence is never "
+                            "accepted as close evidence"
+                        ),
+                        symbol=closed.symbol,
+                        broker_value=f"closed {closed.side.value} {closed.quantity}",
+                        client_order_id=closed.client_order_id,
+                        broker_trade_id=closed.trade_id,
+                    )
+                )
+                continue
             if symbol in excluded or filled is None or filled == 0:
                 continue
             if request_id in open_matched_order_ids:
@@ -1104,8 +1162,6 @@ class BrokerOrderReconciliationService:
                 if row["side"] == OrderSide.BUY.value
                 else PositionSide.SHORT
             )
-            if closed.side is not order_direction:
-                continue  # the closed trade is not the exposure this order opened
             symbol_net = net.get(symbol, Decimal(0))
             expected_side = (
                 PositionSide.LONG
@@ -1144,6 +1200,37 @@ class BrokerOrderReconciliationService:
                     broker_transaction_ids=closed.closing_transaction_ids,
                 )
             )
+
+    @staticmethod
+    def _matched_trade_identity_conflict(
+        row: dict, trade_symbol: str, trade_side: PositionSide
+    ) -> str | None:
+        """Whether a trade matched by ID evidence CONTRADICTS the matched
+        order's own identity (PR #108 re-review).
+
+        A trade opened by an order shares the order's instrument and
+        direction (BUY -> long, SELL -> short). A matching client id / fill
+        id combined with a different symbol or an opposite side is
+        contradictory evidence -- a malformed response or a stale / reused
+        identifier -- and must never be treated as a unique match: no close
+        confirmation, no SL/TP comparison against the wrong instrument.
+        Returns the human-readable contradiction, or None when coherent."""
+        problems: list[str] = []
+        if trade_symbol != row["symbol"]:
+            problems.append(
+                f"trade symbol {trade_symbol!r} != order symbol {row['symbol']!r}"
+            )
+        order_direction = (
+            PositionSide.LONG if row["side"] == OrderSide.BUY.value else PositionSide.SHORT
+        )
+        if trade_side is not order_direction:
+            problems.append(
+                f"trade side {trade_side.value!r} contradicts the order's "
+                f"{order_direction.value!r} direction"
+            )
+        if not problems:
+            return None
+        return "; ".join(problems)
 
     @staticmethod
     def _match_order_candidates(
