@@ -2957,6 +2957,492 @@ def test_leaked_adapter_exception_text_never_reaches_logs_or_audit(paths, caplog
     assert "RuntimeError" in emitted  # the class name IS logged
 
 
+# --- r7 review: the promotion critical section -------------------------------
+#
+# The Blocker: verifying the committed fence and promoting the claim are
+# writes to two different SQLite files. Between them another attempt could
+# replace the order's fence, leaving the claim at generation 2 under
+# identity X while the order was fenced for Y -- a split identity produced
+# by the reconciliation store's own API. Re-reading the fence just before
+# the CAS only narrows that window; these tests pin that there is no window
+# at all, because the whole section runs under the ORDER STORE's write lock.
+
+
+def foreign_fence_token(attempt_id="attempt-intruder"):
+    """A fence token for a DIFFERENT attempt -- the replacement the protocol
+    normally permits, which must NOT land inside a promotion."""
+    return execution_store.RepairFenceToken(
+        repair_attempt_id=attempt_id,
+        generation=1,
+        owner_id="owner-intruder",
+        claim_execution_id="claim-intruder",
+    )
+
+
+def impatient_order_store(monkeypatch, seconds=0.2):
+    """Shrink the order store's busy timeout so a blocked writer fails fast
+    instead of waiting the production 30s."""
+    monkeypatch.setattr(execution_store, "BUSY_TIMEOUT_SECONDS", seconds)
+
+
+def pause_inside_promotion(monkeypatch, *, entered, release):
+    """Hold a promotion INSIDE its guarded critical section.
+
+    The fence has already been verified under the order store's write lock
+    at this point and the claim CAS has not run yet -- exactly the window
+    the Blocker described."""
+    real = reconciliation_store._promote_under_guard
+
+    def paused(*args, **kwargs):
+        entered.set()
+        assert release.wait(GATE_TIMEOUT), "the other worker never finished"
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(reconciliation_store, "_promote_under_guard", paused)
+
+
+def test_no_fence_replacement_can_land_between_the_check_and_the_claim_cas(
+    paths, monkeypatch
+):
+    """The CodeX reproduction, run with real threads.
+
+    Worker A is suspended inside the promotion's critical section; worker B
+    tries to replace the order's fence with another attempt's. B must not
+    succeed before A's claim CAS commits -- here it fails typed, which is
+    the allowed 'conflict' outcome (the 'wait' outcome is covered by
+    ``test_a_fence_replacement_waits_for_the_promotion_and_then_proceeds``).
+    """
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-90", "run-90", monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    pause_inside_promotion(monkeypatch, entered=entered, release=release)
+    impatient_order_store(monkeypatch)
+    intruder = {}
+
+    def replace_the_fence():
+        assert entered.wait(GATE_TIMEOUT), "the promotion never reached its guard"
+        try:
+            execution_store.register_repair_fence(
+                "exec-90",
+                token=foreign_fence_token(),
+                registered_at_utc=RESTART_AT,
+                db_path=execution_db,
+            )
+            intruder["outcome"] = "replaced"
+        except Exception as exc:  # noqa: BLE001 - the type is asserted below
+            intruder["outcome"] = type(exc).__name__
+        finally:
+            release.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        intruding = pool.submit(replace_the_fence)
+        recovered = pool.submit(
+            lambda: recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+        ).result()
+        intruding.result()
+
+    # the intruder was refused WHILE the promotion held the order store
+    assert intruder["outcome"] == "ExecutionStoreBusyError", intruder
+
+    # and the promotion completed against the fence it verified
+    entry = only(recovered)
+    assert (entry.outcome, entry.generation) is not None
+    assert entry.outcome is RepairOutcome.APPLIED
+    assert entry.generation == 2
+    fence = execution_store.get_repair_fence("exec-90", db_path=execution_db)
+    assert fence["repair_attempt_id"] == "crash-1"
+    assert fence["generation"] == 2
+    assert fence["takeover_id"] == intent_of(reconciliation_db).takeover_id
+    assert intent_of(reconciliation_db).status is TakeoverIntentStatus.COMPLETED
+    assert pending(reconciliation_db) == ()
+
+
+def test_a_fence_replacement_waits_for_the_promotion_and_then_proceeds(paths, monkeypatch):
+    """The other allowed pattern: with the production busy timeout the
+    intruder BLOCKS until the guard is released, then the ordinary fence
+    contract decides. Either way it never lands inside the section."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-91", "run-91", monkeypatch)
+    entered = threading.Event()
+    order = []
+    real = reconciliation_store._promote_under_guard
+
+    def paused(*args, **kwargs):
+        entered.set()
+        result = real(*args, **kwargs)
+        order.append("claim-cas")  # still inside the guard
+        return result
+
+    monkeypatch.setattr(reconciliation_store, "_promote_under_guard", paused)
+
+    def replace_the_fence():
+        assert entered.wait(GATE_TIMEOUT)
+        try:
+            execution_store.register_repair_fence(
+                "exec-91",
+                token=foreign_fence_token(),
+                registered_at_utc=RESTART_AT,
+                db_path=execution_db,
+            )
+        finally:
+            order.append("fence-replaced")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        intruding = pool.submit(replace_the_fence)
+        recovered = pool.submit(
+            lambda: recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+        ).result()
+        intruding.result()
+
+    assert order == ["claim-cas", "fence-replaced"]  # never the other way round
+    assert only(recovered).outcome is RepairOutcome.APPLIED
+
+
+def test_a_promotion_whose_fence_was_replaced_first_never_moves_the_claim(
+    paths, monkeypatch
+):
+    """The fence is replaced BEFORE the guard is taken. The guard reads the
+    real row, sees a foreign identity and refuses -- the claim stays at
+    generation 1 instead of splitting away from the fence."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-92", "run-92", monkeypatch)
+    crash_after(monkeypatch, "promote_repair_claim", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = intent_of(reconciliation_db)
+    assert intent.status is TakeoverIntentStatus.FENCE_INSTALLED  # historical fact
+
+    force_fence(  # somebody else owns the order now
+        execution_db,
+        "exec-92",
+        attempt_id="attempt-intruder",
+        generation=1,
+        takeover=None,
+        claim="claim-intruder",
+    )
+
+    with pytest.raises(reconciliation_store.TakeoverIdentityMismatchError):
+        reconciliation_store.promote_repair_claim(
+            intent,
+            execution_db_path=execution_db,
+            promoted_at_utc=RESTART_AT,
+            db_path=reconciliation_db,
+        )
+    assert only(pending(reconciliation_db)).generation == 1  # never split
+
+
+def test_fence_installed_alone_is_not_permission_to_promote(paths, monkeypatch):
+    """``FENCE_INSTALLED`` says the fence carried this identity at SOME
+    earlier moment. It is a historical fact, never the authorization."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-93", "run-93", monkeypatch)
+    crash_after(monkeypatch, "promote_repair_claim", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = intent_of(reconciliation_db)
+    assert intent.status is TakeoverIntentStatus.FENCE_INSTALLED
+
+    with closing(sqlite3.connect(execution_db)) as connection:  # the fence disappears
+        connection.execute(f"DELETE FROM {execution_store.FENCES_TABLE}")
+        connection.commit()
+
+    with pytest.raises(reconciliation_store.TakeoverProtocolInvariantError):
+        reconciliation_store.promote_repair_claim(
+            intent,
+            execution_db_path=execution_db,
+            promoted_at_utc=RESTART_AT,
+            db_path=reconciliation_db,
+        )
+    assert only(pending(reconciliation_db)).generation == 1
+
+
+@pytest.mark.parametrize("workers", [2, 10])
+def test_concurrent_promotions_never_split_the_identity(paths, monkeypatch, workers):
+    """N recovery workers race over one abandoned claim while the promotion
+    critical section is genuinely contended: one winner, one generation
+    bump, and the fence and the claim always name the same identity."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending(paths, "exec-94", "run-94", monkeypatch)
+    barrier = threading.Barrier(workers, timeout=GATE_TIMEOUT)
+    brokers = [QueryOnlyBroker(broker) for _ in range(workers)]
+
+    def recover(index):
+        aligned = {"first": True}
+
+        def aligned_clock():
+            if aligned.pop("first", None):
+                barrier.wait()
+            return RECOVERY_AT
+
+        return repair_service(
+            brokers[index],
+            paths,
+            prefix=f"rec{index}",
+            owner=f"recovery-{index}",
+            clock=aligned_clock,
+        ).recover_pending_attempts()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = [f.result() for f in [pool.submit(recover, i) for i in range(workers)]]
+
+    applied = [only(r) for r in results if r and only(r).outcome is RepairOutcome.APPLIED]
+    assert len(applied) == 1  # no split brain, no deadlock, no timeout leak
+    winner = applied[0]
+    assert winner.generation == 2  # exactly one bump, never one per worker
+    fence = execution_store.get_repair_fence("exec-94", db_path=execution_db)
+    assert fence["generation"] == 2
+    assert fence["takeover_id"] == winner.takeover_id  # fence == claim identity
+    assert sum(b.query_count for b in brokers) == 1
+    assert pending(reconciliation_db) == ()
+    assert len(execution_store.get_state_history("exec-94", db_path=execution_db)) >= 1
+
+
+def test_a_process_death_inside_the_critical_section_leaves_no_lock_behind(
+    paths, monkeypatch
+):
+    """The guard is a SQLite file lock held by the process, not a durable
+    row: dying inside it releases the lock with nothing to clean up."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-95", "run-95", monkeypatch)
+    real = reconciliation_store._promote_under_guard
+
+    def die_before_the_cas(*args, **kwargs):
+        raise KeyboardInterrupt("process killed inside the promotion guard")
+
+    monkeypatch.setattr(reconciliation_store, "_promote_under_guard", die_before_the_cas)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.setattr(reconciliation_store, "_promote_under_guard", real)
+
+    intent = intent_of(reconciliation_db)
+    assert intent.status is TakeoverIntentStatus.FENCE_INSTALLED
+    assert only(pending(reconciliation_db)).generation == 1  # the CAS never ran
+
+    # the order store is immediately writable again -- no leaked lock
+    impatient_order_store(monkeypatch)
+    assert execution_store.get_repair_fence("exec-95", db_path=execution_db) is not None
+    restarted = repair_service(
+        QueryOnlyBroker(broker), paths, prefix="restart", owner="worker-restarted",
+        clock=lambda: RESTART_AT,
+    ).recover_pending_attempts()
+
+    entry = only(restarted)
+    assert entry.outcome is RepairOutcome.APPLIED
+    assert entry.takeover_id == intent.takeover_id  # same identity, not a new one
+    assert intent_of(reconciliation_db).status is TakeoverIntentStatus.COMPLETED
+
+
+def test_a_write_locked_order_store_is_a_retryable_backoff_not_a_block(
+    paths, monkeypatch, caplog
+):
+    """A busy order store means 'try again', not 'park this takeover': the
+    durable intent survives untouched and the next pass resumes it."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-96", "run-96", monkeypatch)
+    crash_after(monkeypatch, "promote_repair_claim", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = intent_of(reconciliation_db)
+    impatient_order_store(monkeypatch)
+
+    with closing(sqlite3.connect(execution_db, isolation_level=None)) as hostile:
+        hostile.execute("BEGIN IMMEDIATE")  # somebody else is writing the order store
+        with caplog.at_level("DEBUG"):
+            recovered = repair_service(
+                QueryOnlyBroker(broker), paths, prefix="busy", owner="worker-busy",
+                clock=lambda: RESTART_AT,
+            ).recover_pending_attempts()
+        hostile.execute("ROLLBACK")
+
+    assert recovered == ()  # backed off; nothing invented, nothing blocked
+    resumed = intent_of(reconciliation_db)
+    # only the resumption LEASE moved; the takeover identity and status did not
+    assert (resumed.takeover_id, resumed.status) == (intent.takeover_id, intent.status)
+    assert resumed.target_owner_id == intent.target_owner_id
+    assert resumed.target_claim_execution_id == intent.target_claim_execution_id
+    assert resumed.target_generation == intent.target_generation
+    assert only(pending(reconciliation_db)).generation == 1
+    assert any(  # the back-off is reported, never silent
+        "order store" in record.getMessage() for record in caplog.records
+    )
+
+    # and once the store is free again the SAME takeover finishes
+    again = repair_service(
+        QueryOnlyBroker(broker), paths, prefix="after", owner="worker-after",
+        clock=lambda: RESTART_AT + timedelta(days=1),
+    ).recover_pending_attempts()
+    assert only(again).takeover_id == intent.takeover_id
+    assert only(again).outcome is RepairOutcome.APPLIED
+
+
+def test_a_fence_replaced_after_the_promotion_loses_at_the_execution_commit(
+    paths, monkeypatch
+):
+    """The guard ends at the claim CAS -- by design. A replacement that
+    lands afterwards is caught by ``record_order_result``'s own in-transaction
+    fence check, and recovery converges instead of hanging forever."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-97", "run-97", monkeypatch)
+    crash_after(monkeypatch, "record_order_result", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    assert only(pending(reconciliation_db)).generation == 2  # promoted, not committed
+
+    force_fence(  # the order is taken over AFTER the promotion
+        execution_db,
+        "exec-97",
+        attempt_id="attempt-intruder",
+        generation=1,
+        takeover=None,
+        claim="claim-intruder",
+    )
+    before = order_state(execution_db, "exec-97")[0]
+
+    recovered = repair_service(
+        QueryOnlyBroker(broker), paths, prefix="after", owner="worker-after",
+        clock=lambda: RESTART_AT,
+    ).recover_pending_attempts()
+
+    entry = only(recovered)  # never an empty tuple, never a wrong APPLIED
+    assert entry.outcome is RepairOutcome.BLOCKED
+    assert entry.failure_code in (
+        RepairFailureCode.FENCE_INTENT_MISMATCH,
+        RepairFailureCode.FENCE_AHEAD,
+    )
+    assert order_state(execution_db, "exec-97")[0] == before  # nothing was written
+
+
+def test_the_promotion_guard_never_deadlocks_against_the_other_lock_users(
+    paths, monkeypatch
+):
+    """Lock inversion, deliberately: while a promotion holds the order
+    store, other paths that read it from INSIDE a reconciliation transaction
+    keep running. The guard is read-only, so it blocks writers without ever
+    blocking readers -- which is what makes the two orders safe."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-98", "run-98", monkeypatch)
+    crash_after(monkeypatch, "promote_repair_claim", calls_before_crash=1)
+    with pytest.raises(KeyboardInterrupt):
+        recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+    monkeypatch.undo()
+    intent = intent_of(reconciliation_db)
+    token = execution_store.RepairFenceToken(
+        repair_attempt_id=intent.repair_attempt_id,
+        generation=intent.target_generation,
+        owner_id=intent.target_owner_id,
+        claim_execution_id=intent.target_claim_execution_id,
+        takeover_id=intent.takeover_id,
+    )
+    impatient_order_store(monkeypatch)
+
+    with execution_store.repair_fence_promotion_guard(
+        "exec-98", expected=token, db_path=execution_db
+    ):
+        # reads of the order store still work (no reader starvation)...
+        assert execution_store.get_repair_fence("exec-98", db_path=execution_db) is not None
+        assert order_state(execution_db, "exec-98")[0] == "unknown"
+        # ...and the reconciliation store is fully usable meanwhile
+        assert reconciliation_store.list_takeover_intents(db_path=reconciliation_db)
+        # only WRITERS of the order store are held off
+        with pytest.raises(execution_store.ExecutionStoreBusyError):
+            execution_store.register_repair_fence(
+                "exec-98",
+                token=foreign_fence_token(),
+                registered_at_utc=RESTART_AT,
+                db_path=execution_db,
+            )
+
+    # released cleanly: the very same write succeeds now
+    execution_store.register_repair_fence(
+        "exec-98",
+        token=foreign_fence_token(),
+        registered_at_utc=RESTART_AT,
+        db_path=execution_db,
+    )
+
+
+def test_an_old_worker_cannot_commit_while_a_promotion_holds_the_fence(paths, monkeypatch):
+    """The taken-over worker races the promotion: it is refused, the caller
+    never sees APPLIED, and no audit row is damaged."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-99", "run-99", monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    pause_inside_promotion(monkeypatch, entered=entered, release=release)
+    impatient_order_store(monkeypatch)
+    old_worker = {}
+
+    def old_worker_commit():
+        assert entered.wait(GATE_TIMEOUT)
+        try:
+            execution_store.record_order_result(
+                "exec-99",
+                _stale_result(broker),
+                reason="the old worker still thinks it owns this order",
+                changed_at_utc=RESTART_AT,
+                db_path=execution_db,
+                repair_fence=execution_store.RepairFenceToken(
+                    repair_attempt_id="crash-1",
+                    generation=1,
+                    owner_id="worker-1",
+                    claim_execution_id="claim-stale",
+                ),
+            )
+            old_worker["outcome"] = "committed"
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            old_worker["outcome"] = type(exc).__name__
+        finally:
+            release.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stale = pool.submit(old_worker_commit)
+        recovered = pool.submit(
+            lambda: recovery_service(QueryOnlyBroker(broker), paths).recover_pending_attempts()
+        ).result()
+        stale.result()
+
+    assert old_worker["outcome"] != "committed", old_worker
+    assert only(recovered).outcome is RepairOutcome.APPLIED
+    assert only(recovered).generation == 2
+    history = execution_store.get_state_history("exec-99", db_path=execution_db)
+    assert only([h for h in history if h["repair_attempt_id"]])["repair_generation"] == 2
+
+
+def _stale_result(broker):
+    return broker.get_order(client_id("exec-99"))
+
+
+def test_dry_run_never_takes_the_order_stores_write_lock(paths, monkeypatch):
+    """Dry-run stays absolutely side-effect free -- including locks: with
+    the order store held write-locked by somebody else the whole pass still
+    completes, which it could not do if it tried to guard anything."""
+    execution_db, reconciliation_db = paths
+    broker = crashed_pending_at(paths, "exec-89", "run-89", monkeypatch)
+    before = (execution_db.read_bytes(), reconciliation_db.read_bytes())
+    stats_before = (execution_db.stat().st_mtime_ns, reconciliation_db.stat().st_mtime_ns)
+    impatient_order_store(monkeypatch)
+
+    with closing(sqlite3.connect(execution_db, isolation_level=None)) as hostile:
+        hostile.execute("BEGIN IMMEDIATE")
+        result = repair_service(QueryOnlyBroker(broker), paths).repair(
+            run_id="run-89", mode=RepairMode.DRY_RUN
+        )
+        hostile.execute("ROLLBACK")
+
+    assert only(result.attempts).outcome is RepairOutcome.WOULD_APPLY
+    assert (execution_db.read_bytes(), reconciliation_db.read_bytes()) == before
+    assert (
+        execution_db.stat().st_mtime_ns,
+        reconciliation_db.stat().st_mtime_ns,
+    ) == stats_before
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not pathlib.Path(str(execution_db) + suffix).exists()
+        assert not pathlib.Path(str(reconciliation_db) + suffix).exists()
+
+
 # --- r6 review: the fence_installed marker reads the COMMITTED row -----------
 #
 # The Blocker: the marker used to accept a caller-built ``TakeoverFenceProof``.
@@ -3174,6 +3660,7 @@ def test_the_repair_module_hands_no_fence_evidence_to_the_reconciliation_store()
         "get_active_takeover_intent",
         "register_repair_fence",
         "get_repair_fence",
+        "repair_fence_promotion_guard",
         "promote_repair_claim",
         "mark_takeover_fence_installed",
         "mark_takeover_claim_promoted",

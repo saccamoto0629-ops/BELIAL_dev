@@ -311,6 +311,17 @@ class TakeoverClaimNotPromotedError(TakeoverProtocolInvariantError):
     claim held by this intent."""
 
 
+class TakeoverFenceUnavailableError(TakeoverProtocolInvariantError):
+    """The order store could not be held still long enough to promote a claim
+    (Issue #104 re-review r7).
+
+    The promotion never entered its critical section: no fence was read
+    under a lock, no claim was moved and both DBs are untouched. Unlike an
+    identity mismatch this is a TRANSIENT condition -- another writer simply
+    held the order store past the busy timeout -- so the caller backs off
+    and the next pass resumes the SAME durable intent."""
+
+
 class TakeoverIdentityMismatchError(TakeoverProtocolInvariantError):
     """The attempt (or a fence proof) is held by a DIFFERENT identity than
     the intent whose status was to be advanced."""
@@ -1498,6 +1509,95 @@ def _require_claim_matches_intent(row: sqlite3.Row, intent: RepairTakeoverIntent
         )
 
 
+def _order_of_attempt(intent: RepairTakeoverIntent, db_path: Path) -> str | None:
+    """The execution order this attempt acts on, read WITHOUT holding a lock.
+
+    The guard names an order, so the order must be known before it can be
+    taken. This read goes through a TRUE read-only connection and is fully
+    finished before the guard is acquired, so **no reconciliation lock is
+    ever held while the order store is locked** -- that is what keeps the
+    repository-wide lock order one-way.
+
+    It also re-checks the caller's intent identity first, so an unknown or
+    foreign intent fails with its usual typed error WITHOUT the order
+    store's write lock ever being taken for a doomed step. Nothing here is
+    trusted: the guarded transaction reads both rows again and decides.
+    """
+    with _verified_read(db_path) as connection:
+        _verified_intent_row(connection, intent)
+        row = connection.execute(
+            f"SELECT execution_request_id FROM {REPAIRS_TABLE} WHERE attempt_id = ?",
+            (intent.repair_attempt_id,),
+        ).fetchone()
+    if row is None:
+        raise TakeoverProtocolInvariantError(
+            f"takeover intent {intent.takeover_id!r} names repair attempt "
+            f"{intent.repair_attempt_id!r}, which does not exist"
+        )
+    return row["execution_request_id"]
+
+
+@contextmanager
+def _fence_held_still(
+    intent: RepairTakeoverIntent, execution_request_id: str, execution_db_path: Path
+):
+    """Hold the order's fence still for a takeover step, or refuse it.
+
+    THE CRITICAL SECTION (r7 review Blocker). Everything inside this block
+    runs while this process holds the ORDER STORE's write lock, and the
+    fence has already been verified to name exactly this intent under that
+    lock. No other connection can replace the fence until the block exits,
+    so a reconciliation write committed inside it can never be based on a
+    fence that has since moved.
+
+    Every failure mode is typed and leaves BOTH stores untouched:
+
+    - no fence row / no order store -> :class:`TakeoverProtocolInvariantError`
+    - the fence names another identity -> :class:`TakeoverIdentityMismatchError`
+    - the store stayed write-locked -> :class:`TakeoverFenceUnavailableError`
+      (transient; the durable intent survives and the next pass retries)
+    - the store is unreadable/corrupt -> :class:`TakeoverProtocolInvariantError`
+    """
+    from execution import execution_store  # local: keeps the import graph acyclic
+
+    expected = execution_store.RepairFenceToken(
+        repair_attempt_id=intent.repair_attempt_id,
+        generation=intent.target_generation,
+        owner_id=intent.target_owner_id,
+        claim_execution_id=intent.target_claim_execution_id,
+        takeover_id=intent.takeover_id,
+    )
+    try:
+        with execution_store.repair_fence_promotion_guard(
+            execution_request_id, expected=expected, db_path=execution_db_path
+        ):
+            yield
+    except execution_store.ExecutionRepairFenceMissingError as exc:
+        raise TakeoverProtocolInvariantError(
+            f"execution order {execution_request_id!r} has no committed repair fence; "
+            f"takeover intent {intent.takeover_id!r} is not advanced "
+            f"({type(exc).__name__})"
+        ) from exc
+    except execution_store.ExecutionRepairFenceBusyError as exc:
+        raise TakeoverFenceUnavailableError(
+            f"the execution order store could not be held still for takeover intent "
+            f"{intent.takeover_id!r} ({type(exc).__name__}); nothing was written and the "
+            "step is retried later"
+        ) from exc
+    except execution_store.ExecutionRepairFenceConflictError as exc:
+        differing = ", ".join(getattr(exc, "mismatched_columns", ()) or ("identity",))
+        raise TakeoverIdentityMismatchError(
+            f"the committed repair fence of execution order {execution_request_id!r} "
+            f"does not carry takeover intent {intent.takeover_id!r} at the moment of "
+            f"this step (differing: {differing}); the takeover is not advanced"
+        ) from exc
+    except (execution_store.ExecutionStoreError, sqlite3.Error) as exc:
+        raise TakeoverProtocolInvariantError(
+            f"the execution order store could not be read to fence takeover intent "
+            f"{intent.takeover_id!r} ({type(exc).__name__}); the takeover is not advanced"
+        ) from exc
+
+
 def mark_takeover_fence_installed(
     intent: RepairTakeoverIntent,
     *,
@@ -1507,34 +1607,29 @@ def mark_takeover_fence_installed(
 ) -> RepairTakeoverIntent:
     """Record that the EXECUTION fence carries this intent's identity.
 
-    SUBSTANCE CHECK (r6 review Blocker): this function READS THE COMMITTED
-    FENCE ROW from the execution order store itself
-    (:func:`execution_store.get_repair_fence` -- the owning store's own
-    read API, never re-implemented SQL here) and compares the full identity:
+    SUBSTANCE CHECK (r6 review Blocker): the fence is read from the ORDER
+    STORE's own committed row and compared in FULL --
+    ``execution_request_id`` / ``repair_attempt_id`` / ``generation`` /
+    ``takeover_id`` / ``owner_id`` / ``claim_execution_id`` -- against this
+    intent's target identity AND the attempt's OWN execution order. **No
+    caller-supplied value is accepted as evidence** that a fence exists, so
+    there is no ``proof`` parameter at all. ``execution_db_path`` is
+    CONFIGURATION (which order store this deployment uses), not evidence.
 
-        execution_request_id / repair_attempt_id / generation /
-        takeover_id / owner_id / claim_execution_id
-
-    against this intent's target identity AND the attempt's OWN execution
-    order. **No caller-supplied value is accepted as evidence** that a fence
-    exists: a value object built in Python proves nothing about durable
-    state, so there is no ``proof`` parameter at all. ``execution_db_path``
-    is CONFIGURATION (which order store this deployment uses), not
-    evidence -- a caller able to point at a different store could equally
-    well write the real one.
+    GUARDED (r7 review): the read and the status write happen while this
+    process holds the order store's write lock
+    (:func:`execution_store.repair_fence_promotion_guard`), so the fence
+    cannot be replaced between them. That also keeps the repository-wide
+    LOCK ORDER one-way -- **order-store guard first, reconciliation
+    transaction second** -- on every cross-DB path.
 
     An attempt with no execution order (a broker-only target) has no fence
-    to install and is accepted without one; an attempt that HAS an order
-    must have the matching row committed.
+    to install and is accepted without one and without a guard.
 
-    TOCTOU: the fence contract is monotonic (a generation never rolls back,
-    a generation is never re-pointed at a different identity of the same
-    attempt, and a finalized fence is never re-armed), so a fence observed
-    at this identity can afterwards only stay as it is or be replaced by a
-    DIFFERENT attempt taking the order over. The latter cannot forge this
-    intent's identity, and the eventual ``record_order_result`` re-verifies
-    the fence inside its own transaction -- so a takeover that races a new
-    attempt loses at the commit, never writes wrongly.
+    Marking this status is still only a HISTORICAL FACT about the moment it
+    ran. It is never on its own the permission to promote a claim:
+    :func:`promote_repair_claim` re-verifies the current fence under its own
+    guard.
     """
     _require_utc_argument(at_utc, "at_utc")
     if execution_db_path is None:
@@ -1544,64 +1639,37 @@ def mark_takeover_fence_installed(
         )
     execution_db_path = Path(execution_db_path)
     db_path = _require_existing_db(db_path)
+    order_id = _order_of_attempt(intent, db_path)
+    if order_id is None:
+        return _mark_fence_installed_locked(intent, at_utc, db_path, guarded_order=None)
+    with _fence_held_still(intent, order_id, execution_db_path):
+        return _mark_fence_installed_locked(
+            intent, at_utc, db_path, guarded_order=order_id
+        )
+
+
+def _mark_fence_installed_locked(
+    intent: RepairTakeoverIntent,
+    at_utc: datetime,
+    db_path: Path,
+    *,
+    guarded_order: str | None,
+) -> RepairTakeoverIntent:
+    """The status write itself -- runs while the fence is held still."""
     with _verified_txn(db_path) as connection:
         stored = _verified_intent_row(connection, intent)
         current = TakeoverIntentStatus(stored["status"])
         attempt = _attempt_row_for_intent(connection, intent)
-        expected_order = attempt["execution_request_id"]
-        if expected_order is not None:
-            _require_committed_fence(intent, expected_order, execution_db_path)
+        if attempt["execution_request_id"] != guarded_order:
+            raise TakeoverProtocolInvariantError(
+                f"repair attempt {intent.repair_attempt_id!r} names execution order "
+                f"{attempt['execution_request_id']!r}, but the fence held still for this "
+                f"transition is {guarded_order!r}; the intent is not advanced"
+            )
         if current is TakeoverIntentStatus.FENCE_INSTALLED:
             return _restore_intent(stored)  # idempotent retry after a crash
         return _advance_status(
             connection, intent, current, TakeoverIntentStatus.FENCE_INSTALLED, at_utc
-        )
-
-
-def _require_committed_fence(
-    intent: RepairTakeoverIntent, execution_request_id: str, execution_db_path: Path
-) -> None:
-    """The order store must ALREADY hold this intent's identity as its fence.
-
-    Read through the execution store's own read API so this module never
-    duplicates that schema knowledge. A missing row, an unreadable store or
-    any identity difference refuses the transition (the caller's
-    reconciliation transaction rolls back untouched). Raw
-    :class:`sqlite3.Error` is caught alongside the typed store errors: a
-    corrupt order file must become a typed protocol failure here, not a
-    DB-layer exception that the surrounding transaction re-labels as
-    reconciliation schema corruption."""
-    from execution import execution_store  # local: keeps the import graph acyclic
-
-    try:
-        fence = execution_store.get_repair_fence(
-            execution_request_id, db_path=execution_db_path
-        )
-    except (execution_store.ExecutionStoreError, sqlite3.Error) as exc:
-        raise TakeoverProtocolInvariantError(
-            f"the execution order store could not be read to verify the repair fence of "
-            f"{execution_request_id!r} ({type(exc).__name__}); takeover intent "
-            f"{intent.takeover_id!r} is not advanced"
-        ) from exc
-    if fence is None:
-        raise TakeoverProtocolInvariantError(
-            f"execution order {execution_request_id!r} has no committed repair fence; "
-            f"takeover intent {intent.takeover_id!r} may not be marked fence_installed"
-        )
-    expected = {
-        "execution_request_id": execution_request_id,
-        "repair_attempt_id": intent.repair_attempt_id,
-        "generation": intent.target_generation,
-        "takeover_id": intent.takeover_id,
-        "owner_id": intent.target_owner_id,
-        "claim_execution_id": intent.target_claim_execution_id,
-    }
-    mismatched = sorted(column for column, value in expected.items() if fence[column] != value)
-    if mismatched:
-        raise TakeoverIdentityMismatchError(
-            f"the committed repair fence of execution order {execution_request_id!r} does "
-            f"not carry takeover intent {intent.takeover_id!r} (differing: "
-            f"{', '.join(mismatched)}); the intent is not advanced"
         )
 
 
@@ -2004,6 +2072,7 @@ def list_takeover_intents(
 def promote_repair_claim(
     intent: RepairTakeoverIntent,
     *,
+    execution_db_path: Path,
     promoted_at_utc: datetime,
     db_path: Path | None = None,
 ) -> RepairAttemptReservation:
@@ -2018,12 +2087,62 @@ def promote_repair_claim(
 
     A row that moved on to another identity raises
     :class:`RepairClaimLostError`; a finalized attempt raises
-    :class:`RepairAttemptConflictError`. The intent must be ``fence_installed``
-    -- promoting a claim before the execution fence carries the identity
-    would open the very window the fence exists to close.
+    :class:`RepairAttemptConflictError`.
+
+    PROMOTION IS FENCED, NOT MERELY PRECEDED BY A FENCE (r7 review
+    Blocker). ``fence_installed`` records that the fence carried this
+    identity at SOME EARLIER MOMENT; it is a historical fact, not a standing
+    permission. Between that check and this CAS another attempt could
+    replace the order's fence, leaving the claim at generation 2 under
+    identity X while the order was fenced for Y -- a split identity produced
+    by this very API. Re-reading the fence here would only narrow that
+    window, so instead the whole critical section runs under the ORDER
+    STORE's write lock:
+
+    .. code-block:: text
+
+        execution_store.repair_fence_promotion_guard()   # BEGIN IMMEDIATE
+          -> the committed fence still names this intent (6 columns)
+          -> reconciliation BEGIN IMMEDIATE -> claim CAS -> COMMIT
+        release the guard
+
+    No other connection can take the order store's write lock in between, so
+    no fence replacement can land between the check and the committed CAS.
+    The guard is read-only, so it never blocks READERS and the lock order
+    (order store first, reconciliation second) cannot deadlock against
+    :func:`mark_takeover_fence_installed`, which reads the order store from
+    inside a reconciliation transaction.
+
+    Typed outcomes: a fence that is missing or names someone else raises
+    :class:`TakeoverIdentityMismatchError`; an order store that stays
+    write-locked past its busy timeout raises
+    :class:`TakeoverFenceUnavailableError` (retryable -- nothing was
+    written). An attempt with NO execution order (a broker-only target) has
+    no fence to hold and is promoted without a guard.
     """
     _require_utc_argument(promoted_at_utc, "promoted_at_utc")
+    if execution_db_path is None:
+        raise ReconciliationStoreError(
+            "execution_db_path is required: a claim is promoted only while this "
+            "process holds the order store's fence still"
+        )
+    execution_db_path = Path(execution_db_path)
     db_path = _require_existing_db(db_path)
+    order_id = _order_of_attempt(intent, db_path)
+    if order_id is None:
+        return _promote_under_guard(intent, promoted_at_utc, db_path, guarded_order=None)
+    with _fence_held_still(intent, order_id, execution_db_path):
+        return _promote_under_guard(intent, promoted_at_utc, db_path, guarded_order=order_id)
+
+
+def _promote_under_guard(
+    intent: RepairTakeoverIntent,
+    promoted_at_utc: datetime,
+    db_path: Path,
+    *,
+    guarded_order: str | None,
+) -> RepairAttemptReservation:
+    """The claim CAS itself -- runs while the order's fence is held still."""
     with _verified_txn(db_path) as connection:
         stored_intent = _verified_intent_row(connection, intent)
         status = TakeoverIntentStatus(stored_intent["status"])
@@ -2047,6 +2166,13 @@ def promote_repair_claim(
             raise RepairAttemptConflictError(
                 f"repair attempt {intent.repair_attempt_id!r} is already finalized "
                 f"(outcome {row['outcome']!r}); its claim cannot be promoted"
+            )
+        if row["execution_request_id"] != guarded_order:
+            # the order named by the guard must still be this attempt's order
+            raise TakeoverProtocolInvariantError(
+                f"repair attempt {intent.repair_attempt_id!r} names execution order "
+                f"{row['execution_request_id']!r}, but the fence held still for this "
+                f"promotion is {guarded_order!r}; the claim is not promoted"
             )
         if (
             row["generation"] == intent.target_generation

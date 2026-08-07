@@ -239,6 +239,90 @@ TOCTOU について: fence contract は単調である(generation は巻き戻�
 | `observed_at_utc` / `at_utc`(clock) | 入力であって durable fact の証明ではない。早すぎる takeover は fence と CAS で敗北するだけで、誤った書き込みにはならない |
 
 
+### claim promotion の critical section(再レビュー r7)
+
+`fence_installed` は「**過去のある時点で** fence がこの identity を指していた」という歴史的事実にすぎず、claim promotion の許可そのものではない。r6 までは
+
+```text
+fence を read して検証 → (窓) → promote_repair_claim() の CAS
+```
+
+の間に別 attempt が同じ注文の fence を置換でき、その結果
+
+```text
+Reconciliation claim : generation 2 / identity X
+takeover intent      : CLAIM_PROMOTED / X
+Execution fence      : generation 1 / identity Y
+```
+
+という **identity 分裂**を、reconciliation store の API 自身が作れてしまった(Blocker)。
+
+**「CAS の直前にもう一度 read する」は修正にならない。** read と CAS の間に同じ窓が残るだけである。したがって検証と CAS の全体を、fence を置換できない排他区間の中に入れる。
+
+```text
+execution_store.repair_fence_promotion_guard()   # Execution DB: BEGIN IMMEDIATE
+  → commit 済み fence 行を lock 下で read
+  → intent target identity と 6 項目完全比較
+  ├ reconciliation DB: BEGIN IMMEDIATE → claim CAS → COMMIT
+  └ guard 解放
+```
+
+guard は Execution DB の **write lock(RESERVED)** を保持する。保持中:
+
+- 他 connection は Execution DB の write lock を取得できない = `register_repair_fence()` / `record_order_result()` による fence 置換は成功しない(busy timeout まで待ち、その後 typed に失敗する)
+- 他 connection の **read は一切ブロックされない**。guard は `PRAGMA query_only` を立てて**自分では書けない**ため、RESERVED を EXCLUSIVE へ昇格させることが決してないからである
+
+同じ guard は `mark_takeover_fence_installed()` でも使う。これにより **cross-DB を触る全経路の lock order が一方向に統一**される。
+
+#### lock order(全経路で統一)
+
+```text
+Execution order store の guard(write lock)
+        ↓
+Reconciliation DB の transaction
+```
+
+逆順(Reconciliation の lock を保持したまま Execution の lock を取る)経路は存在しない。guard を取る前に必要な `execution_request_id` は **true read-only 接続**で読み、その read は guard 取得前に完全に終了している(lock を跨いで保持しない)。`execution_store` から `reconciliation_store` を呼ぶ経路は 1 つも無い。
+
+対象経路の確認: repair claim promotion / repair finalize / recovery / live worker commit / fence register・replace / blocked handling / old worker finalize — いずれも「Execution の write lock を保持したまま Reconciliation の lock を待つ」か「どちらか一方だけ」であり、逆順は無い。
+
+#### promotion 時の identity 検証
+
+guard を取得したあと、**Execution DB の実 row** について次の 6 項目を比較し、1 つでも違えば claim CAS を行わない。
+
+```text
+execution_request_id / repair_attempt_id / generation /
+takeover_id / owner_id / claim_execution_id
+```
+
+| guard 下で観測した状態 | 例外 | service の扱い |
+|---|---|---|
+| fence 行なし / order store なし | `TakeoverProtocolInvariantError` | BLOCKED `takeover_protocol_corrupt` |
+| 別 attempt・別 takeover・別 owner・別 claim・別 order | `TakeoverIdentityMismatchError`(差分列名付き) | BLOCKED `fence_intent_mismatch` |
+| 先の generation | 同上 | BLOCKED `fence_ahead` |
+| 古い generation(置換対象の旧 claim の fence) | 同上 | BLOCKED `fence_intent_mismatch` |
+| store が壊れて読めない | `TakeoverProtocolInvariantError` | BLOCKED `takeover_protocol_corrupt` |
+| store が write lock されたまま busy timeout | `TakeoverFenceUnavailableError` | **BLOCKED にしない**。sanitize 済みログを出して back off し、次の pass が同じ intent を再開する |
+
+#### promotion 成功時に保証される invariant
+
+```text
+claim(generation N+1 / identity X)が commit された瞬間、
+Execution fence は identity X を指していた
+```
+
+guard 保持中に fence を置換できないので、これは「検証時に真だった」ではなく「CAS commit 時点でも真だった」である。
+
+#### process death / timeout / deadlock
+
+- guard は **SQLite のファイルロック**であり、耐久化された lock 行ではない。プロセスが死ねば OS がロックを解放する。**永久ロックも掃除対象も存在しない**(lease や cleanup を持つ durable reservation を新設していないのはこのためで、schema も増えていない)。
+- ロック待ちは必ず `BUSY_TIMEOUT_SECONDS`(30 秒)で打ち切られ、`ExecutionStoreBusyError` / `TakeoverFenceUnavailableError` という **typed failure** になる。無限待機する経路は無い。
+- guard が read-only であることにより、「Reconciliation transaction の中から Execution を read する」経路(`mark_takeover_fence_installed` の substance check)と互いにブロックしない。これが deadlock 不在の根拠である。
+
+#### guard を抜けたあと
+
+guard は claim CAS までを守る。その後に別 attempt が fence を置換する契約は従来どおり維持される(attempt ID は reservation ごとに一意なので、新しい attempt が正当に注文を取る)。置換された場合、先の worker は `record_order_result()` の transaction 内 fence 検証で拒否され、recovery は typed BLOCKED へ収束する(永久 pending にはならない)。
+
 ### cross-DB protocol(8 段階・各段階から restart 可能)
 
 ```text

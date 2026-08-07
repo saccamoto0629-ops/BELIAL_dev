@@ -144,7 +144,21 @@ fencing token は `RepairFenceToken`(attempt id / generation / takeover id / own
 
 `register_repair_fence()` は成功時に **commit した fence 行を読み戻した** `InstalledRepairFence`(order ID + token + 更新時刻)を返す。呼び出し側の引数をそのまま echo するのではなく**この store が実際に保持している値**なので、生成された瞬間においては真である。ただしこれは **観測値であって権限ではない**: reconciliation 側へ「fence を設置した証明」として持ち回すことはしない(r6 レビュー)。in-memory のオブジェクトを持てる者はそれを捏造することもできるからである。
 
-reconciliation 側が `fence_installed` を記録するときは、`mark_takeover_fence_installed(execution_db_path=...)` が **この store の `get_repair_fence()` を自分で呼び、commit 済み fence 行を read して** intent の identity 6 項目と突き合わせる。行がない・identity が違う・store が読めない場合は遷移せず typed 例外になる。したがって fence に関する信頼の起点は、常にこの store に commit された行そのものである。
+#### promotion guard(claim 昇格中は fence を止める。再レビュー r7)
+
+`repair_fence_promotion_guard(execution_request_id, expected=RepairFenceToken)` は、この store に `BEGIN IMMEDIATE`(RESERVED lock)を張ったまま **commit 済み fence 行を lock 下で read し、6 項目 identity を照合してから** 呼び出し側の critical section を実行する context manager である。reconciliation 側の claim CAS をこの中で commit することで、「fence を確認してから claim を昇格するまでの間に別 attempt が fence を置換する」窓(r7 Blocker)を無くす。
+
+性質:
+
+- **write 排他 / read 非排他**: guard は `PRAGMA query_only` を立てるので自分では書けず、RESERVED を EXCLUSIVE へ昇格させない。したがって他 connection の read は一切ブロックしない一方、`register_repair_fence()` / `record_order_result()` などの writer は guard 解放まで進めない。
+- **process 間で有効**: SQLite のファイルロックなので、thread だけでなく別プロセスにも効く。
+- **lock leak なし**: プロセス死で OS がロックを解放する。耐久 lock 行を持たないので掃除も migration も不要。
+- **typed timeout**: 取得できなければ `ExecutionRepairFenceBusyError`(`ExecutionStoreBusyError` のサブクラス)。無限待機はしない。通常の write 経路も同様に、lock 競合は生の `sqlite3.OperationalError` ではなく `ExecutionStoreBusyError` になる。
+- **fail-closed**: fence 行なし / store なしは `ExecutionRepairFenceMissingError`、identity 不一致は差分列名を持つ `ExecutionRepairFenceConflictError`。どちらも critical section に入らない。
+
+lock order は **この store の guard が先、reconciliation DB の transaction が後**で固定されている。
+
+reconciliation 側が `fence_installed` を記録するときは、`mark_takeover_fence_installed(execution_db_path=...)` が **この store の `get_repair_fence()` を自分で呼び、commit 済み fence 行を read して** intent の identity 6 項目と突き合わせる。行がない・identity が違う・store が読めない場合は遷移せず typed 例外になる。この read も上記 guard の中で行われるため、確認と reconciliation 側の書き込みの間に fence が動くことはない。したがって fence に関する信頼の起点は、常にこの store に commit された行そのものである。
 
 `register_repair_fence(token=...)` の規則(すべて単一 `BEGIN IMMEDIATE` 内):
 

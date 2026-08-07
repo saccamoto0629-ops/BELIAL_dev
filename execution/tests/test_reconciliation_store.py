@@ -891,7 +891,7 @@ def promoted(path, intent=None, *, at_utc=None):
     """Drive one intent through fence + claim promotion + status."""
     intent = intent or sample_intent()
     fence_installed(path, intent)
-    store.promote_repair_claim(intent, promoted_at_utc=at_utc or at(1302), db_path=path)
+    store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at_utc or at(1302), db_path=path)
     return store.mark_takeover_claim_promoted(
         intent, at_utc=at_utc or at(1303), db_path=path
     )
@@ -1089,7 +1089,7 @@ def test_intent_transitions_are_forward_only_and_idempotent(tmp_path):
     # completing before the claim exists is refused by the SUBSTANCE check
     with pytest.raises(store.TakeoverProtocolInvariantError, match="finalized"):
         store.complete_takeover_intent(intent, at_utc=at(1302), db_path=path)
-    store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at(1302), db_path=path)
     claim_promoted = store.mark_takeover_claim_promoted(
         intent, at_utc=at(1303), db_path=path
     )
@@ -1143,7 +1143,7 @@ def test_claim_promotion_requires_the_fence_step_first(tmp_path):
     path = reserved_db(tmp_path)
     intent = prepared(path)
     with pytest.raises(store.TakeoverIntentStateError, match="execution fence"):
-        store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+        store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at(1302), db_path=path)
     assert only_pending(path).generation == 1
 
 
@@ -1152,7 +1152,7 @@ def test_claim_promotion_moves_the_claim_onto_the_intent_identity_idempotently(t
     intent = prepared(path)
     fence_installed(path, intent)
 
-    promoted = store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    promoted = store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at(1302), db_path=path)
 
     assert (promoted.generation, promoted.owner_id, promoted.claim_execution_id) == (
         2,
@@ -1164,7 +1164,7 @@ def test_claim_promotion_moves_the_claim_onto_the_intent_identity_idempotently(t
     assert promoted.last_claimed_at_utc == at(1302)
     assert promoted.attempt_id == "attempt-1" and promoted.reserved_at_utc == at(10)
     # replaying the promotion after a crash returns the same row, writes nothing
-    assert store.promote_repair_claim(intent, promoted_at_utc=at(7777), db_path=path) == promoted
+    assert store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at(7777), db_path=path) == promoted
     assert only_pending(path) == promoted
 
 
@@ -1180,7 +1180,7 @@ def test_a_completed_intent_can_never_move_the_claim_again(tmp_path):
     assert completed.status is TakeoverIntentStatus.COMPLETED
 
     with pytest.raises(store.TakeoverIntentStateError, match="fence_installed|claim"):
-        store.promote_repair_claim(intent, promoted_at_utc=at(3003), db_path=path)
+        store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at(3003), db_path=path)
     with pytest.raises(store.TakeoverIntentStateError):
         fence_installed(path, intent, at_utc=at(3004))
     # completing again is an idempotent no-op, not a second write
@@ -1246,7 +1246,7 @@ def test_finalize_requires_the_current_claim_including_the_takeover_id(tmp_path)
     path = reserved_db(tmp_path)
     intent = prepared(path)
     fence_installed(path, intent)
-    store.promote_repair_claim(intent, promoted_at_utc=at(1302), db_path=path)
+    store.promote_repair_claim(intent, execution_db_path=fenced_for(path, intent), promoted_at_utc=at(1302), db_path=path)
 
     # the ORIGINAL generation-1 worker resurrects and tries to finalize
     with pytest.raises(store.RepairClaimLostError, match="generation 2"):

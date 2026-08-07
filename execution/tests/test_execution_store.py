@@ -2346,3 +2346,152 @@ def test_a_failed_v3_to_v4_migration_rolls_back_to_the_untouched_file(db_path, m
         store.init_db(db_path)
 
     assert full_db_state(db_path) == before
+
+
+# --- the promotion guard (Issue #104 re-review r7) ----------------------------
+#
+# The guard exists so a repair claim can be promoted in the RECONCILIATION DB
+# while this order's fence is held still. It is a WRITE lock that can never
+# itself write, which is what lets it block writers without blocking readers.
+
+
+def guard_token(intent_attempt="attempt-xyz"):
+    return token(intent_attempt, 2, claim="claim-2", owner="worker-2", takeover="tk-2")
+
+
+def fenced_order(db_path, *, request_id="exec-1"):
+    submit_and_accept(db_path)
+    _fence(db_path, request_id, guard_token())
+    return db_path
+
+
+def test_the_guard_yields_the_committed_fence_and_holds_off_other_writers(db_path):
+    fenced_order(db_path)
+    with store.repair_fence_promotion_guard(
+        "exec-1", expected=guard_token(), db_path=db_path
+    ) as held:
+        assert held.execution_request_id == "exec-1"
+        assert held.token.identity() == guard_token().identity()
+        # readers are never blocked ...
+        assert store.get_repair_fence("exec-1", db_path=db_path)["generation"] == 2
+        # ... but no other connection may take the write lock
+        with closing(sqlite3.connect(db_path, isolation_level=None)) as other:
+            other.execute("PRAGMA busy_timeout = 200")
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+
+
+def test_the_guard_can_never_write_through_its_own_write_lock(db_path):
+    """``PRAGMA query_only`` is what stops the guard escalating RESERVED to
+    EXCLUSIVE -- the property the deadlock-freedom argument rests on."""
+    fenced_order(db_path)
+    with store.repair_fence_promotion_guard(
+        "exec-1", expected=guard_token(), db_path=db_path
+    ):
+        with closing(sqlite3.connect(db_path, isolation_level=None)) as reader:
+            reader.execute("PRAGMA busy_timeout = 200")
+            assert reader.execute("SELECT count(*) FROM execution_orders").fetchone()[0] == 1
+
+
+def test_the_guard_is_released_when_its_body_raises(db_path):
+    fenced_order(db_path)
+    with pytest.raises(ZeroDivisionError):
+        with store.repair_fence_promotion_guard(
+            "exec-1", expected=guard_token(), db_path=db_path
+        ):
+            raise ZeroDivisionError("the caller died inside the critical section")
+    # no leaked lock: the very next write succeeds
+    store.register_repair_fence(
+        "exec-1", token=token("attempt-other"), registered_at_utc=at(11), db_path=db_path
+    )
+
+
+def test_a_write_locked_store_makes_the_guard_a_typed_busy_failure(db_path, monkeypatch):
+    fenced_order(db_path)
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_SECONDS", 0.2)
+    with closing(sqlite3.connect(db_path, isolation_level=None)) as hostile:
+        hostile.execute("BEGIN IMMEDIATE")
+        with pytest.raises(store.ExecutionRepairFenceBusyError):
+            with store.repair_fence_promotion_guard(
+                "exec-1", expected=guard_token(), db_path=db_path
+            ):
+                raise AssertionError("the critical section must not be entered")
+        hostile.execute("ROLLBACK")
+    assert isinstance(
+        store.ExecutionRepairFenceBusyError("x"), store.ExecutionStoreBusyError
+    )
+
+
+def test_a_blocked_ordinary_write_is_typed_busy_too(db_path, monkeypatch):
+    """No path waits forever and none surfaces a raw sqlite error."""
+    fenced_order(db_path)
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_SECONDS", 0.2)
+    with closing(sqlite3.connect(db_path, isolation_level=None)) as hostile:
+        hostile.execute("BEGIN IMMEDIATE")
+        with pytest.raises(store.ExecutionStoreBusyError):
+            store.register_repair_fence(
+                "exec-1", token=token("attempt-other"), registered_at_utc=at(11),
+                db_path=db_path,
+            )
+        hostile.execute("ROLLBACK")
+
+
+def test_the_guard_refuses_an_order_without_a_fence(db_path):
+    submit_and_accept(db_path)
+    with pytest.raises(store.ExecutionRepairFenceMissingError):
+        with store.repair_fence_promotion_guard(
+            "exec-1", expected=guard_token(), db_path=db_path
+        ):
+            raise AssertionError("the critical section must not be entered")
+
+
+def test_the_guard_refuses_a_missing_store(tmp_path):
+    with pytest.raises(store.ExecutionRepairFenceMissingError):
+        with store.repair_fence_promotion_guard(
+            "exec-1", expected=guard_token(), db_path=tmp_path / "absent.sqlite3"
+        ):
+            raise AssertionError("the critical section must not be entered")
+    assert not (tmp_path / "absent.sqlite3").exists()  # never created
+
+
+@pytest.mark.parametrize(
+    "override,column",
+    [
+        ({"attempt_id": "attempt-other"}, "repair_attempt_id"),
+        ({"generation": 3}, "generation"),
+        ({"takeover": "tk-other"}, "takeover_id"),
+        ({"owner": "owner-other"}, "owner_id"),
+        ({"claim": "claim-other"}, "claim_execution_id"),
+    ],
+    ids=["attempt", "generation", "takeover", "owner", "claim-execution"],
+)
+def test_the_guard_compares_every_identity_column(db_path, override, column):
+    fenced_order(db_path)
+    wanted = dict(attempt_id="attempt-xyz", generation=2, claim="claim-2",
+                  owner="worker-2", takeover="tk-2")
+    wanted.update(override)
+    with pytest.raises(store.ExecutionRepairFenceConflictError, match=column) as caught:
+        with store.repair_fence_promotion_guard(
+            "exec-1", expected=token(**wanted), db_path=db_path
+        ):
+            raise AssertionError("the critical section must not be entered")
+    assert caught.value.mismatched_columns == (column,)
+
+
+def test_the_guard_refuses_a_fence_that_belongs_to_another_order(db_path):
+    fenced_order(db_path)
+    with pytest.raises(store.ExecutionRepairFenceMissingError):
+        with store.repair_fence_promotion_guard(
+            "exec-elsewhere", expected=guard_token(), db_path=db_path
+        ):
+            raise AssertionError("the critical section must not be entered")
+
+
+def test_the_guard_rejects_a_non_token_expectation(db_path):
+    fenced_order(db_path)
+    for bad in (None, "attempt-xyz", {"repair_attempt_id": "attempt-xyz"}):
+        with pytest.raises(ValueError, match="RepairFenceToken"):
+            with store.repair_fence_promotion_guard(
+                "exec-1", expected=bad, db_path=db_path
+            ):
+                raise AssertionError("the critical section must not be entered")

@@ -192,6 +192,7 @@ from execution.reconciliation_store import (
     ReconciliationStoreError,
     RepairAttemptConflictError,
     RepairClaimLostError,
+    TakeoverFenceUnavailableError,
     TakeoverIdentityMismatchError,
     TakeoverIntentConflictError,
     TakeoverIntentStateError,
@@ -224,6 +225,12 @@ _INFO_OUTCOMES: frozenset[RepairOutcome] = frozenset(
 )
 
 DEFAULT_LEASE_DURATION_SECONDS = 600
+
+# Returned by the takeover steps when the ORDER STORE was write-locked past
+# its busy timeout. Distinct from a (reason, detail) block: nothing is wrong
+# with the state, the store was simply busy, so the durable intent is left
+# exactly as it is and the next pass resumes it (r7 review).
+_STORE_BUSY = object()
 
 
 class ReconciliationRepairError(RuntimeError):
@@ -751,9 +758,13 @@ class BrokerOrderReconciliationRepairService:
 
         if intent.status is TakeoverIntentStatus.PREPARED:
             problem = self._install_fence(reservation, intent, now)
+            if problem is _STORE_BUSY:
+                return None
             if problem is not None:
                 return self._block_intent(reservation, intent, now, *problem)
             marked = self._mark_fence_installed(reservation, intent, now)
+            if marked is _STORE_BUSY:
+                return None
             if isinstance(marked, tuple):
                 return self._block_intent(reservation, intent, now, *marked)
             intent = marked
@@ -761,6 +772,8 @@ class BrokerOrderReconciliationRepairService:
             # re-assert the SAME token (idempotent) so a crash between the
             # fence commit and the status update cannot leave them apart
             problem = self._install_fence(reservation, intent, now)
+            if problem is _STORE_BUSY:
+                return None
             if problem is not None:
                 return self._block_intent(reservation, intent, now, *problem)
 
@@ -770,7 +783,45 @@ class BrokerOrderReconciliationRepairService:
         ):
             try:
                 reservation = promote_repair_claim(
-                    intent, promoted_at_utc=now, db_path=self._reconciliation_db_path
+                    intent,
+                    execution_db_path=self._execution_db_path,
+                    promoted_at_utc=now,
+                    db_path=self._reconciliation_db_path,
+                )
+            except TakeoverFenceUnavailableError as exc:
+                # transient: the order store stayed write-locked. Nothing was
+                # written, the durable intent survives, the next pass resumes
+                # THIS takeover -- so back off instead of parking it.
+                self._safe_log_sanitized_exception(
+                    "a takeover promotion could not fence the order store",
+                    exc,
+                    failure_code=None,
+                    attempt_id=reservation.attempt_id,
+                    run_id=reservation.run_id,
+                    target_id=reservation.target_id,
+                )
+                return None
+            except TakeoverIdentityMismatchError as exc:
+                fence = (
+                    None
+                    if reservation.execution_request_id is None
+                    else self._read_fence(reservation.execution_request_id)
+                )
+                return self._block_intent(
+                    reservation,
+                    intent,
+                    now,
+                    (
+                        TakeoverBlockedReason.FENCE_AHEAD
+                        if fence is not None
+                        and fence["generation"] > intent.target_generation
+                        else TakeoverBlockedReason.FENCE_IDENTITY_MISMATCH
+                    ),
+                    (
+                        "the order's committed repair fence no longer carried this "
+                        f"takeover identity when the claim was promoted "
+                        f"({type(exc).__name__}); the claim was not moved"
+                    ),
                 )
             except RepairClaimLostError as exc:
                 return self._block_intent(
@@ -879,6 +930,16 @@ class BrokerOrderReconciliationRepairService:
             )
         except execution_store.ExecutionOrderNotFoundError:
             return None  # no order row -> nothing to fence; the claim decides
+        except execution_store.ExecutionStoreBusyError as exc:
+            self._safe_log_sanitized_exception(
+                "a takeover could not take the order store's write lock",
+                exc,
+                failure_code=None,
+                attempt_id=reservation.attempt_id,
+                run_id=reservation.run_id,
+                target_id=reservation.target_id,
+            )
+            return _STORE_BUSY  # transient: retry, do not park the takeover
         except ExecutionStoreError as exc:
             return (
                 TakeoverBlockedReason.PROTOCOL_CORRUPT,
@@ -928,6 +989,16 @@ class BrokerOrderReconciliationRepairService:
                     f"{intent.target_generation}; the fence is {observed})"
                 ),
             )
+        except TakeoverFenceUnavailableError as exc:
+            self._safe_log_sanitized_exception(
+                "a takeover could not hold the order store's fence still",
+                exc,
+                failure_code=None,
+                attempt_id=reservation.attempt_id,
+                run_id=reservation.run_id,
+                target_id=reservation.target_id,
+            )
+            return _STORE_BUSY  # transient: retry, do not park the takeover
         except TakeoverProtocolInvariantError as exc:
             return (
                 TakeoverBlockedReason.PROTOCOL_CORRUPT,

@@ -381,6 +381,39 @@ class ExecutionRepairFenceConflictError(ExecutionStoreError):
     classifies its work as a typed lost-claim result, never as applied."""
 
 
+class ExecutionRepairFenceMissingError(ExecutionRepairFenceConflictError):
+    """The order carries NO committed repair fence at all (Issue #104
+    re-review r7).
+
+    Distinguished from a fence that exists and names somebody else so the
+    reconciliation side can report "nothing to resume here" separately from
+    "another identity owns this order"."""
+
+
+class ExecutionStoreBusyError(ExecutionStoreError):
+    """The order store's WRITE LOCK could not be taken within the busy
+    timeout (Issue #104 re-review r7).
+
+    SQLite serialises writers, so a writer that waits out
+    ``BUSY_TIMEOUT_SECONDS`` gets a typed, retryable failure instead of a
+    raw ``sqlite3.OperationalError``. Nothing was written and the DB is
+    untouched: the caller backs off rather than treating a busy store as a
+    broken one. This is the ONLY way a lock wait ends -- there is no
+    unbounded wait anywhere."""
+
+
+class ExecutionRepairFenceBusyError(ExecutionStoreBusyError):
+    """The order store stayed write-locked while a repair fence was being
+    held still for a takeover step (Issue #104 re-review r7).
+
+    Raised by :func:`repair_fence_promotion_guard` when another writer holds
+    the order store long enough that the guard's ``BEGIN IMMEDIATE`` times
+    out. Nothing was read under a lock and nothing was written: the caller
+    retries later rather than promoting a claim it cannot fence. Distinct
+    from :class:`ExecutionRepairFenceConflictError`, which means the fence
+    WAS read and belongs to somebody else."""
+
+
 @dataclass(frozen=True)
 class RepairFenceToken:
     """The COMPLETE identity of a repair execution (Issue #104 re-review r4).
@@ -935,7 +968,15 @@ def _verified_txn(db_path: Path):
     (:func:`_validate_writeback`, called by every writer) -> COMMIT
     (ROLLBACK on any error, so a failed write leaves the DB untouched)."""
     with closing(_connect(db_path)) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_contention(exc):
+                raise  # corruption is not contention; never mask it as busy
+            raise ExecutionStoreBusyError(
+                f"the execution order store at {db_path} stayed write-locked for "
+                f"{BUSY_TIMEOUT_SECONDS}s; nothing was written ({type(exc).__name__})"
+            ) from exc
         try:
             _verify_schema(connection, db_path)
             _assert_no_duplicate_broker_ids(connection)
@@ -2294,6 +2335,135 @@ def _installed_fence(row) -> InstalledRepairFence:
         ),
         updated_at_utc=_parse_utc(row["updated_at_utc"]),
     )
+
+
+@contextmanager
+def repair_fence_promotion_guard(
+    execution_request_id: str,
+    *,
+    expected: RepairFenceToken,
+    db_path: Path | None = None,
+):
+    """Hold this order's fence STILL while a repair claim is promoted.
+
+    THE WINDOW THIS CLOSES (Issue #104 re-review r7 Blocker). Verifying the
+    committed fence and then promoting the reconciliation claim are writes
+    to two different SQLite files, so between them another attempt could
+    replace the fence. The claim then reached generation 2 under identity X
+    while the order's fence already belonged to Y -- the reconciliation
+    store's own API producing a split identity. Re-reading the fence just
+    before the promotion does NOT fix that: it only makes the window
+    smaller.
+
+    THE GUARD. This context manager opens a WRITE transaction on the order
+    store (``BEGIN IMMEDIATE`` -> RESERVED lock) and reads the fence row
+    INSIDE it. While the guard is held:
+
+    - no other connection can take the order store's write lock, so
+      :func:`register_repair_fence` and :func:`record_order_result` cannot
+      replace or move the fence -- they wait for the busy timeout and then
+      fail typed;
+    - other connections can still READ the order store. The guard sets
+      ``PRAGMA query_only`` so it can never write, which means it never
+      escalates RESERVED to EXCLUSIVE. That is what keeps the reverse-order
+      path (a reconciliation transaction reading this store, e.g.
+      :func:`get_repair_fence`) deadlock-free.
+
+    LOCK ORDER, repository-wide: **order-store guard first, reconciliation
+    transaction second.** No path takes them the other way round while
+    holding a write lock.
+
+    CRASH / TIMEOUT. The lock is an OS-level SQLite file lock held by the
+    process; process death releases it -- there is no durable lock row to
+    leak and nothing to clean up. A guard that cannot be acquired within
+    ``BUSY_TIMEOUT_SECONDS`` raises
+    :class:`ExecutionRepairFenceBusyError` instead of waiting forever.
+
+    IDENTITY. Before yielding, the fence row must match ``expected`` in
+    FULL -- execution request, attempt, generation, takeover, owner and
+    claim execution id. A missing row or any difference raises
+    :class:`ExecutionRepairFenceConflictError` and the guard is released
+    without the caller ever entering its critical section. The row is read
+    from the DB under the lock; no caller-supplied value is accepted as
+    evidence that it exists (r6 review).
+    """
+    _require_non_empty_str(execution_request_id, "execution_request_id")
+    if not isinstance(expected, RepairFenceToken):
+        raise ValueError(f"expected must be a RepairFenceToken, got {expected!r}")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        raise ExecutionRepairFenceMissingError(
+            f"execution order store at {db_path} does not exist, so the order has no "
+            f"committed repair fence; {execution_request_id!r} cannot be guarded"
+        )
+    with closing(_connect(db_path)) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_contention(exc):
+                raise  # a corrupt/unreadable store is not "busy"; do not mask it
+            raise ExecutionRepairFenceBusyError(
+                f"the execution order store at {db_path} stayed write-locked for "
+                f"{BUSY_TIMEOUT_SECONDS}s; the repair fence of {execution_request_id!r} "
+                f"could not be held still ({type(exc).__name__})"
+            ) from exc
+        # A guard that cannot write can never escalate its RESERVED lock to
+        # EXCLUSIVE, so it blocks writers WITHOUT ever blocking readers.
+        connection.execute("PRAGMA query_only = ON")
+        try:
+            _verify_schema(connection, db_path)
+            _assert_no_duplicate_broker_ids(connection)
+            row = _fence_row(connection, execution_request_id)
+            if row is None:
+                raise ExecutionRepairFenceMissingError(
+                    f"execution order {execution_request_id!r} has no committed repair "
+                    "fence; the takeover protocol never proceeds without one"
+                )
+            mismatched = _fence_identity_diff(row, execution_request_id, expected)
+            if mismatched:
+                conflict = ExecutionRepairFenceConflictError(
+                    f"execution order {execution_request_id!r} is fenced by "
+                    f"{_installed_fence(row).token.describe()}, which differs from the "
+                    f"guarding identity in {', '.join(mismatched)}; the takeover step "
+                    "does not proceed"
+                )
+                # the differing column names travel with the error so the
+                # reconciliation side can report them without re-reading
+                conflict.mismatched_columns = tuple(mismatched)
+                raise conflict
+            yield _installed_fence(row)
+        finally:
+            connection.execute("PRAGMA query_only = OFF")
+            connection.execute("ROLLBACK")
+
+
+def _is_lock_contention(exc: sqlite3.Error) -> bool:
+    """Is this a WRITE-LOCK contention failure (as opposed to corruption)?"""
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
+def _fence_identity_diff(
+    row, execution_request_id: str, expected: RepairFenceToken
+) -> list[str]:
+    """Which of the fence's six identity columns differ from ``expected``."""
+    actual = {
+        "execution_request_id": row["execution_request_id"],
+        "repair_attempt_id": row["repair_attempt_id"],
+        "generation": row["generation"],
+        "takeover_id": row["takeover_id"],
+        "owner_id": row["owner_id"],
+        "claim_execution_id": row["claim_execution_id"],
+    }
+    wanted = {
+        "execution_request_id": execution_request_id,
+        "repair_attempt_id": expected.repair_attempt_id,
+        "generation": expected.generation,
+        "takeover_id": expected.takeover_id,
+        "owner_id": expected.owner_id,
+        "claim_execution_id": expected.claim_execution_id,
+    }
+    return sorted(column for column, value in actual.items() if value != wanted[column])
 
 
 def get_repair_fence(execution_request_id: str, *, db_path: Path | None = None) -> dict | None:
