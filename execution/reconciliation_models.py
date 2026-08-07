@@ -181,6 +181,14 @@ class OrderDiscrepancy:
     client_order_id: str | None = None
     broker_order_id: str | None = None
     broker_error_code: BrokerErrorCode | None = None
+    # The internal order's REVISION at observation time (Issue #104: the
+    # execution store's history row count). Repair uses it to prove the order
+    # is UNCHANGED since this observation -- a same-state write (another
+    # UNKNOWN record, a snapshot refresh, a further partial fill) increments
+    # it even though the state text stays equal. None only on records stored
+    # before revision tracking existed (schema v1); such records are never
+    # auto-repaired.
+    internal_revision: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.discrepancy_type, DiscrepancyType):
@@ -214,6 +222,22 @@ class OrderDiscrepancy:
                 f"broker_error_code must be a BrokerErrorCode or None, got "
                 f"{self.broker_error_code!r}"
             )
+        if self.internal_revision is not None:
+            if isinstance(self.internal_revision, bool) or not isinstance(
+                self.internal_revision, int
+            ):
+                raise ValueError(
+                    f"internal_revision must be an int or None, got {self.internal_revision!r}"
+                )
+            if self.internal_revision < 0:
+                raise ValueError(
+                    f"internal_revision must be >= 0, got {self.internal_revision}"
+                )
+            if self.internal_state is None:
+                raise ValueError(
+                    "internal_revision belongs to an observed internal order, so it "
+                    "requires internal_state"
+                )
 
         expected_target, internal_required, broker_required = _TYPE_RULES[self.discrepancy_type]
         if self.target_type is not expected_target:

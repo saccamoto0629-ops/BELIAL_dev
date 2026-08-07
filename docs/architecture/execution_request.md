@@ -127,6 +127,54 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - `broker_order_id` TEXT NULL(変更時点の値)
 - `order_result_json` TEXT NULL(**snapshot anchor**。この観測を生んだ完全 `OrderResult`。state-only UNKNOWN と最初の pending 行のみ NULL)
 - `changed_at_utc` TEXT NOT NULL
+- `repair_attempt_id` TEXT NULL(schema v4 / Issue #104: **構造化 repair provenance**。reconciliation repair が適用した観測にのみ設定され、partial UNIQUE index `idx_execution_order_state_history_repair_attempt` により 1 attempt = 高々 1 行。provenance 付き行は snapshot 必須(復元時検証)。crash recovery はこの列で適用済み事実を判定する — reason 文字列は人間向け補助であり解析しない)
+- `repair_generation` INTEGER NULL(schema v4 / Issue #104: その適用を commit した **claim generation**(≥ 1)。`repair_attempt_id` と**必ず同時に設定 / 同時に NULL**。UNIQUE は attempt ID 単位のままでよい — 同じ attempt は generation を跨いでも高々 1 回しか適用されないため、旧 generation が commit 済みなら新 generation は再 commit せず provenance を読んで `applied` を確定する)
+
+`execution_repair_fences`(WITHOUT ROWID。schema v4 / Issue #104: **repair fencing mirror**):
+
+- `execution_request_id` TEXT PRIMARY KEY(FK → `execution_orders`)— 注文ごとに高々 1 行
+- `repair_attempt_id` TEXT NOT NULL / `generation` INTEGER NOT NULL CHECK(`>= 1`)
+- `takeover_id` TEXT NULL(generation ≥ 2 でのみ NOT NULL。`CHECK ((generation = 1) = (takeover_id IS NULL))`)
+- `owner_id` TEXT NOT NULL / `claim_execution_id` TEXT NOT NULL(**どの実行**が現在この注文の修復を所有しているか)
+- `updated_at_utc` TEXT NOT NULL(UTC)
+
+reconciliation DB の claim を `record_order_result()` のトランザクション内から読むことは(SQLite ファイルを跨げないため)できない。そこで **Execution DB 側に claim の mirror を置き、状態更新と同じトランザクションで照合する**(案 A)。責務は「現在どの (attempt, generation) が更新を許可されているか」だけで、注文行や通常の submission 経路には一切影響しない。
+
+fencing token は `RepairFenceToken`(attempt id / generation / takeover id / owner / claim execution id)という**1 つの identity オブジェクト**として扱う。reconciliation DB の durable takeover intent がこれを生成し、fence 登録と状態更新の両方が同じオブジェクトを提示する。
+
+`register_repair_fence()` は成功時に **commit した fence 行を読み戻した** `InstalledRepairFence`(order ID + token + 更新時刻)を返す。呼び出し側の引数をそのまま echo するのではなく**この store が実際に保持している値**なので、生成された瞬間においては真である。ただしこれは **観測値であって権限ではない**: reconciliation 側へ「fence を設置した証明」として持ち回すことはしない(r6 レビュー)。in-memory のオブジェクトを持てる者はそれを捏造することもできるからである。
+
+#### promotion guard(claim 昇格中は fence を止める。再レビュー r7)
+
+`repair_fence_promotion_guard(execution_request_id, expected=RepairFenceToken)` は、この store に `BEGIN IMMEDIATE`(RESERVED lock)を張ったまま **commit 済み fence 行を lock 下で read し、6 項目 identity を照合してから** 呼び出し側の critical section を実行する context manager である。reconciliation 側の claim CAS をこの中で commit することで、「fence を確認してから claim を昇格するまでの間に別 attempt が fence を置換する」窓(r7 Blocker)を無くす。
+
+性質:
+
+- **write 排他 / read 非排他**: guard は `PRAGMA query_only` を立てるので自分では書けず、RESERVED を EXCLUSIVE へ昇格させない。したがって他 connection の read は一切ブロックしない一方、`register_repair_fence()` / `record_order_result()` などの writer は guard 解放まで進めない。
+- **process 間で有効**: SQLite のファイルロックなので、thread だけでなく別プロセスにも効く。
+- **lock leak なし**: プロセス死で OS がロックを解放する。耐久 lock 行を持たないので掃除も migration も不要。
+- **typed timeout**: 取得できなければ `ExecutionRepairFenceBusyError`(`ExecutionStoreBusyError` のサブクラス)。無限待機はしない。通常の write 経路も同様に、lock 競合は生の `sqlite3.OperationalError` ではなく `ExecutionStoreBusyError` になる。
+- **fail-closed**: fence 行なし / store なしは `ExecutionRepairFenceMissingError`、identity 不一致は差分列名を持つ `ExecutionRepairFenceConflictError`。どちらも critical section に入らない。
+
+lock order は **この store の guard が先、reconciliation DB の transaction が後**で固定されている。
+
+reconciliation 側が `fence_installed` を記録するときは、`mark_takeover_fence_installed(execution_db_path=...)` が **この store の `get_repair_fence()` を自分で呼び、commit 済み fence 行を read して** intent の identity 6 項目と突き合わせる。行がない・identity が違う・store が読めない場合は遷移せず typed 例外になる。この read も上記 guard の中で行われるため、確認と reconciliation 側の書き込みの間に fence が動くことはない。したがって fence に関する信頼の起点は、常にこの store に commit された行そのものである。
+
+`register_repair_fence(token=...)` の規則(すべて単一 `BEGIN IMMEDIATE` 内):
+
+| 現在の fence | 要求 | 結果 |
+|---|---|---|
+| 無し | 任意 | INSERT |
+| 別 attempt | 任意 | REPLACE(新しい attempt が所有権を取る。旧 attempt の後続 commit / finalize は typed に失敗する) |
+| 同一 attempt / **5 要素すべて一致** | 再登録(restart 後の retry) | 冪等 no-op |
+| 同一 attempt / stored generation + 1 = 要求 generation | takeover | UPDATE |
+| 同一 attempt / 同一 generation・**別 takeover id / 別 claim / 別 owner** | 別実行の割り込み | `ExecutionRepairFenceConflictError`(DB 無変更) |
+| 同一 attempt / stored `>` 要求 generation | 巻き戻し | `ExecutionRepairFenceConflictError` |
+| 同一 attempt / stored + 1 `<` 要求 generation | 飛び越し | `ExecutionRepairFenceConflictError` |
+
+**「同じ attempt かつ同じ generation」でも identity が違えば adopt しない**のが要点である(誰が正当かを決めるのは durable intent だけで、intent は restart 後も同じ token を提示する)。
+
+fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい attempt が来れば無条件に置換されるため蓄積せず、「最後にどの実行がこの注文を修復したか」の手がかりとしても読める(`get_repair_fence()`。読み取り経路は read-only 接続で、存在しない DB を作成しない)。dry-run は fence を作成も更新もしない。**旧 schema(v3 以前)から migrate した DB では fence テーブルは空**であり、fence が無い注文への repair commit は typed に拒否されるので、migration 直後に不明な identity が滑り込む窓は無い。
 
 ### 状態更新 API の契約
 
@@ -153,6 +201,9 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - **history に anchor された直前 snapshot を必ず `validate_order_result_update()` の old 側として使用**する(メモリ上のコピーは使わない)。stale な snapshot を根拠に、既知の fill・`filled_quantity` / `remaining_quantity`・`broker_order_id`・`updated_at_utc` を巻き戻すことは、**プロセス再起動直後であっても**不可能である。
 - 呼び出し側が `previous_result` を渡す場合、**anchored snapshot と完全一致するときのみ受理**する(呼び出し側の stale 前提を検出する)。
 - 遷移は snapshot との内容検証に加えて、**現在の追跡状態**(snapshot の後に state-only UNKNOWN が記録されていることがある)に対しても検証する。
+- `expected_current_state` / `expected_revision`(Issue #104、optional)を渡すと**原子的 compare-and-set** になる: 同一 `BEGIN IMMEDIATE` トランザクション内で読み直した現在状態 / **revision**(= 履歴行数。すべての書き込み — same-state 再観測・snapshot / broker_order_id / timestamp のみの更新を含む — で必ず 1 増える導出値。schema 列ではない)が一致しなければ `ExecutionOrderStateConflictError` で拒否し、DB は無変更のまま rollback する。**state だけの比較では same-state 更新(UNKNOWN → UNKNOWN 履歴追加・部分約定の増加・snapshot refresh)を検出できないため、repair は revision CAS を用いる**。省略時は従来どおり(same-state 再観測は許可・記録)。read API が返す行 dict には同一トランザクションで導出した `revision` キーが含まれる。
+- `repair_attempt_id` / `repair_generation`(Issue #104、optional。**両方 or どちらも無し**)は追加される history 行に**構造化された repair provenance**として記録される(schema v4 列 + partial UNIQUE index)。1 つの repair attempt は DB 全体で高々 1 行しか commit できず、recovery は reason 文字列の解析ではなくこの列で「この attempt が適用済みか」を判定する。provenance 付き history 行は必ず完全 snapshot を伴う(復元時検証)。
+- **fencing 検証(Issue #104 再レビュー r4)**: `repair_fence` を伴う更新は、**同じトランザクション内で** `execution_repair_fences` の行が**この token と 5 要素すべて一致**(attempt id / generation / takeover id / owner / claim execution id)することを確認する。fence が無い / 別 attempt / 別 generation / **同一 generation の別実行**のいずれでも `ExecutionRepairFenceConflictError` で**全 rollback**する。したがって claim を takeover された旧 worker は、**現在状態も revision もまだ一致していても** commit できない。1 回の更新で検証されるのは `expected_current_state` / `expected_revision` / fence identity の全要素であり、どれか 1 つでも外れれば DB は無変更のままになる。呼び出し側はこの typed 例外を `applied` に分類してはならない(repair サービスは `conflict` + `claim_lost` / `repair_fence_conflict`、あるいは provenance が示す場合のみ `already_applied` として結果化する)。
 
 **`record_order_state`(state-only 経路)は UNKNOWN の記録専用**である。UNKNOWN は「完全な `OrderResult` を構造上取得できなかった」(submit / query の結果喪失、例: `BrokerTimeoutError`)ことを表す唯一の状態であるため、snapshot 無しで記録できるのはこれだけとする。他のすべての観測は Broker snapshot を伴うため `record_order_result` を通る。state-only UNKNOWN は保存済み snapshot に**触れない**ため、結果不明になる前に判明していた fill が後続の解決を検証し続ける。また state-only 更新は保存済み `broker_order_id` を**確認できるだけ**であり、新規導入・変更はできない(Broker ID は完全な `OrderResult` からのみ得られる)。
 
@@ -168,7 +219,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - `list_in_flight_orders()`(Issue #103)は、**終端でない全注文**(`order_state` が pending / accepted / partially_filled / unknown)だけを返す read-only APIであり、終端状態を in-flight と誤分類しない。`list_reconciliation_orders()`(同)は Broker state を持つ全注文(in-flight + terminal、`created` は除外)を返し、Broker 照合の完全な比較対象抽出に使う。終端状態は BELIAL 内では不変でも、Broker の外部事実と矛盾していないか監査する必要があるためである。`list_client_order_ids()`(同)は Broker 側にのみ存在する注文を判定するための `client_order_id` 全件(終端・created 含む)を返す。`get_execution_order_by_broker_order_id()`(同)は **`broker_order_id` を現在所有している注文**を返す(DB 全体 UNIQUE のため高々 1 件。未割当は None)— Broker 観測を反映可能と判断する前に、その ID が別 Execution Request に割当済みでないことを確認するために使う。いずれも missing DB を作成せず、状態行を返す 3 APIは行ごとに完全な bundle 検証を通す([Broker Reconciliation](broker_reconciliation.md))。
 - UNKNOWN の解決は、後続照会の結果(完全な `OrderResult`)を `record_order_result` で記録することによってのみ行われる。許可される解決先は既存遷移表のとおり(accepted / partially_filled / filled / cancelled / rejected)で、**保存済み snapshot の fill を失う解決(例: 部分約定既知のまま fill 無しの CANCELLED / REJECTED へ確定)は `validate_order_result_update()` が拒否**する。
 - store / API は UNKNOWN を「未発注」「拒否」「再送可」へ**自動変換しない**。即時再送可能状態として扱わない。
-- 自動照会 runner・**定期** reconciliation は**非スコープ**(未実装)。Broker 照合の**差分検出**(内部状態を変更しない照合・分類・記録)は Issue #103 で実装済み([Broker Reconciliation](broker_reconciliation.md))であり、UNKNOWN の**実際の解決(修復)は Issue #104**。
+- 自動照会 runner・**定期** reconciliation は**非スコープ**(未実装)。Broker 照合の**差分検出**(内部状態を変更しない照合・分類・記録)は Issue #103 で、`auto_repair_candidate` に分類された注文状態の**安全な修復**(既存状態機械経由・冪等・`expected_current_state` による compare-and-set。stale / conflict / manual review は変更しない)は Issue #104 で実装済み([Broker Reconciliation](broker_reconciliation.md))。いずれもサービス API の明示呼び出しのみで、scheduler への組み込みはない。
 
 ### 二重発注防止と idempotency(Issue #76)
 
@@ -184,8 +235,9 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 
 ### schema 管理・読み取り経路
 
-- schema version は **v3**(v1 = PR #91 初版、v2 = r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加、v3 = Issue #76 で `signal_id` の UNIQUE index を追加)。
-- **v2 → v3 migration**(Issue #76): `init_db()` が「**完全な構造検証で v2 と一致した DB のみ**」を additive に migration する — 重複 `signal_id` の事前 scan → `CREATE UNIQUE INDEX` → version bump → **v3 の完全再検証** → COMMIT を**単一の `BEGIN IMMEDIATE` トランザクション**で行う。途中失敗は全体 rollback となり中途半端な schema は残らない。既存行は削除・書き換えされない。**既存データに重複 signal がある場合は明示的に失敗**し(重複の解消は人間の判断)、DB は無変更。v1 および v2 / v3 のどちらとも一致しない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
+- schema version は **v4**(v1 = PR #91 初版、v2 = r2 レビューで history anchor 列・PK の NOT NULL / WITHOUT ROWID を追加、v3 = Issue #76 で `signal_id` の UNIQUE index を追加、**v4 = Issue #104 で history の repair provenance 2 列 + `execution_repair_fences` テーブル**)。
+- **v2 → v3 migration**(Issue #76): `init_db()` が「**完全な構造検証で v2 と一致した DB のみ**」を additive に migration する — 重複 `signal_id` の事前 scan → `CREATE UNIQUE INDEX` → version bump → **完全再検証** → COMMIT を**単一の `BEGIN IMMEDIATE` トランザクション**で行う。途中失敗は全体 rollback となり中途半端な schema は残らない。既存行は削除・書き換えされない。**既存データに重複 signal がある場合は明示的に失敗**し(重複の解消は人間の判断)、DB は無変更。
+- **v3 → v4 migration**(Issue #104): 完全一致した v3 DB のみを `init_db()` が additive に migration する — `ALTER TABLE ... ADD COLUMN repair_attempt_id` / `ADD COLUMN repair_generation`(SQLite は列を**テーブル制約の前・列リスト末尾**へ挿入するため、migration 後の DDL は v4 参照 CREATE と token 正規化で一致する)+ `CREATE TABLE execution_repair_fences`(`takeover_id` 列を含む)+ partial UNIQUE index + version bump + **完全再検証**を単一トランザクションで行う。既存 history 行は両列 NULL として読み戻され、fence テーブルは空で始まる(fence の無い注文への repair commit は typed に拒否されるため、migration 直後に不明な identity が滑り込む窓は無い)。fence テーブルは v4 で新設されるため、**旧 schema 由来の fence 行や NULL identity は存在しない**。途中失敗は全 rollback で v3 ファイル無変更。v2 DB は v3 を経由して連鎖 migration される。v1 および migratable でない schema は従来どおり DB 無変更で失敗する。**読み取り経路は migration しない**(v2 / v3 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。
 - `init_db()` が schema を**新規作成するのは pristine な DB のみ**(PR #91 レビュー r2 Major 2): `sqlite_master` のオブジェクトが **0 件**かつ `user_version = 0`。**version だけが設定された DB・metadata だけが残った DB(`sqlite_sequence` 等)は新規 DB として扱わず**、DB を変更せずに失敗する。
 - 既存 schema の判定は**列名ではなく完全な構造検証**で行う(PR #91 レビュー r2 Minor 2 / r3 Major 1 / r3 Minor 1)。
   - **sqlite_master 全 object 集合の closed-world 検証(r3 Major 1)**: `type IN ('table','index')` の抽出ではなく、**全 type の object 集合**を pristine な参照 schema(in-memory)の集合と完全一致で比較する。許可される SQLite 内部 object は本 schema 自身が作るもの(AUTOINCREMENT の `sqlite_sequence`、UNIQUE 制約の `sqlite_autoindex_*`)だけを**明示的に**参照集合へ含める。**trigger・view・予期しないテーブル・予期しない index は type を問わずすべて失敗**である(trigger / view は store の背後で行を書き換え・削除できるため、存在自体を拒否する)。
