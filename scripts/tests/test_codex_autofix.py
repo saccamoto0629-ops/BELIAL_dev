@@ -823,11 +823,22 @@ class TestWorkflowSafety:
             for step in job["steps"]:
                 assert "pull_request_target" not in json.dumps(step)
 
-    def test_least_privilege_permissions(self):
+    def test_least_privilege_permissions_per_job(self):
+        """PR #110 review r3740689732: credentials are isolated per job.
+
+        The job that runs Claude Code (fix) must be read-only; only the
+        fresh deliver job -- which never executes anything Claude could
+        have modified -- holds write permissions.
+        """
         workflow = load_workflow()
-        assert workflow["permissions"] == {
-            "contents": "write",
-            "pull-requests": "write",
+        assert "permissions" not in workflow  # no workflow-wide grants
+        permissions = {
+            name: job["permissions"] for name, job in workflow["jobs"].items()
+        }
+        assert permissions == {
+            "gate": {"contents": "read", "pull-requests": "read"},
+            "fix": {"contents": "read"},
+            "deliver": {"contents": "write", "pull-requests": "write"},
         }
 
     def test_concurrency_serializes_per_pr_without_cancel(self):
@@ -836,12 +847,20 @@ class TestWorkflowSafety:
         assert concurrency["cancel-in-progress"] is False
         assert "pull_request.number" in concurrency["group"]
 
-    def test_job_prefilters_on_codex_identity_and_same_repo(self):
+    def test_gate_prefilters_on_codex_identity_and_same_repo(self):
         workflow = load_workflow()
-        condition = workflow["jobs"]["autofix"]["if"]
+        condition = workflow["jobs"]["gate"]["if"]
         assert "chatgpt-codex-connector[bot]" in condition
         assert "head.repo.full_name == github.repository" in condition
         assert "state == 'open'" in condition
+
+    def test_fix_and_deliver_require_the_gate_to_proceed(self):
+        workflow = load_workflow()
+        for name in ("fix", "deliver"):
+            job = workflow["jobs"][name]
+            assert "gate" in job["needs"]
+            assert "needs.gate.outputs.proceed == 'true'" in job["if"]
+        assert "fix" in workflow["jobs"]["deliver"]["needs"]
 
     def test_no_force_push_and_no_codex_mention_in_commands(self):
         for command in workflow_run_commands(load_workflow()):
@@ -852,45 +871,95 @@ class TestWorkflowSafety:
 
     def test_no_merge_call_anywhere(self):
         for command in workflow_run_commands(load_workflow()):
-            assert "merge" not in command.lower()
+            # `git merge-base` is the fast-forward ancestry *check*; no other
+            # merge operation (git merge, merge API, auto-merge) may appear.
+            cleaned = command.replace("merge-base", "")
+            assert "merge" not in cleaned.lower()
 
-    def test_claude_step_has_no_github_token(self):
+    def test_claude_runs_in_the_credential_free_fix_job(self):
         workflow = load_workflow()
-        steps = workflow["jobs"]["autofix"]["steps"]
-        claude_steps = [s for s in steps if "claude -p" in s.get("run", "")]
+        fix_job = workflow["jobs"]["fix"]
+        claude_steps = [
+            step for step in fix_job["steps"] if "claude -p" in step.get("run", "")
+        ]
         assert len(claude_steps) == 1
         assert set(claude_steps[0]["env"]) == {"ANTHROPIC_API_KEY"}
+        # No step of the fix job may reference a GitHub token at all: even a
+        # fully compromised Claude process must find no credential to steal.
+        fix_json = json.dumps(fix_job)
+        assert "GITHUB_TOKEN" not in fix_json
+        assert "github.token" not in fix_json
+        # and no other job invokes claude
+        for name, job in workflow["jobs"].items():
+            if name == "fix":
+                continue
+            for step in job["steps"]:
+                assert "claude -p" not in step.get("run", "")
 
     def test_checkouts_do_not_persist_credentials(self):
         workflow = load_workflow()
         checkouts = [
             step
-            for step in workflow["jobs"]["autofix"]["steps"]
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
             if str(step.get("uses", "")).startswith("actions/checkout")
         ]
-        assert len(checkouts) == 2
+        assert len(checkouts) == 4
         for step in checkouts:
             assert step["with"]["persist-credentials"] is False
+
+    def test_gate_job_never_checks_out_pr_code(self):
+        workflow = load_workflow()
+        gate_job = workflow["jobs"]["gate"]
+        checkouts = [
+            step
+            for step in gate_job["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout")
+        ]
+        assert len(checkouts) == 1
+        assert checkouts[0]["with"]["ref"] == "main"
 
     def test_only_expected_secrets_are_referenced(self):
         text = WORKFLOW_PATH.read_text(encoding="utf-8")
         assert set(re.findall(r"secrets\.\w+", text)) == {"secrets.ANTHROPIC_API_KEY"}
 
-    def test_gate_and_reply_run_from_trusted_checkout(self):
+    def test_gate_has_bootstrap_guard_and_reply_runs_from_trusted_checkout(self):
         commands = workflow_run_commands(load_workflow())
-        for keyword in (" gate", " render-prompt", " reply"):
-            matching = [c for c in commands if keyword in c]
-            assert matching, f"no step runs the {keyword.strip()} subcommand"
-            for command in matching:
-                assert "_codex_autofix_trusted/scripts/codex_autofix.py" in command
+        gate_commands = [c for c in commands if "codex_autofix.py gate" in c]
+        assert len(gate_commands) == 1
+        # bootstrap: before the scripts land on main, skip cleanly
+        assert "proceed=false" in gate_commands[0]
+        reply_commands = [c for c in commands if "codex_autofix.py reply" in c]
+        assert len(reply_commands) == 1
+        assert "_codex_autofix_trusted/scripts/codex_autofix.py" in reply_commands[0]
 
-    def test_push_is_guarded_against_default_branch(self):
-        commands = [c for c in workflow_run_commands(load_workflow()) if "git" in c and "push" in c]
+    def test_package_step_rejects_untracked_files(self):
+        """PR #110 review r3740689735: the cleanliness check must include
+
+        untracked files, so a regression test that was written but never
+        `git add`-ed can never be silently dropped from the pushed fix.
+        """
+        text = WORKFLOW_PATH.read_text(encoding="utf-8")
+        assert "--untracked-files=no" not in text
+        package = [
+            c for c in workflow_run_commands(load_workflow()) if "git bundle create" in c
+        ]
+        assert len(package) == 1
+        assert "git status --porcelain" in package[0]
+
+    def test_push_is_guarded_and_verifies_bundle_ancestry(self):
+        commands = [
+            c
+            for c in workflow_run_commands(load_workflow())
+            if "git" in c and "push" in c
+        ]
         assert len(commands) == 1
         push = commands[0]
         assert "main|master" in push
         assert "refs/heads/$BRANCH" in push
         assert "add-mask" in push
+        assert "git bundle verify" in push
+        assert "merge-base" in push  # fast-forward-from-gated-head check
 
     def test_ci_runs_the_scripts_test_suite(self):
         assert "python -m pytest scripts/tests -q" in CI_PATH.read_text(encoding="utf-8")
