@@ -12,7 +12,7 @@ BELIAL_dev の GitHub Issue を実装・修正するときの共通手順。Clau
 - **対象**: BELIAL_dev の GitHub Issue の実装・修正。レビュー指摘(review submissions / inline threads / conversation comments)を受けて実装を修正する作業を含む。
 - **非発動(原則対象外)**:
   - 単なる質問・説明への回答
-  - コード変更を伴わない純粋なレビュー
+  - コード変更を伴わない純粋なレビュー(PR レビューは [`belial-pr-review`](../belial-pr-review/SKILL.md) を使う。ユーザーが修正を依頼した時点で本 Skill へ引き継がれる)
   - 実装を伴わない独立した CI 原因調査
   - PR 作成・push だけの作業
   - Issue 実装と無関係なリポジトリ案内

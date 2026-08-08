@@ -1,6 +1,6 @@
 # Agent Skills(Issue #86)
 
-BELIAL の Issue 実装・修正手順を、AI エージェント(Claude Code / Codex 等)が共通に参照できる Agent Skill として管理する。
+BELIAL の Issue 実装・修正手順と PR レビュー手順を、AI エージェント(Claude Code / Codex 等)が共通に参照できる Agent Skill として管理する。
 
 ## 配置
 
@@ -10,8 +10,17 @@ BELIAL の Issue 実装・修正手順を、AI エージェント(Claude Code / 
 └── references/
     ├── repository-guide.md       # コンポーネント/docs/テスト対応表、調査コマンド(必要時に読む)
     └── pr-template.md            # PR 本文テンプレート(PR 作成時に読む)
+.claude/skills/belial-pr-review/
+└── SKILL.md                      # コード変更を伴わない純粋 PR レビューの手順(Issue #90)。
+                                  # references/ は持たず、repository-guide.md を相対パスで再利用する
 AGENTS.md                         # リポジトリルート。全エージェント共通の入口(Skill へのポインタのみ)
 ```
+
+### Skill 間のルーティング
+
+- **Issue 実装・修正・レビュー指摘対応(実変更あり)** → `belial-issue-implementation`
+- **コード変更を伴わない純粋な PR レビュー**(受け入れ条件との突き合わせ・再レビュー・mergeable 判定) → `belial-pr-review`
+- レビュー中に修正が必要になっても、ユーザーが修正を依頼した時点で `belial-pr-review` から `belial-issue-implementation` へ引き継ぐ(勝手に修正へ移行しない)。
 
 ### この配置を採用した理由
 
