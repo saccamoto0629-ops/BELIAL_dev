@@ -503,6 +503,11 @@ def validate_replies(replies: object, findings_doc: dict) -> list[dict]:
         if not isinstance(entry, dict):
             raise ValueError("each reply must be a JSON object")
         comment_id = entry.get("comment_id")
+        # Exact int required: Python equality would let 123.0 (or True) pass
+        # the membership test, and the float would only break the reply URL
+        # after the push already happened.
+        if type(comment_id) is not int:
+            raise ValueError(f"reply comment id must be an integer, got {comment_id!r}")
         if comment_id not in finding_ids:
             raise ValueError(f"reply targets unknown comment id {comment_id!r}")
         if comment_id in seen:
@@ -644,6 +649,12 @@ def cmd_verify_live(args: argparse.Namespace) -> int:
     live_head_repo = live_head.get("repo") or {}
     if live_head_repo.get("full_name") != doc["repo"]:
         return _skip("pull request head repository changed before delivery")
+    # The remote tip must still be exactly the SHA the gate recorded: if the
+    # branch was rewound (force-pushed to an ancestor) mid-run, an ordinary
+    # push from the still-at-gated-SHA checkout would be a fast-forward that
+    # silently restores the commits the author deliberately removed.
+    if live_head.get("sha") != doc["live_head_sha"]:
+        return _skip("pull request head SHA changed before delivery")
     _write_github_output({"proceed": "true"})
     return 0
 

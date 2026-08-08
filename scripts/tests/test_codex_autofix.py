@@ -644,6 +644,19 @@ class TestVerifyLiveCommand:
         assert code == 0
         assert outputs["proceed"] == "false"
 
+    def test_changed_head_sha_skips(self, monkeypatch, tmp_path):
+        """PR #110 review r3740923029: a branch rewound (force-pushed
+
+        to an ancestor) mid-run must not receive a fast-forward push that
+        restores the removed commits: the live tip must still be exactly
+        the SHA the gate recorded.
+        """
+        live = self.live()
+        live["head"]["sha"] = HEAD_SHA  # rewound: differs from LIVE_SHA
+        code, outputs = self.run_verify(monkeypatch, tmp_path, live)
+        assert code == 0
+        assert outputs["proceed"] == "false"
+
 
 # --- Prompt rendering ------------------------------------------------------
 
@@ -826,6 +839,12 @@ class TestValidateReplies:
             [{"comment_id": 1000, "body": "a"}, {"comment_id": 1000, "body": "b"}],
             [],  # missing reply for the finding
             [["bad entry"]],
+            # PR #110 review r3740923026: numeric equality would let a
+            # float (or bool) pass membership and break the reply URL only
+            # after the push -- the ID must be an exact int.
+            [{"comment_id": 1000.0, "body": "float id"}],
+            [{"comment_id": "1000", "body": "string id"}],
+            [{"comment_id": True, "body": "bool id"}],
         ],
     )
     def test_invalid_reply_sets_are_refused(self, replies):
