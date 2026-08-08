@@ -305,9 +305,10 @@ jobs:
 
   # Fresh runner that Claude never touched. Treats the fix job's output
   # strictly as data: the bundle is verified to fast-forward from the gated
-  # head SHA before a plain (never --force) push, and replies are validated
-  # by the trusted script (finding-thread-only, credential-pattern scan,
-  # "@codex" defused, handled marker appended) before posting.
+  # head SHA and pushed as an exact-SHA compare-and-swap (never a blanket
+  # force), and replies are validated by the trusted script
+  # (finding-thread-only, credential-pattern scan, "@codex" defused,
+  # handled marker appended) before posting.
   deliver:
     name: Push fixes and reply to review threads
     needs: [gate, fix]

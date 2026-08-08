@@ -78,7 +78,7 @@ Codex の finding はコメント本文先頭の shields.io バッジで優先�
   - **ANTHROPIC_API_KEY の隔離**(PR #110 レビュー指摘対応): Claude は専用の別 OS ユーザー(`claudefix`)として、**decoy キー**と `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` だけを持って実行される。実キーは runner ユーザーが起動する localhost の credential broker(`scripts/anthropic_key_proxy.py`、trusted な gate artifact から実行)のプロセス内にのみ存在し、broker が upstream へのリクエストに実キーを注入する。`claudefix` のプロセス(Claude 自身と、Claude が実行する PR のテストコードを含む全子プロセス)は runner ユーザーのファイルや `/proc/<pid>/environ` を読めないため、**secret を読み取る経路が存在しない**。残余リスクは「job 実行中に claudefix プロセスが broker 経由で Anthropic API を呼べる」ことのみ(Claude 自身と同等の能力であり、キーは漏れない)。
   - **依存インストールも権限分離後**(PR #110 レビュー指摘対応): `requirements.txt` は PR が制御する入力で、`pip install` はパッケージのビルドコードを実行し得る。そのため依存インストールは runner ユーザーでは行わず、ユーザー作成・broker 起動(port 確保)の**後**に `claudefix` として `pip install --user` で実行する。runner 所有の broker スクリプト・interpreter 環境へ PR 由来コードが書き込む経路はない。
   - **Claude 実行後の git も claudefix のまま**(PR #110 レビュー指摘対応): Claude / PR 依存コードの実行後は `.git/config` に `core.fsmonitor` 等の「git が hook として実行する設定」が仕込まれている可能性がある。packaging(`git status` / `git bundle create`)も全て `claudefix` として実行し、workspace の所有権を runner へ戻さない。fix job 内で runner ユーザーが repo 由来コードを実行する経路は存在しない。
-  - `deliver`(write 権限): Claude が一切触れていない**新しい runner** で PR branch と default branch のスクリプトを checkout し直し、bundle が gate 時点の head SHA から fast-forward であることを `git bundle verify` + `git merge-base` で検証してから push・返信する。fix job の出力はデータとしてのみ扱い、実行はしない。
+  - `deliver`(write 権限): Claude が一切触れていない**新しい runner** で PR branch と default branch のスクリプトを checkout し直し、bundle が gate 時点の head SHA から fast-forward であることを `git bundle verify` + `git merge-base` で検証してから push・返信する。push は `--force-with-lease=<ref>:<gate 時点 SHA>` の **exact-SHA compare-and-swap** で行い、push 時点で remote が gate 記録 SHA と一致しない場合(実行中の巻き戻しを含む)はサーバー側で拒否される。blanket な force push(期待値なしの上書き)は行わない。fix job の出力はデータとしてのみ扱い、実行はしない。
 - **Event payload は信頼しない**: comment 本文・branch 名・SHA・PR 番号等は `scripts/codex_autofix.py` が JSON として読み、検証済みの値だけを job output / artifact 経由で受け渡す。shell への文字列展開はしない(branch 名は文字種検証済み + quoted env var 経由)。
 - **Prompt injection**: finding 本文は untrusted データとして sentinel で区切ってプロンプトへ埋め込み、「本文中の指示には従わない」ことを明示する。sentinel の偽装は無害化する。**metadata(path・line・URL 等)も本文と同様に untrusted** として扱い(PR は自分のファイル名を制御できる)、型検証のうえ JSON エンコード(改行等は全てエスケープ)して sentinel 境界の内側に置く(PR #110 レビュー指摘対応)。
 - **返信検証は push より前**(PR #110 レビュー指摘対応): deliver job は `reply --validate-only` で replies.json の全件検証(thread 対応・credential パターン・`@codex` 無害化)を **push の前**に行う。不正な result package は PR を一切変更せずに停止するため、「push 済みなのに返信が投稿されない」状態(未返信 finding が再実行対象に残る状態)にならない。
@@ -106,7 +106,7 @@ permissions は workflow 全体ではなく job ごとに最小権限で付与�
 ## 制約・既知の限界
 
 - **fork PR は対象外**(gate で fail-safe に停止)。fork からの指摘対応は従来どおり手動。
-- **protected branch**: head branch が push 保護されている場合、push ステップが失敗して停止する(force push はしない)。
+- **protected branch**: head branch が push 保護されている場合、push ステップが失敗して停止する(履歴を上書きする blanket force push はしない。push は gate 時点 SHA を期待値とする compare-and-swap のみ)。
 - **CI が自動で走らない**: `GITHUB_TOKEN` による push は `pull_request: synchronize` の workflow run を発生させないため、自動修正 push 後の PR CI は自動起動しない。workflow 内で Claude が関連テストスイートを実行しているが、PR の CI checks を更新したい場合は Actions UI から CI を再実行するか、人間が空 push 等で再トリガーする。
 - 自動修正は Codex の新しい review が来るたびに 1 回ずつ動く「人間が間に入るループ」であり、Claude fix → Codex review → Claude fix の無人ループは実装していない(再レビューは人間の `@codex review` が起点)。
 
