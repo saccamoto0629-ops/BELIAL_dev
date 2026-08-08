@@ -565,6 +565,8 @@ def cmd_gate(args: argparse.Namespace) -> int:
     live = fetch_pull_request(api_url, expected_repo, ctx["pr_number"], token)
     if live.get("state") != "open" or live.get("merged") is not False:
         return _skip("pull request is no longer open")
+    if live.get("draft") is not False:
+        return _skip("pull request is a draft at run time")
     live_head = live.get("head") or {}
     if live_head.get("ref") != ctx["branch"]:
         return _skip("pull request head ref changed unexpectedly")

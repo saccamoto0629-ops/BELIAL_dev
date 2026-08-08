@@ -186,20 +186,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # No pip cache here: the cache would be restored by (and owned by)
+      # the runner user, while dependency installation happens as the
+      # isolated user below.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements.txt
 
-      # Claude must be able to run the component pytest suites (same
-      # dependency set as ci.yml).
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
+      # Installs from the npm registry only -- no PR-controlled input.
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
@@ -237,6 +232,18 @@ jobs:
           cat /tmp/anthropic-broker.log
           exit 1
 
+      # PR #110 review r3740811232: requirements.txt is PR-controlled and
+      # `pip install` can execute package build code, so dependency
+      # installation must run AFTER privilege separation, as the isolated
+      # user, into that user's own --user site. It must never run as the
+      # runner user, which owns the broker script and the real key. PATH is
+      # passed through sudo so the setup-python interpreter (runner-owned,
+      # read-only to claudefix) is used here and in the Claude step alike.
+      # The broker is already listening (previous step), so no claudefix
+      # process can squat its port.
+      - name: Install dependencies (isolated user)
+        run: sudo -u claudefix -H env PATH="$PATH" python -m pip install --user -r requirements.txt
+
       # Claude runs with a decoy key and no repository secrets. It
       # validates findings, fixes, tests, and commits locally, and writes
       # replies.json. It cannot push, merge, post, or read the real
@@ -245,7 +252,7 @@ jobs:
       - name: Run Claude Code (isolated user, no repository secrets)
         run: >-
           sudo -u claudefix -H
-          env ANTHROPIC_BASE_URL=http://127.0.0.1:8377 ANTHROPIC_API_KEY=broker-managed
+          env PATH="$PATH" ANTHROPIC_BASE_URL=http://127.0.0.1:8377 ANTHROPIC_API_KEY=broker-managed
           claude -p --dangerously-skip-permissions < /tmp/codex-autofix-gate/prompt.md
 
       - name: Reclaim workspace ownership from the isolated user

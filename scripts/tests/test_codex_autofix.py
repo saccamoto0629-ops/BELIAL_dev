@@ -434,6 +434,7 @@ def live_pr_fixture(**overrides) -> dict:
     live = {
         "state": "open",
         "merged": False,
+        "draft": False,
         "head": {
             "ref": "claude/position-sltp-oanda-reconciliation-gha1pb",
             "sha": LIVE_SHA,
@@ -517,6 +518,24 @@ class TestGateCommand:
             review_event(),
             live_pr_fixture(merged=True),
             [review_comment()],
+        )
+        assert code == 0
+        assert outputs["proceed"] == "false"
+
+    @pytest.mark.parametrize("draft", [True, None])
+    def test_pr_converted_to_draft_at_run_time_skips(self, monkeypatch, tmp_path, draft):
+        """PR #110 review r3740811234: the live re-check must reject a PR
+
+        whose draft flag is not exactly False (converted back to draft
+        between the webhook and the gate, or a malformed live response).
+        """
+        live = live_pr_fixture()
+        if draft is None:
+            del live["draft"]
+        else:
+            live["draft"] = draft
+        code, outputs, _, _ = run_gate(
+            monkeypatch, tmp_path, review_event(), live, [review_comment()]
         )
         assert code == 0
         assert outputs["proceed"] == "false"
@@ -1040,6 +1059,42 @@ class TestWorkflowSafety:
         # the gate job stages the broker into the artifact
         gate_runs = [s.get("run", "") for s in workflow["jobs"]["gate"]["steps"]]
         assert any("cp scripts/anthropic_key_proxy.py" in r for r in gate_runs)
+
+    def test_dependency_install_runs_only_as_the_isolated_user(self):
+        """PR #110 review r3740811232: requirements.txt is PR-controlled and
+
+        pip may execute package build code, so dependency installation must
+        happen after privilege separation (as claudefix, --user site) and
+        never as the runner user that owns the broker and the real key.
+        """
+        workflow = load_workflow()
+        steps = workflow["jobs"]["fix"]["steps"]
+        pip_steps = [
+            (i, s) for i, s in enumerate(steps) if "requirements.txt" in s.get("run", "")
+        ]
+        assert len(pip_steps) == 1
+        pip_index, pip_step = pip_steps[0]
+        assert "sudo -u claudefix" in pip_step["run"]
+        assert "--user" in pip_step["run"]
+        user_index = next(
+            i for i, s in enumerate(steps) if "useradd" in s.get("run", "")
+        )
+        broker_index = next(
+            i for i, s in enumerate(steps) if "anthropic_key_proxy.py" in s.get("run", "")
+        )
+        claude_index = next(
+            i for i, s in enumerate(steps) if "claude -p" in s.get("run", "")
+        )
+        # privilege separation first, broker's port bound next, only then
+        # any PR-controlled code (pip build hooks, Claude, tests)
+        assert user_index < broker_index < pip_index < claude_index
+        # and no other run step in any job installs the PR's requirements
+        for name, job in workflow["jobs"].items():
+            for step in job["steps"]:
+                run = step.get("run", "")
+                if "requirements.txt" in run:
+                    assert name == "fix"
+                    assert "sudo -u claudefix" in run
 
     def test_replies_are_validated_before_the_push(self):
         """PR #110 review r3740741456: no privileged side effect before the
