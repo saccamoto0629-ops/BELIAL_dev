@@ -109,7 +109,14 @@ jobs:
           --out "$RUNNER_TEMP/codex-autofix/prompt.md"
           --replies-path /tmp/codex-autofix/replies.json
 
-      - name: Upload gate artifact (findings + prompt)
+      # The credential broker must come from the trusted default branch,
+      # never from the PR checkout, because the fix job runs it with the
+      # real ANTHROPIC_API_KEY in its environment.
+      - name: Stage the credential broker for the fix job
+        if: steps.gate.outputs.proceed == 'true'
+        run: cp scripts/anthropic_key_proxy.py "$RUNNER_TEMP/codex-autofix/"
+
+      - name: Upload gate artifact (findings + prompt + broker)
         if: steps.gate.outputs.proceed == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -196,17 +203,53 @@ jobs:
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
-      # Claude gets ONLY the Anthropic credential. It validates findings,
-      # fixes, tests, and commits locally, and writes replies.json. It
-      # cannot push, merge, or post anything. --dangerously-skip-permissions
-      # is required for headless -p mode and is acceptable here because the
-      # job is ephemeral and holds no credentials beyond the Anthropic key.
-      - name: Run Claude Code (no GitHub credentials)
+      # PR #110 review r3740741454: if ANTHROPIC_API_KEY were
+      # in Claude's environment, every child process (including repository
+      # test commands from the mutable PR branch) would inherit the secret.
+      # Claude therefore runs as a separate unprivileged user holding only
+      # a decoy key; the real key lives solely inside the runner-user
+      # broker process below, which injects it upstream on localhost
+      # requests. The isolated user cannot read the runner user's files or
+      # /proc environments, so no process in Claude's session can reach it.
+      - name: Create isolated user for Claude
+        run: |
+          set -euo pipefail
+          sudo useradd --create-home claudefix
+          sudo chown -R claudefix:claudefix "$GITHUB_WORKSPACE"
+          mkdir -p /tmp/codex-autofix
+          sudo chown claudefix:claudefix /tmp/codex-autofix
+
+      - name: Start the Anthropic credential broker (runner user only)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          mkdir -p /tmp/codex-autofix
+          set -euo pipefail
+          nohup python3 /tmp/codex-autofix-gate/anthropic_key_proxy.py --port 8377 \
+            > /tmp/anthropic-broker.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8377) 2>/dev/null; then
+              exec 3>&- || true
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::credential broker did not start"
+          cat /tmp/anthropic-broker.log
+          exit 1
+
+      # Claude runs with a decoy key and no repository secrets. It
+      # validates findings, fixes, tests, and commits locally, and writes
+      # replies.json. It cannot push, merge, post, or read the real
+      # credential. --dangerously-skip-permissions is required for headless
+      # -p mode and is acceptable inside this credential-free session.
+      - name: Run Claude Code (isolated user, no repository secrets)
+        run: >-
+          sudo -u claudefix -H
+          env ANTHROPIC_BASE_URL=http://127.0.0.1:8377 ANTHROPIC_API_KEY=broker-managed
           claude -p --dangerously-skip-permissions < /tmp/codex-autofix-gate/prompt.md
+
+      - name: Reclaim workspace ownership from the isolated user
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" /tmp/codex-autofix
 
       # Package the result as pure data. The FULL `git status --porcelain`
       # (tracked AND untracked; PR #110 review r3740689735) must be clean:
@@ -286,6 +329,17 @@ jobs:
         with:
           name: codex-autofix-result
           path: /tmp/codex-autofix-result
+
+      # PR #110 review r3740741456 (P2): validate Claude's
+      # replies BEFORE any privileged side effect, so a rejected result
+      # package can never leave the PR mutated with its thread replies
+      # unposted (which would also re-arm the finding for another run).
+      - name: Validate replies before any side effect
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py reply
+          --findings /tmp/codex-autofix-gate/findings.json
+          --replies /tmp/codex-autofix-result/replies.json
+          --validate-only
 
       # Fast-forward push only (never --force), only to the PR head branch,
       # only of commits that build directly on the head SHA the gate saw.

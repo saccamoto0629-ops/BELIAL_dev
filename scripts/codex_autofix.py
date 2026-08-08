@@ -243,15 +243,34 @@ def build_findings_doc(ctx: dict, live_head_sha: str, findings: list[dict]) -> d
     for comment in findings:
         body = comment.get("body") or ""
         truncated = len(body) > MAX_FINDING_BODY_CHARS
+        # Metadata fields are as untrusted as the body (a PR controls its
+        # own file paths, for example): keep only values of the expected
+        # shape, and let render_prompt JSON-encode them inside the
+        # untrusted-data boundary.
+        path = comment.get("path")
+        line = comment.get("line")
+        original_commit_id = comment.get("original_commit_id")
+        html_url = comment.get("html_url")
+        created_at = comment.get("created_at")
         entries.append(
             {
                 "comment_id": comment["id"],
                 "severity": parse_severity(body),
-                "path": comment.get("path"),
-                "line": comment.get("line"),
-                "original_commit_id": comment.get("original_commit_id"),
-                "html_url": comment.get("html_url"),
-                "created_at": comment.get("created_at"),
+                "path": path if isinstance(path, str) else None,
+                "line": line if isinstance(line, int) else None,
+                "original_commit_id": (
+                    original_commit_id
+                    if isinstance(original_commit_id, str)
+                    and _SHA_RE.fullmatch(original_commit_id)
+                    else None
+                ),
+                "html_url": (
+                    html_url
+                    if isinstance(html_url, str)
+                    and html_url.startswith("https://github.com/")
+                    else None
+                ),
+                "created_at": created_at if isinstance(created_at, str) else None,
                 "body": body[:MAX_FINDING_BODY_CHARS],
                 "body_truncated": truncated,
             }
@@ -351,8 +370,9 @@ def render_prompt(doc: dict, replies_path: str) -> str:
         f"2. Confirm the current HEAD: at workflow start the branch tip was",
         f"   `{doc['live_head_sha']}` and the review was written against",
         f"   `{doc['review_commit_id']}`. For EACH finding, verify it is still",
-        "   valid at the current HEAD before changing anything; the per-finding",
-        "   `original_commit_id` tells you which commit the finding saw.",
+        "   valid at the current HEAD before changing anything; the",
+        "   `commit_reviewed` field in each finding's metadata tells you",
+        "   which commit the finding saw.",
         "3. Reproduce the failure scenario, or trace the exact code path, so",
         "   the root cause is demonstrated rather than assumed.",
         "4. If a finding is already resolved at HEAD, or is factually wrong,",
@@ -409,18 +429,27 @@ def render_prompt(doc: dict, replies_path: str) -> str:
         "",
     ]
     for finding in doc["findings"]:
+        # Metadata is untrusted just like the body (e.g. a PR-controlled
+        # filename could embed a newline plus an instruction line), so it is
+        # JSON-encoded -- one line, all control characters escaped -- and
+        # placed INSIDE the BEGIN/END untrusted-data boundary.
+        metadata = {
+            "comment_id": finding["comment_id"],
+            "severity": finding["severity"],
+            "path": finding["path"],
+            "line": finding["line"],
+            "commit_reviewed": finding["original_commit_id"],
+            "url": finding["html_url"],
+            "body_truncated": finding["body_truncated"],
+        }
+        metadata_line = neutralize_sentinels(json.dumps(metadata, ensure_ascii=True))
         lines.extend(
             [
                 f"### Finding comment_id={finding['comment_id']}",
                 "",
-                f"- severity: {finding['severity']}",
-                f"- path: {finding['path']}",
-                f"- line: {finding['line']}",
-                f"- commit reviewed: {finding['original_commit_id']}",
-                f"- url: {finding['html_url']}",
-                f"- body truncated: {finding['body_truncated']}",
-                "",
                 f"-----BEGIN CODEX FINDING {finding['comment_id']}-----",
+                f"metadata: {metadata_line}",
+                "body:",
                 neutralize_sentinels(finding["body"]),
                 f"-----END CODEX FINDING {finding['comment_id']}-----",
                 "",
@@ -590,7 +619,6 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
 
 
 def cmd_reply(args: argparse.Namespace) -> int:
-    token = _require_env("GITHUB_TOKEN")
     api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
     with open(args.findings, encoding="utf-8") as handle:
         doc = json.load(handle)
@@ -605,6 +633,13 @@ def cmd_reply(args: argparse.Namespace) -> int:
     except ValueError as error:
         print(f"[codex-autofix] invalid replies: {error}", file=sys.stderr)
         return 2
+    if args.validate_only:
+        # Run BEFORE any privileged side effect (the deliver job's push):
+        # a rejected result package must never leave the PR mutated with
+        # its thread replies unposted.
+        print(f"[codex-autofix] replies validated for {len(validated)} finding(s)")
+        return 0
+    token = _require_env("GITHUB_TOKEN")
     for reply in validated:
         post_reply(
             api_url,
@@ -637,6 +672,11 @@ def main(argv: list[str] | None = None) -> int:
     reply = subparsers.add_parser("reply", help="post validated replies to finding threads")
     reply.add_argument("--findings", required=True)
     reply.add_argument("--replies", required=True)
+    reply.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate the replies file and exit without posting anything",
+    )
     reply.set_defaults(func=cmd_reply)
 
     args = parser.parse_args(argv)
