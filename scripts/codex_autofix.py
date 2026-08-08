@@ -347,7 +347,14 @@ def post_reply_with_retry(
 
     Permanent client errors (4xx other than 429) are raised immediately;
     5xx / 429 / network errors are retried up to ``attempts`` times.
+
+    PR #110 review r3741114619: a failed POST is AMBIGUOUS -- GitHub may
+    have accepted the reply even though the response never arrived. Before
+    any retry the thread is re-fetched, and if the handled marker is
+    already present the reply is treated as delivered instead of being
+    posted a second time.
     """
+    last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             post_reply(api_url, repo, pr_number, comment_id, body, token)
@@ -355,11 +362,21 @@ def post_reply_with_retry(
         except urllib.error.HTTPError as error:
             if 400 <= error.code < 500 and error.code != 429:
                 raise
-            if attempt == attempts:
-                raise
-        except urllib.error.URLError:
-            if attempt == attempts:
-                raise
+            last_error = error
+        except urllib.error.URLError as error:
+            last_error = error
+        try:
+            refreshed = fetch_review_comments(api_url, repo, pr_number, token)
+            if is_already_handled(comment_id, refreshed):
+                print(
+                    f"[codex-autofix] reply for comment {comment_id} exists after an "
+                    "ambiguous failure; not retrying"
+                )
+                return
+        except (RuntimeError, urllib.error.URLError):
+            pass  # the recheck itself failed; fall through to retry/raise
+        if attempt == attempts:
+            raise last_error
         time.sleep(2**attempt)
 
 
@@ -683,10 +700,19 @@ def cmd_verify_live(args: argparse.Namespace) -> int:
     # branch was rewound (force-pushed to an ancestor) mid-run, an ordinary
     # push from the still-at-gated-SHA checkout would be a fast-forward that
     # silently restores the commits the author deliberately removed.
-    if live_head.get("sha") != doc["live_head_sha"]:
-        return _skip("pull request head SHA changed before delivery")
-    _write_github_output({"proceed": "true"})
-    return 0
+    live_sha = live_head.get("sha")
+    if live_sha == doc["live_head_sha"]:
+        _write_github_output({"proceed": "true", "push_required": "true"})
+        return 0
+    # PR #110 review r3741016955: a live tip equal to the VERIFIED fix tip
+    # means a previous (partially failed) run already delivered the push.
+    # Proceed without another push so the remaining thread replies can
+    # still be posted; any other SHA stays a fail-closed skip.
+    fix_tip = getattr(args, "fix_tip", "") or ""
+    if fix_tip and _SHA_RE.fullmatch(fix_tip) and live_sha == fix_tip:
+        _write_github_output({"proceed": "true", "push_required": "false"})
+        return 0
+    return _skip("pull request head SHA changed before delivery")
 
 
 def cmd_reply(args: argparse.Namespace) -> int:
@@ -755,6 +781,11 @@ def main(argv: list[str] | None = None) -> int:
         "verify-live", help="re-check the live PR state before delivery side effects"
     )
     verify_live.add_argument("--findings", required=True)
+    verify_live.add_argument(
+        "--fix-tip",
+        default="",
+        help="verified bundle tip SHA; a live head equal to it means the push already happened",
+    )
     verify_live.set_defaults(func=cmd_verify_live)
 
     reply = subparsers.add_parser("reply", help="post validated replies to finding threads")

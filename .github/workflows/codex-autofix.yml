@@ -72,6 +72,7 @@ jobs:
       pr_number: ${{ steps.gate.outputs.pr_number }}
       live_head_sha: ${{ steps.gate.outputs.live_head_sha }}
       findings_count: ${{ steps.gate.outputs.findings_count }}
+      trusted_sha: ${{ steps.gate.outputs.trusted_sha }}
     steps:
       - name: Check out default branch (trusted automation scripts)
         uses: actions/checkout@v4
@@ -90,6 +91,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # PR #110 review r3741149095: record the exact trusted revision
+          # this run evaluated, so the deliver job executes the SAME
+          # automation code even if main advances during the long fix job.
+          echo "trusted_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           if [ ! -f scripts/codex_autofix.py ]; then
             echo "::notice::codex_autofix scripts are not on the default branch yet (bootstrap PR); skipping"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -209,6 +214,14 @@ jobs:
       - name: Create isolated user for Claude
         run: |
           set -euo pipefail
+          # PR #110 review r3741016953: reserve the runner-owned staging
+          # directory BEFORE any untrusted code can exist. /tmp is
+          # world-writable, so an attacker process could otherwise
+          # pre-create the path and plant symlinks that the artifact upload
+          # would dereference as the runner. Mode 700 plus /tmp's sticky
+          # bit mean claudefix can neither write into nor replace it.
+          rm -rf /tmp/codex-autofix-upload
+          mkdir -m 700 /tmp/codex-autofix-upload
           sudo useradd --create-home claudefix
           sudo chown -R claudefix:claudefix "$GITHUB_WORKSPACE"
           mkdir -p /tmp/codex-autofix
@@ -321,7 +334,13 @@ jobs:
             echo "::error::broker or claudefix processes still alive; refusing to stage the result"
             exit 1
           fi
-          mkdir -p /tmp/codex-autofix-upload
+          # PR #110 review r3741016953: even though the staging path was
+          # reserved (runner-owned, mode 700) before any untrusted code
+          # ran, delete and recreate it now that no untrusted process is
+          # left -- the upload must only ever see a directory this step
+          # itself created.
+          rm -rf /tmp/codex-autofix-upload
+          mkdir -m 700 /tmp/codex-autofix-upload
           for name in replies.json fix.bundle; do
             src="/tmp/codex-autofix/$name"
             if [ -L "$src" ]; then
@@ -372,10 +391,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check out trusted automation scripts (default branch)
+      # PR #110 review r3741149095: pinned to the exact revision the gate
+      # job evaluated, so validation and delivery run the same automation
+      # code / schema contract even if main advanced during the fix job.
+      - name: Check out trusted automation scripts (gate revision)
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.gate.outputs.trusted_sha }}
           path: _codex_autofix_trusted
           persist-credentials: false
 
@@ -402,29 +424,61 @@ jobs:
           --replies /tmp/codex-autofix-result/replies.json
           --validate-only
 
+      # Resolve and verify the bundle BEFORE the live check, so the live
+      # check can recognise a fix tip that a previous partially-failed run
+      # already pushed (PR #110 review r3741016955).
+      - name: Verify the fix bundle and resolve its tip
+        id: bundle
+        env:
+          LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/codex-autofix-result/fix.bundle ]; then
+            echo "No fix bundle (replies only)."
+            echo "fix_tip=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git bundle verify /tmp/codex-autofix-result/fix.bundle
+          git fetch /tmp/codex-autofix-result/fix.bundle HEAD
+          FIX_TIP=$(git rev-parse FETCH_HEAD)
+          if [ "$(git merge-base "$LIVE_HEAD_SHA" "$FIX_TIP")" != "$LIVE_HEAD_SHA" ]; then
+            echo "::error::bundle does not fast-forward from the gated head SHA; refusing to deliver"
+            exit 1
+          fi
+          echo "fix_tip=$FIX_TIP" >> "$GITHUB_OUTPUT"
+
       # PR #110 review r3740883683 (P2): the fix job can run
       # for a long time; re-check the LIVE PR state (open, non-draft,
       # unmerged, same head branch/repo) immediately before pushing or
       # replying. A PR merged/closed/drafted mid-run makes this a clean
-      # no-op skip instead of a push to a dead PR.
+      # no-op skip instead of a push to a dead PR. PR #110 review
+      # r3741016955: a live head equal to the VERIFIED fix tip means a
+      # previous run already pushed -- proceed with push_required=false so
+      # the remaining replies can still be delivered, without permitting
+      # another (now stale) push.
       - name: Re-verify the live PR state before delivery
         id: livecheck
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          FIX_TIP: ${{ steps.bundle.outputs.fix_tip }}
         run: >-
           python3 _codex_autofix_trusted/scripts/codex_autofix.py verify-live
           --findings /tmp/codex-autofix-gate/findings.json
+          --fix-tip "$FIX_TIP"
 
-      # Fast-forward push only (never --force), only to the PR head branch,
-      # only of commits that build directly on the head SHA the gate saw.
-      # Credentials are supplied ephemerally for this single command and
-      # the derived value is masked so `set -x`-style leaks are impossible.
+      # Push only of commits that build directly on the head SHA the gate
+      # saw, only to the PR head branch. Credentials are supplied
+      # ephemerally for this single command and the derived value is
+      # masked so `set -x`-style leaks are impossible.
       - name: Push fix commits to the PR head branch
-        if: steps.livecheck.outputs.proceed == 'true'
+        if: >-
+          steps.livecheck.outputs.proceed == 'true' &&
+          steps.livecheck.outputs.push_required == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BRANCH: ${{ needs.gate.outputs.branch }}
           LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
+          FIX_TIP: ${{ steps.bundle.outputs.fix_tip }}
         run: |
           set -euo pipefail
           case "$BRANCH" in
@@ -433,19 +487,12 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "$(git rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
-            echo "::error::PR head moved during the run; re-run the workflow to pick up the new HEAD"
-            exit 1
-          fi
-          if [ ! -f /tmp/codex-autofix-result/fix.bundle ]; then
+          if [ -z "$FIX_TIP" ]; then
             echo "No fix commits to push (replies only)."
             exit 0
           fi
-          git bundle verify /tmp/codex-autofix-result/fix.bundle
-          git fetch /tmp/codex-autofix-result/fix.bundle HEAD
-          FIX_TIP=$(git rev-parse FETCH_HEAD)
-          if [ "$(git merge-base "$LIVE_HEAD_SHA" "$FIX_TIP")" != "$LIVE_HEAD_SHA" ]; then
-            echo "::error::bundle does not fast-forward from the gated head SHA; refusing to push"
+          if [ "$(git rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
+            echo "::error::PR head moved during the run; re-run the workflow to pick up the new HEAD"
             exit 1
           fi
           AUTH_B64=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
@@ -454,19 +501,39 @@ jobs:
           # the push must be atomic. The lease option below, with an
           # EXPLICIT expected SHA, is a compare-and-swap: the remote ref
           # must still be exactly the gated SHA at push time, or the push
-          # is rejected. Combined with the ancestry check above this is
-          # strictly STRICTER than an ordinary push -- it can never
-          # overwrite anything (unleased/blanket force pushes stay
+          # is rejected. Combined with the ancestry check in the bundle
+          # step this is strictly STRICTER than an ordinary push -- it can
+          # never overwrite anything (unleased/blanket force pushes stay
           # forbidden and are pinned by tests).
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH_B64" \
             push --force-with-lease="refs/heads/$BRANCH:$LIVE_HEAD_SHA" \
             origin "$FIX_TIP:refs/heads/$BRANCH"
 
+      # PR #110 review r3741170737 (P2): in the replies-only path
+      # (no bundle) the head can change between the first live check and
+      # the reply step. Re-verify immediately before posting, so
+      # conclusions produced for the gated SHA are never posted (and the
+      # findings never marked handled) against a different head. After a
+      # successful push the live head equals the verified fix tip, which
+      # this check accepts.
+      - name: Re-verify the live PR state before replies
+        id: livecheck2
+        if: steps.livecheck.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FIX_TIP: ${{ steps.bundle.outputs.fix_tip }}
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py verify-live
+          --findings /tmp/codex-autofix-gate/findings.json
+          --fix-tip "$FIX_TIP"
+
       # Post per-finding results as replies on the original review threads
       # (never new top-level comments). Uses the trusted findings.json from
       # the gate job, so replies can only target the gated finding threads.
       - name: Reply to the Codex review threads
-        if: steps.livecheck.outputs.proceed == 'true'
+        if: >-
+          steps.livecheck.outputs.proceed == 'true' &&
+          steps.livecheck2.outputs.proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-

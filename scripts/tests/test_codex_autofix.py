@@ -569,7 +569,7 @@ class TestGateCommand:
 class TestVerifyLiveCommand:
     """PR #110 review r3740883683: deliver-time re-check of the live PR."""
 
-    def run_verify(self, monkeypatch, tmp_path, live):
+    def run_verify(self, monkeypatch, tmp_path, live, fix_tip=None):
         doc = {
             "schema_version": codex_autofix.SCHEMA_VERSION,
             "repo": EXPECTED_REPO,
@@ -589,7 +589,10 @@ class TestVerifyLiveCommand:
         monkeypatch.setattr(
             codex_autofix, "fetch_pull_request", lambda *a, **k: live
         )
-        code = codex_autofix.main(["verify-live", "--findings", str(findings_path)])
+        argv = ["verify-live", "--findings", str(findings_path)]
+        if fix_tip is not None:
+            argv.extend(["--fix-tip", fix_tip])
+        code = codex_autofix.main(argv)
         outputs = {}
         for line in output_path.read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
@@ -614,6 +617,44 @@ class TestVerifyLiveCommand:
         code, outputs = self.run_verify(monkeypatch, tmp_path, self.live())
         assert code == 0
         assert outputs["proceed"] == "true"
+        assert outputs["push_required"] == "true"
+
+    def test_already_pushed_fix_tip_resumes_replies_without_push(
+        self, monkeypatch, tmp_path
+    ):
+        """PR #110 review r3741016955: after a partial delivery failure the
+
+        branch tip IS the verified fix tip; the run must proceed for the
+        remaining replies while forbidding another (stale) push.
+        """
+        fix_tip = "fedcba9876543210fedcba9876543210fedcba98"
+        live = self.live()
+        live["head"]["sha"] = fix_tip
+        code, outputs = self.run_verify(monkeypatch, tmp_path, live, fix_tip=fix_tip)
+        assert code == 0
+        assert outputs["proceed"] == "true"
+        assert outputs["push_required"] == "false"
+
+    def test_unrelated_head_sha_skips_even_with_fix_tip(self, monkeypatch, tmp_path):
+        live = self.live()
+        live["head"]["sha"] = HEAD_SHA  # neither gated SHA nor fix tip
+        code, outputs = self.run_verify(
+            monkeypatch,
+            tmp_path,
+            live,
+            fix_tip="fedcba9876543210fedcba9876543210fedcba98",
+        )
+        assert code == 0
+        assert outputs["proceed"] == "false"
+
+    def test_malformed_fix_tip_cannot_authorize_delivery(self, monkeypatch, tmp_path):
+        live = self.live()
+        live["head"]["sha"] = "not-a-sha"
+        code, outputs = self.run_verify(
+            monkeypatch, tmp_path, live, fix_tip="not-a-sha"
+        )
+        assert code == 0
+        assert outputs["proceed"] == "false"
 
     @pytest.mark.parametrize(
         "overrides",
@@ -939,9 +980,34 @@ class TestReplyCommand:
                 raise urllib.error.URLError("temporary network failure")
 
         monkeypatch.setattr(codex_autofix, "post_reply", flaky_post)
+        monkeypatch.setattr(
+            codex_autofix, "fetch_review_comments", lambda *a, **k: []
+        )
         monkeypatch.setattr(codex_autofix.time, "sleep", lambda s: None)
         codex_autofix.post_reply_with_retry("api", EXPECTED_REPO, 110, 42, "b", "t")
         assert calls == [42, 42, 42]
+
+    def test_ambiguous_failure_with_existing_marker_is_not_retried(self, monkeypatch):
+        """PR #110 review r3741114619: a dropped connection after GitHub
+
+        accepted the POST must not lead to a duplicate reply -- the thread
+        is re-fetched and the present marker ends the retry loop.
+        """
+        calls: list[int] = []
+
+        def dropped_connection(api, repo, pr, cid, body, token):
+            calls.append(cid)
+            raise urllib.error.URLError("connection reset after send")
+
+        marker = f"{codex_autofix.HANDLED_MARKER_PREFIX}42 -->"
+        thread = [review_comment(comment_id=999, in_reply_to_id=42, body=marker)]
+        monkeypatch.setattr(codex_autofix, "post_reply", dropped_connection)
+        monkeypatch.setattr(
+            codex_autofix, "fetch_review_comments", lambda *a, **k: thread
+        )
+        monkeypatch.setattr(codex_autofix.time, "sleep", lambda s: None)
+        codex_autofix.post_reply_with_retry("api", EXPECTED_REPO, 110, 42, "b", "t")
+        assert calls == [42]  # no second POST
 
     def test_permanent_client_errors_are_not_retried(self, monkeypatch):
         calls: list[int] = []
@@ -1283,7 +1349,7 @@ class TestWorkflowSafety:
             i for i, s in enumerate(steps) if "--validate-only" in s.get("run", "")
         )
         push_index = next(
-            i for i, s in enumerate(steps) if "git bundle verify" in s.get("run", "")
+            i for i, s in enumerate(steps) if "--force-with-lease" in s.get("run", "")
         )
         post_index = next(
             i
@@ -1389,7 +1455,7 @@ class TestWorkflowSafety:
         stage_index = next(
             i
             for i, s in enumerate(steps)
-            if "codex-autofix-upload" in s.get("run", "")
+            if "replies.json fix.bundle" in s.get("run", "")
         )
         assert package_index < stage_index
         stage = steps[stage_index]["run"]
@@ -1398,6 +1464,18 @@ class TestWorkflowSafety:
         assert '-L "$src"' in stage  # symlink rejection
         assert "replies.json fix.bundle" in stage  # allowlist, not recursive
         assert "cp -r" not in stage
+        # PR #110 review r3741016953: the staging directory is deleted and
+        # recreated (mode 700) after untrusted processes are gone -- an
+        # attacker-precreated path with planted symlinks can never survive
+        # into the upload -- and it is additionally reserved runner-owned
+        # BEFORE the isolated user exists.
+        assert "rm -rf /tmp/codex-autofix-upload" in stage
+        assert "mkdir -m 700 /tmp/codex-autofix-upload" in stage
+        assert "mkdir -p /tmp/codex-autofix-upload" not in stage
+        create_user = next(s for s in steps if "useradd" in s.get("run", ""))
+        reserve_pos = create_user["run"].index("mkdir -m 700 /tmp/codex-autofix-upload")
+        useradd_pos = create_user["run"].index("useradd")
+        assert reserve_pos < useradd_pos  # reserved before any untrusted code
         # the broker start step records its pid for the staged shutdown
         broker = next(
             s for s in steps if "anthropic_key_proxy.py" in s.get("run", "")
@@ -1417,14 +1495,21 @@ class TestWorkflowSafety:
 
         so the deliver job must re-fetch the live PR and gate the push and
         the reply posting on it still being open / non-draft / unmerged.
+        PR #110 review r3741016955: the bundle tip is resolved BEFORE the
+        live check so an already-delivered push is recognised, the push is
+        additionally gated on push_required, and reply posting stays
+        reachable for resume.
         """
         workflow = load_workflow()
         steps = workflow["jobs"]["deliver"]["steps"]
+        bundle_index = next(
+            i for i, s in enumerate(steps) if "git bundle verify" in s.get("run", "")
+        )
         livecheck_index = next(
             i for i, s in enumerate(steps) if "verify-live" in s.get("run", "")
         )
         push_index = next(
-            i for i, s in enumerate(steps) if "git bundle verify" in s.get("run", "")
+            i for i, s in enumerate(steps) if "--force-with-lease" in s.get("run", "")
         )
         post_index = next(
             i
@@ -1432,28 +1517,72 @@ class TestWorkflowSafety:
             if "codex_autofix.py reply" in s.get("run", "")
             and "--validate-only" not in s.get("run", "")
         )
-        assert livecheck_index < push_index < post_index
-        assert steps[livecheck_index].get("id") == "livecheck"
-        for index in (push_index, post_index):
-            assert "steps.livecheck.outputs.proceed == 'true'" in steps[index]["if"]
+        assert bundle_index < livecheck_index < push_index < post_index
+        assert steps[bundle_index].get("id") == "bundle"
+        # the bundle step performs verification + the ancestry check
+        assert "merge-base" in steps[bundle_index]["run"]
+        livecheck = steps[livecheck_index]
+        assert livecheck.get("id") == "livecheck"
+        assert "--fix-tip" in livecheck["run"]
+        assert "steps.livecheck.outputs.proceed == 'true'" in steps[push_index]["if"]
+        assert (
+            "steps.livecheck.outputs.push_required == 'true'"
+            in steps[push_index]["if"]
+        )
+        assert "steps.livecheck.outputs.proceed == 'true'" in steps[post_index]["if"]
+        # reply posting must NOT require push_required: resume after an
+        # already-delivered push still posts the missing replies
+        assert "push_required" not in steps[post_index]["if"]
+        # PR #110 review r3741170737: a SECOND live check runs between
+        # the push and the reply posting, so replies-only runs never post
+        # conclusions against a head that changed after the first check.
+        livecheck2_index = next(
+            i for i, s in enumerate(steps) if s.get("id") == "livecheck2"
+        )
+        assert push_index < livecheck2_index < post_index
+        assert "verify-live" in steps[livecheck2_index]["run"]
+        assert "--fix-tip" in steps[livecheck2_index]["run"]
+        assert "steps.livecheck2.outputs.proceed == 'true'" in steps[post_index]["if"]
 
     def test_push_is_guarded_and_verifies_bundle_ancestry(self):
-        commands = [
-            c
-            for c in workflow_run_commands(load_workflow())
-            if "git" in c and "push" in c
-        ]
-        assert len(commands) == 1
-        push = commands[0]
+        commands = workflow_run_commands(load_workflow())
+        pushes = [c for c in commands if "--force-with-lease" in c]
+        assert len(pushes) == 1
+        push = pushes[0]
         assert "main|master" in push
         assert "refs/heads/$BRANCH" in push
         assert "add-mask" in push
-        assert "git bundle verify" in push
-        assert "merge-base" in push  # fast-forward-from-gated-head check
         # atomic compare-and-swap: the remote ref must still be exactly the
         # gated SHA at push time (PR #110 review: TOCTOU between the
         # verify-live check and the ref update)
         assert '--force-with-lease="refs/heads/$BRANCH:$LIVE_HEAD_SHA"' in push
+        # the bundle step (before the live check) verifies the bundle and
+        # its fast-forward ancestry from the gated head SHA
+        bundles = [c for c in commands if "git bundle verify" in c]
+        assert len(bundles) == 1
+        assert "merge-base" in bundles[0]
+
+    def test_deliver_scripts_are_pinned_to_the_gate_revision(self):
+        """PR #110 review r3741149095: the deliver job must execute the SAME
+
+        automation revision the gate evaluated, even if main advances
+        during the long fix job -- the gate records its checkout SHA and
+        the deliver trusted checkout pins exactly that SHA.
+        """
+        workflow = load_workflow()
+        gate_job = workflow["jobs"]["gate"]
+        assert "trusted_sha" in gate_job["outputs"]
+        gate_run = next(
+            s["run"] for s in gate_job["steps"] if "codex_autofix.py gate" in s.get("run", "")
+        )
+        assert "trusted_sha=$(git rev-parse HEAD)" in gate_run
+        trusted_checkout = next(
+            s
+            for s in workflow["jobs"]["deliver"]["steps"]
+            if str(s.get("uses", "")).startswith("actions/checkout")
+            and s["with"].get("path") == "_codex_autofix_trusted"
+        )
+        assert trusted_checkout["with"]["ref"] == "${{ needs.gate.outputs.trusted_sha }}"
 
     def test_ci_runs_the_scripts_test_suite(self):
         assert "python -m pytest scripts/tests -q" in CI_PATH.read_text(encoding="utf-8")
