@@ -15,6 +15,7 @@ import json
 import pathlib
 import re
 import sys
+import urllib.error
 
 import pytest
 import yaml
@@ -875,6 +876,9 @@ class TestReplyCommand:
             return {}
 
         monkeypatch.setattr(codex_autofix, "_api_request", fake_api)
+        monkeypatch.setattr(
+            codex_autofix, "fetch_review_comments", lambda *a, **k: []
+        )
         code = codex_autofix.main(
             ["reply", "--findings", str(findings_path), "--replies", str(replies_path)]
         )
@@ -885,6 +889,72 @@ class TestReplyCommand:
             assert url.endswith(f"/pulls/108/comments/{comment_id}/replies")
             assert "/merge" not in url
             assert f"{codex_autofix.HANDLED_MARKER_PREFIX}{comment_id} -->" in data["body"]
+
+    def test_resume_skips_findings_that_already_have_replies(self, monkeypatch, tmp_path):
+        """PR #110 review r3740981771: after a partial delivery failure,
+
+        re-running the deliver job must re-post only the missing replies --
+        threads already carrying a reply are skipped.
+        """
+        doc = findings_doc([P1_BADGE_BODY, P1_MAJOR_TAG_BODY])
+        findings_path = tmp_path / "findings.json"
+        findings_path.write_text(json.dumps(doc), encoding="utf-8")
+        replies_path = tmp_path / "replies.json"
+        replies_path.write_text(
+            json.dumps(
+                [
+                    {"comment_id": 1000, "body": "already delivered earlier"},
+                    {"comment_id": 1001, "body": "still to deliver"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+        marker = f"{codex_autofix.HANDLED_MARKER_PREFIX}1000 -->"
+        existing = [
+            review_comment(comment_id=1000, body=P1_BADGE_BODY),
+            review_comment(comment_id=5000, in_reply_to_id=1000, body=marker),
+        ]
+        monkeypatch.setattr(
+            codex_autofix, "fetch_review_comments", lambda *a, **k: existing
+        )
+        posted: list[int] = []
+        monkeypatch.setattr(
+            codex_autofix,
+            "post_reply_with_retry",
+            lambda api, repo, pr, cid, body, token, **kw: posted.append(cid),
+        )
+        code = codex_autofix.main(
+            ["reply", "--findings", str(findings_path), "--replies", str(replies_path)]
+        )
+        assert code == 0
+        assert posted == [1001]
+
+    def test_transient_post_failures_are_retried(self, monkeypatch):
+        calls: list[int] = []
+
+        def flaky_post(api, repo, pr, cid, body, token):
+            calls.append(cid)
+            if len(calls) < 3:
+                raise urllib.error.URLError("temporary network failure")
+
+        monkeypatch.setattr(codex_autofix, "post_reply", flaky_post)
+        monkeypatch.setattr(codex_autofix.time, "sleep", lambda s: None)
+        codex_autofix.post_reply_with_retry("api", EXPECTED_REPO, 110, 42, "b", "t")
+        assert calls == [42, 42, 42]
+
+    def test_permanent_client_errors_are_not_retried(self, monkeypatch):
+        calls: list[int] = []
+
+        def not_found(api, repo, pr, cid, body, token):
+            calls.append(cid)
+            raise urllib.error.HTTPError("u", 404, "not found", None, None)
+
+        monkeypatch.setattr(codex_autofix, "post_reply", not_found)
+        monkeypatch.setattr(codex_autofix.time, "sleep", lambda s: None)
+        with pytest.raises(urllib.error.HTTPError):
+            codex_autofix.post_reply_with_retry("api", EXPECTED_REPO, 110, 42, "b", "t")
+        assert calls == [42]  # exactly one attempt
 
     def test_reply_with_secret_posts_nothing(self, monkeypatch, tmp_path):
         doc = findings_doc([P1_BADGE_BODY, P1_MAJOR_TAG_BODY])

@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -331,6 +332,35 @@ def post_reply(api_url: str, repo: str, pr_number: int, comment_id: int, body: s
         method="POST",
         data={"body": body},
     )
+
+
+def post_reply_with_retry(
+    api_url: str,
+    repo: str,
+    pr_number: int,
+    comment_id: int,
+    body: str,
+    token: str,
+    attempts: int = 3,
+) -> None:
+    """Post one reply, retrying transient failures with backoff.
+
+    Permanent client errors (4xx other than 429) are raised immediately;
+    5xx / 429 / network errors are retried up to ``attempts`` times.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            post_reply(api_url, repo, pr_number, comment_id, body, token)
+            return
+        except urllib.error.HTTPError as error:
+            if 400 <= error.code < 500 and error.code != 429:
+                raise
+            if attempt == attempts:
+                raise
+        except urllib.error.URLError:
+            if attempt == attempts:
+                raise
+        time.sleep(2**attempt)
 
 
 # --- Prompt rendering ------------------------------------------------------
@@ -681,8 +711,19 @@ def cmd_reply(args: argparse.Namespace) -> int:
         print(f"[codex-autofix] replies validated for {len(validated)} finding(s)")
         return 0
     token = _require_env("GITHUB_TOKEN")
+    # PR #110 review r3740981771: delivery must be resumable. A transient
+    # failure on a later reply must not leave the run unrecoverable:
+    # re-running the deliver job re-posts ONLY the replies whose threads do
+    # not yet carry a reply (the fix phase is never re-run), and each post
+    # retries transient errors before giving up.
+    existing = fetch_review_comments(api_url, doc["repo"], doc["pr_number"], token)
     for reply in validated:
-        post_reply(
+        if is_already_handled(reply["comment_id"], existing):
+            print(
+                f"[codex-autofix] comment {reply['comment_id']} already has a reply; skipping (resume)"
+            )
+            continue
+        post_reply_with_retry(
             api_url,
             doc["repo"],
             doc["pr_number"],

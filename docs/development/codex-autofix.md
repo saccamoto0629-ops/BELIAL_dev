@@ -117,4 +117,5 @@ permissions は workflow 全体ではなく job ごとに最小権限で付与�
 - **bootstrap**: `scripts/codex_autofix.py` が default branch にまだ存在しない間(この仕組みを導入する PR 自身など)は、gate が notice を出して green skip する。
 - **起動しない**: 上記「起動条件」を 1 つずつ確認する。特に (a) inline comment に P0/P1 バッジ等の actionable severity があるか、(b) その thread に既に返信が付いていないか、(c) PR が open か。
 - **失敗した run の再実行**: 原因(例: secret 未設定、head 移動、push の非 fast-forward、テスト失敗)をログで確認して解消後、Actions UI の「Re-run failed jobs」で再実行する。gate が finding 単位で重複排除するため、再実行しても返信済み finding が二重修正されることはない。
+- **返信投稿の途中失敗**: 返信は一時エラーをリトライし、それでも deliver job が返信途中で失敗した場合は「Re-run failed jobs」で **deliver job のみ**を再実行する(artifact は保持されている)。投稿処理は再開可能で、既に返信が付いた thread はスキップされ、未投稿分だけが再送される。fix フェーズが再走することはない。
 - **手動でのロジック検証**: `python -m pytest scripts/tests -q` で gate / severity / reply の回帰テストを実行できる。
