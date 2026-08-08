@@ -221,6 +221,7 @@ jobs:
           set -euo pipefail
           nohup python3 /tmp/codex-autofix-gate/anthropic_key_proxy.py --port 8377 \
             > /tmp/anthropic-broker.log 2>&1 &
+          echo $! > /tmp/anthropic-broker.pid
           for _ in $(seq 1 50); do
             if (exec 3<>/dev/tcp/127.0.0.1/8377) 2>/dev/null; then
               exec 3>&- || true
@@ -295,11 +296,56 @@ jobs:
             echo "No fix commits were created (findings stale/invalid); packaging replies only."
           fi
 
+      # PR #110 review r3740962371: the upload action runs as the RUNNER
+      # user and dereferences symlinks, so a hostile symlink under
+      # /tmp/codex-autofix (e.g. -> /proc/<broker-pid>/environ) would leak
+      # runner-readable secrets into the artifact. Before staging: the
+      # broker is terminated (its key leaves the system) and every
+      # claudefix process is killed, so nothing can race the checks below.
+      # Then ONLY the two allowlisted result files are copied -- each
+      # verified to be a regular non-symlink file -- into a fresh
+      # runner-owned staging directory, which is what gets uploaded.
+      - name: Stage result files for upload (symlink-safe)
+        run: |
+          set -euo pipefail
+          BROKER_PID=$(cat /tmp/anthropic-broker.pid)
+          kill "$BROKER_PID" 2>/dev/null || true
+          sudo pkill -9 -u claudefix 2>/dev/null || true
+          for _ in $(seq 1 50); do
+            if ! kill -0 "$BROKER_PID" 2>/dev/null && ! sudo pgrep -u claudefix >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          if kill -0 "$BROKER_PID" 2>/dev/null || sudo pgrep -u claudefix >/dev/null 2>&1; then
+            echo "::error::broker or claudefix processes still alive; refusing to stage the result"
+            exit 1
+          fi
+          mkdir -p /tmp/codex-autofix-upload
+          for name in replies.json fix.bundle; do
+            src="/tmp/codex-autofix/$name"
+            if [ -L "$src" ]; then
+              echo "::error::$name is a symlink; refusing to stage"
+              exit 1
+            fi
+            if [ -e "$src" ] && [ ! -f "$src" ]; then
+              echo "::error::$name is not a regular file; refusing to stage"
+              exit 1
+            fi
+            if [ -f "$src" ]; then
+              cp -- "$src" "/tmp/codex-autofix-upload/$name"
+            fi
+          done
+          test -f /tmp/codex-autofix-upload/replies.json || {
+            echo "::error::replies.json missing from the staged result"
+            exit 1
+          }
+
       - name: Upload result artifact (bundle + replies)
         uses: actions/upload-artifact@v4
         with:
           name: codex-autofix-result
-          path: /tmp/codex-autofix/
+          path: /tmp/codex-autofix-upload/
           retention-days: 7
           if-no-files-found: error
 

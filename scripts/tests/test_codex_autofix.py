@@ -1303,6 +1303,45 @@ class TestWorkflowSafety:
         package = next(s for s in steps if "git bundle create" in s.get("run", ""))
         assert "sudo -u claudefix -H git" in package["run"]
 
+    def test_result_artifact_is_staged_symlink_safe(self):
+        """PR #110 review r3740962371: the upload action runs as the runner
+
+        and dereferences symlinks, so the result artifact must come from a
+        runner-owned staging directory populated by an allowlist copy that
+        rejects symlinks -- after the broker (and every claudefix process
+        that could race the checks) has been terminated.
+        """
+        workflow = load_workflow()
+        steps = workflow["jobs"]["fix"]["steps"]
+        package_index = next(
+            i for i, s in enumerate(steps) if "git bundle create" in s.get("run", "")
+        )
+        stage_index = next(
+            i
+            for i, s in enumerate(steps)
+            if "codex-autofix-upload" in s.get("run", "")
+        )
+        assert package_index < stage_index
+        stage = steps[stage_index]["run"]
+        assert "anthropic-broker.pid" in stage  # broker terminated first
+        assert "pkill" in stage and "-u claudefix" in stage  # no racing processes
+        assert '-L "$src"' in stage  # symlink rejection
+        assert "replies.json fix.bundle" in stage  # allowlist, not recursive
+        assert "cp -r" not in stage
+        # the broker start step records its pid for the staged shutdown
+        broker = next(
+            s for s in steps if "anthropic_key_proxy.py" in s.get("run", "")
+        )
+        assert "anthropic-broker.pid" in broker["run"]
+        # the uploaded path is the staged directory, never the claudefix dir
+        upload = next(
+            s
+            for s in steps
+            if str(s.get("uses", "")).startswith("actions/upload-artifact")
+            and s["with"]["name"] == "codex-autofix-result"
+        )
+        assert upload["with"]["path"] == "/tmp/codex-autofix-upload/"
+
     def test_deliver_rechecks_live_pr_state_before_side_effects(self):
         """PR #110 review r3740883683: the fix job can run for a long time,
 
