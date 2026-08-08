@@ -1,0 +1,542 @@
+name: Codex Autofix
+
+# Issue #109: when the Codex GitHub App submits a review containing
+# actionable inline findings (Blocker / Major / P1-equivalent), run Claude
+# Code on the PR head branch to validate each finding against the current
+# HEAD, fix the root cause, add regression tests, run the affected suites,
+# commit, push, and reply on the original review threads.
+#
+# Trigger / trust model (details: docs/development/codex-autofix.md):
+# - Only `pull_request_review` "submitted" events are handled. Codex posts
+#   findings as inline review comments grouped under one review submission,
+#   so one run handles the whole review; summary-only reviews yield zero
+#   actionable findings and the gate skips cleanly. Review-comment replies,
+#   issue comments, and pushes never trigger this workflow.
+# - The job-level `if` is a cheap pre-filter; the authoritative fail-closed
+#   validation (bot login + numeric id + type, same-repo head/base, branch
+#   name / SHA formats, severity, duplicate + stale handling) lives in
+#   scripts/codex_autofix.py, always executed from the DEFAULT branch, so
+#   the PR branch cannot redefine the privileged gate/reply logic mid-run.
+# - Fork PRs are excluded (head repo must equal this repo): the push token
+#   could not update a fork anyway, and untrusted fork code must never run
+#   next to secrets. `pull_request_target` is deliberately NOT used.
+# - Three isolated jobs (PR #110 review r3740689732): `gate` (read-only)
+#   evaluates the event on a default-branch-only checkout; `fix` runs
+#   Claude Code with the Anthropic key as its ONLY credential -- no
+#   GITHUB_TOKEN anywhere in the job, no persisted git credentials -- and
+#   exports the result as pure data (a git bundle + replies.json);
+#   `deliver` runs on a fresh runner that Claude never touched, verifies
+#   the bundle fast-forwards from the gated head SHA, pushes, and replies.
+#   Even a fully compromised Claude process can therefore only produce
+#   data for validation, never execute with a token.
+# - Loop prevention: pushes and replies made here use GITHUB_TOKEN, and
+#   GITHUB_TOKEN-initiated events never start new workflow runs, so this
+#   workflow cannot re-trigger itself. It never posts "@codex" (the reply
+#   script defangs any mention), so it never starts a Codex re-review;
+#   re-review stays a manual human action.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+# Serialize runs per PR so two Codex reviews cannot race pushes to the same
+# branch. cancel-in-progress stays false: an in-flight fix round must not be
+# killed by a newer review (its findings are deduplicated per-thread by the
+# gate instead).
+concurrency:
+  group: codex-autofix-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # Read-only evaluation. Runs entirely on a default-branch checkout: the
+  # PR's code is never present in this job.
+  gate:
+    name: Gate Codex review event
+    # Cheap pre-filter so ordinary human reviews never spin up a runner.
+    # This is NOT the security boundary -- the gate script re-validates
+    # identity (including the immutable numeric app id), repo, branch, and
+    # PR state before anything else runs.
+    if: >-
+      github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      branch: ${{ steps.gate.outputs.branch }}
+      pr_number: ${{ steps.gate.outputs.pr_number }}
+      live_head_sha: ${{ steps.gate.outputs.live_head_sha }}
+      findings_count: ${{ steps.gate.outputs.findings_count }}
+      trusted_sha: ${{ steps.gate.outputs.trusted_sha }}
+    steps:
+      - name: Check out default branch (trusted automation scripts)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      # Fail-closed event validation + finding extraction. Reads the event
+      # payload as JSON (never shell-interpolated), re-fetches the live PR
+      # state (stale events: PR closed/merged since), selects actionable
+      # Codex findings for THIS review, and drops findings whose thread
+      # already has a non-Codex reply (duplicate delivery / re-run safety).
+      - name: Validate event and extract actionable findings
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # PR #110 review r3741149095: record the exact trusted revision
+          # this run evaluated, so the deliver job executes the SAME
+          # automation code even if main advances during the long fix job.
+          echo "trusted_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ ! -f scripts/codex_autofix.py ]; then
+            echo "::notice::codex_autofix scripts are not on the default branch yet (bootstrap PR); skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/codex_autofix.py gate --out "$RUNNER_TEMP/codex-autofix/findings.json"
+
+      # Finding bodies are embedded as clearly delimited untrusted data; the
+      # prompt instructs Claude to treat them as bug reports only and to
+      # ignore any instructions inside them. Rendered here, in the trusted
+      # job, so the fix job never runs automation scripts at all.
+      - name: Render the Claude Code prompt
+        if: steps.gate.outputs.proceed == 'true'
+        run: >-
+          python3 scripts/codex_autofix.py render-prompt
+          --findings "$RUNNER_TEMP/codex-autofix/findings.json"
+          --out "$RUNNER_TEMP/codex-autofix/prompt.md"
+          --replies-path /tmp/codex-autofix/replies.json
+
+      # The credential broker must come from the trusted default branch,
+      # never from the PR checkout, because the fix job runs it with the
+      # real ANTHROPIC_API_KEY in its environment.
+      - name: Stage the credential broker for the fix job
+        if: steps.gate.outputs.proceed == 'true'
+        run: cp scripts/anthropic_key_proxy.py "$RUNNER_TEMP/codex-autofix/"
+
+      - name: Upload gate artifact (findings + prompt + broker)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-autofix-gate
+          path: ${{ runner.temp }}/codex-autofix/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Claude Code runs here with NO GitHub credentials of any kind: the job
+  # token is never exposed to any step, checkout persists nothing, and the
+  # job's own permissions are read-only. The job's only outputs are data
+  # files (a git bundle of local commits + replies.json) for `deliver` to
+  # verify -- so nothing Claude can do to this runner (edit files, plant
+  # git hooks, rewrite configs) can reach a token or the repository.
+  fix:
+    name: Fix actionable Codex findings
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out PR head branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download gate artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-autofix-gate
+          path: /tmp/codex-autofix-gate
+
+      # Fail safe if the branch moved between checkout and gating, or the
+      # checkout is detached / on the wrong branch: stop before any fixing.
+      - name: Verify local checkout matches the live PR head
+        env:
+          LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ "$(git symbolic-ref --quiet --short HEAD || true)" != "$BRANCH" ]; then
+            echo "::error::checkout is detached or not on the PR head branch"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
+            echo "::error::PR head moved during the run; re-run the workflow to pick up the new HEAD"
+            exit 1
+          fi
+
+      - name: Verify the Claude Code credential is configured
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not configured (see docs/development/codex-autofix.md)"
+            exit 1
+          fi
+
+      # The runner has no git identity by default; without this, local
+      # commits made during the fix would fail.
+      - name: Configure git identity for fix commits
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # No pip cache here: the cache would be restored by (and owned by)
+      # the runner user, while dependency installation happens as the
+      # isolated user below.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Installs from the npm registry only -- no PR-controlled input.
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      # PR #110 review r3740741454: if ANTHROPIC_API_KEY were
+      # in Claude's environment, every child process (including repository
+      # test commands from the mutable PR branch) would inherit the secret.
+      # Claude therefore runs as a separate unprivileged user holding only
+      # a decoy key; the real key lives solely inside the runner-user
+      # broker process below, which injects it upstream on localhost
+      # requests. The isolated user cannot read the runner user's files or
+      # /proc environments, so no process in Claude's session can reach it.
+      - name: Create isolated user for Claude
+        run: |
+          set -euo pipefail
+          # PR #110 review r3741016953: reserve the runner-owned staging
+          # directory BEFORE any untrusted code can exist. /tmp is
+          # world-writable, so an attacker process could otherwise
+          # pre-create the path and plant symlinks that the artifact upload
+          # would dereference as the runner. Mode 700 plus /tmp's sticky
+          # bit mean claudefix can neither write into nor replace it.
+          rm -rf /tmp/codex-autofix-upload
+          mkdir -m 700 /tmp/codex-autofix-upload
+          sudo useradd --create-home claudefix
+          sudo chown -R claudefix:claudefix "$GITHUB_WORKSPACE"
+          mkdir -p /tmp/codex-autofix
+          sudo chown claudefix:claudefix /tmp/codex-autofix
+
+      - name: Start the Anthropic credential broker (runner user only)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          nohup python3 /tmp/codex-autofix-gate/anthropic_key_proxy.py --port 8377 \
+            > /tmp/anthropic-broker.log 2>&1 &
+          echo $! > /tmp/anthropic-broker.pid
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8377) 2>/dev/null; then
+              exec 3>&- || true
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::credential broker did not start"
+          cat /tmp/anthropic-broker.log
+          exit 1
+
+      # PR #110 review r3740811232: requirements.txt is PR-controlled and
+      # `pip install` can execute package build code, so dependency
+      # installation must run AFTER privilege separation, as the isolated
+      # user, into that user's own --user site. It must never run as the
+      # runner user, which owns the broker script and the real key. PATH is
+      # passed through sudo so the setup-python interpreter (runner-owned,
+      # read-only to claudefix) is used here and in the Claude step alike.
+      # The broker is already listening (previous step), so no claudefix
+      # process can squat its port.
+      - name: Install dependencies (isolated user)
+        run: sudo -u claudefix -H env PATH="$PATH" python -m pip install --user -r requirements.txt
+
+      # Claude runs with a decoy key and no repository secrets. It
+      # validates findings, fixes, tests, and commits locally, and writes
+      # replies.json. It cannot push, merge, post, or read the real
+      # credential. --dangerously-skip-permissions is required for headless
+      # -p mode and is acceptable inside this credential-free session.
+      - name: Run Claude Code (isolated user, no repository secrets)
+        run: >-
+          sudo -u claudefix -H
+          env PATH="$PATH" ANTHROPIC_BASE_URL=http://127.0.0.1:8377 ANTHROPIC_API_KEY=broker-managed
+          claude -p --dangerously-skip-permissions < /tmp/codex-autofix-gate/prompt.md
+
+      # Package the result as pure data. The FULL `git status --porcelain`
+      # (tracked AND untracked; PR #110 review r3740689735) must be clean:
+      # an unstaged or forgotten file means the commit is partial -- e.g. a
+      # regression test that was written but never added -- so refuse to
+      # package it rather than ship half a fix.
+      #
+      # PR #110 review r3740883679: every git command here
+      # runs as the ISOLATED user, never as the runner. After Claude (and
+      # PR dependency code) ran, `.git` may carry attacker-set config such
+      # as `core.fsmonitor`, which git executes as a hook -- a runner-user
+      # `git status` would run that code on the same UID as the live
+      # credential broker. As claudefix, such hooks stay inside the
+      # already-untrusted session. The workspace is never chowned back;
+      # no later step in this job runs git or executes workspace content.
+      - name: Package fix bundle and replies (isolated user)
+        env:
+          LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gitc() { sudo -u claudefix -H git "$@"; }
+          if [ "$(gitc symbolic-ref --quiet --short HEAD || true)" != "$BRANCH" ]; then
+            echo "::error::not on the PR head branch after the fix; refusing to package"
+            exit 1
+          fi
+          if [ -n "$(gitc status --porcelain)" ]; then
+            echo "::error::worktree has uncommitted or untracked changes; refusing to package a partial fix"
+            gitc status --porcelain
+            exit 1
+          fi
+          if [ ! -f /tmp/codex-autofix/replies.json ]; then
+            echo "::error::Claude did not produce replies.json; nothing can be reported back"
+            exit 1
+          fi
+          if [ "$(gitc rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
+            sudo -u claudefix -H git bundle create /tmp/codex-autofix/fix.bundle "$LIVE_HEAD_SHA..HEAD"
+          else
+            echo "No fix commits were created (findings stale/invalid); packaging replies only."
+          fi
+
+      # PR #110 review r3740962371: the upload action runs as the RUNNER
+      # user and dereferences symlinks, so a hostile symlink under
+      # /tmp/codex-autofix (e.g. -> /proc/<broker-pid>/environ) would leak
+      # runner-readable secrets into the artifact. Before staging: the
+      # broker is terminated (its key leaves the system) and every
+      # claudefix process is killed, so nothing can race the checks below.
+      # Then ONLY the two allowlisted result files are copied -- each
+      # verified to be a regular non-symlink file -- into a fresh
+      # runner-owned staging directory, which is what gets uploaded.
+      - name: Stage result files for upload (symlink-safe)
+        run: |
+          set -euo pipefail
+          BROKER_PID=$(cat /tmp/anthropic-broker.pid)
+          kill "$BROKER_PID" 2>/dev/null || true
+          sudo pkill -9 -u claudefix 2>/dev/null || true
+          for _ in $(seq 1 50); do
+            if ! kill -0 "$BROKER_PID" 2>/dev/null && ! sudo pgrep -u claudefix >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          if kill -0 "$BROKER_PID" 2>/dev/null || sudo pgrep -u claudefix >/dev/null 2>&1; then
+            echo "::error::broker or claudefix processes still alive; refusing to stage the result"
+            exit 1
+          fi
+          # PR #110 review r3741016953: even though the staging path was
+          # reserved (runner-owned, mode 700) before any untrusted code
+          # ran, delete and recreate it now that no untrusted process is
+          # left -- the upload must only ever see a directory this step
+          # itself created.
+          rm -rf /tmp/codex-autofix-upload
+          mkdir -m 700 /tmp/codex-autofix-upload
+          for name in replies.json fix.bundle; do
+            src="/tmp/codex-autofix/$name"
+            if [ -L "$src" ]; then
+              echo "::error::$name is a symlink; refusing to stage"
+              exit 1
+            fi
+            if [ -e "$src" ] && [ ! -f "$src" ]; then
+              echo "::error::$name is not a regular file; refusing to stage"
+              exit 1
+            fi
+            if [ -f "$src" ]; then
+              cp -- "$src" "/tmp/codex-autofix-upload/$name"
+            fi
+          done
+          test -f /tmp/codex-autofix-upload/replies.json || {
+            echo "::error::replies.json missing from the staged result"
+            exit 1
+          }
+
+      - name: Upload result artifact (bundle + replies)
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-autofix-result
+          path: /tmp/codex-autofix-upload/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Fresh runner that Claude never touched. Treats the fix job's output
+  # strictly as data: the bundle is verified to fast-forward from the gated
+  # head SHA and pushed as an exact-SHA compare-and-swap (never a blanket
+  # force), and replies are validated by the trusted script
+  # (finding-thread-only, credential-pattern scan, "@codex" defused,
+  # handled marker appended) before posting.
+  deliver:
+    name: Push fixes and reply to review threads
+    needs: [gate, fix]
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out PR head branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # PR #110 review r3741149095: pinned to the exact revision the gate
+      # job evaluated, so validation and delivery run the same automation
+      # code / schema contract even if main advanced during the fix job.
+      - name: Check out trusted automation scripts (gate revision)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.trusted_sha }}
+          path: _codex_autofix_trusted
+          persist-credentials: false
+
+      - name: Download gate artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-autofix-gate
+          path: /tmp/codex-autofix-gate
+
+      - name: Download result artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-autofix-result
+          path: /tmp/codex-autofix-result
+
+      # PR #110 review r3740741456 (P2): validate Claude's
+      # replies BEFORE any privileged side effect, so a rejected result
+      # package can never leave the PR mutated with its thread replies
+      # unposted (which would also re-arm the finding for another run).
+      - name: Validate replies before any side effect
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py reply
+          --findings /tmp/codex-autofix-gate/findings.json
+          --replies /tmp/codex-autofix-result/replies.json
+          --validate-only
+
+      # Resolve and verify the bundle BEFORE the live check, so the live
+      # check can recognise a fix tip that a previous partially-failed run
+      # already pushed (PR #110 review r3741016955).
+      - name: Verify the fix bundle and resolve its tip
+        id: bundle
+        env:
+          LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/codex-autofix-result/fix.bundle ]; then
+            echo "No fix bundle (replies only)."
+            echo "fix_tip=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git bundle verify /tmp/codex-autofix-result/fix.bundle
+          git fetch /tmp/codex-autofix-result/fix.bundle HEAD
+          FIX_TIP=$(git rev-parse FETCH_HEAD)
+          if [ "$(git merge-base "$LIVE_HEAD_SHA" "$FIX_TIP")" != "$LIVE_HEAD_SHA" ]; then
+            echo "::error::bundle does not fast-forward from the gated head SHA; refusing to deliver"
+            exit 1
+          fi
+          echo "fix_tip=$FIX_TIP" >> "$GITHUB_OUTPUT"
+
+      # PR #110 review r3740883683 (P2): the fix job can run
+      # for a long time; re-check the LIVE PR state (open, non-draft,
+      # unmerged, same head branch/repo) immediately before pushing or
+      # replying. A PR merged/closed/drafted mid-run makes this a clean
+      # no-op skip instead of a push to a dead PR. PR #110 review
+      # r3741016955: a live head equal to the VERIFIED fix tip means a
+      # previous run already pushed -- proceed with push_required=false so
+      # the remaining replies can still be delivered, without permitting
+      # another (now stale) push.
+      - name: Re-verify the live PR state before delivery
+        id: livecheck
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FIX_TIP: ${{ steps.bundle.outputs.fix_tip }}
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py verify-live
+          --findings /tmp/codex-autofix-gate/findings.json
+          --fix-tip "$FIX_TIP"
+
+      # Push only of commits that build directly on the head SHA the gate
+      # saw, only to the PR head branch. Credentials are supplied
+      # ephemerally for this single command and the derived value is
+      # masked so `set -x`-style leaks are impossible.
+      - name: Push fix commits to the PR head branch
+        if: >-
+          steps.livecheck.outputs.proceed == 'true' &&
+          steps.livecheck.outputs.push_required == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+          LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
+          FIX_TIP: ${{ steps.bundle.outputs.fix_tip }}
+        run: |
+          set -euo pipefail
+          case "$BRANCH" in
+            main|master)
+              echo "::error::refusing to push to the default branch"
+              exit 1
+              ;;
+          esac
+          if [ -z "$FIX_TIP" ]; then
+            echo "No fix commits to push (replies only)."
+            exit 0
+          fi
+          if [ "$(git rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
+            echo "::error::PR head moved during the run; re-run the workflow to pick up the new HEAD"
+            exit 1
+          fi
+          AUTH_B64=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$AUTH_B64"
+          # PR #110 review r3740940621 (P2): the verify-live SHA check and
+          # the push must be atomic. The lease option below, with an
+          # EXPLICIT expected SHA, is a compare-and-swap: the remote ref
+          # must still be exactly the gated SHA at push time, or the push
+          # is rejected. Combined with the ancestry check in the bundle
+          # step this is strictly STRICTER than an ordinary push -- it can
+          # never overwrite anything (unleased/blanket force pushes stay
+          # forbidden and are pinned by tests).
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH_B64" \
+            push --force-with-lease="refs/heads/$BRANCH:$LIVE_HEAD_SHA" \
+            origin "$FIX_TIP:refs/heads/$BRANCH"
+
+      # PR #110 review r3741170737 (P2): in the replies-only path
+      # (no bundle) the head can change between the first live check and
+      # the reply step. Re-verify immediately before posting, so
+      # conclusions produced for the gated SHA are never posted (and the
+      # findings never marked handled) against a different head. After a
+      # successful push the live head equals the verified fix tip, which
+      # this check accepts.
+      - name: Re-verify the live PR state before replies
+        id: livecheck2
+        if: steps.livecheck.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FIX_TIP: ${{ steps.bundle.outputs.fix_tip }}
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py verify-live
+          --findings /tmp/codex-autofix-gate/findings.json
+          --fix-tip "$FIX_TIP"
+
+      # Post per-finding results as replies on the original review threads
+      # (never new top-level comments). Uses the trusted findings.json from
+      # the gate job, so replies can only target the gated finding threads.
+      - name: Reply to the Codex review threads
+        if: >-
+          steps.livecheck.outputs.proceed == 'true' &&
+          steps.livecheck2.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py reply
+          --findings /tmp/codex-autofix-gate/findings.json
+          --replies /tmp/codex-autofix-result/replies.json

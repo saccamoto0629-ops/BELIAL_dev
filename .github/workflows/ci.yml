@@ -71,6 +71,13 @@ jobs:
       - name: Run execution tests
         run: python -m pytest execution/tests -q
 
+      # Issue #109: gate / severity / duplicate / reply-sanitizing logic for
+      # the Codex review autofix workflow (codex-autofix.yml), plus the
+      # pre-existing scripts/ unit tests (PNG cleanup, systemd units).
+      # Fixture payloads only -- no network, no GitHub API, no secrets.
+      - name: Run scripts tests
+        run: python -m pytest scripts/tests -q
+
       # Issue #77: fixed execution scenarios via the runner CLI. The same
       # scenarios also run inside "Run execution tests" (test_fixed_scenarios
       # parametrizes per scenario id) -- including the Issue #78 shadow-mode
