@@ -1092,10 +1092,17 @@ class TestWorkflowSafety:
             assert "needs.gate.outputs.proceed == 'true'" in job["if"]
         assert "fix" in workflow["jobs"]["deliver"]["needs"]
 
-    def test_no_force_push_and_no_codex_mention_in_commands(self):
+    def test_no_bare_force_push_and_no_codex_mention_in_commands(self):
+        """A bare `--force` (or a bare `--force-with-lease` without an
+
+        explicit expected SHA) could overwrite history and stays banned.
+        The only permitted form is the compare-and-swap
+        `--force-with-lease=<ref>:<expected sha>` used by the deliver push
+        (PR #110 review: atomic SHA check), which is stricter than an
+        ordinary push and can never overwrite anything.
+        """
         for command in workflow_run_commands(load_workflow()):
-            assert "--force" not in command
-            assert "force-with-lease" not in command
+            assert not re.search(r"--force(?!-with-lease=)", command)
             assert "@codex" not in command.lower()
             assert "set -x" not in command
 
@@ -1206,7 +1213,7 @@ class TestWorkflowSafety:
             i for i, s in enumerate(steps) if "--validate-only" in s.get("run", "")
         )
         push_index = next(
-            i for i, s in enumerate(steps) if "push origin" in s.get("run", "")
+            i for i, s in enumerate(steps) if "git bundle verify" in s.get("run", "")
         )
         post_index = next(
             i
@@ -1308,7 +1315,7 @@ class TestWorkflowSafety:
             i for i, s in enumerate(steps) if "verify-live" in s.get("run", "")
         )
         push_index = next(
-            i for i, s in enumerate(steps) if "push origin" in s.get("run", "")
+            i for i, s in enumerate(steps) if "git bundle verify" in s.get("run", "")
         )
         post_index = next(
             i
@@ -1334,6 +1341,10 @@ class TestWorkflowSafety:
         assert "add-mask" in push
         assert "git bundle verify" in push
         assert "merge-base" in push  # fast-forward-from-gated-head check
+        # atomic compare-and-swap: the remote ref must still be exactly the
+        # gated SHA at push time (PR #110 review: TOCTOU between the
+        # verify-live check and the ref update)
+        assert '--force-with-lease="refs/heads/$BRANCH:$LIVE_HEAD_SHA"' in push
 
     def test_ci_runs_the_scripts_test_suite(self):
         assert "python -m pytest scripts/tests -q" in CI_PATH.read_text(encoding="utf-8")

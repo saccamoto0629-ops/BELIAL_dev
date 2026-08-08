@@ -403,8 +403,17 @@ jobs:
           fi
           AUTH_B64=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
           echo "::add-mask::$AUTH_B64"
+          # PR #110 review r3740940621 (P2): the verify-live SHA check and
+          # the push must be atomic. The lease option below, with an
+          # EXPLICIT expected SHA, is a compare-and-swap: the remote ref
+          # must still be exactly the gated SHA at push time, or the push
+          # is rejected. Combined with the ancestry check above this is
+          # strictly STRICTER than an ordinary push -- it can never
+          # overwrite anything (unleased/blanket force pushes stay
+          # forbidden and are pinned by tests).
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH_B64" \
-            push origin "$FIX_TIP:refs/heads/$BRANCH"
+            push --force-with-lease="refs/heads/$BRANCH:$LIVE_HEAD_SHA" \
+            origin "$FIX_TIP:refs/heads/$BRANCH"
 
       # Post per-finding results as replies on the original review threads
       # (never new top-level comments). Uses the trusted findings.json from
