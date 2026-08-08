@@ -565,6 +565,86 @@ class TestGateCommand:
         assert [f["comment_id"] for f in doc["findings"]] == [3737068868]
 
 
+class TestVerifyLiveCommand:
+    """PR #110 review r3740883683: deliver-time re-check of the live PR."""
+
+    def run_verify(self, monkeypatch, tmp_path, live):
+        doc = {
+            "schema_version": codex_autofix.SCHEMA_VERSION,
+            "repo": EXPECTED_REPO,
+            "pr_number": 110,
+            "branch": "claude/belial-issue-109-l82nrf",
+            "event_head_sha": HEAD_SHA,
+            "live_head_sha": LIVE_SHA,
+            "review_id": REVIEW_ID,
+            "review_commit_id": HEAD_SHA,
+            "findings": [],
+        }
+        findings_path = tmp_path / "findings.json"
+        findings_path.write_text(json.dumps(doc), encoding="utf-8")
+        output_path = tmp_path / "github_output"
+        monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+        monkeypatch.setattr(
+            codex_autofix, "fetch_pull_request", lambda *a, **k: live
+        )
+        code = codex_autofix.main(["verify-live", "--findings", str(findings_path)])
+        outputs = {}
+        for line in output_path.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            outputs[key] = value
+        return code, outputs
+
+    def live(self, **overrides):
+        live = {
+            "state": "open",
+            "merged": False,
+            "draft": False,
+            "head": {
+                "ref": "claude/belial-issue-109-l82nrf",
+                "sha": LIVE_SHA,
+                "repo": {"full_name": EXPECTED_REPO},
+            },
+        }
+        live.update(overrides)
+        return live
+
+    def test_open_unmerged_nondraft_pr_proceeds(self, monkeypatch, tmp_path):
+        code, outputs = self.run_verify(monkeypatch, tmp_path, self.live())
+        assert code == 0
+        assert outputs["proceed"] == "true"
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"state": "closed"},
+            {"merged": True},
+            {"draft": True},
+            {"draft": None},
+        ],
+    )
+    def test_closed_merged_drafted_pr_skips(self, monkeypatch, tmp_path, overrides):
+        code, outputs = self.run_verify(
+            monkeypatch, tmp_path, self.live(**overrides)
+        )
+        assert code == 0
+        assert outputs["proceed"] == "false"
+
+    def test_changed_head_branch_skips(self, monkeypatch, tmp_path):
+        live = self.live()
+        live["head"]["ref"] = "another-branch"
+        code, outputs = self.run_verify(monkeypatch, tmp_path, live)
+        assert code == 0
+        assert outputs["proceed"] == "false"
+
+    def test_changed_head_repo_skips(self, monkeypatch, tmp_path):
+        live = self.live()
+        live["head"]["repo"] = {"full_name": "someone/else"}
+        code, outputs = self.run_verify(monkeypatch, tmp_path, live)
+        assert code == 0
+        assert outputs["proceed"] == "false"
+
+
 # --- Prompt rendering ------------------------------------------------------
 
 
@@ -1169,7 +1249,58 @@ class TestWorkflowSafety:
             c for c in workflow_run_commands(load_workflow()) if "git bundle create" in c
         ]
         assert len(package) == 1
-        assert "git status --porcelain" in package[0]
+        assert "status --porcelain" in package[0]
+
+    def test_post_claude_git_runs_only_as_the_isolated_user(self):
+        """PR #110 review r3740883679: after Claude (and PR dependency code)
+
+        ran, `.git` may carry attacker-set config such as `core.fsmonitor`
+        that git executes as a hook. Runner-user git on that repo would run
+        it on the same UID as the live credential broker, so every
+        post-Claude git command in the fix job must run as claudefix and
+        the workspace must never be chowned back to the runner.
+        """
+        workflow = load_workflow()
+        steps = workflow["jobs"]["fix"]["steps"]
+        claude_index = next(
+            i for i, s in enumerate(steps) if "claude -p" in s.get("run", "")
+        )
+        for step in steps[claude_index + 1 :]:
+            run = step.get("run", "")
+            # no reclaim of the (potentially hostile) workspace
+            assert "chown" not in run
+            # any git invocation must go through the isolated user
+            for line in run.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("git ") or " $(git " in line:
+                    raise AssertionError(f"runner-user git after Claude: {line!r}")
+        package = next(s for s in steps if "git bundle create" in s.get("run", ""))
+        assert "sudo -u claudefix -H git" in package["run"]
+
+    def test_deliver_rechecks_live_pr_state_before_side_effects(self):
+        """PR #110 review r3740883683: the fix job can run for a long time,
+
+        so the deliver job must re-fetch the live PR and gate the push and
+        the reply posting on it still being open / non-draft / unmerged.
+        """
+        workflow = load_workflow()
+        steps = workflow["jobs"]["deliver"]["steps"]
+        livecheck_index = next(
+            i for i, s in enumerate(steps) if "verify-live" in s.get("run", "")
+        )
+        push_index = next(
+            i for i, s in enumerate(steps) if "push origin" in s.get("run", "")
+        )
+        post_index = next(
+            i
+            for i, s in enumerate(steps)
+            if "codex_autofix.py reply" in s.get("run", "")
+            and "--validate-only" not in s.get("run", "")
+        )
+        assert livecheck_index < push_index < post_index
+        assert steps[livecheck_index].get("id") == "livecheck"
+        for index in (push_index, post_index):
+            assert "steps.livecheck.outputs.proceed == 'true'" in steps[index]["if"]
 
     def test_push_is_guarded_and_verifies_bundle_ancestry(self):
         commands = [

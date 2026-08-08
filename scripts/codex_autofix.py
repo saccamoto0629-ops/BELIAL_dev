@@ -620,6 +620,34 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_live(args: argparse.Namespace) -> int:
+    """Re-check the live PR immediately before the deliver job's side effects.
+
+    The fix job can run for a long time; if the PR was merged, closed, or
+    converted to draft in the meantime, pushing and replying would act on a
+    PR that no longer satisfies the trigger conditions. Emits proceed=true
+    only when the PR is still open, non-draft, unmerged, and on the same
+    head branch/repo the gate saw.
+    """
+    token = _require_env("GITHUB_TOKEN")
+    api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    with open(args.findings, encoding="utf-8") as handle:
+        doc = json.load(handle)
+    live = fetch_pull_request(api_url, doc["repo"], doc["pr_number"], token)
+    if live.get("state") != "open" or live.get("merged") is not False:
+        return _skip("pull request is no longer open at delivery time")
+    if live.get("draft") is not False:
+        return _skip("pull request is a draft at delivery time")
+    live_head = live.get("head") or {}
+    if live_head.get("ref") != doc["branch"]:
+        return _skip("pull request head ref changed before delivery")
+    live_head_repo = live_head.get("repo") or {}
+    if live_head_repo.get("full_name") != doc["repo"]:
+        return _skip("pull request head repository changed before delivery")
+    _write_github_output({"proceed": "true"})
+    return 0
+
+
 def cmd_reply(args: argparse.Namespace) -> int:
     api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
     with open(args.findings, encoding="utf-8") as handle:
@@ -670,6 +698,12 @@ def main(argv: list[str] | None = None) -> int:
         "--replies-path", required=True, help="path Claude must write replies.json to"
     )
     render.set_defaults(func=cmd_render_prompt)
+
+    verify_live = subparsers.add_parser(
+        "verify-live", help="re-check the live PR state before delivery side effects"
+    )
+    verify_live.add_argument("--findings", required=True)
+    verify_live.set_defaults(func=cmd_verify_live)
 
     reply = subparsers.add_parser("reply", help="post validated replies to finding threads")
     reply.add_argument("--findings", required=True)

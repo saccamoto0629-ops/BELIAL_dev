@@ -255,35 +255,42 @@ jobs:
           env PATH="$PATH" ANTHROPIC_BASE_URL=http://127.0.0.1:8377 ANTHROPIC_API_KEY=broker-managed
           claude -p --dangerously-skip-permissions < /tmp/codex-autofix-gate/prompt.md
 
-      - name: Reclaim workspace ownership from the isolated user
-        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" /tmp/codex-autofix
-
       # Package the result as pure data. The FULL `git status --porcelain`
       # (tracked AND untracked; PR #110 review r3740689735) must be clean:
       # an unstaged or forgotten file means the commit is partial -- e.g. a
       # regression test that was written but never added -- so refuse to
       # package it rather than ship half a fix.
-      - name: Package fix bundle and replies
+      #
+      # PR #110 review r3740883679: every git command here
+      # runs as the ISOLATED user, never as the runner. After Claude (and
+      # PR dependency code) ran, `.git` may carry attacker-set config such
+      # as `core.fsmonitor`, which git executes as a hook -- a runner-user
+      # `git status` would run that code on the same UID as the live
+      # credential broker. As claudefix, such hooks stay inside the
+      # already-untrusted session. The workspace is never chowned back;
+      # no later step in this job runs git or executes workspace content.
+      - name: Package fix bundle and replies (isolated user)
         env:
           LIVE_HEAD_SHA: ${{ needs.gate.outputs.live_head_sha }}
           BRANCH: ${{ needs.gate.outputs.branch }}
         run: |
           set -euo pipefail
-          if [ "$(git symbolic-ref --quiet --short HEAD || true)" != "$BRANCH" ]; then
+          gitc() { sudo -u claudefix -H git "$@"; }
+          if [ "$(gitc symbolic-ref --quiet --short HEAD || true)" != "$BRANCH" ]; then
             echo "::error::not on the PR head branch after the fix; refusing to package"
             exit 1
           fi
-          if [ -n "$(git status --porcelain)" ]; then
+          if [ -n "$(gitc status --porcelain)" ]; then
             echo "::error::worktree has uncommitted or untracked changes; refusing to package a partial fix"
-            git status --porcelain
+            gitc status --porcelain
             exit 1
           fi
           if [ ! -f /tmp/codex-autofix/replies.json ]; then
             echo "::error::Claude did not produce replies.json; nothing can be reported back"
             exit 1
           fi
-          if [ "$(git rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
-            git bundle create /tmp/codex-autofix/fix.bundle "$LIVE_HEAD_SHA..HEAD"
+          if [ "$(gitc rev-parse HEAD)" != "$LIVE_HEAD_SHA" ]; then
+            sudo -u claudefix -H git bundle create /tmp/codex-autofix/fix.bundle "$LIVE_HEAD_SHA..HEAD"
           else
             echo "No fix commits were created (findings stale/invalid); packaging replies only."
           fi
@@ -348,11 +355,25 @@ jobs:
           --replies /tmp/codex-autofix-result/replies.json
           --validate-only
 
+      # PR #110 review r3740883683 (P2): the fix job can run
+      # for a long time; re-check the LIVE PR state (open, non-draft,
+      # unmerged, same head branch/repo) immediately before pushing or
+      # replying. A PR merged/closed/drafted mid-run makes this a clean
+      # no-op skip instead of a push to a dead PR.
+      - name: Re-verify the live PR state before delivery
+        id: livecheck
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 _codex_autofix_trusted/scripts/codex_autofix.py verify-live
+          --findings /tmp/codex-autofix-gate/findings.json
+
       # Fast-forward push only (never --force), only to the PR head branch,
       # only of commits that build directly on the head SHA the gate saw.
       # Credentials are supplied ephemerally for this single command and
       # the derived value is masked so `set -x`-style leaks are impossible.
       - name: Push fix commits to the PR head branch
+        if: steps.livecheck.outputs.proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BRANCH: ${{ needs.gate.outputs.branch }}
@@ -389,6 +410,7 @@ jobs:
       # (never new top-level comments). Uses the trusted findings.json from
       # the gate job, so replies can only target the gated finding threads.
       - name: Reply to the Codex review threads
+        if: steps.livecheck.outputs.proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
