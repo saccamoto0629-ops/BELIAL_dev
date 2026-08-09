@@ -31,7 +31,7 @@ BELIAL Issue 実装時に参照するコンポーネント・ドキュメント�
 
 ## テストスイート実行コマンド
 
-ルートに `pytest.ini` / `conftest.py` / `pyproject.toml` は存在しない。**ディレクトリ単位で個別に**実行する(CI `.github/workflows/ci.yml` と同じ 7 スイート)。
+ルートに `pytest.ini` / `conftest.py` / `pyproject.toml` は存在しない。**ディレクトリ単位で個別に**実行する(CI `.github/workflows/ci.yml` と同じ 8 スイート = 7 コンポーネントスイート + `scripts/tests`)。
 
 ```bash
 python -m pytest backtest/tests -q
@@ -41,12 +41,15 @@ python -m pytest paper-signal/tests -q
 python -m pytest paper-execution/tests -q
 python -m pytest broker/tests -q
 python -m pytest execution/tests -q
+python -m pytest scripts/tests -q
 ```
 
+- `scripts/tests` は `scripts/` 配下のユニットテストと Codex autofix workflow 補助ロジックのテスト(Issue #109)。`scripts/` や autofix 関連の変更をレビュー・実装するときの対象スイートになる。
 - 依存は repo ルートの `requirements.txt`(`python -m pip install -r requirements.txt`)。
 - テストは外部ネットワーク・実 DB・実 S3・実 Discord に到達してはならない。
 - paper-execution は CI に Windows ジョブがある(SQLite ファイルハンドル / snapshot cleanup)。Windows 固有の副作用に触れる変更では Windows での挙動を考慮する。
-- CI はこの 7 スイートに加えて、リポジトリルートからの `broker` / `execution` パッケージ import smoke test を実行する。
+- CI はこの 8 スイートに加えて、リポジトリルートからの `broker` / `execution` パッケージ import smoke test と、execution scenario runner CLI(`python -m execution.scenario_runner`)を実行する。
+- スイート構成の正は常に `.github/workflows/ci.yml`。本表と食い違う場合は ci.yml に従い、本表の更新 Issue を立てる。
 
 ## 影響マトリクス評価項目
 

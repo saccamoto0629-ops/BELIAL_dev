@@ -106,7 +106,7 @@ Issue 番号が提示されていなくても機械的に停止はせず、2〜3
 
 1. **対象**: 変更したコンポーネントのスイート(例: `python -m pytest paper-execution/tests -q`)。
 2. **関連**: 影響マトリクスで参照が見つかった他コンポーネントのスイート。
-3. **全体**: 7 スイート(コマンド一覧は [references/repository-guide.md](references/repository-guide.md)。ルートに pytest 設定はなく、ディレクトリ単位で個別に実行)。実行要否は下の「全体 pytest の要否」で判断する。
+3. **全体**: 8 スイート(コマンド一覧は [references/repository-guide.md](references/repository-guide.md)。ルートに pytest 設定はなく、ディレクトリ単位で個別に実行)。実行要否は下の「全体 pytest の要否」で判断する。
 
 - 新規動作は正常系・異常系・境界値のテストを追加する。外部 API / Discord / S3 / 実 DB へは到達させない(Mock / tmp_path / monkeypatch)。
 - Windows 固有の副作用(SQLite ファイルハンドル等)に触れる場合は CI の Windows ジョブ対象かを確認する。
