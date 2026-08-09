@@ -47,9 +47,13 @@ python -m pytest scripts/tests -q
 - `scripts/tests` は `scripts/` 配下のユニットテストと Codex autofix workflow 補助ロジックのテスト(Issue #109)。`scripts/` や autofix 関連の変更をレビュー・実装するときの対象スイートになる。
 - 依存は repo ルートの `requirements.txt`(`python -m pip install -r requirements.txt`)。
 - テストは外部ネットワーク・実 DB・実 S3・実 Discord に到達してはならない。
-- paper-execution は CI に Windows ジョブがある(SQLite ファイルハンドル / snapshot cleanup)。Windows 固有の副作用に触れる変更では Windows での挙動を考慮する。
-- CI はこの 8 スイートに加えて、リポジトリルートからの `broker` / `execution` パッケージ import smoke test と、execution scenario runner CLI(`python -m execution.scenario_runner`)を実行する。
-- スイート構成の正は常に `.github/workflows/ci.yml`。本表と食い違う場合は ci.yml に従い、本表の更新 Issue を立てる。
+- CI はこの 8 スイートに加えて、以下の CI-only 付随チェックを実行する。該当モジュール・CLI に触れる変更では、pytest スイートだけでなく対応する付随チェックの観点(dry-run の無副作用・CLI 契約・出力形式)も確認する。正確なコマンドは `.github/workflows/ci.yml` の該当 step が正:
+  - リポジトリルートからの `broker` / `execution` パッケージ import smoke test(PR #87、Issues #74 / #75 / #77 / #78 / #105)
+  - execution scenario runner CLI(`python -m execution.scenario_runner`。Issue #77)
+  - shadow-mode CLI 契約チェック(`execution.shadow_runner` / `execution.shadow_report`。dry-run が何も作成しないこと、fixture / production signal cycle、既存 store への dry-run 不変性、report の text / `--json` / `--orphan-decisions` 出力。Issue #78 / PR #100)
+  - manual reconciliation CLI 契約チェック(`execution.reconciliation_runner`。dry-run が何も作成しないこと + 記録付き実行で監査 DB が 1 run 追記されること。Issue #105)
+- Windows ジョブは paper-execution / execution の 2 スイートに加え、scenario runner CLI と shadow-mode CLI を Windows コンソール(ANSI codepage、`PYTHONUTF8` 非設定)で再実行する(SQLite ファイルハンドル / snapshot cleanup / エンコーディング回帰)。Windows 固有の副作用・CLI 出力に触れる変更では Windows での挙動を考慮する。
+- スイート・付随チェック構成の正は常に `.github/workflows/ci.yml`。本表と食い違う場合は ci.yml に従い、本表の更新 Issue を立てる。
 
 ## 影響マトリクス評価項目
 
