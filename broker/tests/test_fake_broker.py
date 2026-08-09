@@ -1114,3 +1114,37 @@ def test_reissue_scenarios_are_deterministic_across_runs():
         return broker.fill_remaining("c-1", price=Decimal("2401.00"))
 
     assert run() == run()
+
+
+def test_rejected_reissue_pin_burns_no_sequence_number():
+    # PR #112 review r3 (rejection atomicity): a reissue script rejected
+    # over EITHER pinned id — the reissued pin included, while the original
+    # resolves sequentially — must not consume a FAKE-<n> sequence number.
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.FillImmediately(
+        price=Decimal("2400"), broker_order_id="TAKEN"
+    ))
+    broker.submit_order(make_request("c-1"))
+    broker.script_order("c-2", fb.PartiallyFillThenReissue(
+        fills=((Decimal("2400"), Decimal("4")),),
+        reissued_broker_order_id="TAKEN",  # original id stays unpinned
+    ))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request("c-2"))
+    # the rejected submit consumed nothing: the next unpinned order still
+    # receives the FIRST sequential id
+    broker.script_order("c-3", fb.FillImmediately(price=Decimal("2400")))
+    assert broker.submit_order(make_request("c-3")).broker_order_id == "FAKE-1"
+
+
+def test_unpinned_original_never_collides_with_a_pinned_sequential_reissue_id():
+    # pinning the reissued id to a FAKE-<n> value the sequence would hand
+    # out next must not collide with the unpinned original id
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.PartiallyFillThenReissue(
+        fills=((Decimal("2400"), Decimal("4")),),
+        reissued_broker_order_id="FAKE-1",
+    ))
+    result = broker.submit_order(make_request("c-1"))
+    assert result.broker_order_id == "FAKE-1"
+    assert result.superseded_broker_order_ids == ("FAKE-2",)

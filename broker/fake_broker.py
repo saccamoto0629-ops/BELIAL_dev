@@ -585,11 +585,10 @@ class FakeBroker:
                 )
             # Both ids are resolved (duplicate check included) BEFORE any
             # fill / timestamp side effect, keeping rejection atomicity.
-            original_id = self._resolve_pinned_or_next(
-                script.broker_order_id, request.client_order_id
-            )
-            reissued_id = self._resolve_pinned_or_next(
-                script.reissued_broker_order_id, request.client_order_id, taken={original_id}
+            original_id, reissued_id = self._resolve_reissue_ids(
+                script.broker_order_id,
+                script.reissued_broker_order_id,
+                request.client_order_id,
             )
             fills = self._build_fills(script.fills)
             # The submit answer already reflects the reissue (mirroring a
@@ -877,7 +876,7 @@ class FakeBroker:
     ) -> str:
         """Resolve one broker order id — a pinned value (duplicate-checked
         against every id ever assigned, chain ids included, plus the ids
-        ``taken`` earlier in the same submit) or the next free ``FAKE-<n>``."""
+        ``taken`` earlier in the same call) or the next free ``FAKE-<n>``."""
         reserved = self._assigned_broker_order_ids if not taken else (
             self._assigned_broker_order_ids | taken
         )
@@ -893,6 +892,35 @@ class FakeBroker:
             candidate = self._next_broker_order_id()
             if candidate not in reserved:
                 return candidate
+
+    def _resolve_reissue_ids(
+        self, original_pin: str | None, reissued_pin: str | None, client_order_id: str
+    ) -> tuple[str, str]:
+        """Resolve BOTH ids of a reissue script — every pinned id is
+        duplicate-checked BEFORE any sequence number is consumed (PR #112
+        review r3): a submit rejected over either pin burns no ``FAKE-<n>``,
+        keeping the rejection-atomicity contract. Sequential ids then skip
+        the pins, so an unpinned original can never collide with a pinned
+        reissued id either."""
+        pins = {pin for pin in (original_pin, reissued_pin) if pin is not None}
+        for pinned in pins:
+            if pinned in self._assigned_broker_order_ids:
+                raise BrokerInvalidRequestError(
+                    f"broker_order_id {pinned!r} is already assigned to "
+                    "another order; broker order IDs are unique across orders",
+                    client_order_id=client_order_id,
+                )
+        if original_pin is not None:
+            original_id = original_pin
+        else:
+            original_id = self._resolve_pinned_or_next(None, client_order_id, taken=pins)
+        if reissued_pin is not None:
+            reissued_id = reissued_pin
+        else:
+            reissued_id = self._resolve_pinned_or_next(
+                None, client_order_id, taken=pins | {original_id}
+            )
+        return original_id, reissued_id
 
     def _build_fills(self, price_qty_pairs: tuple[tuple[Decimal, Decimal], ...]) -> tuple[Fill, ...]:
         return tuple(

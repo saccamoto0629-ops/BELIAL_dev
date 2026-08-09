@@ -81,11 +81,13 @@ never leave this module — they are normalized into the common model's
   the superseded chain
 - 2xx submit answer with a partial fill AND a fully correlated
   ``orderReissueRejectTransaction`` (type ``ORDER_REISSUE_REJECT``, a
-  transaction id, ``clientExtensions.id`` correlation, and
+  transaction id, ``clientExtensions.id`` correlation,
   ``intendedReplacesOrderID`` = the filled/original order — the reject
-  transaction names the order it ATTEMPTED to replace) -> the remainder is
-  definitively dead: terminal ``CANCELLED`` with the partial fill kept on
-  the ORIGINAL id
+  transaction names the order it ATTEMPTED to replace — and ``units`` =
+  the exact remaining quantity of the attempted replacement) -> the
+  remainder is definitively dead: terminal ``CANCELLED`` with the partial
+  fill kept on the ORIGINAL id. Transaction quantities are validated
+  SIGNED against the request's side before normalization
 - ``get_order`` / ``cancel_order`` keep addressing by ``client_order_id``
   (the ``@<id>`` specifier), which OANDA resolves to the CURRENT order of a
   reissue chain; ``get_order`` walks the chain backwards over
@@ -702,11 +704,15 @@ class OandaDemoAdapter:
           fill transaction filled named by ``replacesOrderID`` (successful
           reissue) / ``intendedReplacesOrderID`` (reissue reject — the
           OANDA reject transaction names the order it ATTEMPTED to replace;
-          no replacement ever happened). A successful reissue additionally
-          carries the NEW order id as its transaction ``id`` (the
-          order-creating transaction's id is the new order's id, distinct
-          from the original) plus ``units`` equal to the exact remaining
-          quantity (old/new correlation + quantity consistency).
+          no replacement ever happened). BOTH branches must carry ``units``
+          equal to the exact remaining quantity, and every transaction
+          quantity (fill and reissue alike) must be SIGNED on the request's
+          side before it is normalized to the common model's unsigned
+          quantity — an opposite-signed answer is contradictory (PR #112
+          re-review). A successful reissue additionally carries the NEW
+          order id as its transaction ``id`` (the order-creating
+          transaction's id is the new order's id, distinct from the
+          original).
 
         Success -> ``PARTIALLY_FILLED`` with ``broker_order_id`` = the
         reissued (current) id and the original id in the superseded chain.
@@ -746,9 +752,17 @@ class OandaDemoAdapter:
         if not isinstance(original_id, str) or not original_id.strip():
             refuse("the fill transaction does not identify the original order")
         try:
-            filled_quantity = abs(
-                _parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")
-            )
+            raw_fill_units = _parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")
+        except BrokerError:
+            refuse("the fill transaction is malformed")
+        # The SIGNED direction must match the request BEFORE the value is
+        # normalized to the common model's unsigned quantity (PR #112
+        # re-review): a BUY request answered with SELL-signed transactions
+        # is a contradictory response, not a fill of this order.
+        if (raw_fill_units > 0) != (request.side is OrderSide.BUY):
+            refuse("the fill transaction describes units on the opposite side of the request")
+        filled_quantity = abs(raw_fill_units)
+        try:
             fill = Fill(
                 fill_id=self._tx_id(fill_tx, "orderFillTransaction.id"),
                 price=_parse_decimal(fill_tx.get("price"), "orderFillTransaction.price"),
@@ -786,6 +800,23 @@ class OandaDemoAdapter:
         replaces_field = "intendedReplacesOrderID" if has_reissue_reject else "replacesOrderID"
         if tx.get(replaces_field) != original_id:
             refuse(f"{key} does not reference the partially filled order it replaces")
+        # Quantity consistency holds for BOTH branches (PR #112 re-review):
+        # the transaction describes the (attempted) replacement, so its units
+        # must be the exact remainder — signed on the request's side. A
+        # reject with missing / inconsistent / opposite-signed units is as
+        # uninterpretable as a successful reissue with them, and must never
+        # confirm a terminal CANCELLED.
+        try:
+            raw_reissued_units = _parse_decimal(tx.get("units"), f"{key}.units")
+        except BrokerError:
+            refuse(f"{key} carries no interpretable units")
+        if (raw_reissued_units > 0) != (request.side is OrderSide.BUY):
+            refuse(f"{key} describes units on the opposite side of the request")
+        if abs(raw_reissued_units) != request.quantity - filled_quantity:
+            refuse(
+                f"{key} carries a quantity inconsistent with the remaining "
+                "quantity of the request"
+            )
 
         if has_reissue_reject:
             # The remainder's reissue was definitively rejected: no new order
@@ -803,17 +834,6 @@ class OandaDemoAdapter:
         new_order_id = tx_id
         if new_order_id == original_id:
             refuse("the reissued order id equals the original order id")
-        try:
-            reissued_units = abs(
-                _parse_decimal(tx.get("units"), "orderReissueTransaction.units")
-            )
-        except BrokerError:
-            refuse("the reissue transaction carries no interpretable units")
-        if reissued_units != request.quantity - filled_quantity:
-            refuse(
-                "the reissued quantity is inconsistent with the remaining "
-                "quantity of the request"
-            )
         return self._result_from_request(
             request,
             state=OrderState.PARTIALLY_FILLED,

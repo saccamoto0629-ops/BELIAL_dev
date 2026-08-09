@@ -1851,9 +1851,11 @@ def test_reissue_reject_translates_to_cancelled_on_the_original_id():
         "type": "ORDER_REISSUE_REJECT",
         # the reject transaction names the order it ATTEMPTED to replace
         # (intendedReplacesOrderID) — replacesOrderID belongs to the
-        # successful OrderReissueTransaction (PR #112 re-review)
+        # successful OrderReissueTransaction (PR #112 re-review) — and
+        # carries the attempted replacement's units (the exact remainder)
         "intendedReplacesOrderID": "1001",
         "clientExtensions": {"id": "c-1"},
+        "units": "3",
         "rejectReason": "MARKET_HALTED",
     }
     adapter, transport = make_adapter((status, payload))
@@ -1970,6 +1972,7 @@ def test_reissue_reject_with_broken_correlation_or_schema_fails_closed():
         "type": "ORDER_REISSUE_REJECT",
         "intendedReplacesOrderID": "1001",
         "clientExtensions": {"id": "c-1"},
+        "units": "3",
     }
     cases = (
         {**complete, "clientExtensions": {"id": "someone-else"}},
@@ -1989,6 +1992,12 @@ def test_reissue_reject_with_broken_correlation_or_schema_fails_closed():
         {**complete, "id": ""},
         {key: value for key, value in complete.items() if key != "type"},
         {**complete, "type": "ORDER_CANCEL"},
+        # units of the attempted replacement: missing / inconsistent /
+        # malformed / opposite-signed (PR #112 re-review r3)
+        {key: value for key, value in complete.items() if key != "units"},
+        {**complete, "units": "4"},
+        {**complete, "units": "garbage"},
+        {**complete, "units": "-3"},
         # the Codex example: two loosely matching fields alone must never
         # confirm a terminal CANCELLED
         {"orderID": "1001", "clientOrderID": "c-1"},
@@ -2354,9 +2363,63 @@ def test_reissue_path_fill_transaction_must_be_an_order_fill():
             "type": "ORDER_REISSUE_REJECT",
             "intendedReplacesOrderID": "1001",
             "clientExtensions": {"id": "c-1"},
+            "units": "3",
         }
         adapter, transport = make_adapter((status, payload))
         with pytest.raises(m.BrokerTimeoutError) as exc_info:
             adapter.submit_order(make_request(quantity=Decimal("5")))
         assert "reissue" in str(exc_info.value)
         assert len(transport.calls) == 1
+
+
+def test_reissue_quantities_must_be_signed_on_the_requests_side():
+    # PR #112 re-review r3: a BUY request answered with SELL-signed fill /
+    # reissue units is contradictory and must never be normalized away by
+    # abs() — neither branch may produce a result from it.
+    for overrides in (
+        {"fill_units": "-2"},                              # fill on the wrong side
+        {"reissue_overrides": {"units": "-3"}},            # reissue on the wrong side
+        {"fill_units": "-2", "reissue_overrides": {"units": "-3"}},  # both flipped
+    ):
+        status, payload = reissue_submit_response(
+            reissue_overrides=overrides.get("reissue_overrides"),
+        )
+        if "fill_units" in overrides:
+            payload["orderFillTransaction"]["units"] = overrides["fill_units"]
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+    # the reject branch refuses an opposite-side fill the same way
+    status, payload = fill_response(units="-2", price="155.000")
+    payload["orderReissueRejectTransaction"] = {
+        "id": "2002",
+        "type": "ORDER_REISSUE_REJECT",
+        "intendedReplacesOrderID": "1001",
+        "clientExtensions": {"id": "c-1"},
+        "units": "3",
+    }
+    adapter, _ = make_adapter((status, payload))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert "reissue" in str(exc_info.value)
+
+
+def test_sell_reissue_with_consistently_negative_units_is_interpreted():
+    # SELL requests carry negative units throughout — the sign validation
+    # must accept the consistent case, not just refuse the flipped one
+    status, payload = reissue_submit_response(
+        filled_units="-2", reissue_overrides={"units": "-3"}
+    )
+    adapter, _ = make_adapter((status, payload))
+    result = adapter.submit_order(
+        make_request(side=m.OrderSide.SELL, quantity=Decimal("5"))
+    )
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    assert result.side is m.OrderSide.SELL
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
