@@ -52,7 +52,7 @@ python -m pytest scripts/tests -q
   - execution scenario runner CLI(`python -m execution.scenario_runner`。Issue #77)
   - shadow-mode CLI 契約チェック(`execution.shadow_runner` / `execution.shadow_report`。dry-run が何も作成しないこと、fixture / production signal cycle、既存 store への dry-run 不変性、report の text / `--json` / `--orphan-decisions` 出力。Issue #78 / PR #100)
   - manual reconciliation CLI 契約チェック(`execution.reconciliation_runner`。dry-run が何も作成しないこと + 記録付き実行で監査 DB が 1 run 追記されること。Issue #105)
-- Windows ジョブは paper-execution / execution の 2 スイートに加え、scenario runner CLI と shadow-mode CLI を Windows コンソール(ANSI codepage、`PYTHONUTF8` 非設定)で再実行する(SQLite ファイルハンドル / snapshot cleanup / エンコーディング回帰)。Windows 固有の副作用・CLI 出力に触れる変更では Windows での挙動を考慮する。
+- Windows ジョブは paper-execution / execution の 2 スイートに加え、scenario runner CLI・shadow-mode CLI・manual reconciliation CLI(dry-run の無副作用 + 記録付き実行の JSON 出力)を Windows コンソール(ANSI codepage、`PYTHONUTF8` 非設定)で再実行する(SQLite ファイルハンドル / snapshot cleanup / エンコーディング回帰 / 終了コード契約)。Windows 固有の副作用・CLI 出力に触れる変更では Windows での挙動を考慮する。
 - スイート・付随チェック構成の正は常に `.github/workflows/ci.yml`。本表と食い違う場合は ci.yml に従い、本表の更新 Issue を立てる。
 
 ## 影響マトリクス評価項目
