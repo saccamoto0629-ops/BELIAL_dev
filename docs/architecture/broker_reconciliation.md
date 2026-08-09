@@ -84,8 +84,8 @@ BrokerOrderReconciliationRepairService   ← execution/broker_reconciliation_rep
 
 1. `validate_order_state_transition(内部状態, Broker 状態)` が通ること
 2. Broker snapshot が保存済み intent と一致すること(symbol / side / order_type / quantity / requested_price)
-3. `broker_order_id` が `NULL → 値 → 同値` の連鎖を壊さないこと
-4. **Broker snapshot の `broker_order_id` が他の Execution Request に割当済みでないこと**(`broker_order_id` は execution order テーブル**全体で UNIQUE**。他注文が所有する ID を反映しようとすると `record_order_result` が制約違反で全体 rollback する。所有者が照合中の注文自身である場合は競合ではない)
+3. `broker_order_id` が `NULL → 値` の連鎖を壊さないこと。値の変更は**監査された Order Reissue の場合のみ**許容(Issue #102: 観測 snapshot の `superseded_broker_order_ids` が保存済み ID を記録していること。正確な chain-append 規則は次項の snapshot 更新契約が強制する。記録しない ID 変更は `manual_review`)
+4. **Broker snapshot が名指す全 broker order ID(current + superseded chain)が他の Execution Request に割当済みでないこと**(broker order ID は execution order テーブル**全体で一意**(chain 含む)。他注文が所有する ID を反映しようとすると `record_order_result` が制約違反 / 重複 scan で全体 rollback する。所有者が照合中の注文自身である場合は競合ではない)
 5. history に anchor された snapshot があれば `validate_order_result_update(anchored, observed)` が通ること
 6. `updated_at_utc` が逆行しないこと
 

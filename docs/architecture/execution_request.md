@@ -102,7 +102,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - `client_order_id` TEXT NOT NULL UNIQUE(1:1・不変)
 - `submission_phase` TEXT NOT NULL(CHECK: 上記 3 値)
 - `order_state` TEXT NULL(CHECK: `OrderState` の値集合。`created` ⇔ NULL を CHECK で強制)
-- `broker_order_id` TEXT NULL **UNIQUE(テーブル全体で一意。PR #91 レビュー Major 3)**: 1 つの Broker 注文が複数の execution request に関連付くことを DB レベルで拒否する
+- `broker_order_id` TEXT NULL **UNIQUE(テーブル全体で一意。PR #91 レビュー Major 3)**: 1 つの Broker 注文が複数の execution request に関連付くことを DB レベルで拒否する。**Order Reissue(Issue #102)後は常に「現在操作対象(current actionable)の ID」**を保持し、過去 ID は history 行と snapshot の `superseded_broker_order_ids` chain に監査可能なまま残る(一意性は復元時 scan が過去 chain ID まで含めて検証する。下記)
 - `last_state_reason` TEXT NULL
 - `last_order_result_json` TEXT NULL(**最新の完全な `OrderResult` snapshot**。Decimal は正準文字列・日時は UTC ISO・fills 含めて損失なく・キーソート済みで JSON 化)
 - `created_at_utc` / `updated_at_utc` TEXT NOT NULL
@@ -114,7 +114,7 @@ Issue #74 の選択肢のうち **「CREATED / SUBMITTING を注文状態では�
 - current 行の snapshot は「**最後に snapshot を保存した history 行**」と**バイト一致**(canonical JSON)。**追跡状態が UNKNOWN の間も例外にしない**(state-only UNKNOWN は snapshot に触れないため、一致が維持されるはずである)。current 行の snapshot だけを古いものへ差し替える改竄は必ず検出される。
 - **連続する snapshot 同士は `validate_order_result_update()` で pairwise 検証**される(履歴上でも fill・数量・ID・時刻の巻き戻しは存在できない)。
 - 各 snapshot はそれ自身の history 行(state / `broker_order_id` は **NULL 含む対称比較** / 時刻)および保存済み intent と一致しなければならない。
-- `broker_order_id` は **history 全行にわたる chain**(NULL → 値は一度きり、以後同一値)としても検証される。
+- `broker_order_id` は **history 全行にわたる chain** としても検証される: NULL → 値は一度きり、以後の**値の変更は監査された Order Reissue の場合のみ**(Issue #102: 変更する行は完全 snapshot を持ち、その snapshot の `superseded_broker_order_ids` が直前の ID を記録していること。正確な chain-append 規則は pairwise の `validate_order_result_update()` が強制する。state-only 行は ID を変更できない)。
 - snapshot を持たない history 行は「最初の created → pending 行」と「state-only UNKNOWN 行」だけに限られる(確定観測が snapshot を欠くことは破損)。
 
 `execution_order_state_history`(状態履歴。変更理由の追跡):
@@ -182,7 +182,7 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 
 - 遷移を既存 `validate_order_state_transition()` で検証する(不正遷移は `ValueError`。terminal からの離脱・UNKNOWN の不許可解決はここで拒否される)。
 - **current 更新・snapshot 更新・history 追加を同一 `BEGIN IMMEDIATE` トランザクション**で確定する(すべて or どれも無し)。`broker_order_id` の一意性競合時は current・history とも rollback し `ExecutionOrderConflictError` を送出する。
-- `broker_order_id` は NULL → 値の一度きり。以後**別 ID への差し替えを拒否**する。state-only 観測が ID を含まない場合(`None`)は保存済みの値を維持するが、**完全 snapshot が既知の ID を欠落させること(値 → None)も拒否**する。accepted / partially_filled / filled は更新後に broker_order_id が既知であることを要求する(`OrderResult` の構築不変条件の鏡像)。
+- `broker_order_id` は NULL → 値の一度きり。以後の**値の変更は監査された Order Reissue(Issue #102)としてのみ許可**する: 新 snapshot が保存済み ID を `superseded_broker_order_ids` chain に記録し、anchored snapshot に対する `validate_order_result_update()` の chain-append 規則(旧 chain + 旧 current ID が新 chain の prefix)を満たす場合に限り、current 行の ID を新 ID へ更新する(旧 ID は history と snapshot chain に監査可能なまま残る)。**無断の差し替え(chain に保存済み ID を記録しない ID 変更)は拒否**する。state-only 観測が ID を含まない場合(`None`)は保存済みの値を維持するが、**完全 snapshot が既知の ID を欠落させること(値 → None)も拒否**する。accepted / partially_filled / filled は更新後に broker_order_id が既知であることを要求する(`OrderResult` の構築不変条件の鏡像)。
 - `updated_at_utc` を**逆行させない**(過去時刻の観測は `ValueError`)。
 
 すべての公開 API(読み取り含む)は **「open → schema 検証 → トランザクション → row restore / update」の一連の流れ**で動作する(PR #91 レビュー r2 Major 3)。schema 検証に失敗した DB からは読み取りも書き込みも行われない。さらに書き込みは、更新前に対象注文の **bundle 全体(current 行 + history + anchor)を検証**するため、改竄された DB が更新判断に影響することはない。
@@ -216,7 +216,7 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 - UNKNOWN は**そのまま保存**され、phase は `submitting` に留まる。
 - `list_unknown_orders()` が **照会対象**(`order_state = 'unknown'`)を抽出する。
 - `list_unresolved_submissions()`(Issue #75)は、UNKNOWN に加えて **`submitting` phase のまま `pending` に留まる注文**(送信試行後に Broker 観測が一度も記録されないまま停止したケース)も照会対象として返す read-only API。Broker が注文を保持しうる submission が reconciliation の視界から消えないことを保証する([Safety Gate](safety_gate.md))。
-- `list_in_flight_orders()`(Issue #103)は、**終端でない全注文**(`order_state` が pending / accepted / partially_filled / unknown)だけを返す read-only APIであり、終端状態を in-flight と誤分類しない。`list_reconciliation_orders()`(同)は Broker state を持つ全注文(in-flight + terminal、`created` は除外)を返し、Broker 照合の完全な比較対象抽出に使う。終端状態は BELIAL 内では不変でも、Broker の外部事実と矛盾していないか監査する必要があるためである。`list_client_order_ids()`(同)は Broker 側にのみ存在する注文を判定するための `client_order_id` 全件(終端・created 含む)を返す。`get_execution_order_by_broker_order_id()`(同)は **`broker_order_id` を現在所有している注文**を返す(DB 全体 UNIQUE のため高々 1 件。未割当は None)— Broker 観測を反映可能と判断する前に、その ID が別 Execution Request に割当済みでないことを確認するために使う。いずれも missing DB を作成せず、状態行を返す 3 APIは行ごとに完全な bundle 検証を通す([Broker Reconciliation](broker_reconciliation.md))。
+- `list_in_flight_orders()`(Issue #103)は、**終端でない全注文**(`order_state` が pending / accepted / partially_filled / unknown)だけを返す read-only APIであり、終端状態を in-flight と誤分類しない。`list_reconciliation_orders()`(同)は Broker state を持つ全注文(in-flight + terminal、`created` は除外)を返し、Broker 照合の完全な比較対象抽出に使う。終端状態は BELIAL 内では不変でも、Broker の外部事実と矛盾していないか監査する必要があるためである。`list_client_order_ids()`(同)は Broker 側にのみ存在する注文を判定するための `client_order_id` 全件(終端・created 含む)を返す。`get_execution_order_by_broker_order_id()`(同)は **`broker_order_id` を所有している注文**を返す(現在 ID の column に加え、Issue #102 の reissue で過去になった ID も current snapshot の `superseded_broker_order_ids` chain から解決する。重複 scan により高々 1 件。未割当は None)— Broker 観測を反映可能と判断する前に、その ID が別 Execution Request に割当済みでないことを確認するために使う。いずれも missing DB を作成せず、状態行を返す 3 APIは行ごとに完全な bundle 検証を通す([Broker Reconciliation](broker_reconciliation.md))。
 - UNKNOWN の解決は、後続照会の結果(完全な `OrderResult`)を `record_order_result` で記録することによってのみ行われる。許可される解決先は既存遷移表のとおり(accepted / partially_filled / filled / cancelled / rejected)で、**保存済み snapshot の fill を失う解決(例: 部分約定既知のまま fill 無しの CANCELLED / REJECTED へ確定)は `validate_order_result_update()` が拒否**する。
 - store / API は UNKNOWN を「未発注」「拒否」「再送可」へ**自動変換しない**。即時再送可能状態として扱わない。
 - 自動照会 runner・**定期** reconciliation は**非スコープ**(未実装)。Broker 照合の**差分検出**(内部状態を変更しない照合・分類・記録)は Issue #103 で、`auto_repair_candidate` に分類された注文状態の**安全な修復**(既存状態機械経由・冪等・`expected_current_state` による compare-and-set。stale / conflict / manual review は変更しない)は Issue #104 で実装済み([Broker Reconciliation](broker_reconciliation.md))。いずれもサービス API の明示呼び出しのみで、scheduler への組み込みはない。
@@ -244,8 +244,8 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
   - **構造(列・NOT NULL / PK / UNIQUE / FK / index)は PRAGMA signature が正**: `PRAGMA user_version` に加え、`PRAGMA table_info` / `index_list` / `index_info` / `foreign_key_list` から構築した構造 signature を参照 schema と比較する。
   - **DDL は token 正規化比較(r3 Minor 1)**: `sqlite_master.sql` のバイト一致は要求しない。quoted identifier(`"execution_orders"` 等)・空白 / 改行・keyword の大文字小文字・コメント・冗長な括弧(単一 atom を包む括弧と二重括弧のみ、意味を保存できる collapse に限定)は SQLite 上同値なため吸収する。**設計判断**: CHECK 式のみの抽出比較ではなく DDL 全体の token 比較を選んだ。PRAGMA から見えない意味論は CHECK 式だけでなく `WITHOUT ROWID` / `AUTOINCREMENT` / `COLLATE` 等にも存在し、token 比較はそれらを一括で防御できる。CHECK 式内の**文字列 literal は大文字小文字を保存**して比較し(`'created'` → `'CREATED'` は拒否)、正規化で同値と証明できない差分はすべて不一致として扱う(fail closed。同値だが表記が大きく異なる式の誤拒否は残るが、安全側)。
 - **migration 経路はリリース済み v2 からの additive 移行(上記)のみ**: partial schema(片側テーブル欠損)・制約欠損の同名テーブル・未知 version・他コンポーネントの DB は、いずれも **DB を一切変更せず** `ExecutionSchemaError` で明示的に失敗する(自動補完・黙った rebuild をしない)。v1 は未リリース schema のため migration を提供しない。
-- **復元時の整合検証**(PR #91 レビュー Major 2 / r2 Major 1): 注文を返すすべての読み取りは schema 検証の後、enum 値・UTC・非空 ID / reason・**current / history chain**(先頭は created → pending、リンク欠落なし、各ペアが許可遷移、末尾が current 行と一致)・phase 整合・broker_order_id の chain・**snapshot の history anchor**(上記)を再検証し、帯域外編集で不整合になった DB は `ExecutionIntegrityError` で拒否する。**DB 全体の `broker_order_id` 重複 scan** も読み取り・書き込みの両方で実施し、重複を保持する DB からは一切復元しない(PR #91 レビュー r2 Major 3)。
-- snapshot JSON は**厳格に**解析する(PR #91 レビュー r2 Minor 1): top-level と fills の**キー集合が期待集合と完全一致**しなければならず、未知 field・欠落 field は拒否する。
+- **復元時の整合検証**(PR #91 レビュー Major 2 / r2 Major 1): 注文を返すすべての読み取りは schema 検証の後、enum 値・UTC・非空 ID / reason・**current / history chain**(先頭は created → pending、リンク欠落なし、各ペアが許可遷移、末尾が current 行と一致)・phase 整合・broker_order_id の chain・**snapshot の history anchor**(上記)を再検証し、帯域外編集で不整合になった DB は `ExecutionIntegrityError` で拒否する。**DB 全体の `broker_order_id` 重複 scan** も読み取り・書き込みの両方で実施し、重複を保持する DB からは一切復元しない(PR #91 レビュー r2 Major 3)。scan は **current ID column に加えて current snapshot の `superseded_broker_order_ids` chain の ID も対象**とし、「現在 ID か過去 ID かに関係なく、1 つの Broker 注文 ID は 1 つの execution request にしか属せない」ことを検証する(Issue #102)。
+- snapshot JSON は**厳格に**解析する(PR #91 レビュー r2 Minor 1): top-level と fills の**キー集合が期待集合と完全一致**しなければならず、未知 field・欠落 field は拒否する。**唯一の例外(Issue #102 の後方互換)**: reissue 対応以前に書かれた snapshot は `superseded_broker_order_ids` キーを持たないため、**このキーの欠落だけは「空 chain」として受理**する(当時 reissue は表現不能だったので空 chain が当時の意味そのもの。書き込みは常にキーを含む。schema DDL は不変で migration は不要)。
 - 読み取り API は存在しない DB ファイルを**作成しない**(missing → None / 空)。存在するファイルの読み取りエラーは握り潰さず伝播する。更新 API も存在しないファイルを作成せず `ExecutionOrderNotFoundError` にする。
 
 ## 非スコープ(Issue #74 時点で未実装)

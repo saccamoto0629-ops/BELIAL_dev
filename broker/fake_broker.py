@@ -16,6 +16,16 @@ Behaviour is injected per ``client_order_id`` as a *scripted scenario*
     broker.script_order("c-3", TimeoutOrder())
     broker.script_cancel("c-4", FailCancellation(reason="already filled"))
 
+Order Reissue (Issue #102) is scriptable deterministically:
+``PartiallyFillThenReissue`` answers the submit with a partial fill whose
+remainder was reissued under a NEW broker order id (original id kept in the
+``superseded_broker_order_ids`` audit chain); ``ReissueRejected`` answers
+with the partial fill kept and the remainder definitively dead (terminal
+``CANCELLED`` on the original id); ``ReissueInformationLost`` mirrors the
+fail-closed adapters (``BrokerTimeoutError``, order ``UNKNOWN``). Further
+chain steps are driven by ``reissue_remainder()`` / ``fill_remaining()``,
+each validated through ``validate_order_result_update``.
+
 Unscripted orders use ``default_script`` (immediate fill by default).
 Scenario values and configuration-API inputs (``script_order`` /
 ``script_cancel`` / ``set_positions`` / ``set_account_state``) are validated
@@ -153,6 +163,91 @@ class PartiallyFill:
 
 
 @dataclass(frozen=True)
+class PartiallyFillThenReissue:
+    """Partial fill, then the broker REISSUES the remaining quantity as a new
+    broker order under a NEW broker order id (Issue #102, OANDA-style
+    lifecycle). The submit snapshot is ``PARTIALLY_FILLED`` with
+    ``broker_order_id`` set to the reissued (current) id and the original id
+    recorded in ``superseded_broker_order_ids`` — mirroring a real submit
+    response that carries both the fill and the reissue transaction.
+
+    ``broker_order_id`` pins the ORIGINAL id, ``reissued_broker_order_id``
+    pins the NEW current id (each defaults to the next ``FAKE-<n>``). Use
+    :meth:`FakeBroker.reissue_remainder` / :meth:`FakeBroker.fill_remaining`
+    for further chain steps after the submit."""
+
+    fills: tuple[tuple[Decimal, Decimal], ...]
+    broker_order_id: str | None = None
+    reissued_broker_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fills, tuple) or not self.fills:
+            raise BrokerInvalidRequestError(
+                f"PartiallyFillThenReissue.fills must be a non-empty tuple, got {self.fills!r}"
+            )
+        for entry in self.fills:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise BrokerInvalidRequestError(
+                    "each PartiallyFillThenReissue.fills entry must be a "
+                    f"(price, quantity) tuple, got {entry!r}"
+                )
+            price, quantity = entry
+            _require_valid_price(price, "PartiallyFillThenReissue price")
+            _require_valid_price(quantity, "PartiallyFillThenReissue quantity")
+        _require_optional_broker_order_id(
+            self.broker_order_id, "PartiallyFillThenReissue.broker_order_id"
+        )
+        _require_optional_broker_order_id(
+            self.reissued_broker_order_id, "PartiallyFillThenReissue.reissued_broker_order_id"
+        )
+        if (
+            self.broker_order_id is not None
+            and self.broker_order_id == self.reissued_broker_order_id
+        ):
+            raise BrokerInvalidRequestError(
+                "PartiallyFillThenReissue requires distinct original and reissued "
+                f"broker order ids, got {self.broker_order_id!r} twice"
+            )
+
+
+@dataclass(frozen=True)
+class ReissueRejected:
+    """Partial fill, then the broker REJECTS the reissue of the remaining
+    quantity (Issue #102, ``orderReissueRejectTransaction`` analogue): the
+    partial fills stand, the remainder is definitively dead, so the submit
+    snapshot is terminal ``CANCELLED`` with the fills kept and the ORIGINAL
+    broker order id (no new order was ever created, so the chain stays
+    empty). ``broker_order_id`` optionally pins the original id."""
+
+    fills: tuple[tuple[Decimal, Decimal], ...]
+    broker_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fills, tuple) or not self.fills:
+            raise BrokerInvalidRequestError(
+                f"ReissueRejected.fills must be a non-empty tuple, got {self.fills!r}"
+            )
+        for entry in self.fills:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise BrokerInvalidRequestError(
+                    f"each ReissueRejected.fills entry must be a (price, quantity) tuple, got {entry!r}"
+                )
+            price, quantity = entry
+            _require_valid_price(price, "ReissueRejected price")
+            _require_valid_price(quantity, "ReissueRejected quantity")
+        _require_optional_broker_order_id(self.broker_order_id, "ReissueRejected.broker_order_id")
+
+
+@dataclass(frozen=True)
+class ReissueInformationLost:
+    """The broker's answer indicates a reissue but the information needed to
+    interpret it is missing / malformed / uncorrelated (Issue #102): the
+    outcome must not be guessed, so submit raises ``BrokerTimeoutError`` and
+    records the order as ``UNKNOWN`` — resolved by a later query, never by
+    resending (mirrors the adapters' fail-closed contract)."""
+
+
+@dataclass(frozen=True)
 class RejectOrder:
     """Broker definitively rejects the order (state ``REJECTED``)."""
 
@@ -175,11 +270,27 @@ class FailCommunication:
 
 
 SubmitScript = Union[
-    FillImmediately, StayPending, PartiallyFill, RejectOrder, TimeoutOrder, FailCommunication
+    FillImmediately,
+    StayPending,
+    PartiallyFill,
+    PartiallyFillThenReissue,
+    ReissueRejected,
+    ReissueInformationLost,
+    RejectOrder,
+    TimeoutOrder,
+    FailCommunication,
 ]
 
 _SUBMIT_SCRIPT_TYPES = (
-    FillImmediately, StayPending, PartiallyFill, RejectOrder, TimeoutOrder, FailCommunication
+    FillImmediately,
+    StayPending,
+    PartiallyFill,
+    PartiallyFillThenReissue,
+    ReissueRejected,
+    ReissueInformationLost,
+    RejectOrder,
+    TimeoutOrder,
+    FailCommunication,
 )
 
 
@@ -406,6 +517,25 @@ class FakeBroker:
                 client_order_id=request.client_order_id,
             )
 
+        if isinstance(script, ReissueInformationLost):
+            # Issue #102 fail-closed analogue: the answer indicated a reissue
+            # but could not be interpreted — nothing about the outcome may be
+            # guessed, so the order is recorded UNKNOWN (the broker may hold
+            # it, may have partially filled it) and the caller resolves it by
+            # a later query, never by resending.
+            self._orders[request.client_order_id] = self._result(
+                request,
+                state=OrderState.UNKNOWN,
+                broker_order_id=None,
+                fills=(),
+            )
+            raise BrokerTimeoutError(
+                "broker response carried reissue information that could not be "
+                "interpreted; the outcome is unknown and is resolved by a later "
+                "query, never by resending",
+                client_order_id=request.client_order_id,
+            )
+
         # Rejection atomicity (PR #96 review r2): every branch below runs in
         # the same strict order -- (1) side-effect-free validation, (2)
         # broker_order_id resolution incl. the duplicate check, (3) fill /
@@ -445,6 +575,53 @@ class FakeBroker:
                 broker_order_id=broker_order_id,
                 fills=fills,
             )
+        elif isinstance(script, PartiallyFillThenReissue):
+            total = sum((quantity for _, quantity in script.fills), Decimal(0))
+            if not (0 < total < request.quantity):
+                raise BrokerInvalidRequestError(
+                    f"PartiallyFillThenReissue script must fill 0 < total < requested "
+                    f"quantity ({request.quantity}), got {total}",
+                    client_order_id=request.client_order_id,
+                )
+            # Both ids are resolved (duplicate check included) BEFORE any
+            # fill / timestamp side effect, keeping rejection atomicity.
+            original_id = self._resolve_pinned_or_next(
+                script.broker_order_id, request.client_order_id
+            )
+            reissued_id = self._resolve_pinned_or_next(
+                script.reissued_broker_order_id, request.client_order_id, taken={original_id}
+            )
+            fills = self._build_fills(script.fills)
+            # The submit answer already reflects the reissue (mirroring a
+            # broker response carrying the fill AND the reissue transaction):
+            # the CURRENT actionable id is the reissued one, the original id
+            # is auditable in the superseded chain (Issue #102).
+            result = self._result(
+                request,
+                state=OrderState.PARTIALLY_FILLED,
+                broker_order_id=reissued_id,
+                fills=fills,
+                superseded_broker_order_ids=(original_id,),
+            )
+        elif isinstance(script, ReissueRejected):
+            total = sum((quantity for _, quantity in script.fills), Decimal(0))
+            if not (0 < total < request.quantity):
+                raise BrokerInvalidRequestError(
+                    f"ReissueRejected script must fill 0 < total < requested quantity "
+                    f"({request.quantity}), got {total}",
+                    client_order_id=request.client_order_id,
+                )
+            broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
+            fills = self._build_fills(script.fills)
+            # The reissue of the remainder was definitively rejected: the
+            # partial fills stand and the remainder is dead — terminal
+            # CANCELLED on the ORIGINAL id, no chain (no new order exists).
+            result = self._result(
+                request,
+                state=OrderState.CANCELLED,
+                broker_order_id=broker_order_id,
+                fills=fills,
+            )
         elif isinstance(script, FillImmediately):
             # Explicit None checks — never truthiness, which would silently
             # skip a (mis-)configured Decimal("0") to a fallback price (PR #87).
@@ -471,10 +648,12 @@ class FakeBroker:
         else:  # unreachable while script_order()/__init__ validate script types
             raise BrokerInvalidRequestError(f"unknown submit script {script!r}")
 
-        # The ID joins the assignment set only together with its stored order,
-        # so a submit rejected above leaves neither an order nor a burned ID.
-        if result.broker_order_id is not None:
-            self._assigned_broker_order_ids.add(result.broker_order_id)
+        # The IDs join the assignment set only together with their stored
+        # order, so a submit rejected above leaves neither an order nor a
+        # burned ID. Superseded (reissued-away) ids stay in the set too:
+        # broker order ids are unique across orders INCLUDING past chain ids
+        # (Issue #102 audit contract).
+        self._assigned_broker_order_ids.update(result.all_broker_order_ids)
         self._orders[request.client_order_id] = result
         return result
 
@@ -500,6 +679,9 @@ class FakeBroker:
             )
         cancelled = OrderResult(
             client_order_id=current.client_order_id,
+            # Cancellation targets the CURRENT actionable broker order and
+            # keeps the audit chain (Issue #102): a reissued order cancels
+            # under its reissued id with the superseded ids preserved.
             broker_order_id=current.broker_order_id,
             state=OrderState.CANCELLED,
             symbol=current.symbol,
@@ -512,6 +694,7 @@ class FakeBroker:
             average_fill_price=current.average_fill_price,
             updated_at_utc=self._now(),
             fills=current.fills,
+            superseded_broker_order_ids=current.superseded_broker_order_ids,
         )
         # Full update validation (state pair + content invariants, PR #87)
         validate_order_result_update(current, cancelled)
@@ -526,6 +709,119 @@ class FakeBroker:
                 client_order_id=client_order_id,
             )
         return result
+
+    # --- deterministic post-submit lifecycle (Issue #102) --------------------
+    #
+    # Test-side drivers that advance an order AFTER its submit — no network,
+    # no sleep, no randomness. Every step goes through the full
+    # validate_order_result_update contract, so FakeBroker can never record a
+    # lifecycle the common state machine would reject.
+
+    def reissue_remainder(
+        self,
+        client_order_id: str,
+        *,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        reissued_broker_order_id: str | None = None,
+    ) -> OrderResult:
+        """A further partial fill on the CURRENT broker order, whose still
+        remaining quantity the broker reissues under a NEW broker order id
+        (Issue #102 chain step: PARTIALLY_FILLED -> PARTIALLY_FILLED with an
+        audited id change). Requires a working, broker-acknowledged order and
+        ``fill_quantity`` strictly below the remaining quantity."""
+        _require_id(client_order_id)
+        _require_valid_price(fill_price, "fill_price")
+        _require_valid_price(fill_quantity, "fill_quantity")
+        _require_optional_broker_order_id(reissued_broker_order_id, "reissued_broker_order_id")
+        with self._lock:
+            current = self._require_working_order(client_order_id)
+            if fill_quantity >= current.remaining_quantity:
+                raise BrokerInvalidRequestError(
+                    f"reissue_remainder must leave a remainder: fill_quantity "
+                    f"{fill_quantity} >= remaining {current.remaining_quantity} "
+                    "(use fill_remaining for the final fill)",
+                    client_order_id=client_order_id,
+                )
+            new_id = self._resolve_pinned_or_next(reissued_broker_order_id, client_order_id)
+            fill = Fill(self._next_fill_id(), fill_price, fill_quantity, self._now())
+            updated = self._advanced(
+                current,
+                state=OrderState.PARTIALLY_FILLED,
+                broker_order_id=new_id,
+                superseded=current.superseded_broker_order_ids + (current.broker_order_id,),
+                new_fill=fill,
+            )
+            self._assigned_broker_order_ids.add(new_id)
+            self._orders[client_order_id] = updated
+            return updated
+
+    def fill_remaining(self, client_order_id: str, *, price: Decimal) -> OrderResult:
+        """Fill the whole remaining quantity of a working order at ``price``
+        (Issue #102 final-fill step: the CURRENT broker order — reissued or
+        not — completes, keeping the audit chain)."""
+        _require_id(client_order_id)
+        _require_valid_price(price, "price")
+        with self._lock:
+            current = self._require_working_order(client_order_id)
+            fill = Fill(self._next_fill_id(), price, current.remaining_quantity, self._now())
+            updated = self._advanced(
+                current,
+                state=OrderState.FILLED,
+                broker_order_id=current.broker_order_id,
+                superseded=current.superseded_broker_order_ids,
+                new_fill=fill,
+            )
+            self._orders[client_order_id] = updated
+            return updated
+
+    def _require_working_order(self, client_order_id: str) -> OrderResult:
+        current = self._orders.get(client_order_id)
+        if current is None:
+            raise BrokerOrderNotFoundError(
+                f"no order under client_order_id {client_order_id!r}",
+                client_order_id=client_order_id,
+            )
+        if current.state not in (OrderState.ACCEPTED, OrderState.PARTIALLY_FILLED):
+            raise BrokerInvalidRequestError(
+                f"order under client_order_id {client_order_id!r} is not working "
+                f"(state {current.state.value!r}); only accepted / partially_filled "
+                "orders can take further fills or reissues",
+                client_order_id=client_order_id,
+            )
+        return current
+
+    def _advanced(
+        self,
+        current: OrderResult,
+        *,
+        state: OrderState,
+        broker_order_id: str,
+        superseded: tuple[str, ...],
+        new_fill: Fill,
+    ) -> OrderResult:
+        fills = current.fills + (new_fill,)
+        filled = sum((f.quantity for f in fills), Decimal(0))
+        updated = OrderResult(
+            client_order_id=current.client_order_id,
+            broker_order_id=broker_order_id,
+            state=state,
+            symbol=current.symbol,
+            side=current.side,
+            order_type=current.order_type,
+            requested_quantity=current.requested_quantity,
+            filled_quantity=filled,
+            remaining_quantity=current.requested_quantity - filled,
+            requested_price=current.requested_price,
+            average_fill_price=weighted_average_price(fills),
+            updated_at_utc=self._now(),
+            fills=fills,
+            superseded_broker_order_ids=superseded,
+        )
+        # Full update validation (state pair + content invariants, PR #87 /
+        # Issue #102 chain-append rule) — same contract as cancel_order.
+        validate_order_result_update(current, updated)
+        return updated
 
     def list_orders(self) -> tuple[OrderResult, ...]:
         """Every order this broker currently holds, ordered by
@@ -574,15 +870,29 @@ class FakeBroker:
         pinned duplicate raises here having consumed nothing (r2 atomicity);
         an unpinned script advances the sequence only after every validation
         that could still reject the order has passed."""
-        if script.broker_order_id is not None:
-            if script.broker_order_id in self._assigned_broker_order_ids:
+        return self._resolve_pinned_or_next(script.broker_order_id, client_order_id)
+
+    def _resolve_pinned_or_next(
+        self, pinned: str | None, client_order_id: str, *, taken: set[str] | None = None
+    ) -> str:
+        """Resolve one broker order id — a pinned value (duplicate-checked
+        against every id ever assigned, chain ids included, plus the ids
+        ``taken`` earlier in the same submit) or the next free ``FAKE-<n>``."""
+        reserved = self._assigned_broker_order_ids if not taken else (
+            self._assigned_broker_order_ids | taken
+        )
+        if pinned is not None:
+            if pinned in reserved:
                 raise BrokerInvalidRequestError(
-                    f"broker_order_id {script.broker_order_id!r} is already assigned to "
+                    f"broker_order_id {pinned!r} is already assigned to "
                     "another order; broker order IDs are unique across orders",
                     client_order_id=client_order_id,
                 )
-            return script.broker_order_id
-        return self._next_broker_order_id()
+            return pinned
+        while True:
+            candidate = self._next_broker_order_id()
+            if candidate not in reserved:
+                return candidate
 
     def _build_fills(self, price_qty_pairs: tuple[tuple[Decimal, Decimal], ...]) -> tuple[Fill, ...]:
         return tuple(
@@ -598,6 +908,7 @@ class FakeBroker:
         broker_order_id: str | None,
         fills: tuple[Fill, ...],
         reject_reason: str | None = None,
+        superseded_broker_order_ids: tuple[str, ...] = (),
     ) -> OrderResult:
         filled = sum((f.quantity for f in fills), Decimal(0))
         return OrderResult(
@@ -615,4 +926,5 @@ class FakeBroker:
             updated_at_utc=self._now(),
             fills=fills,
             reject_reason=reject_reason,
+            superseded_broker_order_ids=superseded_broker_order_ids,
         )

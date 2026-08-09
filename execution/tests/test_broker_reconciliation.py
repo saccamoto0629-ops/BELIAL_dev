@@ -38,6 +38,7 @@ from broker.fake_broker import (
     FakeBroker,
     FillImmediately,
     PartiallyFill,
+    PartiallyFillThenReissue,
     RejectOrder,
     StayPending,
     TimeoutOrder,
@@ -1136,3 +1137,124 @@ def test_get_order_raises_not_found_for_an_unknown_id():
     broker = FakeBroker(default_fill_price=FILL_PRICE)
     with pytest.raises(BrokerOrderNotFoundError):
         broker.get_order("nobody")
+
+
+# --- Issue #102: broker order reissue observations ----------------------------
+
+
+def test_reissued_observation_is_an_auto_repair_candidate(paths):
+    # internal: PARTIALLY_FILLED under the original id; broker: a further
+    # partial fill whose remainder was reissued under a NEW id. The audited
+    # chain makes the observation recordable, so it is repair-candidate —
+    # never a "mismatched broker id" manual case.
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(
+        client_id("exec-reissue"),
+        PartiallyFillThenReissue(
+            fills=((FILL_PRICE, Decimal("3")),),
+            broker_order_id="B-RE-1",
+            reissued_broker_order_id="B-RE-2",
+        ),
+    )
+    partial = broker.submit_order(broker_request("exec-reissue"))
+    seed_internal_pending(execution_db, "exec-reissue")
+    execution_store.record_order_result(
+        "exec-reissue", partial, reason="partial + reissue", db_path=execution_db
+    )
+    # the broker moves on: another reissue happened since our last record --
+    # a same-state observation whose id change is fully audited is LEGAL
+    # progress, not a discrepancy (the state machine does not break)
+    broker.reissue_remainder(
+        client_id("exec-reissue"),
+        fill_price=FILL_PRICE,
+        fill_quantity=Decimal("2"),
+        reissued_broker_order_id="B-RE-3",
+    )
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-reissue")
+    assert run.discrepancies == ()
+
+    # the reissued remainder finally fills: PARTIALLY_FILLED (internal) vs
+    # FILLED (broker) is a discrepancy, and the audited chain keeps it
+    # recordable -- auto-repair candidate, never a broker-id mismatch
+    broker.fill_remaining(client_id("exec-reissue"), price=FILL_PRICE)
+    run = service(QueryOnlyBroker(broker), paths).detect(run_id="run-reissue-2")
+
+    entry = only(run.discrepancies)
+    assert entry.internal_state is OrderState.PARTIALLY_FILLED
+    assert entry.broker_state is OrderState.FILLED
+    assert entry.broker_order_id == "B-RE-3"
+    assert entry.resolution_category is ResolutionCategory.AUTO_REPAIR_CANDIDATE
+
+
+def test_unaudited_broker_id_change_stays_manual_review(paths):
+    # a broker snapshot whose id changed WITHOUT recording the stored id as
+    # superseded is never repair-candidate (fail-closed toward a human)
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(
+        client_id("exec-swap"),
+        PartiallyFill(fills=((FILL_PRICE, Decimal("3")),), broker_order_id="B-SW-1"),
+    )
+    partial = broker.submit_order(broker_request("exec-swap"))
+    seed_internal_pending(execution_db, "exec-swap")
+    execution_store.record_order_result(
+        "exec-swap", partial, reason="partial", db_path=execution_db
+    )
+    swapped = replace(
+        partial,
+        broker_order_id="B-SW-2",
+        updated_at_utc=partial.updated_at_utc + timedelta(seconds=1),
+    )
+
+    run = service(
+        SnapshotBroker(broker, {client_id("exec-swap"): swapped}), paths
+    ).detect(run_id="run-swap")
+
+    entry = only(run.discrepancies)
+    assert entry.resolution_category is ResolutionCategory.MANUAL_REVIEW
+    assert "reissue" in entry.detail
+
+
+def test_reissue_chain_owned_by_another_request_stays_manual_review(paths):
+    # the observed chain names an id that ALREADY belongs to a different
+    # execution request: recording it would bind another request's broker
+    # order to this one, so it must never be repair-candidate
+    execution_db, _ = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    broker.script_order(
+        client_id("exec-own-1"),
+        FillImmediately(price=FILL_PRICE, broker_order_id="B-OWNED"),
+    )
+    owned = broker.submit_order(broker_request("exec-own-1"))
+    seed_internal_pending(execution_db, "exec-own-1")
+    execution_store.record_order_result(
+        "exec-own-1", owned, reason="filled", db_path=execution_db
+    )
+
+    broker.script_order(
+        client_id("exec-own-2"),
+        PartiallyFill(fills=((FILL_PRICE, Decimal("3")),), broker_order_id="B-VICTIM"),
+    )
+    partial = broker.submit_order(broker_request("exec-own-2"))
+    seed_internal_pending(execution_db, "exec-own-2")
+    execution_store.record_order_result(
+        "exec-own-2", partial, reason="partial", db_path=execution_db
+    )
+    poisoned = replace(
+        partial,
+        broker_order_id="B-NEW",
+        superseded_broker_order_ids=("B-VICTIM", "B-OWNED"),
+        updated_at_utc=partial.updated_at_utc + timedelta(seconds=1),
+    )
+
+    run = service(
+        SnapshotBroker(broker, {client_id("exec-own-2"): poisoned}), paths
+    ).detect(run_id="run-owned")
+
+    entries = [
+        entry for entry in run.discrepancies if entry.target_id == "exec-own-2"
+    ]
+    assert len(entries) == 1
+    assert entries[0].resolution_category is ResolutionCategory.MANUAL_REVIEW
+    assert "already owned" in entries[0].detail

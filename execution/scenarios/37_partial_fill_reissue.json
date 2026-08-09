@@ -1,0 +1,74 @@
+{
+  "scenario_id": "partial_fill_reissue",
+  "description": "部分約定後のBroker Order Reissue: 残数量が新しいbroker order IDで再発行されても、現行IDと監査chainが保存され、execution_request_id / client_order_idとの相関が維持される (Issue #102)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "partially_fill_then_reissue",
+        "fills": [
+          [
+            "150.00",
+            "4"
+          ]
+        ],
+        "broker_order_id": "BRK-OLD",
+        "reissued_broker_order_id": "BRK-NEW"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "10",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "partially_filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "partially_filled",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "partially_filled",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-NEW"
+      }
+    ],
+    "broker_submit_calls": 1,
+    "broker_order_id": "BRK-NEW",
+    "filled_quantity": "4",
+    "average_fill_price": "150.00",
+    "fill_prices": [
+      "150.00"
+    ],
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

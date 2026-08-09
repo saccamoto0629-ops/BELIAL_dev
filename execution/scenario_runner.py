@@ -64,6 +64,7 @@ from broker.fake_broker import (
     FakeBroker,
     FillImmediately,
     PartiallyFill,
+    PartiallyFillThenReissue,
     RejectOrder,
     StayPending,
     TimeoutOrder,
@@ -224,6 +225,12 @@ def _build_submit_script(spec: dict):
         return PartiallyFill(
             fills=tuple((Decimal(price), Decimal(quantity)) for price, quantity in spec["fills"]),
             broker_order_id=spec.get("broker_order_id"),
+        )
+    if behaviour == "partially_fill_then_reissue":
+        return PartiallyFillThenReissue(
+            fills=tuple((Decimal(price), Decimal(quantity)) for price, quantity in spec["fills"]),
+            broker_order_id=spec.get("broker_order_id"),
+            reissued_broker_order_id=spec.get("reissued_broker_order_id"),
         )
     if behaviour == "reject":
         return RejectOrder(**({"reason": spec["reason"]} if "reason" in spec else {}))

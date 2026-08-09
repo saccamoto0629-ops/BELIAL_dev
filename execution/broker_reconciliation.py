@@ -44,7 +44,9 @@ validators and the store's documented preconditions for
 ``record_order_result`` -- ``validate_order_state_transition``,
 ``validate_order_result_update`` against the DB-anchored snapshot, the
 identity fields of the stored intent, the ``broker_order_id`` NULL -> value
--> immutable chain, the DB-WIDE ``broker_order_id`` uniqueness (an id
+chain (a later id change is legal only as an AUDITED Order Reissue whose
+superseded chain records the stored id, Issue #102), the DB-WIDE
+``broker_order_id`` uniqueness across current AND superseded ids (an id
 already owned by another execution request could never be recorded onto
 this one) and the no-backwards-timestamp rule. Nothing is re-implemented
 here, and this service does not perform the update; it only records whether
@@ -433,10 +435,20 @@ class BrokerOrderReconciliationService:
             blockers.append(identity_problem)
 
         stored_broker_id = row["broker_order_id"]
-        if stored_broker_id is not None and observed.broker_order_id != stored_broker_id:
+        if (
+            stored_broker_id is not None
+            and observed.broker_order_id != stored_broker_id
+            and stored_broker_id not in observed.superseded_broker_order_ids
+        ):
+            # An id change is recordable ONLY as an audited Order Reissue
+            # (Issue #102): the observation must carry the stored id in its
+            # superseded chain (the exact chain-append rule is enforced by
+            # validate_order_result_update against the anchored snapshot
+            # below). Anything else stays a mismatch for a human.
             blockers.append(
-                f"broker_order_id is immutable once known: {stored_broker_id!r} -> "
-                f"{observed.broker_order_id!r}"
+                f"broker_order_id may only change as an audited reissue: "
+                f"{stored_broker_id!r} -> {observed.broker_order_id!r} does not "
+                "record the stored id as superseded"
             )
 
         try:
@@ -500,23 +512,26 @@ class BrokerOrderReconciliationService:
         Read-only; a store failure propagates to the caller, which fails
         closed to ``MANUAL_REVIEW``.
         """
-        broker_order_id = observed.broker_order_id
-        if broker_order_id is None:
-            return None  # nothing would be assigned, nothing can collide
-        owner = execution_store.get_execution_order_by_broker_order_id(
-            broker_order_id, db_path=self._execution_db_path
-        )
-        if owner is None:
-            return None  # unassigned
-        owner_id = owner["execution_request_id"]
-        if owner_id == row["execution_request_id"]:
-            return None  # this very order already owns it
-        return (
-            f"broker_order_id {broker_order_id!r} is already owned by execution request "
-            f"{owner_id!r}, not by {row['execution_request_id']!r}; broker order IDs are "
-            "UNIQUE across the execution order store, so this observation cannot be "
-            "recorded onto this request"
-        )
+        # Issue #102: the observation may carry a reissue chain — EVERY id it
+        # names (current + superseded) must be free or owned by this very
+        # order, otherwise recording it would bind another request's broker
+        # order to this one.
+        for broker_order_id in observed.all_broker_order_ids:
+            owner = execution_store.get_execution_order_by_broker_order_id(
+                broker_order_id, db_path=self._execution_db_path
+            )
+            if owner is None:
+                continue  # unassigned
+            owner_id = owner["execution_request_id"]
+            if owner_id == row["execution_request_id"]:
+                continue  # this very order already owns it
+            return (
+                f"broker_order_id {broker_order_id!r} is already owned by execution request "
+                f"{owner_id!r}, not by {row['execution_request_id']!r}; broker order IDs are "
+                "UNIQUE across the execution order store, so this observation cannot be "
+                "recorded onto this request"
+            )
+        return None
 
     @staticmethod
     def _identity_problem(row: dict, observed: OrderResult) -> str | None:

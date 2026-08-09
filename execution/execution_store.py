@@ -41,12 +41,18 @@ snapshot on the LAST snapshot-bearing history row, consecutive history
 snapshots must satisfy ``validate_order_result_update`` pairwise, each
 history snapshot must agree with its own history row (state, broker id --
 compared symmetrically, NULL included -- and timestamp) and with the stored
-intent, and ``broker_order_id`` must follow the NULL -> value -> same-value
-chain across ALL history rows. Rewriting the current row alone (state,
-broker id or snapshot) therefore always fails restore-time validation --
-including while the tracked state is UNKNOWN, which is deliberately NOT an
-escape hatch: a state-only UNKNOWN never touches the snapshot, so the
-current snapshot must still equal the latest anchored one.
+intent, and ``broker_order_id`` must follow the NULL -> value chain across
+ALL history rows, where a later value CHANGE is legal exactly as an AUDITED
+Order Reissue (Issue #102): the changing row must carry a full snapshot
+whose ``superseded_broker_order_ids`` chain records the prior id, and the
+pairwise snapshot validation enforces the exact chain-append rule (old
+chain + old id lead the new chain). The ``broker_order_id`` column always
+holds the CURRENT actionable id; past ids stay auditable in the history
+rows and in the snapshots' superseded chains. Rewriting the current row
+alone (state, broker id or snapshot) therefore always fails restore-time
+validation -- including while the tracked state is UNKNOWN, which is
+deliberately NOT an escape hatch: a state-only UNKNOWN never touches the
+snapshot, so the current snapshot must still equal the latest anchored one.
 
 Update contract: the ``old`` side of ``validate_order_result_update`` is the
 ANCHORED DB snapshot -- never an in-memory copy -- so known fills /
@@ -61,9 +67,10 @@ CONFIRM the stored ``broker_order_id`` but can never introduce or change one
 
 ``broker_order_id`` is UNIQUE across the WHOLE table (PR #91 review Major 3):
 one broker order can never be attached to two execution requests. The
-constraint guards writes; restore additionally scans the whole table and
-refuses to restore ANY row while a duplicate exists (a corrupted /
-constraint-stripped DB must not be readable back into use).
+constraint guards writes; restore additionally scans the whole table --
+superseded chain ids included (Issue #102) -- and refuses to restore ANY
+row while a duplicate exists (a corrupted / constraint-stripped DB must not
+be readable back into use).
 
 Every public API -- reads included -- follows one flow (PR #91 review r2
 Major 3): open the DB, VERIFY the schema, start a transaction, then
@@ -324,6 +331,11 @@ FENCES_TABLE = "execution_repair_fences"
 
 # Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
 # match EXACTLY -- unknown fields are rejected, missing fields are rejected.
+# One deliberate exception (Issue #102, backward compatibility): snapshots
+# written BEFORE the reissue support lack "superseded_broker_order_ids";
+# they parse as an empty chain (no reissue had been representable, so the
+# empty chain is exactly what those snapshots meant). Writes always include
+# the key.
 _RESULT_JSON_KEYS: frozenset[str] = frozenset(
     {
         "client_order_id",
@@ -340,8 +352,12 @@ _RESULT_JSON_KEYS: frozenset[str] = frozenset(
         "updated_at_utc",
         "reject_reason",
         "fills",
+        "superseded_broker_order_ids",
     }
 )
+_LEGACY_RESULT_JSON_KEYS: frozenset[str] = _RESULT_JSON_KEYS - {
+    "superseded_broker_order_ids"
+}
 _FILL_JSON_KEYS: frozenset[str] = frozenset({"fill_id", "price", "quantity", "filled_at_utc"})
 
 
@@ -938,6 +954,14 @@ def _assert_no_duplicate_broker_ids(connection: sqlite3.Connection) -> None:
     The UNIQUE constraint guards writes; this scan additionally refuses to
     RESTORE anything from a DB that somehow holds duplicates (e.g. a
     constraint-stripped copy). NULLs are not duplicates of each other.
+
+    Order Reissue (Issue #102): a reissued order's CURRENT id lives in the
+    ``broker_order_id`` column while its past ids live in the snapshot's
+    ``superseded_broker_order_ids`` chain -- the column constraint alone can
+    no longer see them. This scan therefore covers EVERY id an order has
+    ever lived under (current + superseded, taken from the current row's
+    snapshot): one broker order id belonging to two execution requests --
+    in either column or chain position -- refuses the whole DB.
     """
     duplicates = [
         row[0]
@@ -950,6 +974,36 @@ def _assert_no_duplicate_broker_ids(connection: sqlite3.Connection) -> None:
         raise ExecutionIntegrityError(
             f"broker_order_id values assigned to more than one execution order: {duplicates}; "
             "refusing to restore from this DB"
+        )
+    owners: dict[str, str] = {}
+    conflicts: set[str] = set()
+    for request_id, broker_id, snapshot_text in connection.execute(
+        f"SELECT execution_request_id, broker_order_id, last_order_result_json "
+        f"FROM {ORDERS_TABLE} "
+        "WHERE broker_order_id IS NOT NULL OR last_order_result_json IS NOT NULL"
+    ):
+        order_ids = set()
+        if broker_id is not None:
+            order_ids.add(broker_id)
+        if snapshot_text is not None:
+            try:
+                data = json.loads(snapshot_text)
+                chain = data.get("superseded_broker_order_ids", [])
+            except (ValueError, AttributeError):
+                # unparseable snapshots are rejected in depth by the bundle
+                # validation of the row that carries them; this scan only
+                # cares about the id sets it CAN read
+                chain = []
+            if isinstance(chain, list):
+                order_ids.update(entry for entry in chain if isinstance(entry, str))
+        for order_id in order_ids:
+            previous_owner = owners.setdefault(order_id, request_id)
+            if previous_owner != request_id:
+                conflicts.add(order_id)
+    if conflicts:
+        raise ExecutionIntegrityError(
+            "broker order ids (current or superseded) assigned to more than one "
+            f"execution order: {sorted(conflicts)}; refusing to restore from this DB"
         )
 
 
@@ -1142,6 +1196,7 @@ def _result_to_json(result: OrderResult) -> str:
             "average_fill_price": dec(result.average_fill_price),
             "updated_at_utc": _iso(result.updated_at_utc),
             "reject_reason": result.reject_reason,
+            "superseded_broker_order_ids": list(result.superseded_broker_order_ids),
             "fills": [
                 {
                     "fill_id": f.fill_id,
@@ -1162,13 +1217,25 @@ def _result_from_json(text: str) -> OrderResult:
     ``OrderResult`` construction re-runs every invariant -- a tampered or
     extended snapshot fails loudly instead of being trusted."""
     data = json.loads(text)
-    if not isinstance(data, dict) or set(data) != _RESULT_JSON_KEYS:
+    if not isinstance(data, dict) or set(data) not in (
+        _RESULT_JSON_KEYS,
+        # pre-Issue #102 snapshots: no reissue was representable, so the
+        # missing key means exactly "empty chain" (backward compatibility)
+        _LEGACY_RESULT_JSON_KEYS,
+    ):
         raise ValueError(
             f"snapshot JSON keys {sorted(data) if isinstance(data, dict) else type(data).__name__} "
             f"do not match the expected set {sorted(_RESULT_JSON_KEYS)}"
         )
     if not isinstance(data["fills"], list):
         raise ValueError("snapshot JSON 'fills' must be a list")
+    superseded = data.get("superseded_broker_order_ids", [])
+    if not isinstance(superseded, list) or not all(
+        isinstance(entry, str) for entry in superseded
+    ):
+        raise ValueError(
+            "snapshot JSON 'superseded_broker_order_ids' must be a list of strings"
+        )
     for entry in data["fills"]:
         if not isinstance(entry, dict) or set(entry) != _FILL_JSON_KEYS:
             raise ValueError(
@@ -1202,6 +1269,7 @@ def _result_from_json(text: str) -> OrderResult:
             for f in data["fills"]
         ),
         reject_reason=data["reject_reason"],
+        superseded_broker_order_ids=tuple(superseded),
     )
 
 
@@ -1379,14 +1447,36 @@ def _validate_bundle(row: dict, history: list[dict]) -> None:
                 raise _integrity(
                     request_id, f"history row {entry['history_id']} goes back in time"
                 )
-            # broker-id chain: NULL -> value once, then the same value forever
+            # broker-id chain: NULL -> value once; afterwards the value may
+            # only move as an AUDITED Order Reissue (Issue #102) -- the row
+            # must carry a full snapshot whose superseded chain contains the
+            # prior id. The exact chain-append legality is enforced by the
+            # pairwise validate_order_result_update below; this column-level
+            # guard additionally pins that a state-only row can never move
+            # the id and that the supersession is recorded, not implicit.
             prior_broker = previous["broker_order_id"]
             if prior_broker is not None and entry["broker_order_id"] != prior_broker:
-                raise _integrity(
-                    request_id,
-                    f"history row {entry['history_id']} changes broker_order_id "
-                    f"{prior_broker!r} -> {entry['broker_order_id']!r}",
-                )
+                snapshot_text = entry["order_result_json"]
+                if snapshot_text is None:
+                    raise _integrity(
+                        request_id,
+                        f"history row {entry['history_id']} changes broker_order_id "
+                        f"{prior_broker!r} -> {entry['broker_order_id']!r} without an "
+                        "order-result snapshot proving the reissue",
+                    )
+                try:
+                    chain = tuple(
+                        json.loads(snapshot_text).get("superseded_broker_order_ids", [])
+                    )
+                except (ValueError, AttributeError):
+                    chain = ()
+                if prior_broker not in chain:
+                    raise _integrity(
+                        request_id,
+                        f"history row {entry['history_id']} changes broker_order_id "
+                        f"{prior_broker!r} -> {entry['broker_order_id']!r} but its "
+                        "snapshot does not record the prior id as superseded",
+                    )
 
         if entry["order_result_json"] is None:
             # snapshot-less rows are exactly: the initial pending entry and
@@ -2027,9 +2117,11 @@ def record_order_result(
       the anchored snapshot (guards the caller's own staleness assumptions),
     - the transition is additionally validated against the CURRENT tracked
       state (which may be a state-only UNKNOWN recorded after the snapshot),
-    - ``broker_order_id`` follows NULL -> value once, then immutable; a full
-      snapshot must carry the known id itself (dropping it to NULL is
-      refused),
+    - ``broker_order_id`` follows NULL -> value once; afterwards it may only
+      change as an AUDITED Order Reissue (Issue #102): the new snapshot must
+      record the stored id in its ``superseded_broker_order_ids`` chain and
+      pass the chain-append rule against the anchored snapshot. Dropping the
+      id to NULL is refused,
     - the snapshot (current row AND history row), the state and the history
       entry commit in ONE transaction; a DB-wide ``broker_order_id``
       uniqueness conflict rolls all of it back
@@ -2170,13 +2262,25 @@ def record_order_result(
         if db_snapshot is not None:
             validate_order_result_update(db_snapshot, result)
 
-        # broker id: NULL -> value once, then immutable; a full snapshot must
-        # carry the known id itself (row and snapshot must stay in lockstep).
+        # broker id: NULL -> value once; afterwards it may only move as an
+        # AUDITED Order Reissue (Issue #102) -- the new snapshot must record
+        # the stored id in its superseded chain, and the exact chain-append
+        # legality was already enforced against the ANCHORED snapshot by
+        # validate_order_result_update above (so a stored id can never be
+        # silently replaced or its history rewritten). A change without an
+        # anchored snapshot to validate against is refused outright.
         if row["broker_order_id"] is not None and result.broker_order_id != row["broker_order_id"]:
-            raise ValueError(
-                f"broker_order_id is immutable once set: "
-                f"{row['broker_order_id']!r} -> {result.broker_order_id!r} refused"
-            )
+            if result.broker_order_id is None:
+                raise ValueError(
+                    f"broker_order_id may never be dropped: "
+                    f"{row['broker_order_id']!r} -> None refused"
+                )
+            if db_snapshot is None or row["broker_order_id"] not in result.superseded_broker_order_ids:
+                raise ValueError(
+                    f"broker_order_id may only change as an audited reissue: "
+                    f"{row['broker_order_id']!r} -> {result.broker_order_id!r} refused "
+                    "(the stored id is not recorded as superseded by the new snapshot)"
+                )
         effective_broker_id = (
             row["broker_order_id"] if result.broker_order_id is None else result.broker_order_id
         )
@@ -2524,15 +2628,22 @@ def get_execution_order_by_signal_id(
 def get_execution_order_by_broker_order_id(
     broker_order_id: str, *, db_path: Path | None = None
 ) -> dict | None:
-    """The execution order currently OWNING this ``broker_order_id``, or None.
+    """The execution order OWNING this ``broker_order_id``, or None.
 
-    ``broker_order_id`` is UNIQUE across the whole table (PR #91 review
+    Broker order ids are unique across execution orders (PR #91 review
     Major 3), so at most one row can hold it -- the same lookup shape as
     :func:`get_execution_order_by_signal_id`. Callers use it to find out
     whether a broker-assigned id is already bound to a DIFFERENT execution
     request BEFORE treating a broker observation as safely recordable
     (Issue #103 review: reflecting such an observation would collide with
     the UNIQUE constraint inside ``record_order_result`` and roll back).
+
+    Order Reissue (Issue #102): ownership covers EVERY id an order has ever
+    lived under -- the CURRENT ``broker_order_id`` column and the past ids
+    recorded in the current snapshot's ``superseded_broker_order_ids``
+    chain. A reissued-away id therefore still resolves to its execution
+    order (audit lookups keep working across a reissue), and the duplicate
+    scan run by every read guarantees at most one owner exists.
 
     Same read contract as every other read helper: schema verification
     first, full bundle validation of the row it returns, missing DB -> None
@@ -2547,6 +2658,22 @@ def get_execution_order_by_broker_order_id(
             f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE broker_order_id = ?",
             (broker_order_id,),
         ).fetchone()
+        if row is None:
+            # not a current id anywhere -- it may be a reissued-away id
+            # recorded in a snapshot's superseded chain (Issue #102)
+            for request_id, snapshot_text in connection.execute(
+                f"SELECT execution_request_id, last_order_result_json "
+                f"FROM {ORDERS_TABLE} WHERE last_order_result_json IS NOT NULL"
+            ):
+                try:
+                    chain = json.loads(snapshot_text).get(
+                        "superseded_broker_order_ids", []
+                    )
+                except (ValueError, AttributeError):
+                    continue  # rejected in depth by that row's own validation
+                if isinstance(chain, list) and broker_order_id in chain:
+                    row = (request_id,)
+                    break
         bundle = None if row is None else _fetch_and_validate(connection, row[0])
     return None if bundle is None else bundle[0]
 

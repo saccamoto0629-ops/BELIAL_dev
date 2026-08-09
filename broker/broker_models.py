@@ -384,6 +384,20 @@ class OrderResult:
     ``broker_order_id`` (see ``OrderState``). UNKNOWN constrains nothing
     beyond the generic quantity invariants, because it asserts only that the
     broker-side outcome is unconfirmed.
+
+    Order Reissue contract (Issue #102): some brokers reissue the remaining
+    quantity of a partially filled order as a NEW broker order under a NEW
+    broker order id. ``broker_order_id`` therefore always names the CURRENT
+    actionable broker order (the one ``get_order`` / ``cancel_order``
+    operate on), and ``superseded_broker_order_ids`` is the append-only,
+    oldest-first history of the broker order ids this order previously lived
+    under. The chain never rewrites: ids are unique, never contain the
+    current id, and a non-empty chain requires both a current
+    ``broker_order_id`` and ``filled_quantity > 0`` (a reissue exists only
+    because a partial fill happened). ``original_broker_order_id`` exposes
+    the parent identity for audit. The ``client_order_id`` /
+    ``execution_request_id`` correlation is untouched by a reissue: the
+    caller-side key never changes.
     """
 
     client_order_id: str
@@ -400,6 +414,7 @@ class OrderResult:
     updated_at_utc: datetime
     fills: tuple[Fill, ...] = field(default_factory=tuple)
     reject_reason: str | None = None
+    superseded_broker_order_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # --- field/type validation (caller-supplied data) -> BrokerInvalidRequestError
@@ -421,6 +436,18 @@ class OrderResult:
                 raise BrokerInvalidRequestError(f"every fills entry must be a Fill, got {entry!r}")
         if self.reject_reason is not None:
             _require_non_empty_str(self.reject_reason, "reject_reason")
+        if not isinstance(self.superseded_broker_order_ids, tuple):
+            raise BrokerInvalidRequestError(
+                "superseded_broker_order_ids must be a tuple, got "
+                f"{type(self.superseded_broker_order_ids).__name__}"
+            )
+        for entry in self.superseded_broker_order_ids:
+            _require_non_empty_str(entry, "superseded_broker_order_ids entry")
+        if len(set(self.superseded_broker_order_ids)) != len(self.superseded_broker_order_ids):
+            raise BrokerInvalidRequestError(
+                "superseded_broker_order_ids must be unique, got "
+                f"{self.superseded_broker_order_ids!r}"
+            )
         _require_non_empty_str(self.symbol, "symbol")
         _require_positive_decimal(self.requested_quantity, "requested_quantity")
         _require_decimal(self.filled_quantity, "filled_quantity")
@@ -488,6 +515,48 @@ class OrderResult:
             if self.broker_order_id is None:
                 raise ValueError(f"state {state.value!r} requires a broker_order_id")
 
+        # Reissue chain invariants (Issue #102): the chain lists PAST ids, so
+        # it can never contain the current id; a chain exists only for an
+        # order the broker acknowledged (current id known) AND partially
+        # filled (a reissue is caused by a partial fill, so a chain without
+        # fills would fabricate a reissue that cannot have happened).
+        if self.broker_order_id is not None and self.broker_order_id in self.superseded_broker_order_ids:
+            raise ValueError(
+                f"superseded_broker_order_ids must not contain the current "
+                f"broker_order_id {self.broker_order_id!r}"
+            )
+        if self.superseded_broker_order_ids:
+            if self.broker_order_id is None:
+                raise ValueError(
+                    "a reissue chain requires a current broker_order_id; "
+                    "superseded ids cannot exist without one"
+                )
+            if self.filled_quantity <= 0:
+                raise ValueError(
+                    "a reissue chain requires filled_quantity > 0: the remaining "
+                    "quantity is only ever reissued after a partial fill"
+                )
+
+    @property
+    def original_broker_order_id(self) -> str | None:
+        """The FIRST broker order id this order lived under (Issue #102).
+
+        Equals ``broker_order_id`` while no reissue happened; after one or
+        more reissues it is the head of the superseded chain (the parent /
+        original broker order identity, kept for audit)."""
+        if self.superseded_broker_order_ids:
+            return self.superseded_broker_order_ids[0]
+        return self.broker_order_id
+
+    @property
+    def all_broker_order_ids(self) -> tuple[str, ...]:
+        """Every broker order id this order has lived under, oldest first,
+        current id last (Issue #102 audit view). Empty while no broker
+        acknowledgement exists."""
+        if self.broker_order_id is None:
+            return self.superseded_broker_order_ids
+        return self.superseded_broker_order_ids + (self.broker_order_id,)
+
     @property
     def price_deviation(self) -> Decimal | None:
         """``average_fill_price - requested_price`` (None unless both known).
@@ -534,8 +603,15 @@ def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
     - ``old.fills`` is preserved as a prefix of ``new.fills`` — no fill is
       removed, reordered or altered, and an appended fill never reuses an
       existing ``fill_id``
-    - ``broker_order_id`` may go ``None -> value`` (broker ack arrived);
-      ``value -> None`` and ``value A -> value B`` are forbidden
+    - ``broker_order_id`` may go ``None -> value`` (broker ack arrived) and
+      ``value -> None`` stays forbidden. ``value A -> value B`` is allowed
+      EXACTLY for an audited Order Reissue (Issue #102): the new snapshot's
+      ``superseded_broker_order_ids`` must extend the old chain by ``A``
+      first (``old chain + (A,)`` is a prefix of the new chain — further
+      appended ids are reissues learned in the same observation), so a
+      current-id change can never silently drop the history. With the id
+      unchanged the chain must be unchanged too, and no id ever re-enters
+      the chain (uniqueness is a construction invariant)
     - ``updated_at_utc`` is monotonically non-decreasing for every update
     - a same-state re-observation of a TERMINAL state must be identical in
       every field except ``updated_at_utc`` — a settled fill price or a
@@ -585,10 +661,46 @@ def validate_order_result_update(old: OrderResult, new: OrderResult) -> None:
         seen_fill_ids.add(appended.fill_id)
 
     if old.broker_order_id is not None and new.broker_order_id != old.broker_order_id:
-        raise ValueError(
-            f"broker_order_id may only go from None to a value, never "
-            f"{old.broker_order_id!r} -> {new.broker_order_id!r}"
-        )
+        if new.broker_order_id is None:
+            raise ValueError(
+                f"broker_order_id may never be dropped: "
+                f"{old.broker_order_id!r} -> None"
+            )
+        # Order Reissue (Issue #102): a current-id change is legal only as an
+        # AUDITED chain append — the old chain followed by the old current id
+        # must lead the new chain. Any additional appended ids are further
+        # reissues learned within the same observation (multi-hop). A change
+        # that loses or rewrites the history is refused.
+        expected_prefix = old.superseded_broker_order_ids + (old.broker_order_id,)
+        if new.superseded_broker_order_ids[: len(expected_prefix)] != expected_prefix:
+            raise ValueError(
+                f"broker_order_id change {old.broker_order_id!r} -> "
+                f"{new.broker_order_id!r} without an audited reissue chain: "
+                f"superseded_broker_order_ids must start with "
+                f"{expected_prefix!r}, got {new.superseded_broker_order_ids!r}"
+            )
+    elif old.superseded_broker_order_ids != new.superseded_broker_order_ids:
+        if old.broker_order_id is None:
+            # The broker ack (None -> value) may reveal a chain that predates
+            # our first id knowledge (e.g. an UNKNOWN order resolved by a
+            # query that reconstructs the reissue history) — but a chain can
+            # never appear without a current id, and never shrink.
+            if new.broker_order_id is None or (
+                new.superseded_broker_order_ids[: len(old.superseded_broker_order_ids)]
+                != old.superseded_broker_order_ids
+            ):
+                raise ValueError(
+                    "superseded_broker_order_ids may only grow: "
+                    f"{old.superseded_broker_order_ids!r} -> "
+                    f"{new.superseded_broker_order_ids!r}"
+                )
+        else:
+            raise ValueError(
+                "superseded_broker_order_ids must not change while the current "
+                f"broker_order_id {old.broker_order_id!r} is unchanged: "
+                f"{old.superseded_broker_order_ids!r} -> "
+                f"{new.superseded_broker_order_ids!r}"
+            )
 
     if new.updated_at_utc < old.updated_at_utc:
         raise ValueError(

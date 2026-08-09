@@ -8,6 +8,7 @@ import pytest
 from broker import broker_models as m
 
 UTC_NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+UTC_LATER = datetime(2026, 7, 1, 12, 5, 0, tzinfo=timezone.utc)
 
 
 def make_request(**overrides):
@@ -807,3 +808,261 @@ def test_closed_trade_info_validates_shape_and_transaction_ids():
         make_closed_trade(closed_at_utc=UTC_NOW.replace(tzinfo=None))
     with pytest.raises(m.BrokerInvalidRequestError):
         make_closed_trade(client_order_id="")
+
+
+# --- Issue #102: broker order reissue chain ----------------------------------
+#
+# The remaining quantity of a partially filled order may be reissued by the
+# broker as a NEW order under a NEW broker order id. broker_order_id always
+# names the CURRENT actionable order; superseded_broker_order_ids is the
+# append-only, oldest-first audit history of the ids the order lived under.
+
+
+def partial_result(**overrides):
+    kwargs = dict(
+        state=m.OrderState.PARTIALLY_FILLED,
+        filled_quantity=Decimal("4"),
+        remaining_quantity=Decimal("6"),
+        average_fill_price=Decimal("2400.50"),
+        fills=(m.Fill("f-1", Decimal("2400.50"), Decimal("4"), UTC_NOW),),
+    )
+    kwargs.update(overrides)
+    return make_result(**kwargs)
+
+
+def test_reissue_chain_construction_and_audit_properties():
+    result = partial_result(
+        broker_order_id="B-2", superseded_broker_order_ids=("B-1",)
+    )
+    assert result.broker_order_id == "B-2"
+    assert result.original_broker_order_id == "B-1"
+    assert result.all_broker_order_ids == ("B-1", "B-2")
+
+
+def test_without_a_chain_the_current_id_is_also_the_original():
+    result = make_result()
+    assert result.original_broker_order_id == "B-1"
+    assert result.all_broker_order_ids == ("B-1",)
+    result = make_result(
+        state=m.OrderState.UNKNOWN, broker_order_id=None,
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+        average_fill_price=None, fills=(),
+    )
+    assert result.original_broker_order_id is None
+    assert result.all_broker_order_ids == ()
+
+
+def test_reissue_chain_field_shape_is_validated():
+    for bad in (["B-1"], "B-1", ("",), ("  ",), (1,)):
+        with pytest.raises(m.BrokerInvalidRequestError):
+            partial_result(broker_order_id="B-2", superseded_broker_order_ids=bad)
+    with pytest.raises(m.BrokerInvalidRequestError):
+        partial_result(
+            broker_order_id="B-3", superseded_broker_order_ids=("B-1", "B-1")
+        )
+
+
+def test_reissue_chain_must_not_contain_the_current_id():
+    with pytest.raises(ValueError):
+        partial_result(
+            broker_order_id="B-2", superseded_broker_order_ids=("B-1", "B-2")
+        )
+
+
+def test_reissue_chain_requires_a_current_id_and_a_partial_fill():
+    # a chain without a current id cannot exist
+    with pytest.raises(ValueError):
+        make_result(
+            state=m.OrderState.UNKNOWN, broker_order_id=None,
+            filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+            average_fill_price=None, fills=(),
+            superseded_broker_order_ids=("B-1",),
+        )
+    # a chain without any fill would fabricate a reissue that cannot have
+    # happened (reissues are caused by partial fills)
+    with pytest.raises(ValueError):
+        make_result(
+            state=m.OrderState.ACCEPTED, broker_order_id="B-2",
+            filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+            average_fill_price=None, fills=(),
+            superseded_broker_order_ids=("B-1",),
+        )
+
+
+def test_reissue_chain_is_allowed_for_every_fill_bearing_state():
+    for state, filled in (
+        (m.OrderState.PARTIALLY_FILLED, Decimal("4")),
+        (m.OrderState.FILLED, Decimal("10")),
+        (m.OrderState.CANCELLED, Decimal("4")),
+        (m.OrderState.UNKNOWN, Decimal("4")),
+    ):
+        result = make_result(
+            state=state,
+            broker_order_id="B-2",
+            filled_quantity=filled,
+            remaining_quantity=Decimal("10") - filled,
+            average_fill_price=Decimal("2400.50"),
+            fills=(m.Fill("f-1", Decimal("2400.50"), filled, UTC_NOW),),
+            superseded_broker_order_ids=("B-1",),
+        )
+        assert result.superseded_broker_order_ids == ("B-1",)
+
+
+def test_update_allows_an_audited_reissue_id_change():
+    old = partial_result()  # B-1, partially filled 4/10
+    new = partial_result(
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-1",),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(old, new)
+
+
+def test_update_refuses_an_id_change_without_the_audited_chain():
+    old = partial_result()
+    for chain in ((), ("B-9",), ("B-0",)):
+        new = partial_result(
+            broker_order_id="B-2",
+            superseded_broker_order_ids=chain,
+            updated_at_utc=UTC_LATER,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            m.validate_order_result_update(old, new)
+        assert "chain" in str(exc_info.value)
+
+
+def test_update_refuses_dropping_the_id_even_with_a_chain():
+    old = partial_result()
+    new = partial_result(
+        state=m.OrderState.UNKNOWN, broker_order_id=None,
+        updated_at_utc=UTC_LATER,
+    )
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(old, new)
+
+
+def test_update_refuses_chain_changes_while_the_id_is_unchanged():
+    old = partial_result()
+    new = partial_result(
+        superseded_broker_order_ids=("B-0",), updated_at_utc=UTC_LATER
+    )
+    # constructing B-1 current with B-0 superseded is legal in isolation,
+    # but as an UPDATE of a chainless B-1 snapshot it rewrites history
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(old, new)
+
+
+def test_update_allows_a_multi_hop_reissue_learned_in_one_observation():
+    # between two polls the order went B-1 -> B-2 -> B-3: the new snapshot
+    # extends the chain by the old current id FIRST, then the intermediate
+    old = partial_result()
+    new = partial_result(
+        broker_order_id="B-3",
+        superseded_broker_order_ids=("B-1", "B-2"),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(old, new)
+    # but a chain that does not start with the known history is refused
+    wrong = partial_result(
+        broker_order_id="B-3",
+        superseded_broker_order_ids=("B-2", "B-1"),
+        updated_at_utc=UTC_LATER,
+    )
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(old, wrong)
+
+
+def test_update_reissue_chain_progresses_across_repeated_reissues():
+    first = partial_result(
+        broker_order_id="B-2", superseded_broker_order_ids=("B-1",)
+    )
+    second = partial_result(
+        broker_order_id="B-3",
+        superseded_broker_order_ids=("B-1", "B-2"),
+        filled_quantity=Decimal("6"),
+        remaining_quantity=Decimal("4"),
+        fills=first.fills + (m.Fill("f-2", Decimal("2401"), Decimal("2"), UTC_LATER),),
+        average_fill_price=Decimal("2400.67"),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(first, second)
+    # losing an intermediate id from the chain is refused
+    truncated = partial_result(
+        broker_order_id="B-3",
+        superseded_broker_order_ids=("B-1",),
+        filled_quantity=Decimal("6"),
+        remaining_quantity=Decimal("4"),
+        fills=second.fills,
+        average_fill_price=Decimal("2400.67"),
+        updated_at_utc=UTC_LATER,
+    )
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(first, truncated)
+
+
+def test_update_reissued_order_can_reach_every_partial_fill_successor():
+    old = partial_result(broker_order_id="B-2", superseded_broker_order_ids=("B-1",))
+    fills = old.fills + (m.Fill("f-2", Decimal("2401"), Decimal("6"), UTC_LATER),)
+    filled = make_result(
+        state=m.OrderState.FILLED,
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-1",),
+        fills=fills,
+        average_fill_price=Decimal("2400.80"),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(old, filled)
+    cancelled = partial_result(
+        state=m.OrderState.CANCELLED,
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-1",),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(old, cancelled)
+    unknown = partial_result(
+        state=m.OrderState.UNKNOWN,
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-1",),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(old, unknown)
+
+
+def test_update_unknown_resolution_may_reveal_a_reissue_chain():
+    # an UNKNOWN snapshot without any broker id can resolve into a queried
+    # snapshot that reconstructed the whole chain
+    old = make_result(
+        state=m.OrderState.UNKNOWN, broker_order_id=None,
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+        average_fill_price=None, fills=(),
+    )
+    new = partial_result(
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-1",),
+        updated_at_utc=UTC_LATER,
+    )
+    m.validate_order_result_update(old, new)
+
+
+def test_terminal_same_state_reobservation_freezes_the_chain():
+    done = make_result(
+        state=m.OrderState.CANCELLED,
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-1",),
+        filled_quantity=Decimal("4"),
+        remaining_quantity=Decimal("6"),
+        average_fill_price=Decimal("2400.50"),
+        fills=(m.Fill("f-1", Decimal("2400.50"), Decimal("4"), UTC_NOW),),
+    )
+    rewritten = make_result(
+        state=m.OrderState.CANCELLED,
+        broker_order_id="B-2",
+        superseded_broker_order_ids=("B-0", "B-1"),
+        filled_quantity=Decimal("4"),
+        remaining_quantity=Decimal("6"),
+        average_fill_price=Decimal("2400.50"),
+        fills=done.fills,
+        updated_at_utc=UTC_LATER,
+    )
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(done, rewritten)
