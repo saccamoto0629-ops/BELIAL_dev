@@ -973,7 +973,8 @@ def test_duplicate_broker_ids_are_rejected_by_the_restore_scan():
     # schema cannot even hold duplicates, so the scan is exercised directly).
     with closing(sqlite3.connect(":memory:")) as connection:
         connection.execute(
-            f"CREATE TABLE {store.ORDERS_TABLE} (execution_request_id TEXT, broker_order_id TEXT)"
+            f"CREATE TABLE {store.ORDERS_TABLE} (execution_request_id TEXT, "
+            "broker_order_id TEXT, last_order_result_json TEXT)"
         )
         for request_id, broker_id in (
             ("exec-1", "B-SAME"),
@@ -982,13 +983,54 @@ def test_duplicate_broker_ids_are_rejected_by_the_restore_scan():
             ("exec-4", None),
         ):
             connection.execute(
-                f"INSERT INTO {store.ORDERS_TABLE} VALUES (?, ?)", (request_id, broker_id)
+                f"INSERT INTO {store.ORDERS_TABLE} VALUES (?, ?, NULL)",
+                (request_id, broker_id),
             )
         with pytest.raises(store.ExecutionIntegrityError, match="B-SAME"):
             store._assert_no_duplicate_broker_ids(connection)
         # NULLs are not duplicates of each other
         connection.execute(
             f"DELETE FROM {store.ORDERS_TABLE} WHERE execution_request_id = 'exec-2'"
+        )
+        store._assert_no_duplicate_broker_ids(connection)
+
+
+def test_duplicate_scan_covers_superseded_chain_ids():
+    # Issue #102: a reissued-away id lives only in the snapshot's superseded
+    # chain -- the scan must still refuse a DB where it belongs to another
+    # execution order (in either column or chain position).
+    def snapshot_json(chain):
+        return json.dumps({"superseded_broker_order_ids": list(chain)})
+
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.execute(
+            f"CREATE TABLE {store.ORDERS_TABLE} (execution_request_id TEXT, "
+            "broker_order_id TEXT, last_order_result_json TEXT)"
+        )
+        rows = [
+            ("exec-1", "B-2", snapshot_json(["B-1"])),  # reissued B-1 -> B-2
+            ("exec-2", "B-1", None),  # another order claims B-1 as CURRENT
+        ]
+        for row in rows:
+            connection.execute(f"INSERT INTO {store.ORDERS_TABLE} VALUES (?, ?, ?)", row)
+        with pytest.raises(store.ExecutionIntegrityError, match="B-1"):
+            store._assert_no_duplicate_broker_ids(connection)
+
+        # chain-vs-chain conflicts are refused too
+        connection.execute(f"DELETE FROM {store.ORDERS_TABLE}")
+        for row in (
+            ("exec-1", "B-2", snapshot_json(["B-1"])),
+            ("exec-2", "B-9", snapshot_json(["B-1"])),
+        ):
+            connection.execute(f"INSERT INTO {store.ORDERS_TABLE} VALUES (?, ?, ?)", row)
+        with pytest.raises(store.ExecutionIntegrityError, match="B-1"):
+            store._assert_no_duplicate_broker_ids(connection)
+
+        # one order owning its own chain + current id is NOT a conflict
+        connection.execute(f"DELETE FROM {store.ORDERS_TABLE}")
+        connection.execute(
+            f"INSERT INTO {store.ORDERS_TABLE} VALUES (?, ?, ?)",
+            ("exec-1", "B-3", snapshot_json(["B-1", "B-2"])),
         )
         store._assert_no_duplicate_broker_ids(connection)
 
@@ -2495,3 +2537,302 @@ def test_the_guard_rejects_a_non_token_expectation(db_path):
                 "exec-1", expected=bad, db_path=db_path
             ):
                 raise AssertionError("the critical section must not be entered")
+
+
+# --- Issue #102: broker order reissue persistence / audit ---------------------
+#
+# After a partial fill the broker may reissue the remainder under a NEW
+# broker order id. The store accepts the id change ONLY as an audited chain
+# append (validate_order_result_update against the anchored snapshot), keeps
+# the CURRENT id in the broker_order_id column and the past ids auditable in
+# the history rows + snapshot chains.
+
+
+def partial_result(request_id="exec-1", *, broker_order_id="B-1", superseded=(),
+                   filled="4", fills=None, updated_at=None):
+    fills = fills if fills is not None else (fill("f-1", filled, 2),)
+    return make_result(
+        OrderState.PARTIALLY_FILLED,
+        request_id,
+        broker_order_id=broker_order_id,
+        filled=filled,
+        fills=fills,
+        updated_at=updated_at or at(2),
+        superseded_broker_order_ids=tuple(superseded),
+    )
+
+
+def submit_and_partial_fill(db_path, request_id="exec-1"):
+    submit(db_path, request_id)
+    return store.record_order_result(
+        request_id,
+        partial_result(request_id),
+        reason="partial fill",
+        db_path=db_path,
+    )
+
+
+def test_record_order_result_accepts_an_audited_reissue(db_path):
+    submit_and_partial_fill(db_path)
+    reissued = partial_result(
+        broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)
+    )
+    updated = store.record_order_result(
+        "exec-1", reissued, reason="remainder reissued", db_path=db_path
+    )
+    assert updated["broker_order_id"] == "B-2"
+    assert updated["order_state"] == "partially_filled"
+    # the audit chain survives the round-trip
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.broker_order_id == "B-2"
+    assert restored.superseded_broker_order_ids == ("B-1",)
+    assert restored.original_broker_order_id == "B-1"
+    # the history keeps BOTH ids: the partial fill under B-1, the reissued
+    # observation under B-2
+    history = store.get_state_history("exec-1", db_path=db_path)
+    broker_ids = [entry["broker_order_id"] for entry in history]
+    assert broker_ids == [None, "B-1", "B-2"]
+
+
+def test_record_order_result_refuses_an_id_change_without_the_audited_chain(db_path):
+    submit_and_partial_fill(db_path)
+    swapped = partial_result(broker_order_id="B-2", updated_at=at(3))
+    with pytest.raises(ValueError, match="chain"):
+        store.record_order_result(
+            "exec-1", swapped, reason="silent swap", db_path=db_path
+        )
+    # the stored bundle is untouched
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.broker_order_id == "B-1"
+    assert restored.superseded_broker_order_ids == ()
+
+
+def test_reissued_order_completes_and_cancels_with_the_chain_kept(db_path):
+    for request_id, final_state in (("exec-1", OrderState.FILLED),
+                                    ("exec-2", OrderState.CANCELLED)):
+        original_id = f"B-1-{request_id}"
+        reissued_id = f"B-2-{request_id}"
+        submit(db_path, request_id)
+        store.record_order_result(
+            request_id,
+            partial_result(request_id, broker_order_id=original_id),
+            reason="partial fill",
+            db_path=db_path,
+        )
+        store.record_order_result(
+            request_id,
+            partial_result(request_id, broker_order_id=reissued_id,
+                           superseded=(original_id,), updated_at=at(3)),
+            reason="remainder reissued",
+            db_path=db_path,
+        )
+        if final_state is OrderState.FILLED:
+            final = make_result(
+                final_state, request_id, broker_order_id=reissued_id,
+                filled="10",
+                fills=(fill("f-1", "4", 2), fill("f-2", "6", 4)),
+                updated_at=at(5),
+                superseded_broker_order_ids=(original_id,),
+            )
+        else:
+            final = make_result(
+                OrderState.CANCELLED, request_id,
+                broker_order_id=reissued_id, filled="4",
+                fills=(fill("f-1", "4", 2),), updated_at=at(5),
+                superseded_broker_order_ids=(original_id,),
+            )
+        updated = store.record_order_result(
+            request_id, final, reason="final observation", db_path=db_path
+        )
+        assert updated["order_state"] == final_state.value
+        restored = store.load_order_result(request_id, db_path=db_path)
+        assert restored.superseded_broker_order_ids == (original_id,)
+        assert restored.broker_order_id == reissued_id
+
+
+def test_reissued_away_id_still_resolves_to_its_execution_order(db_path):
+    submit_and_partial_fill(db_path)
+    store.record_order_result(
+        "exec-1",
+        partial_result(broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)),
+        reason="remainder reissued",
+        db_path=db_path,
+    )
+    current = store.get_execution_order_by_broker_order_id("B-2", db_path=db_path)
+    superseded = store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
+    assert current["execution_request_id"] == "exec-1"
+    assert superseded["execution_request_id"] == "exec-1"
+    assert store.get_execution_order_by_broker_order_id("B-9", db_path=db_path) is None
+
+
+def test_reissue_conflicting_with_another_orders_current_id_is_rolled_back(db_path):
+    # exec-2 already owns B-2 as its CURRENT id; exec-1 must not be able to
+    # adopt it via a reissue chain
+    submit_and_partial_fill(db_path, "exec-1")
+    submit_and_accept(db_path, "exec-2", broker_order_id="B-2")
+    with pytest.raises(store.ExecutionOrderConflictError):
+        store.record_order_result(
+            "exec-1",
+            partial_result(broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)),
+            reason="conflicting reissue",
+            db_path=db_path,
+        )
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.broker_order_id == "B-1"
+
+
+def test_legacy_snapshots_without_the_chain_key_still_restore(db_path):
+    # snapshots written BEFORE Issue #102 lack superseded_broker_order_ids;
+    # they must keep parsing as an empty chain (backward compatibility)
+    submit_and_partial_fill(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        rows = list(connection.execute(
+            f"SELECT execution_request_id, last_order_result_json FROM {store.ORDERS_TABLE}"
+        ))
+        for request_id, snapshot_text in rows:
+            data = json.loads(snapshot_text)
+            data.pop("superseded_broker_order_ids")
+            legacy = json.dumps(data, sort_keys=True)
+            connection.execute(
+                f"UPDATE {store.ORDERS_TABLE} SET last_order_result_json = ? "
+                "WHERE execution_request_id = ?",
+                (legacy, request_id),
+            )
+            connection.execute(
+                f"UPDATE {store.HISTORY_TABLE} SET order_result_json = ? "
+                "WHERE execution_request_id = ? AND order_result_json IS NOT NULL",
+                (legacy, request_id),
+            )
+        connection.commit()
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.superseded_broker_order_ids == ()
+    # and the order can still progress -- including into a reissue
+    store.record_order_result(
+        "exec-1",
+        partial_result(broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)),
+        reason="reissue after legacy restore",
+        db_path=db_path,
+    )
+    assert store.load_order_result("exec-1", db_path=db_path).broker_order_id == "B-2"
+
+
+def test_tampered_history_chain_is_refused_on_restore(db_path):
+    submit_and_partial_fill(db_path)
+    store.record_order_result(
+        "exec-1",
+        partial_result(broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)),
+        reason="remainder reissued",
+        db_path=db_path,
+    )
+    # rewrite the reissued snapshot to hide the supersession: the id change
+    # in the history must then be refused as unaudited
+    with closing(sqlite3.connect(db_path)) as connection:
+        row = connection.execute(
+            f"SELECT history_id, order_result_json FROM {store.HISTORY_TABLE} "
+            "WHERE broker_order_id = 'B-2'"
+        ).fetchone()
+        data = json.loads(row[1])
+        data["superseded_broker_order_ids"] = []
+        connection.execute(
+            f"UPDATE {store.HISTORY_TABLE} SET order_result_json = ? WHERE history_id = ?",
+            (json.dumps(data, sort_keys=True), row[0]),
+        )
+        connection.execute(
+            f"UPDATE {store.ORDERS_TABLE} SET last_order_result_json = ? "
+            "WHERE execution_request_id = 'exec-1'",
+            (json.dumps(data, sort_keys=True),),
+        )
+        connection.commit()
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.load_order_result("exec-1", db_path=db_path)
+
+
+def test_state_only_unknown_after_reissue_confirms_the_current_id(db_path):
+    submit_and_partial_fill(db_path)
+    store.record_order_result(
+        "exec-1",
+        partial_result(broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)),
+        reason="remainder reissued",
+        db_path=db_path,
+    )
+    # a state-only UNKNOWN may confirm the CURRENT id but never a past one
+    store.record_order_state(
+        "exec-1", OrderState.UNKNOWN, reason="query timed out",
+        changed_at_utc=at(4), broker_order_id="B-2", db_path=db_path,
+    )
+    with pytest.raises(ValueError):
+        store.record_order_state(
+            "exec-1", OrderState.UNKNOWN, reason="stale id",
+            changed_at_utc=at(5), broker_order_id="B-1", db_path=db_path,
+        )
+
+
+def test_chain_ids_owned_by_another_order_are_refused_before_commit(db_path):
+    # PR #112 review: a multi-hop reissue naming an intermediate id another
+    # execution order already owns must be refused INSIDE the update
+    # transaction — the column UNIQUE constraint cannot see chain ids, and a
+    # committed collision would brick every later read via the DB-wide scan.
+    submit_and_partial_fill(db_path, "exec-1")          # exec-1 current B-1
+    submit_and_accept(db_path, "exec-2", broker_order_id="B-2")  # exec-2 owns B-2
+    poisoned = partial_result(
+        broker_order_id="B-3", superseded=("B-1", "B-2"), updated_at=at(3)
+    )
+    with pytest.raises(store.ExecutionOrderConflictError, match="B-2"):
+        store.record_order_result(
+            "exec-1", poisoned, reason="multi-hop reissue", db_path=db_path
+        )
+    # the DB is untouched and still fully restorable — nothing was bricked
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.broker_order_id == "B-1"
+    assert restored.superseded_broker_order_ids == ()
+    assert store.load_order_result("exec-2", db_path=db_path).broker_order_id == "B-2"
+
+
+def test_chain_ids_inside_another_orders_chain_are_refused_before_commit(db_path):
+    # the owned id may itself live only in the OTHER order's superseded
+    # chain (not its current column) — still a conflict
+    submit_and_partial_fill(db_path, "exec-1")
+    submit(db_path, "exec-2")
+    store.record_order_result(
+        "exec-2", partial_result("exec-2", broker_order_id="B-2"),
+        reason="partial fill", db_path=db_path,
+    )
+    store.record_order_result(
+        "exec-2",
+        partial_result("exec-2", broker_order_id="B-2b", superseded=("B-2",),
+                       updated_at=at(3)),
+        reason="reissued", db_path=db_path,
+    )
+    poisoned = partial_result(
+        broker_order_id="B-3", superseded=("B-1", "B-2"), updated_at=at(3)
+    )
+    with pytest.raises(store.ExecutionOrderConflictError, match="B-2"):
+        store.record_order_result(
+            "exec-1", poisoned, reason="multi-hop reissue", db_path=db_path
+        )
+    assert store.load_order_result("exec-1", db_path=db_path).broker_order_id == "B-1"
+
+
+def test_new_current_id_sitting_in_another_orders_chain_is_refused(db_path):
+    # the NEW current id colliding with another order's superseded id is a
+    # conflict the column UNIQUE constraint alone would not see either
+    submit(db_path, "exec-2")
+    store.record_order_result(
+        "exec-2", partial_result("exec-2", broker_order_id="B-2"),
+        reason="partial fill", db_path=db_path,
+    )
+    store.record_order_result(
+        "exec-2",
+        partial_result("exec-2", broker_order_id="B-2b", superseded=("B-2",),
+                       updated_at=at(3)),
+        reason="reissued", db_path=db_path,
+    )
+    submit_and_partial_fill(db_path, "exec-1")
+    poisoned = partial_result(
+        broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)
+    )
+    with pytest.raises(store.ExecutionOrderConflictError, match="B-2"):
+        store.record_order_result(
+            "exec-1", poisoned, reason="reissue onto an owned id", db_path=db_path
+        )
+    assert store.load_order_result("exec-1", db_path=db_path).broker_order_id == "B-1"

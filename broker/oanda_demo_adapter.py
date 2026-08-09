@@ -63,11 +63,49 @@ Error translation (everything crossing the boundary is a common type):
 - malformed / unsupported call -> ``BrokerInvalidRequestError``
 - unknown order specifier      -> ``BrokerOrderNotFoundError``
 - refused cancellation         -> ``BrokerCancellationError``
-- any submit response carrying an order reissue field (2xx / 400 / 404
-  alike, checked BEFORE business interpretation; value type irrelevant)
-  -> ``BrokerTimeoutError`` (deliberately UNSUPPORTED pending Issue #102;
-  the response is not interpreted at all — fail-closed toward UNKNOWN,
-  resolved by a later query)
+
+Order Reissue (Issue #102): OANDA may reissue the remaining quantity of a
+partially filled order as a NEW order under a NEW order id
+(``orderReissueTransaction``); the reissue itself can also be rejected
+(``orderReissueRejectTransaction``). The OANDA-specific transaction shapes
+never leave this module — they are normalized into the common model's
+``broker_order_id`` (CURRENT actionable id) + ``superseded_broker_order_ids``
+(audited id history) here:
+
+- 2xx submit answer with a partial ``orderFillTransaction`` (type
+  ``ORDER_FILL``) AND a fully correlated ``orderReissueTransaction`` (type
+  ``ORDER_REISSUE``, our client id echoed as ``clientExtensions.id``,
+  ``replacesOrderID`` = the filled/original order, transaction ``id`` = the
+  NEW order id, ``units`` = the exact remaining quantity) ->
+  ``PARTIALLY_FILLED`` with the reissued id current and the original id in
+  the superseded chain
+- 2xx submit answer with a partial fill AND a fully correlated
+  ``orderReissueRejectTransaction`` (type ``ORDER_REISSUE_REJECT``, a
+  transaction id, ``clientExtensions.id`` correlation,
+  ``intendedReplacesOrderID`` = the filled/original order — the reject
+  transaction names the order it ATTEMPTED to replace — and ``units`` =
+  the exact remaining quantity of the attempted replacement) -> the
+  remainder is definitively dead: terminal ``CANCELLED`` with the partial
+  fill kept on the ORIGINAL id. Transaction quantities are validated
+  SIGNED against the request's side before normalization
+- ``get_order`` / ``cancel_order`` keep addressing by ``client_order_id``
+  (the ``@<id>`` specifier), which OANDA resolves to the CURRENT order of a
+  reissue chain; ``get_order`` walks the chain backwards over
+  ``replacesOrderID`` / ``replacedByOrderID`` (bounded depth, every link
+  verified: our client id, bidirectional references, the documented
+  terminal state FILLED a reissued-away order completes into — OANDA has
+  no dedicated "reissued" order state — and per-link quantity
+  consistency) to rebuild the FULL cumulative snapshot. A FILLED current
+  order whose cumulative fills stay below the requested quantity is the
+  REJECTED-reissue shape (a terminal partial fill with no successor) and
+  maps to terminal ``CANCELLED`` with the partial fills kept, matching
+  the submit answer
+- any reissue field that cannot be interpreted — missing / malformed
+  transaction, missing or mismatched client correlation, old/new order id
+  correlation failure, quantity inconsistency, reissue fields on an error
+  status (400/404), contradictory transaction combinations —
+  -> ``BrokerTimeoutError`` (fail-closed toward UNKNOWN, resolved by a
+  later query, never by resending)
 """
 
 from __future__ import annotations
@@ -122,6 +160,17 @@ OANDA_DEMO_CONNECTION_TARGET = "oanda-demo"
 # restricted to unreserved URL characters up to 128 chars. The execution
 # layer generates ids well inside this alphabet.
 _CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# Broker-assigned order ids from RESPONSES are embedded into request paths
+# when a reissue chain is resolved (Issue #102), so — like client order ids —
+# they are restricted to unreserved URL characters before any fetch. A
+# broker-supplied id outside this alphabet is a malformed response.
+_BROKER_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# Upper bound on how many reissued-away orders one chain may be walked
+# through (Issue #102): a longer chain — or a reference cycle, which would
+# otherwise loop forever — is refused as an uninterpretable response.
+_MAX_REISSUE_CHAIN = 10
 
 # OANDA's definitive duplicate-id rejection. The Broker boundary contract
 # (Issue #73 / FakeBroker) models a duplicate client_order_id as
@@ -482,27 +531,29 @@ class OandaDemoAdapter:
         )
 
         # Order Reissue check comes BEFORE any business interpretation —
-        # 2xx, 400 and 404 alike (PR #101 5th review): a reject/fill/cancel
-        # transaction sharing the body with a reissue field must not be
-        # confirmed as REJECTED / FILLED / PARTIALLY_FILLED / CANCELLED.
-        # KEY PRESENCE alone triggers the refusal: reissue handling is
-        # deliberately unsupported here (Issue #102 owns it across the state
-        # machine / audit / query / cancel paths), and a reissue field whose
-        # value is a string, an array, null or a malformed mapping must not
-        # be silently skipped as "absent" either. Fail closed toward UNKNOWN
-        # so the recorded state can never misrepresent a reissued order; a
-        # later query (never a resend) resolves it.
-        if (
-            "orderReissueTransaction" in payload
-            or "orderReissueRejectTransaction" in payload
-        ):
-            raise BrokerTimeoutError(
-                "broker response carries an order reissue field; reissue "
-                "handling is deliberately unsupported by this adapter "
-                "(Issue #102) — the outcome is treated as unknown and is "
-                "resolved by a later query, never by resending",
-                client_order_id=request.client_order_id,
-            )
+        # 2xx, 400 and 404 alike (PR #101 5th review / Issue #102): a
+        # reject/fill/cancel transaction sharing the body with a reissue
+        # field must never be confirmed by the NON-reissue interpretation
+        # paths below. KEY PRESENCE alone routes the answer into the strict
+        # reissue interpretation: a supported reissue is normalized into the
+        # common model (current id + superseded chain), and EVERYTHING the
+        # interpretation cannot prove — malformed values, broken client /
+        # order correlation, quantity inconsistency, reissue fields on an
+        # error status, contradictory transaction combinations — fails
+        # closed toward UNKNOWN (``BrokerTimeoutError``), resolved by a
+        # later query, never by resending.
+        has_reissue = "orderReissueTransaction" in payload
+        has_reissue_reject = "orderReissueRejectTransaction" in payload
+        if has_reissue or has_reissue_reject:
+            if status not in (200, 201):
+                raise BrokerTimeoutError(
+                    "broker error response carries an order reissue field; a "
+                    "reissue combined with an error status cannot be "
+                    "interpreted — the outcome is treated as unknown and is "
+                    "resolved by a later query, never by resending",
+                    client_order_id=request.client_order_id,
+                )
+            return self._reissue_result(request, payload)
 
         if status in (400, 404):
             reject = payload.get("orderRejectTransaction")
@@ -635,10 +686,173 @@ class OandaDemoAdapter:
             client_order_id=request.client_order_id,
         )
 
+    def _reissue_result(self, request: OrderRequest, payload: Mapping) -> OrderResult:
+        """Interpret a 2xx submit answer that carries an order reissue field
+        (Issue #102) into the common model — or fail closed toward UNKNOWN.
+
+        A reissue exists only because a partial fill happened, so the answer
+        must carry a fully correlated partial ``orderFillTransaction`` AND
+        exactly one interpretable reissue transaction. Every requirement
+        below refuses with ``BrokerTimeoutError`` (never a guessed state):
+
+        - exactly one of ``orderReissueTransaction`` /
+          ``orderReissueRejectTransaction`` (both together is contradictory)
+        - no coexisting cancel / reject transaction (ambiguous outcome)
+        - the fill transaction: a Mapping of ``type`` ``ORDER_FILL`` echoing
+          OUR ``clientOrderID``, identifying the original order
+          (``orderID``), with a partial quantity (0 < filled < requested)
+          and a well-formed fill
+        - the reissue / reissue-reject transaction, using the fields the
+          OANDA transaction schema actually carries (PR #112 review): a
+          Mapping with a non-empty transaction ``id``, the expected ``type``
+          (``ORDER_REISSUE`` / ``ORDER_REISSUE_REJECT``), OUR client id
+          echoed as ``clientExtensions.id``, and the SAME original order the
+          fill transaction filled named by ``replacesOrderID`` (successful
+          reissue) / ``intendedReplacesOrderID`` (reissue reject — the
+          OANDA reject transaction names the order it ATTEMPTED to replace;
+          no replacement ever happened). BOTH branches must carry ``units``
+          equal to the exact remaining quantity, and every transaction
+          quantity (fill and reissue alike) must be SIGNED on the request's
+          side before it is normalized to the common model's unsigned
+          quantity — an opposite-signed answer is contradictory (PR #112
+          re-review). A successful reissue additionally carries the NEW
+          order id as its transaction ``id`` (the order-creating
+          transaction's id is the new order's id, distinct from the
+          original).
+
+        Success -> ``PARTIALLY_FILLED`` with ``broker_order_id`` = the
+        reissued (current) id and the original id in the superseded chain.
+        Reissue reject -> the remainder is definitively dead: terminal
+        ``CANCELLED`` with the partial fill kept on the ORIGINAL id.
+        """
+        client_order_id = request.client_order_id
+
+        def refuse(detail: str) -> None:
+            raise BrokerTimeoutError(
+                f"broker response carries an order reissue field but {detail}; "
+                "the outcome is treated as unknown and is resolved by a later "
+                "query, never by resending",
+                client_order_id=client_order_id,
+            )
+
+        has_reissue = "orderReissueTransaction" in payload
+        has_reissue_reject = "orderReissueRejectTransaction" in payload
+        if has_reissue and has_reissue_reject:
+            refuse("carries BOTH a reissue and a reissue-reject transaction")
+        if "orderCancelTransaction" in payload or "orderRejectTransaction" in payload:
+            refuse(
+                "a cancel or reject transaction coexists with it, making the "
+                "outcome ambiguous"
+            )
+        fill_tx = payload.get("orderFillTransaction")
+        if not isinstance(fill_tx, Mapping):
+            refuse("no interpretable partial-fill transaction accompanies it")
+        # The transaction that may drive a reissue interpretation must prove
+        # it IS a fill (PR #112 re-review): a mapping with matching ids but a
+        # missing or foreign type is a malformed response, not a fill.
+        if fill_tx.get("type") != "ORDER_FILL":
+            refuse("the fill transaction is not an ORDER_FILL transaction")
+        if fill_tx.get("clientOrderID") != client_order_id:
+            refuse("the fill transaction is not correlated to this client order id")
+        original_id = fill_tx.get("orderID")
+        if not isinstance(original_id, str) or not original_id.strip():
+            refuse("the fill transaction does not identify the original order")
+        try:
+            raw_fill_units = _parse_decimal(fill_tx.get("units"), "orderFillTransaction.units")
+        except BrokerError:
+            refuse("the fill transaction is malformed")
+        # The SIGNED direction must match the request BEFORE the value is
+        # normalized to the common model's unsigned quantity (PR #112
+        # re-review): a BUY request answered with SELL-signed transactions
+        # is a contradictory response, not a fill of this order.
+        if (raw_fill_units > 0) != (request.side is OrderSide.BUY):
+            refuse("the fill transaction describes units on the opposite side of the request")
+        filled_quantity = abs(raw_fill_units)
+        try:
+            fill = Fill(
+                fill_id=self._tx_id(fill_tx, "orderFillTransaction.id"),
+                price=_parse_decimal(fill_tx.get("price"), "orderFillTransaction.price"),
+                quantity=filled_quantity,
+                filled_at_utc=_parse_utc_time(fill_tx.get("time"), "orderFillTransaction.time"),
+            )
+        except BrokerError:
+            refuse("the fill transaction is malformed")
+        if not (0 < filled_quantity < request.quantity):
+            refuse("the fill quantity is not a partial fill of the requested quantity")
+
+        key = "orderReissueRejectTransaction" if has_reissue_reject else "orderReissueTransaction"
+        expected_type = "ORDER_REISSUE_REJECT" if has_reissue_reject else "ORDER_REISSUE"
+        tx = payload.get(key)
+        if not isinstance(tx, Mapping):
+            refuse(f"{key} is not an object")
+        # Required transaction schema (PR #112 review): a transaction that
+        # may drive a terminal CANCELLED or move the current broker order id
+        # must prove its own identity (id + type), its client correlation
+        # (clientExtensions.id — the field OANDA reissue transactions carry;
+        # NOT clientOrderID, which belongs to fill transactions) and the
+        # order it replaces (replacesOrderID). Anything less is refused.
+        tx_id = tx.get("id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            refuse(f"{key} carries no transaction id")
+        if tx.get("type") != expected_type:
+            refuse(f"{key} does not carry the expected transaction type")
+        if self._client_extension_id(tx) != client_order_id:
+            refuse(f"{key} is not correlated to this client order id")
+        # The replaced-order reference lives in a DIFFERENT field per branch
+        # (PR #112 re-review): a successful OrderReissueTransaction names the
+        # order it replaces as replacesOrderID, while the reject transaction
+        # names the order it ATTEMPTED to replace as intendedReplacesOrderID
+        # (no replacement ever happened).
+        replaces_field = "intendedReplacesOrderID" if has_reissue_reject else "replacesOrderID"
+        if tx.get(replaces_field) != original_id:
+            refuse(f"{key} does not reference the partially filled order it replaces")
+        # Quantity consistency holds for BOTH branches (PR #112 re-review):
+        # the transaction describes the (attempted) replacement, so its units
+        # must be the exact remainder — signed on the request's side. A
+        # reject with missing / inconsistent / opposite-signed units is as
+        # uninterpretable as a successful reissue with them, and must never
+        # confirm a terminal CANCELLED.
+        try:
+            raw_reissued_units = _parse_decimal(tx.get("units"), f"{key}.units")
+        except BrokerError:
+            refuse(f"{key} carries no interpretable units")
+        if (raw_reissued_units > 0) != (request.side is OrderSide.BUY):
+            refuse(f"{key} describes units on the opposite side of the request")
+        if abs(raw_reissued_units) != request.quantity - filled_quantity:
+            refuse(
+                f"{key} carries a quantity inconsistent with the remaining "
+                "quantity of the request"
+            )
+
+        if has_reissue_reject:
+            # The remainder's reissue was definitively rejected: no new order
+            # exists, the partial fill stands, the remainder is dead. The
+            # ORIGINAL id stays the current (and last) actionable identity.
+            return self._result_from_request(
+                request,
+                state=OrderState.CANCELLED,
+                broker_order_id=original_id,
+                fills=(fill,),
+            )
+
+        # The reissue transaction CREATES the new order, so its transaction
+        # id is the new order's id (same convention as orderCreateTransaction).
+        new_order_id = tx_id
+        if new_order_id == original_id:
+            refuse("the reissued order id equals the original order id")
+        return self._result_from_request(
+            request,
+            state=OrderState.PARTIALLY_FILLED,
+            broker_order_id=new_order_id,
+            fills=(fill,),
+            superseded_broker_order_ids=(original_id,),
+        )
+
     def cancel_order(self, client_order_id: str) -> OrderResult:
-        """Cancel the pending order registered under ``client_order_id``
-        (OANDA order specifier ``@<client id>``) and return the post-cancel
-        snapshot."""
+        """Cancel the order registered under ``client_order_id`` (OANDA
+        order specifier ``@<client id>``, which resolves to the CURRENT
+        actionable order of a reissue chain — Issue #102) and return the
+        post-cancel snapshot."""
         self._require_client_order_id(client_order_id)
         status, payload = self._request(
             "PUT",
@@ -1299,6 +1513,7 @@ class OandaDemoAdapter:
         broker_order_id: str | None = None,
         fills: tuple[Fill, ...] = (),
         reject_reason: str | None = None,
+        superseded_broker_order_ids: tuple[str, ...] = (),
     ) -> OrderResult:
         filled = sum((f.quantity for f in fills), Decimal(0))
         try:
@@ -1319,6 +1534,7 @@ class OandaDemoAdapter:
                 updated_at_utc=self._now(),
                 fills=fills,
                 reject_reason=reject_reason,
+                superseded_broker_order_ids=superseded_broker_order_ids,
             )
         except (ValueError, BrokerInvalidRequestError) as exc:
             # A broker answer inconsistent with the common-model invariants
@@ -1336,7 +1552,16 @@ class OandaDemoAdapter:
 
         The order's echoed client extension id is verified against the
         queried ``client_order_id`` first: a missing or different echo is a
-        broken response correlation (PR #101 review)."""
+        broken response correlation (PR #101 review).
+
+        Order Reissue (Issue #102): the ``@<client id>`` specifier resolves
+        to the CURRENT order of a reissue chain. When the order carries
+        ``replacesOrderID`` the chain is walked backwards
+        (:meth:`_reissue_chain`, every link verified) and the snapshot is
+        rebuilt CUMULATIVELY: ``requested_quantity`` comes from the root
+        (original) order, the fills of every reissued-away link are
+        collected oldest-first, ``broker_order_id`` stays the current order
+        id and the predecessors form the superseded chain."""
         self._verify_client_correlation(
             self._client_extension_id(order),
             client_order_id,
@@ -1377,15 +1602,92 @@ class OandaDemoAdapter:
             else None
         )
         oanda_state = order.get("state")
+        if order.get("replacedByOrderID") is not None:
+            # The client-id specifier must resolve to the CURRENT order of a
+            # reissue chain. A ``replacedByOrderID`` marks the order as
+            # reissued-away — OANDA has no dedicated order state for it
+            # (PR #112 re-review: the documented states are PENDING /
+            # TRIGGERED / FILLED / CANCELLED; reissue is expressed by the
+            # replacement links) — so an answer carrying one here means the
+            # broker responses are inconsistent (Issue #102, fail-closed).
+            raise BrokerCommunicationError(
+                "the client order specifier resolved to a reissued-away order; "
+                "the broker responses are inconsistent",
+                client_order_id=client_order_id,
+            )
+
+        chain = self._reissue_chain(order, broker_order_id, client_order_id)
+        superseded: list[str] = []
+        chain_fills: list[Fill] = []
+        chain_units: list[Decimal] = []
+        for member in chain:
+            member_units = _parse_decimal(member.get("units"), "reissued order.units")
+            if (member_units > 0) != (units > 0):
+                raise BrokerCommunicationError(
+                    "a reissued-away order in the chain carries units with the "
+                    "opposite sign",
+                    client_order_id=client_order_id,
+                )
+            if member.get("type") != oanda_type or member.get("instrument") != instrument:
+                raise BrokerCommunicationError(
+                    "a reissued-away order in the chain does not match the current "
+                    "order's type or instrument",
+                    client_order_id=client_order_id,
+                )
+            if order_type is OrderType.LIMIT:
+                member_price = _parse_decimal(member.get("price"), "reissued order.price")
+                if member_price != requested_price:
+                    raise BrokerCommunicationError(
+                        "a reissued-away order in the chain carries a different "
+                        "limit price than the current order",
+                        client_order_id=client_order_id,
+                    )
+            superseded.append(member["id"])
+            chain_fills.append(self._fetch_fill(member, client_order_id, side=side))
+            chain_units.append(abs(member_units))
+        # Per-link quantity consistency: each reissued-away order's size must
+        # equal its own partial fill plus the size reissued to its successor
+        # (the current order closes the chain). A mismatch means the chain
+        # cannot be trusted to describe one request (Issue #102 fail-closed).
+        for index, member_quantity in enumerate(chain_units):
+            successor_quantity = (
+                chain_units[index + 1] if index + 1 < len(chain_units) else quantity
+            )
+            if member_quantity != chain_fills[index].quantity + successor_quantity:
+                raise BrokerCommunicationError(
+                    "the reissue chain is quantity-inconsistent: a reissued-away "
+                    "order's size does not equal its partial fill plus the "
+                    "reissued remainder",
+                    client_order_id=client_order_id,
+                )
+        requested_quantity = chain_units[0] if chain_units else quantity
+
         if oanda_state in ("PENDING", "TRIGGERED"):
-            state = OrderState.ACCEPTED
-            fills: tuple[Fill, ...] = ()
+            # a working order behind a reissue chain means the chain's fills
+            # exist and the remainder is still working: PARTIALLY_FILLED
+            state = OrderState.PARTIALLY_FILLED if chain else OrderState.ACCEPTED
+            fills: tuple[Fill, ...] = tuple(chain_fills)
         elif oanda_state == "CANCELLED":
             state = OrderState.CANCELLED
-            fills = ()
+            fills = tuple(chain_fills)
         elif oanda_state == "FILLED":
-            state = OrderState.FILLED
-            fills = (self._fetch_fill(order, client_order_id),)
+            fills = tuple(chain_fills) + (
+                self._fetch_fill(order, client_order_id, side=side),
+            )
+            # A FILLED order whose cumulative (fully correlated) fills stay
+            # BELOW the requested quantity is a terminal partial fill with
+            # NO successor — the rejected-reissue shape (PR #112 re-review):
+            # the remainder is definitively dead, which the common model
+            # expresses as CANCELLED with the partial fills kept, matching
+            # the terminal result the submit answer produced. This covers
+            # the original order after its reissue was rejected AND a
+            # mid-chain member whose NEXT reissue was rejected. A cumulative
+            # total ABOVE the requested quantity stays a malformed response
+            # (model invariant -> BrokerCommunicationError below).
+            if sum((f.quantity for f in fills), Decimal(0)) < requested_quantity:
+                state = OrderState.CANCELLED
+            else:
+                state = OrderState.FILLED
         else:
             raise BrokerCommunicationError(
                 f"broker order object carries an unknown state {oanda_state!r}",
@@ -1400,13 +1702,14 @@ class OandaDemoAdapter:
                 symbol=instrument,
                 side=side,
                 order_type=order_type,
-                requested_quantity=quantity,
+                requested_quantity=requested_quantity,
                 filled_quantity=filled,
-                remaining_quantity=quantity - filled,
+                remaining_quantity=requested_quantity - filled,
                 requested_price=requested_price,
                 average_fill_price=weighted_average_price(fills),
                 updated_at_utc=self._now(),
                 fills=fills,
+                superseded_broker_order_ids=tuple(superseded),
             )
         except (ValueError, BrokerInvalidRequestError) as exc:
             # units=0, zero/negative LIMIT price and every other invalid
@@ -1417,10 +1720,120 @@ class OandaDemoAdapter:
                 client_order_id=client_order_id,
             ) from None
 
-    def _fetch_fill(self, order: Mapping, client_order_id: str) -> Fill:
-        """Fetch the ORDER_FILL transaction referenced by a FILLED order to
-        recover fill price / quantity / time (transaction & fill results,
-        Issue #79 scope)."""
+    def _reissue_chain(
+        self, order: Mapping, order_id: str, client_order_id: str
+    ) -> tuple[Mapping, ...]:
+        """Walk a reissue chain BACKWARDS from the current order over
+        ``replacesOrderID``, oldest link first in the result (Issue #102).
+
+        Every link is verified before it may contribute to the snapshot —
+        anything unprovable fails closed as ``BrokerCommunicationError``:
+
+        - ``replacesOrderID`` must be a well-formed, URL-safe order id (it
+          is embedded into a request path)
+        - the referenced order must exist, echo OUR client extension id,
+          point BACK at its successor via ``replacedByOrderID``
+          (bidirectional correlation) and report the documented terminal
+          state ``FILLED`` its partial fill and replacement imply — OANDA
+          has no dedicated "reissued" order state (PR #112 re-review), so
+          the replacement links plus the fill are the reissue evidence, and
+          a working / cancelled order claiming replacement is contradictory
+        - the chain depth is bounded (no unbounded fetch loops; a cycle or
+          runaway chain is refused)
+        """
+        members: list[Mapping] = []
+        successor = order
+        successor_id = order_id
+        while True:
+            reference = successor.get("replacesOrderID")
+            if reference is None:
+                break
+            if (
+                not isinstance(reference, str)
+                or not _BROKER_ORDER_ID_RE.fullmatch(reference)
+            ):
+                raise BrokerCommunicationError(
+                    "broker order object carries a malformed replacesOrderID",
+                    client_order_id=client_order_id,
+                )
+            if len(members) >= _MAX_REISSUE_CHAIN:
+                raise BrokerCommunicationError(
+                    "the reissue chain exceeds the supported depth "
+                    f"({_MAX_REISSUE_CHAIN}); refusing to interpret it",
+                    client_order_id=client_order_id,
+                )
+            predecessor = self._fetch_order_by_id(reference, client_order_id)
+            if predecessor.get("id") != reference:
+                raise BrokerCommunicationError(
+                    "a reissued-away order reports a different id than the chain "
+                    "reference that led to it",
+                    client_order_id=client_order_id,
+                )
+            self._verify_client_correlation(
+                self._client_extension_id(predecessor),
+                client_order_id,
+                required=True,
+                context="reissued order chain",
+            )
+            if predecessor.get("replacedByOrderID") != successor_id:
+                raise BrokerCommunicationError(
+                    "a reissued-away order does not reference its successor "
+                    "(replacedByOrderID mismatch); the reissue chain cannot be "
+                    "trusted",
+                    client_order_id=client_order_id,
+                )
+            # OANDA has NO dedicated "reissued" order state (PR #112
+            # re-review): a reissued-away order completed through its
+            # partial fill, so it reports the documented terminal state
+            # FILLED; the reissue itself is evidenced by the verified
+            # replacesOrderID / replacedByOrderID links and the fill
+            # transaction fetched next. Any other state — a working or
+            # cancelled order claiming to have been replaced — is
+            # contradictory.
+            if predecessor.get("state") != "FILLED":
+                raise BrokerCommunicationError(
+                    "an order inside the reissue chain does not report the "
+                    "FILLED state its partial fill and replacement imply; "
+                    "the chain cannot be trusted",
+                    client_order_id=client_order_id,
+                )
+            members.append(predecessor)
+            successor = predecessor
+            successor_id = reference
+        return tuple(reversed(members))
+
+    def _fetch_order_by_id(self, order_id: str, client_order_id: str) -> Mapping:
+        """Fetch one order by its BROKER order id (plain specifier, no
+        ``@``); used only to resolve reissue chains. A missing or malformed
+        answer is a broken chain — a response problem, never NOT_FOUND for
+        the queried client order (which does exist)."""
+        status, payload = self._request(
+            "GET",
+            f"/v3/accounts/{self._config.account_id}/orders/{order_id}",
+            client_order_id=client_order_id,
+        )
+        if status != 200:
+            raise BrokerCommunicationError(
+                f"reissue-chain order lookup failed with HTTP status {status}",
+                client_order_id=client_order_id,
+            )
+        order = payload.get("order")
+        if not isinstance(order, Mapping):
+            raise BrokerCommunicationError(
+                "reissue-chain order lookup carried no order object",
+                client_order_id=client_order_id,
+            )
+        return order
+
+    def _fetch_fill(self, order: Mapping, client_order_id: str, *, side: OrderSide) -> Fill:
+        """Fetch the ORDER_FILL transaction referenced by a FILLED (or
+        reissued-away) order to recover fill price / quantity / time
+        (transaction & fill results, Issue #79 scope). ``side`` is the
+        order's direction: the transaction's SIGNED units must lie on that
+        side before they are normalized to the common model's unsigned
+        quantity (PR #112 re-review r4 — an opposite-signed fill that
+        happens to satisfy the chain arithmetic is a contradictory
+        response, never a fill of this order)."""
         tx_id = order.get("fillingTransactionID")
         if not isinstance(tx_id, str) or not tx_id.strip():
             raise BrokerCommunicationError(
@@ -1443,11 +1856,47 @@ class OandaDemoAdapter:
                 "broker response carried no transaction object",
                 client_order_id=client_order_id,
             )
+        # The fetched transaction must PROVE it is the fill of THIS order
+        # (Issue #102 / PR #112 review): a transaction that answers under a
+        # different id, is not an ORDER_FILL, filled a different order, or
+        # carries a foreign client correlation must never contribute a fill
+        # to this order's audit snapshot — even when its quantities would
+        # happen to satisfy the chain arithmetic.
+        if self._tx_id(tx, "transaction.id") != tx_id:
+            raise BrokerCommunicationError(
+                "broker answered with a different transaction than the "
+                "fillingTransactionID that was requested",
+                client_order_id=client_order_id,
+            )
+        if tx.get("type") != "ORDER_FILL":
+            raise BrokerCommunicationError(
+                "the filling transaction is not an ORDER_FILL transaction",
+                client_order_id=client_order_id,
+            )
+        if tx.get("orderID") != order.get("id"):
+            raise BrokerCommunicationError(
+                "the filling transaction does not reference the order it was "
+                "fetched for",
+                client_order_id=client_order_id,
+            )
+        if tx.get("clientOrderID") != client_order_id:
+            raise BrokerCommunicationError(
+                "the filling transaction is not correlated to this client "
+                "order id",
+                client_order_id=client_order_id,
+            )
+        raw_units = _parse_decimal(tx.get("units"), "transaction.units")
+        if (raw_units > 0) != (side is OrderSide.BUY):
+            raise BrokerCommunicationError(
+                "the filling transaction describes units on the opposite side "
+                "of the order",
+                client_order_id=client_order_id,
+            )
         try:
             return Fill(
                 fill_id=self._tx_id(tx, "transaction.id"),
                 price=_parse_decimal(tx.get("price"), "transaction.price"),
-                quantity=abs(_parse_decimal(tx.get("units"), "transaction.units")),
+                quantity=abs(raw_units),
                 filled_at_utc=_parse_utc_time(tx.get("time"), "transaction.time"),
             )
         except BrokerInvalidRequestError as exc:

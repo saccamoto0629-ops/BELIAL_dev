@@ -869,3 +869,282 @@ def test_trade_getters_place_no_order_and_record_no_call():
     broker.get_closed_trades()
 
     assert (len(broker.submitted_requests), len(broker.cancel_requests)) == (submits, cancels)
+
+
+# --- Issue #102: deterministic broker order reissue scenarios ----------------
+#
+# submit -> partial fill -> remainder reissued under a NEW broker order id ->
+# query / cancel target the CURRENT order -> old and new ids stay auditable ->
+# final fill / reissue reject / lost reissue information. No network, no
+# sleep, no randomness anywhere.
+
+
+def test_partially_fill_then_reissue_switches_the_current_id_and_keeps_the_audit_chain():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400.50"), Decimal("4")),),
+            broker_order_id="OLD-1",
+            reissued_broker_order_id="NEW-1",
+        ),
+    )
+    result = broker.submit_order(make_request("c-1"))
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    assert result.broker_order_id == "NEW-1"
+    assert result.superseded_broker_order_ids == ("OLD-1",)
+    assert result.original_broker_order_id == "OLD-1"
+    assert result.all_broker_order_ids == ("OLD-1", "NEW-1")
+    assert result.filled_quantity == Decimal("4")
+    assert result.remaining_quantity == Decimal("6")
+    # the caller-side correlation key never changes across the reissue
+    assert result.client_order_id == "c-1"
+
+
+def test_partially_fill_then_reissue_uses_sequential_ids_by_default():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(fills=((Decimal("2400.50"), Decimal("4")),)),
+    )
+    result = broker.submit_order(make_request("c-1"))
+    assert result.superseded_broker_order_ids == ("FAKE-1",)
+    assert result.broker_order_id == "FAKE-2"
+
+
+def test_get_order_after_reissue_returns_the_current_order():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400.50"), Decimal("4")),),
+            broker_order_id="OLD-1",
+            reissued_broker_order_id="NEW-1",
+        ),
+    )
+    submitted = broker.submit_order(make_request("c-1"))
+    snapshot = broker.get_order("c-1")
+    assert snapshot == submitted
+    assert snapshot.broker_order_id == "NEW-1"
+    assert snapshot.superseded_broker_order_ids == ("OLD-1",)
+
+
+def test_cancel_order_after_reissue_targets_the_current_order_and_keeps_history():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400.50"), Decimal("4")),),
+            broker_order_id="OLD-1",
+            reissued_broker_order_id="NEW-1",
+        ),
+    )
+    broker.submit_order(make_request("c-1"))
+    cancelled = broker.cancel_order("c-1")
+    assert cancelled.state is m.OrderState.CANCELLED
+    # the cancel operates on the CURRENT actionable order...
+    assert cancelled.broker_order_id == "NEW-1"
+    # ...and the audit history survives the terminal state
+    assert cancelled.superseded_broker_order_ids == ("OLD-1",)
+    assert cancelled.filled_quantity == Decimal("4")
+
+
+def test_fill_remaining_completes_a_reissued_order():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400.50"), Decimal("4")),),
+            broker_order_id="OLD-1",
+            reissued_broker_order_id="NEW-1",
+        ),
+    )
+    submitted = broker.submit_order(make_request("c-1"))
+    final = broker.fill_remaining("c-1", price=Decimal("2401.00"))
+    m.validate_order_result_update(submitted, final)
+    assert final.state is m.OrderState.FILLED
+    assert final.broker_order_id == "NEW-1"
+    assert final.superseded_broker_order_ids == ("OLD-1",)
+    assert final.filled_quantity == Decimal("10")
+    assert [f.quantity for f in final.fills] == [Decimal("4"), Decimal("6")]
+    assert broker.get_order("c-1") == final
+
+
+def test_repeated_reissue_chain_stays_auditable_and_validated():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400.50"), Decimal("4")),),
+            broker_order_id="OLD-1",
+            reissued_broker_order_id="NEW-1",
+        ),
+    )
+    first = broker.submit_order(make_request("c-1"))
+    second = broker.reissue_remainder(
+        "c-1",
+        fill_price=Decimal("2400.75"),
+        fill_quantity=Decimal("3"),
+        reissued_broker_order_id="NEW-2",
+    )
+    m.validate_order_result_update(first, second)
+    assert second.state is m.OrderState.PARTIALLY_FILLED
+    assert second.broker_order_id == "NEW-2"
+    assert second.superseded_broker_order_ids == ("OLD-1", "NEW-1")
+    assert second.filled_quantity == Decimal("7")
+    final = broker.fill_remaining("c-1", price=Decimal("2401.00"))
+    m.validate_order_result_update(second, final)
+    assert final.state is m.OrderState.FILLED
+    assert final.all_broker_order_ids == ("OLD-1", "NEW-1", "NEW-2")
+
+
+def test_reissue_remainder_must_leave_a_remainder():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(fills=((Decimal("2400.50"), Decimal("4")),)),
+    )
+    broker.submit_order(make_request("c-1"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.reissue_remainder(
+            "c-1", fill_price=Decimal("2400.75"), fill_quantity=Decimal("6")
+        )
+
+
+def test_reissue_lifecycle_methods_require_a_working_order():
+    broker = fb.FakeBroker()
+    broker.script_order("c-done", fb.FillImmediately(price=Decimal("2400")))
+    broker.submit_order(make_request("c-done"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.fill_remaining("c-done", price=Decimal("2400"))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.reissue_remainder(
+            "c-done", fill_price=Decimal("2400"), fill_quantity=Decimal("1")
+        )
+    with pytest.raises(m.BrokerOrderNotFoundError):
+        broker.fill_remaining("c-unknown", price=Decimal("2400"))
+
+
+def test_reissue_ids_are_unique_across_orders_including_superseded_ids():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400.50"), Decimal("4")),),
+            broker_order_id="OLD-1",
+            reissued_broker_order_id="NEW-1",
+        ),
+    )
+    broker.submit_order(make_request("c-1"))
+    # neither the superseded nor the current id may ever be assigned again
+    for taken in ("OLD-1", "NEW-1"):
+        broker.script_order("c-2", fb.FillImmediately(
+            price=Decimal("2400"), broker_order_id=taken
+        ))
+        with pytest.raises(m.BrokerInvalidRequestError):
+            broker.submit_order(make_request("c-2"))
+        assert "c-2" not in [r.client_order_id for r in broker.list_orders()]
+
+
+def test_partially_fill_then_reissue_script_validation():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.PartiallyFillThenReissue(fills=())
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.PartiallyFillThenReissue(fills=((Decimal("2400"), Decimal("0")),))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.PartiallyFillThenReissue(
+            fills=((Decimal("2400"), Decimal("4")),),
+            broker_order_id="SAME",
+            reissued_broker_order_id="SAME",
+        )
+    # over-filling is caught at submit time against the order quantity
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.PartiallyFillThenReissue(fills=((Decimal("2400"), Decimal("10")),)),
+    )
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request("c-1"))
+
+
+def test_reissue_rejected_is_terminal_cancelled_on_the_original_id():
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.ReissueRejected(
+            fills=((Decimal("2400.50"), Decimal("4")),), broker_order_id="OLD-1"
+        ),
+    )
+    result = broker.submit_order(make_request("c-1"))
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "OLD-1"
+    assert result.superseded_broker_order_ids == ()
+    assert result.filled_quantity == Decimal("4")
+    assert result.remaining_quantity == Decimal("6")
+    # terminal: no further lifecycle steps, cancel refuses as usual
+    with pytest.raises(m.BrokerCancellationError):
+        broker.cancel_order("c-1")
+
+
+def test_reissue_information_lost_fails_closed_toward_unknown():
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.ReissueInformationLost())
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        broker.submit_order(make_request("c-1"))
+    assert "reissue" in str(exc_info.value)
+    snapshot = broker.get_order("c-1")
+    # nothing about the outcome is guessed: UNKNOWN, no id, no fills
+    assert snapshot.state is m.OrderState.UNKNOWN
+    assert snapshot.broker_order_id is None
+    assert snapshot.superseded_broker_order_ids == ()
+    assert snapshot.filled_quantity == Decimal("0")
+
+
+def test_reissue_scenarios_are_deterministic_across_runs():
+    def run():
+        broker = fb.FakeBroker()
+        broker.script_order(
+            "c-1",
+            fb.PartiallyFillThenReissue(fills=((Decimal("2400.50"), Decimal("4")),)),
+        )
+        broker.submit_order(make_request("c-1"))
+        broker.reissue_remainder(
+            "c-1", fill_price=Decimal("2400.75"), fill_quantity=Decimal("3")
+        )
+        return broker.fill_remaining("c-1", price=Decimal("2401.00"))
+
+    assert run() == run()
+
+
+def test_rejected_reissue_pin_burns_no_sequence_number():
+    # PR #112 review r3 (rejection atomicity): a reissue script rejected
+    # over EITHER pinned id — the reissued pin included, while the original
+    # resolves sequentially — must not consume a FAKE-<n> sequence number.
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.FillImmediately(
+        price=Decimal("2400"), broker_order_id="TAKEN"
+    ))
+    broker.submit_order(make_request("c-1"))
+    broker.script_order("c-2", fb.PartiallyFillThenReissue(
+        fills=((Decimal("2400"), Decimal("4")),),
+        reissued_broker_order_id="TAKEN",  # original id stays unpinned
+    ))
+    with pytest.raises(m.BrokerInvalidRequestError):
+        broker.submit_order(make_request("c-2"))
+    # the rejected submit consumed nothing: the next unpinned order still
+    # receives the FIRST sequential id
+    broker.script_order("c-3", fb.FillImmediately(price=Decimal("2400")))
+    assert broker.submit_order(make_request("c-3")).broker_order_id == "FAKE-1"
+
+
+def test_unpinned_original_never_collides_with_a_pinned_sequential_reissue_id():
+    # pinning the reissued id to a FAKE-<n> value the sequence would hand
+    # out next must not collide with the unpinned original id
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.PartiallyFillThenReissue(
+        fills=((Decimal("2400"), Decimal("4")),),
+        reissued_broker_order_id="FAKE-1",
+    ))
+    result = broker.submit_order(make_request("c-1"))
+    assert result.broker_order_id == "FAKE-1"
+    assert result.superseded_broker_order_ids == ("FAKE-2",)

@@ -54,6 +54,11 @@ _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
     "fill_immediately": frozenset({"price", "broker_order_id"}),
     "stay_pending": frozenset({"broker_order_id"}),
     "partially_fill": frozenset({"fills", "broker_order_id"}),
+    # Issue #102: partial fill whose remainder the broker reissues under a
+    # NEW broker order id (original id kept in the audit chain)
+    "partially_fill_then_reissue": frozenset(
+        {"fills", "broker_order_id", "reissued_broker_order_id"}
+    ),
     "reject": frozenset({"reason"}),
     "timeout": frozenset(),
     "fail_communication": frozenset(),
@@ -344,9 +349,13 @@ def _validate_script(spec, name: str, scenario: str, *, table: dict[str, frozens
         _require_decimal_str(script["price"], f"{name}.price", scenario)
     if "broker_order_id" in script:
         _require_non_empty_str(script["broker_order_id"], f"{name}.broker_order_id", scenario)
+    if "reissued_broker_order_id" in script:
+        _require_non_empty_str(
+            script["reissued_broker_order_id"], f"{name}.reissued_broker_order_id", scenario
+        )
     if "reason" in script:
         _require_non_empty_str(script["reason"], f"{name}.reason", scenario)
-    if behaviour == "partially_fill":
+    if behaviour in ("partially_fill", "partially_fill_then_reissue"):
         fills = script.get("fills")
         if not isinstance(fills, list) or not fills:
             raise _fail(scenario, f"{name}.fills must be a non-empty list of [price, quantity] pairs")

@@ -257,6 +257,7 @@ def fill_response(client_order_id="c-1", units="1", price="155.123"):
             },
             "orderFillTransaction": {
                 "id": "1002",
+                "type": "ORDER_FILL",
                 "orderID": "1001",
                 "clientOrderID": client_order_id,
                 "units": units,
@@ -528,6 +529,8 @@ def test_get_order_filled_market_fetches_the_filling_transaction():
                 "transaction": {
                     "id": "7002",
                     "type": "ORDER_FILL",
+                    "orderID": "7001",
+                    "clientOrderID": "c-8",
                     "units": "-5",
                     "price": "154.500",
                     "time": "2026-01-02T03:04:07.000000000Z",
@@ -627,6 +630,9 @@ def test_cancel_of_a_terminal_order_is_a_cancellation_failure():
             {
                 "transaction": {
                     "id": "10002",
+                    "type": "ORDER_FILL",
+                    "orderID": "10001",
+                    "clientOrderID": "c-11",
                     "units": "1",
                     "price": "155.000",
                     "time": "2026-01-02T03:04:08Z",
@@ -898,6 +904,9 @@ def test_zero_or_negative_fill_price_is_a_communication_error():
             {
                 "transaction": {
                     "id": "7002",
+                    "type": "ORDER_FILL",
+                    "orderID": "7001",
+                    "clientOrderID": "c-8",
                     "units": "1",
                     "price": "0",
                     "time": "2026-01-02T03:04:07Z",
@@ -1340,11 +1349,12 @@ def test_partial_fill_with_working_remainder_is_partially_filled():
     assert result.broker_order_id == "1001"
 
 
-def test_reissue_transactions_are_deliberately_unsupported_and_fail_closed():
-    # Issue #102 owns reissue handling across the state machine / audit /
-    # query / cancel paths. Until then a reissue-carrying response is NOT
-    # interpreted: the submit fails toward UNKNOWN (no resend), so the
-    # recorded state can never misrepresent a reissued order.
+def test_uncorrelated_reissue_transactions_fail_closed_toward_unknown():
+    # Issue #102: reissue responses ARE interpreted now, but only when every
+    # correlation requirement holds. A bare reissue object without our
+    # clientOrderID cannot be bound to this order: the submit fails toward
+    # UNKNOWN (no resend), so the recorded state can never misrepresent a
+    # reissued order.
     for extra_key in ("orderReissueTransaction", "orderReissueRejectTransaction"):
         response = fill_response(units="2", price="155.000")
         response[1][extra_key] = {"id": "1003"}
@@ -1353,7 +1363,6 @@ def test_reissue_transactions_are_deliberately_unsupported_and_fail_closed():
             adapter.submit_order(make_request(quantity=Decimal("5")))
         assert exc_info.value.code is m.BrokerErrorCode.TIMEOUT
         assert "reissue" in str(exc_info.value)
-        assert "unsupported" in str(exc_info.value)
         # one attempt, no automatic resend
         assert len(transport.calls) == 1
 
@@ -1375,10 +1384,15 @@ def test_overfill_or_zero_fill_responses_are_communication_errors_not_value_erro
             adapter.submit_order(make_request(quantity=Decimal("5")))
 
 
-def test_inconsistent_filled_order_query_raises_a_common_error_not_value_error():
-    # order says 5 units but the filling transaction reports 3: the common
-    # model's FILLED invariant would raise ValueError; the adapter must wrap
-    # it (PR #101 review).
+def test_filled_order_with_partial_fill_is_the_rejected_reissue_shape():
+    # Issue #102 / PR #112 re-review: a FILLED order whose (fully
+    # correlated) filling transaction covers only part of the order — with
+    # NO replacedByOrderID successor — is exactly what a rejected reissue
+    # leaves behind: the remainder is definitively dead. get_order maps it
+    # to terminal CANCELLED with the partial fill kept, matching the
+    # terminal result the submit answer produced (before Issue #102 this
+    # shape was refused as inconsistent; the reissue world gives it a
+    # defined meaning).
     adapter, _ = make_adapter(
         (
             200,
@@ -1399,12 +1413,45 @@ def test_inconsistent_filled_order_query_raises_a_common_error_not_value_error()
             {
                 "transaction": {
                     "id": "7002",
+                    "type": "ORDER_FILL",
+                    "orderID": "7001",
+                    "clientOrderID": "c-8",
                     "units": "3",
                     "price": "154.500",
                     "time": "2026-01-02T03:04:07Z",
                 }
             },
         ),
+    )
+    result = adapter.get_order("c-8")
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "7001"
+    assert result.superseded_broker_order_ids == ()
+    assert result.filled_quantity == Decimal("3")
+    assert result.remaining_quantity == Decimal("2")
+
+
+def test_filled_order_with_an_overfilled_transaction_is_still_refused():
+    # an over-fill (transaction covering MORE than the order) has no
+    # legitimate reading in the reissue world either — it stays a malformed
+    # response wrapped as a common error (PR #101 review contract)
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "7001",
+                    "type": "MARKET",
+                    "instrument": "USD_JPY",
+                    "units": "5",
+                    "state": "FILLED",
+                    "fillingTransactionID": "7002",
+                    "clientExtensions": {"id": "c-8"},
+                }
+            },
+        ),
+        fill_tx_response("7002", "7", order_id="7001", client_order_id="c-8",
+                         price="154.500"),
     )
     with pytest.raises(m.BrokerCommunicationError):
         adapter.get_order("c-8")
@@ -1776,3 +1823,761 @@ def test_get_positions_flat_sides_are_still_no_positions():
         (200, {"positions": [position_entry(long={"units": "0"}, short={"units": "0"})]})
     )
     assert adapter.get_positions() == ()
+
+
+# --- Issue #102: Order Reissue interpretation --------------------------------
+#
+# Partial fill + reissue of the remainder under a NEW broker order id. The
+# OANDA transaction shapes stay inside the adapter; what crosses the boundary
+# is the common model's current broker_order_id + superseded chain. Anything
+# the interpretation cannot prove fails closed toward UNKNOWN.
+
+
+def reissue_submit_response(
+    client_order_id="c-1",
+    filled_units="2",
+    price="155.000",
+    reissue_overrides=None,
+    drop_reissue_keys=(),
+):
+    """A 201 create+fill+reissue response (original order 1001 partially
+    filled, remainder reissued as order 2001)."""
+    status, payload = fill_response(client_order_id, units=filled_units, price=price)
+    # the fields an OANDA reissue transaction actually carries (PR #112
+    # review): client correlation via clientExtensions.id, the replaced
+    # order via replacesOrderID, the transaction id doubling as the NEW
+    # order id, and the reissued units
+    reissue = {
+        "id": "2001",
+        "type": "ORDER_REISSUE",
+        "replacesOrderID": "1001",
+        "clientExtensions": {"id": client_order_id},
+        "units": "3",
+        "time": "2026-01-02T03:04:05.123456789Z",
+    }
+    reissue.update(reissue_overrides or {})
+    for key in drop_reissue_keys:
+        reissue.pop(key, None)
+    payload["orderReissueTransaction"] = reissue
+    return status, payload
+
+
+def test_partial_fill_with_successful_reissue_translates_to_the_common_chain():
+    adapter, transport = make_adapter(reissue_submit_response())
+    result = adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    # the CURRENT actionable id is the reissued order; the original id is
+    # auditable in the superseded chain — nothing is overwritten silently
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.original_broker_order_id == "1001"
+    assert result.all_broker_order_ids == ("1001", "2001")
+    assert result.client_order_id == "c-1"
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
+    assert result.fills[0].price == Decimal("155.000")
+    assert len(transport.calls) == 1  # one attempt, no automatic resend
+
+
+def test_reissue_reject_translates_to_cancelled_on_the_original_id():
+    status, payload = fill_response(units="2", price="155.000")
+    payload["orderReissueRejectTransaction"] = {
+        "id": "2002",
+        "type": "ORDER_REISSUE_REJECT",
+        # the reject transaction names the order it ATTEMPTED to replace
+        # (intendedReplacesOrderID) — replacesOrderID belongs to the
+        # successful OrderReissueTransaction (PR #112 re-review) — and
+        # carries the attempted replacement's units (the exact remainder)
+        "intendedReplacesOrderID": "1001",
+        "clientExtensions": {"id": "c-1"},
+        "units": "3",
+        "rejectReason": "MARKET_HALTED",
+    }
+    adapter, transport = make_adapter((status, payload))
+    result = adapter.submit_order(make_request(quantity=Decimal("5")))
+    # the remainder is definitively dead: terminal CANCELLED, partial fill
+    # kept, NO new order id and therefore no chain
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "1001"
+    assert result.superseded_broker_order_ids == ()
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
+    assert len(transport.calls) == 1
+
+
+def test_reissue_with_uncorrelated_or_inconsistent_fields_fails_closed():
+    # every correlation / consistency failure is refused toward UNKNOWN with
+    # exactly one attempt — never a guessed PARTIALLY_FILLED / CANCELLED
+    cases = (
+        # client correlation missing / mismatched on the reissue tx
+        {"reissue_overrides": {"clientExtensions": {"id": "someone-else"}}},
+        {"reissue_overrides": {"clientExtensions": {}}},
+        {"drop_reissue_keys": ("clientExtensions",)},
+        # replaced-order correlation: reissue references a different order
+        {"reissue_overrides": {"replacesOrderID": "9999"}},
+        {"drop_reissue_keys": ("replacesOrderID",)},
+        # transaction identity: id (= the NEW order id) missing / equal to
+        # the original, type missing / wrong
+        {"drop_reissue_keys": ("id",)},
+        {"reissue_overrides": {"id": "1001"}},
+        {"drop_reissue_keys": ("type",)},
+        {"reissue_overrides": {"type": "ORDER_FILL"}},
+        # legacy/wrong correlation fields alone must not satisfy the schema
+        # (fill-transaction style clientOrderID/orderID are NOT the reissue
+        # transaction's fields — PR #112 review)
+        {"reissue_overrides": {"clientOrderID": "c-1", "orderID": "1001"},
+         "drop_reissue_keys": ("clientExtensions", "replacesOrderID")},
+        # the REJECT transaction's intendedReplacesOrderID must not satisfy
+        # the success branch (PR #112 re-review)
+        {"reissue_overrides": {"intendedReplacesOrderID": "1001"},
+         "drop_reissue_keys": ("replacesOrderID",)},
+        # quantity consistency: reissued units must equal the exact remainder
+        {"reissue_overrides": {"units": "4"}},
+        {"drop_reissue_keys": ("units",)},
+        {"reissue_overrides": {"units": "garbage"}},
+    )
+    for case in cases:
+        adapter, transport = make_adapter(reissue_submit_response(**case))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+
+def test_reissue_without_a_partial_fill_transaction_fails_closed():
+    # a reissue exists only because a partial fill happened; a reissue key
+    # without an interpretable partial fill cannot be interpreted
+    status, payload = reissue_submit_response()
+    del payload["orderFillTransaction"]
+    adapter, _ = make_adapter((status, payload))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert "reissue" in str(exc_info.value)
+
+
+def test_reissue_with_a_full_fill_is_inconsistent_and_fails_closed():
+    adapter, _ = make_adapter(reissue_submit_response(filled_units="5"))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert "reissue" in str(exc_info.value)
+
+
+def test_reissue_with_an_uncorrelated_fill_transaction_fails_closed():
+    status, payload = reissue_submit_response()
+    payload["orderFillTransaction"]["clientOrderID"] = "someone-else"
+    adapter, _ = make_adapter((status, payload))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert "reissue" in str(exc_info.value)
+
+
+def test_reissue_and_reissue_reject_together_are_contradictory():
+    status, payload = reissue_submit_response()
+    payload["orderReissueRejectTransaction"] = {
+        "id": "2002", "orderID": "1001", "clientOrderID": "c-1",
+    }
+    adapter, _ = make_adapter((status, payload))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert "reissue" in str(exc_info.value)
+
+
+def test_reissue_coexisting_with_cancel_or_reject_transactions_fails_closed():
+    # Issue #102: a reissue sharing the body with a cancel / reject
+    # transaction is ambiguous — never confirmed as any definite state
+    for extra_key, extra in (
+        ("orderCancelTransaction", {"id": "3001", "orderID": "2001", "clientOrderID": "c-1"}),
+        ("orderRejectTransaction", {"id": "3001", "rejectReason": "X"}),
+    ):
+        status, payload = reissue_submit_response()
+        payload[extra_key] = extra
+        adapter, _ = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+
+
+def test_reissue_reject_with_broken_correlation_or_schema_fails_closed():
+    # PR #112 review: a transaction that may confirm a terminal CANCELLED
+    # must prove its identity (id + type) and its correlation
+    # (clientExtensions.id + replacesOrderID); anything less is refused
+    # toward UNKNOWN, never confirmed.
+    complete = {
+        "id": "2002",
+        "type": "ORDER_REISSUE_REJECT",
+        "intendedReplacesOrderID": "1001",
+        "clientExtensions": {"id": "c-1"},
+        "units": "3",
+    }
+    cases = (
+        {**complete, "clientExtensions": {"id": "someone-else"}},
+        {**complete, "clientExtensions": {}},
+        {key: value for key, value in complete.items() if key != "clientExtensions"},
+        {**complete, "intendedReplacesOrderID": "9999"},
+        {key: value for key, value in complete.items()
+         if key != "intendedReplacesOrderID"},
+        # the SUCCESS transaction's replacesOrderID must not satisfy the
+        # reject branch (the reject schema names the attempted replacement
+        # as intendedReplacesOrderID — PR #112 re-review)
+        {**{key: value for key, value in complete.items()
+            if key != "intendedReplacesOrderID"},
+         "replacesOrderID": "1001"},
+        # missing transaction id / missing or wrong type
+        {key: value for key, value in complete.items() if key != "id"},
+        {**complete, "id": ""},
+        {key: value for key, value in complete.items() if key != "type"},
+        {**complete, "type": "ORDER_CANCEL"},
+        # units of the attempted replacement: missing / inconsistent /
+        # malformed / opposite-signed (PR #112 re-review r3)
+        {key: value for key, value in complete.items() if key != "units"},
+        {**complete, "units": "4"},
+        {**complete, "units": "garbage"},
+        {**complete, "units": "-3"},
+        # the Codex example: two loosely matching fields alone must never
+        # confirm a terminal CANCELLED
+        {"orderID": "1001", "clientOrderID": "c-1"},
+    )
+    for reject_tx in cases:
+        status, payload = fill_response(units="2", price="155.000")
+        payload["orderReissueRejectTransaction"] = reject_tx
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+
+# --- Issue #102: get_order resolves the reissue chain ------------------------
+
+
+def chain_order(
+    order_id,
+    *,
+    state,
+    units,
+    client_order_id="c-9",
+    replaces=None,
+    replaced_by=None,
+    filling_tx=None,
+    order_type="LIMIT",
+    price="150.000",
+    client_extensions=True,
+):
+    order = {
+        "id": order_id,
+        "type": order_type,
+        "instrument": "USD_JPY",
+        "units": units,
+        "state": state,
+    }
+    if order_type == "LIMIT":
+        order["price"] = price
+    if client_extensions:
+        order["clientExtensions"] = {"id": client_order_id}
+    if replaces is not None:
+        order["replacesOrderID"] = replaces
+    if replaced_by is not None:
+        order["replacedByOrderID"] = replaced_by
+    if filling_tx is not None:
+        order["fillingTransactionID"] = filling_tx
+    return order
+
+
+def fill_tx_response(tx_id, units, *, order_id, client_order_id="c-9",
+                     price="150.000", time="2026-01-02T03:04:07.000000000Z",
+                     tx_overrides=None):
+    tx = {
+        "id": tx_id,
+        "type": "ORDER_FILL",
+        "orderID": order_id,
+        "clientOrderID": client_order_id,
+        "units": units,
+        "price": price,
+        "time": time,
+    }
+    tx.update(tx_overrides or {})
+    return (200, {"transaction": tx})
+
+
+def test_get_order_after_reissue_rebuilds_the_cumulative_snapshot():
+    # original order 1001 (5 units) partially filled (2) and reissued as
+    # 2001 (3 units, still working): the snapshot must describe the WHOLE
+    # request — requested 5, filled 2, remaining 3 — under the current id
+    adapter, transport = make_adapter(
+        (200, {"order": chain_order("2001", state="PENDING", units="3", replaces="1001")}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+    )
+    result = adapter.get_order("c-9")
+    assert transport.calls[0]["url"].endswith(f"/v3/accounts/{ACCOUNT}/orders/@c-9")
+    assert transport.calls[1]["url"].endswith(f"/v3/accounts/{ACCOUNT}/orders/1001")
+    assert transport.calls[2]["url"].endswith(f"/v3/accounts/{ACCOUNT}/transactions/9001")
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.requested_quantity == Decimal("5")
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
+    assert result.requested_price == Decimal("150.000")
+
+
+def test_get_order_after_reissue_final_fill_is_filled_with_all_fills():
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001", filling_tx="9002"
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+        fill_tx_response("9002", "3", order_id="2001", price="150.000"),
+    )
+    result = adapter.get_order("c-9")
+    assert result.state is m.OrderState.FILLED
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.filled_quantity == Decimal("5")
+    assert [f.quantity for f in result.fills] == [Decimal("2"), Decimal("3")]
+
+
+def test_get_order_after_reissue_cancel_keeps_the_partial_fills():
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order("2001", state="CANCELLED", units="3", replaces="1001")}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+    )
+    result = adapter.get_order("c-9")
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
+
+
+def test_get_order_resolves_a_repeated_reissue_chain_oldest_first():
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order("3001", state="PENDING", units="2", replaces="2001")}),
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001",
+            replaced_by="3001", filling_tx="9002",
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+        fill_tx_response("9002", "1", order_id="2001"),
+    )
+    result = adapter.get_order("c-9")
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    assert result.broker_order_id == "3001"
+    assert result.superseded_broker_order_ids == ("1001", "2001")
+    assert result.requested_quantity == Decimal("5")
+    assert result.filled_quantity == Decimal("3")
+    assert result.remaining_quantity == Decimal("2")
+
+
+def test_get_order_reissue_chain_correlation_failures_fail_closed():
+    # every unprovable link refuses the whole snapshot (never a partial
+    # guess): back-reference mismatch, contradictory state (a reissued-away
+    # order completes as FILLED — a working or cancelled order claiming
+    # replacement cannot be trusted; OANDA has no dedicated "reissued"
+    # state, PR #112 re-review), foreign client id, missing client
+    # extensions, id mismatch against the reference
+    predecessors = (
+        chain_order("1001", state="FILLED", units="5", replaced_by="9999",
+                    filling_tx="9001"),
+        chain_order("1001", state="PENDING", units="5", replaced_by="2001",
+                    filling_tx="9001"),
+        chain_order("1001", state="CANCELLED", units="5", replaced_by="2001",
+                    filling_tx="9001"),
+        chain_order("1001", state="FILLED", units="5", replaced_by="2001",
+                    filling_tx="9001", client_order_id="someone-else"),
+        chain_order("1001", state="FILLED", units="5", replaced_by="2001",
+                    filling_tx="9001", client_extensions=False),
+        chain_order("1002", state="FILLED", units="5", replaced_by="2001",
+                    filling_tx="9001"),
+    )
+    for predecessor in predecessors:
+        adapter, _ = make_adapter(
+            (200, {"order": chain_order("2001", state="PENDING", units="3",
+                                        replaces="1001")}),
+            (200, {"order": predecessor}),
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-9")
+
+
+def test_get_order_reissue_chain_quantity_inconsistency_fails_closed():
+    # 5 units reissued away with a 2-unit fill must leave exactly 3: a
+    # 4-unit successor cannot belong to the same request
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order("2001", state="PENDING", units="4", replaces="1001")}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "quantity" in str(exc_info.value)
+
+
+def test_get_order_resolving_to_a_replaced_order_is_inconsistent():
+    # the @client specifier must resolve to the CURRENT order of the chain;
+    # an answer carrying replacedByOrderID is a reissued-away order (OANDA
+    # marks replacement via the links, not a dedicated state)
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order("1001", state="FILLED", units="5",
+                                    replaced_by="2001", filling_tx="9001")}),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "reissued-away" in str(exc_info.value)
+
+
+def test_get_order_malformed_replaces_order_id_is_refused_before_any_fetch():
+    # a broker-supplied order id is embedded into a request path, so it must
+    # stay inside the URL-safe alphabet — no fetch may happen otherwise
+    for bad in ("", "  ", "../evil", "a/b", "@x", "x" * 129):
+        adapter, transport = make_adapter(
+            (200, {"order": chain_order("2001", state="PENDING", units="3",
+                                        replaces=bad)}),
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-9")
+        assert len(transport.calls) == 1  # only the initial @client lookup
+
+
+def test_get_order_reissue_chain_depth_is_bounded():
+    # a reference cycle (or a runaway chain) must terminate in a refusal,
+    # never an unbounded fetch loop
+    responses = [
+        (200, {"order": chain_order("2001", state="PENDING", units="3", replaces="1001")}),
+    ]
+    # 1001 <-> 2001 reference cycle: every fetched predecessor points back
+    # into the chain, so only the depth bound can stop the walk
+    for _ in range(oa._MAX_REISSUE_CHAIN + 1):
+        responses.append(
+            (200, {"order": chain_order(
+                "1001", state="FILLED", units="5", replaces="2001",
+                replaced_by="2001", filling_tx="9001",
+            )}),
+        )
+        responses.append(
+            (200, {"order": chain_order(
+                "2001", state="FILLED", units="5", replaces="1001",
+                replaced_by="1001", filling_tx="9002",
+            )}),
+        )
+    adapter, transport = make_adapter(*responses)
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "depth" in str(exc_info.value)
+    assert len(transport.calls) <= oa._MAX_REISSUE_CHAIN + 1
+
+
+def test_get_order_reissue_chain_lookup_error_fails_closed():
+    for chain_response in ((404, {}), (200, {"order": "not-an-object"}), (200, {})):
+        adapter, _ = make_adapter(
+            (200, {"order": chain_order("2001", state="PENDING", units="3",
+                                        replaces="1001")}),
+            chain_response,
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-9")
+
+
+def test_submit_reissue_then_get_order_satisfies_the_update_contract():
+    # the lifecycle the execution store will drive: the submit snapshot and
+    # a later query snapshot must chain through validate_order_result_update
+    adapter, _ = make_adapter(
+        reissue_submit_response(client_order_id="c-9"),
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001",
+            order_type="MARKET", filling_tx="9002",
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001",
+            order_type="MARKET", filling_tx="1002",
+        )}),
+        # the SAME fill the submit already observed must come back unchanged
+        # (fills are an append-only prefix across snapshots)
+        fill_tx_response("1002", "2", order_id="1001", price="155.000",
+                         time="2026-01-02T03:04:05.123456789Z"),
+        fill_tx_response("9002", "3", order_id="2001", price="155.500"),
+    )
+    submitted = adapter.submit_order(
+        make_request(client_order_id="c-9", quantity=Decimal("5"))
+    )
+    queried = adapter.get_order("c-9")
+    m.validate_order_result_update(submitted, queried)
+    assert queried.state is m.OrderState.FILLED
+    assert queried.superseded_broker_order_ids == ("1001",)
+    assert queried.broker_order_id == "2001"
+
+
+def test_chain_fill_transactions_must_correlate_to_their_chain_member():
+    # PR #112 review: a predecessor referencing a transaction that answers
+    # under a different id, is not an ORDER_FILL, filled a DIFFERENT order,
+    # or carries a foreign client correlation must never contribute a fill
+    # to this order's audit snapshot — even when the quantities happen to
+    # satisfy the chain arithmetic.
+    cases = (
+        {"orderID": "9999"},                # fill of a different order
+        {"orderID": None},                  # no order reference at all
+        {"clientOrderID": "someone-else"},  # foreign client correlation
+        {"clientOrderID": None},
+        {"type": "MARKET_ORDER"},           # not an ORDER_FILL transaction
+        {"type": None},
+        {"id": "8888"},                     # answers under a different tx id
+    )
+    for overrides in cases:
+        tx_overrides = {k: v for k, v in overrides.items() if v is not None}
+        drop = [k for k, v in overrides.items() if v is None]
+        response = fill_tx_response("9001", "2", order_id="1001",
+                                    tx_overrides=tx_overrides)
+        for key in drop:
+            del response[1]["transaction"][key]
+        adapter, _ = make_adapter(
+            (200, {"order": chain_order("2001", state="PENDING", units="3",
+                                        replaces="1001")}),
+            (200, {"order": chain_order(
+                "1001", state="FILLED", units="5", replaced_by="2001",
+                filling_tx="9001"
+            )}),
+            response,
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-9")
+
+
+def test_filled_order_query_refuses_a_foreign_filling_transaction():
+    # the same correlation contract guards the ordinary (chain-less) FILLED
+    # query path: a transaction filled for another order / client is refused
+    for tx_overrides in (
+        {"orderID": "6000"},
+        {"clientOrderID": "someone-else"},
+        {"type": "TRADE_CLOSE"},
+    ):
+        adapter, _ = make_adapter(
+            (200, {"order": {
+                "id": "7001", "type": "MARKET", "instrument": "USD_JPY",
+                "units": "5", "state": "FILLED", "fillingTransactionID": "7002",
+                "clientExtensions": {"id": "c-8"},
+            }}),
+            fill_tx_response("7002", "5", order_id="7001",
+                             client_order_id="c-8", tx_overrides=tx_overrides),
+        )
+        with pytest.raises(m.BrokerCommunicationError):
+            adapter.get_order("c-8")
+
+
+def test_reissue_path_fill_transaction_must_be_an_order_fill():
+    # PR #112 re-review: a mapping under orderFillTransaction with matching
+    # ids but a missing or foreign type must not drive a reissue result —
+    # neither the successful branch (audit chain) nor the reject branch
+    # (terminal CANCELLED).
+    for tx_type in (None, "MARKET_ORDER", "TRADE_CLOSE"):
+        # successful-reissue branch
+        status, payload = reissue_submit_response()
+        if tx_type is None:
+            del payload["orderFillTransaction"]["type"]
+        else:
+            payload["orderFillTransaction"]["type"] = tx_type
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+        # reissue-reject branch
+        status, payload = fill_response(units="2", price="155.000")
+        if tx_type is None:
+            del payload["orderFillTransaction"]["type"]
+        else:
+            payload["orderFillTransaction"]["type"] = tx_type
+        payload["orderReissueRejectTransaction"] = {
+            "id": "2002",
+            "type": "ORDER_REISSUE_REJECT",
+            "intendedReplacesOrderID": "1001",
+            "clientExtensions": {"id": "c-1"},
+            "units": "3",
+        }
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+
+def test_reissue_quantities_must_be_signed_on_the_requests_side():
+    # PR #112 re-review r3: a BUY request answered with SELL-signed fill /
+    # reissue units is contradictory and must never be normalized away by
+    # abs() — neither branch may produce a result from it.
+    for overrides in (
+        {"fill_units": "-2"},                              # fill on the wrong side
+        {"reissue_overrides": {"units": "-3"}},            # reissue on the wrong side
+        {"fill_units": "-2", "reissue_overrides": {"units": "-3"}},  # both flipped
+    ):
+        status, payload = reissue_submit_response(
+            reissue_overrides=overrides.get("reissue_overrides"),
+        )
+        if "fill_units" in overrides:
+            payload["orderFillTransaction"]["units"] = overrides["fill_units"]
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+    # the reject branch refuses an opposite-side fill the same way
+    status, payload = fill_response(units="-2", price="155.000")
+    payload["orderReissueRejectTransaction"] = {
+        "id": "2002",
+        "type": "ORDER_REISSUE_REJECT",
+        "intendedReplacesOrderID": "1001",
+        "clientExtensions": {"id": "c-1"},
+        "units": "3",
+    }
+    adapter, _ = make_adapter((status, payload))
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        adapter.submit_order(make_request(quantity=Decimal("5")))
+    assert "reissue" in str(exc_info.value)
+
+
+def test_sell_reissue_with_consistently_negative_units_is_interpreted():
+    # SELL requests carry negative units throughout — the sign validation
+    # must accept the consistent case, not just refuse the flipped one
+    status, payload = reissue_submit_response(
+        filled_units="-2", reissue_overrides={"units": "-3"}
+    )
+    adapter, _ = make_adapter((status, payload))
+    result = adapter.submit_order(
+        make_request(side=m.OrderSide.SELL, quantity=Decimal("5"))
+    )
+    assert result.state is m.OrderState.PARTIALLY_FILLED
+    assert result.side is m.OrderSide.SELL
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.filled_quantity == Decimal("2")
+    assert result.remaining_quantity == Decimal("3")
+
+
+def test_chain_fill_with_opposite_signed_units_is_refused_despite_arithmetic():
+    # PR #112 re-review r4: a BUY chain (positive units throughout) whose
+    # predecessor references a SELL-signed fill transaction satisfies the
+    # 5 == |-2| + 3 arithmetic after abs() — the sign must be validated
+    # against the order's side BEFORE normalization, so the contradictory
+    # response fails closed instead of entering the audit snapshot.
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order("2001", state="PENDING", units="3",
+                                    replaces="1001")}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001",
+            filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "-2", order_id="1001"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "opposite side" in str(exc_info.value)
+
+
+def test_final_fill_with_opposite_signed_units_is_refused():
+    # the current (final-fill) order's transaction is validated the same way
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001",
+            filling_tx="9002"
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001",
+            filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+        fill_tx_response("9002", "-3", order_id="2001"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "opposite side" in str(exc_info.value)
+
+
+def test_plain_filled_query_refuses_an_opposite_signed_filling_transaction():
+    # the chain-less FILLED query path shares the sign contract: a SELL
+    # order whose filling transaction reports BUY-signed units is refused
+    adapter, _ = make_adapter(
+        (200, {"order": {
+            "id": "7001", "type": "MARKET", "instrument": "USD_JPY",
+            "units": "-5", "state": "FILLED", "fillingTransactionID": "7002",
+            "clientExtensions": {"id": "c-8"},
+        }}),
+        fill_tx_response("7002", "5", order_id="7001", client_order_id="c-8"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-8")
+    assert "opposite side" in str(exc_info.value)
+
+
+def test_mid_chain_rejected_reissue_reconstructs_as_cancelled():
+    # a reissued order (2001, remainder 3 of root 5) whose OWN next reissue
+    # was rejected: FILLED with a partial own fill (1) and no successor —
+    # the cumulative total 2 + 1 = 3 < 5 maps to terminal CANCELLED with
+    # the chain and every fill kept
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001",
+            filling_tx="9002",
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001",
+            filling_tx="9001",
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+        fill_tx_response("9002", "1", order_id="2001"),
+    )
+    result = adapter.get_order("c-9")
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.requested_quantity == Decimal("5")
+    assert result.filled_quantity == Decimal("3")
+    assert result.remaining_quantity == Decimal("2")
+
+
+def test_submit_reissue_reject_then_get_order_satisfies_the_update_contract():
+    # the lifecycle after a rejected reissue: the submit answer is terminal
+    # CANCELLED, and a later query reconstructs the SAME terminal snapshot
+    # (FILLED state + partial fill + no successor), passing the terminal
+    # same-state re-observation contract
+    status, payload = fill_response(client_order_id="c-9", units="2",
+                                    price="155.000")
+    payload["orderReissueRejectTransaction"] = {
+        "id": "2002",
+        "type": "ORDER_REISSUE_REJECT",
+        "intendedReplacesOrderID": "1001",
+        "clientExtensions": {"id": "c-9"},
+        "units": "3",
+    }
+    adapter, _ = make_adapter(
+        (status, payload),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", order_type="MARKET",
+            filling_tx="1002",
+        )}),
+        fill_tx_response("1002", "2", order_id="1001", price="155.000",
+                         time="2026-01-02T03:04:05.123456789Z"),
+    )
+    submitted = adapter.submit_order(
+        make_request(client_order_id="c-9", quantity=Decimal("5"))
+    )
+    assert submitted.state is m.OrderState.CANCELLED
+    queried = adapter.get_order("c-9")
+    m.validate_order_result_update(submitted, queried)
+    assert queried.state is m.OrderState.CANCELLED
+    assert queried.broker_order_id == "1001"
+    assert queried.superseded_broker_order_ids == ()
+    assert queried.filled_quantity == Decimal("2")
