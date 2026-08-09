@@ -1007,6 +1007,54 @@ def _assert_no_duplicate_broker_ids(connection: sqlite3.Connection) -> None:
         )
 
 
+def _assert_result_broker_ids_unowned(
+    connection: sqlite3.Connection, execution_request_id: str, result: OrderResult
+) -> None:
+    """Every broker order id the snapshot names — current AND superseded —
+    must be free or owned by this very execution order (Issue #102 / PR #112
+    review).
+
+    The column UNIQUE constraint only guards the CURRENT id column: a
+    superseded chain id colliding with another order's current or superseded
+    id (e.g. a multi-hop update learning an intermediate id another request
+    already owns, or a new current id sitting in another order's chain)
+    would otherwise COMMIT and then brick every later read via
+    :func:`_assert_no_duplicate_broker_ids`. Verified INSIDE the update
+    transaction, before any row is written, so a refused update rolls back
+    with the DB untouched."""
+    ids = set(result.all_broker_order_ids)
+    if not ids:
+        return
+    for row in connection.execute(
+        f"SELECT execution_request_id, broker_order_id, last_order_result_json "
+        f"FROM {ORDERS_TABLE} WHERE execution_request_id != ? "
+        "AND (broker_order_id IS NOT NULL OR last_order_result_json IS NOT NULL)",
+        (execution_request_id,),
+    ):
+        owned = set()
+        if row["broker_order_id"] is not None:
+            owned.add(row["broker_order_id"])
+        if row["last_order_result_json"] is not None:
+            try:
+                chain = json.loads(row["last_order_result_json"]).get(
+                    "superseded_broker_order_ids", []
+                )
+            except (ValueError, AttributeError):
+                # rejected in depth by that row's own bundle validation
+                chain = []
+            if isinstance(chain, list):
+                owned.update(entry for entry in chain if isinstance(entry, str))
+        conflict = sorted(ids & owned)
+        if conflict:
+            raise ExecutionOrderConflictError(
+                f"broker order ids {conflict} named by the update for execution "
+                f"order {execution_request_id!r} are already owned by execution "
+                f"order {row['execution_request_id']!r}; broker order ids are "
+                "unique across orders (current and superseded alike) and "
+                "nothing was changed"
+            )
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
     connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
@@ -2286,6 +2334,12 @@ def record_order_result(
         )
         if result.state in _STATES_REQUIRING_BROKER_ID and effective_broker_id is None:
             raise ValueError(f"state {result.state.value!r} requires a broker_order_id")
+        # Ownership pre-check (PR #112 review): EVERY id the snapshot names
+        # (current + superseded chain) must be free or already this order's
+        # own — the column UNIQUE constraint cannot see chain ids, and a
+        # colliding chain id that reached COMMIT would brick all later reads
+        # via the DB-wide duplicate scan.
+        _assert_result_broker_ids_unowned(connection, execution_request_id, result)
         _check_transition_and_time(
             row, new_state=result.state, changed_at_utc=result.updated_at_utc
         )

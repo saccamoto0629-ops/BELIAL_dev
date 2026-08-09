@@ -2765,3 +2765,74 @@ def test_state_only_unknown_after_reissue_confirms_the_current_id(db_path):
             "exec-1", OrderState.UNKNOWN, reason="stale id",
             changed_at_utc=at(5), broker_order_id="B-1", db_path=db_path,
         )
+
+
+def test_chain_ids_owned_by_another_order_are_refused_before_commit(db_path):
+    # PR #112 review: a multi-hop reissue naming an intermediate id another
+    # execution order already owns must be refused INSIDE the update
+    # transaction — the column UNIQUE constraint cannot see chain ids, and a
+    # committed collision would brick every later read via the DB-wide scan.
+    submit_and_partial_fill(db_path, "exec-1")          # exec-1 current B-1
+    submit_and_accept(db_path, "exec-2", broker_order_id="B-2")  # exec-2 owns B-2
+    poisoned = partial_result(
+        broker_order_id="B-3", superseded=("B-1", "B-2"), updated_at=at(3)
+    )
+    with pytest.raises(store.ExecutionOrderConflictError, match="B-2"):
+        store.record_order_result(
+            "exec-1", poisoned, reason="multi-hop reissue", db_path=db_path
+        )
+    # the DB is untouched and still fully restorable — nothing was bricked
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.broker_order_id == "B-1"
+    assert restored.superseded_broker_order_ids == ()
+    assert store.load_order_result("exec-2", db_path=db_path).broker_order_id == "B-2"
+
+
+def test_chain_ids_inside_another_orders_chain_are_refused_before_commit(db_path):
+    # the owned id may itself live only in the OTHER order's superseded
+    # chain (not its current column) — still a conflict
+    submit_and_partial_fill(db_path, "exec-1")
+    submit(db_path, "exec-2")
+    store.record_order_result(
+        "exec-2", partial_result("exec-2", broker_order_id="B-2"),
+        reason="partial fill", db_path=db_path,
+    )
+    store.record_order_result(
+        "exec-2",
+        partial_result("exec-2", broker_order_id="B-2b", superseded=("B-2",),
+                       updated_at=at(3)),
+        reason="reissued", db_path=db_path,
+    )
+    poisoned = partial_result(
+        broker_order_id="B-3", superseded=("B-1", "B-2"), updated_at=at(3)
+    )
+    with pytest.raises(store.ExecutionOrderConflictError, match="B-2"):
+        store.record_order_result(
+            "exec-1", poisoned, reason="multi-hop reissue", db_path=db_path
+        )
+    assert store.load_order_result("exec-1", db_path=db_path).broker_order_id == "B-1"
+
+
+def test_new_current_id_sitting_in_another_orders_chain_is_refused(db_path):
+    # the NEW current id colliding with another order's superseded id is a
+    # conflict the column UNIQUE constraint alone would not see either
+    submit(db_path, "exec-2")
+    store.record_order_result(
+        "exec-2", partial_result("exec-2", broker_order_id="B-2"),
+        reason="partial fill", db_path=db_path,
+    )
+    store.record_order_result(
+        "exec-2",
+        partial_result("exec-2", broker_order_id="B-2b", superseded=("B-2",),
+                       updated_at=at(3)),
+        reason="reissued", db_path=db_path,
+    )
+    submit_and_partial_fill(db_path, "exec-1")
+    poisoned = partial_result(
+        broker_order_id="B-2", superseded=("B-1",), updated_at=at(3)
+    )
+    with pytest.raises(store.ExecutionOrderConflictError, match="B-2"):
+        store.record_order_result(
+            "exec-1", poisoned, reason="reissue onto an owned id", db_path=db_path
+        )
+    assert store.load_order_result("exec-1", db_path=db_path).broker_order_id == "B-1"

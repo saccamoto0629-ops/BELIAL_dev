@@ -73,13 +73,16 @@ never leave this module — they are normalized into the common model's
 (audited id history) here:
 
 - 2xx submit answer with a partial ``orderFillTransaction`` AND a fully
-  correlated ``orderReissueTransaction`` (our ``clientOrderID``, ``orderID``
-  = the filled/original order, ``id`` = the NEW order id, ``units`` = the
-  exact remaining quantity) -> ``PARTIALLY_FILLED`` with the reissued id
-  current and the original id in the superseded chain
+  correlated ``orderReissueTransaction`` (type ``ORDER_REISSUE``, our client
+  id echoed as ``clientExtensions.id``, ``replacesOrderID`` = the
+  filled/original order, transaction ``id`` = the NEW order id, ``units`` =
+  the exact remaining quantity) -> ``PARTIALLY_FILLED`` with the reissued
+  id current and the original id in the superseded chain
 - 2xx submit answer with a partial fill AND a fully correlated
-  ``orderReissueRejectTransaction`` -> the remainder is definitively dead:
-  terminal ``CANCELLED`` with the partial fill kept on the ORIGINAL id
+  ``orderReissueRejectTransaction`` (type ``ORDER_REISSUE_REJECT``, a
+  transaction id, ``clientExtensions.id`` / ``replacesOrderID`` correlation)
+  -> the remainder is definitively dead: terminal ``CANCELLED`` with the
+  partial fill kept on the ORIGINAL id
 - ``get_order`` / ``cancel_order`` keep addressing by ``client_order_id``
   (the ``@<id>`` specifier), which OANDA resolves to the CURRENT order of a
   reissue chain; ``get_order`` walks the chain backwards over
@@ -687,11 +690,16 @@ class OandaDemoAdapter:
         - the fill transaction: a Mapping echoing OUR ``clientOrderID``,
           identifying the original order (``orderID``), with a partial
           quantity (0 < filled < requested) and a well-formed fill
-        - the reissue transaction: a Mapping echoing OUR ``clientOrderID``,
-          referencing the SAME original order (``orderID``), and — for a
-          successful reissue — carrying the NEW order id (``id``, distinct
-          from the original) plus ``units`` equal to the exact remaining
-          quantity (old/new correlation + quantity consistency).
+        - the reissue / reissue-reject transaction, using the fields the
+          OANDA transaction schema actually carries (PR #112 review): a
+          Mapping with a non-empty transaction ``id``, the expected ``type``
+          (``ORDER_REISSUE`` / ``ORDER_REISSUE_REJECT``), OUR client id
+          echoed as ``clientExtensions.id``, and ``replacesOrderID`` naming
+          the SAME original order the fill transaction filled. A successful
+          reissue additionally carries the NEW order id as its transaction
+          ``id`` (the order-creating transaction's id is the new order's id,
+          distinct from the original) plus ``units`` equal to the exact
+          remaining quantity (old/new correlation + quantity consistency).
 
         Success -> ``PARTIALLY_FILLED`` with ``broker_order_id`` = the
         reissued (current) id and the original id in the superseded chain.
@@ -741,13 +749,25 @@ class OandaDemoAdapter:
             refuse("the fill quantity is not a partial fill of the requested quantity")
 
         key = "orderReissueRejectTransaction" if has_reissue_reject else "orderReissueTransaction"
+        expected_type = "ORDER_REISSUE_REJECT" if has_reissue_reject else "ORDER_REISSUE"
         tx = payload.get(key)
         if not isinstance(tx, Mapping):
             refuse(f"{key} is not an object")
-        if tx.get("clientOrderID") != client_order_id:
+        # Required transaction schema (PR #112 review): a transaction that
+        # may drive a terminal CANCELLED or move the current broker order id
+        # must prove its own identity (id + type), its client correlation
+        # (clientExtensions.id — the field OANDA reissue transactions carry;
+        # NOT clientOrderID, which belongs to fill transactions) and the
+        # order it replaces (replacesOrderID). Anything less is refused.
+        tx_id = tx.get("id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            refuse(f"{key} carries no transaction id")
+        if tx.get("type") != expected_type:
+            refuse(f"{key} does not carry the expected transaction type")
+        if self._client_extension_id(tx) != client_order_id:
             refuse(f"{key} is not correlated to this client order id")
-        if tx.get("orderID") != original_id:
-            refuse(f"{key} references a different order than the fill transaction")
+        if tx.get("replacesOrderID") != original_id:
+            refuse(f"{key} does not reference the partially filled order it replaces")
 
         if has_reissue_reject:
             # The remainder's reissue was definitively rejected: no new order
@@ -760,9 +780,9 @@ class OandaDemoAdapter:
                 fills=(fill,),
             )
 
-        new_order_id = tx.get("id")
-        if not isinstance(new_order_id, str) or not new_order_id.strip():
-            refuse("the reissue transaction carries no new order id")
+        # The reissue transaction CREATES the new order, so its transaction
+        # id is the new order's id (same convention as orderCreateTransaction).
+        new_order_id = tx_id
         if new_order_id == original_id:
             refuse("the reissued order id equals the original order id")
         try:
@@ -1754,6 +1774,35 @@ class OandaDemoAdapter:
         if not isinstance(tx, Mapping):
             raise BrokerCommunicationError(
                 "broker response carried no transaction object",
+                client_order_id=client_order_id,
+            )
+        # The fetched transaction must PROVE it is the fill of THIS order
+        # (Issue #102 / PR #112 review): a transaction that answers under a
+        # different id, is not an ORDER_FILL, filled a different order, or
+        # carries a foreign client correlation must never contribute a fill
+        # to this order's audit snapshot — even when its quantities would
+        # happen to satisfy the chain arithmetic.
+        if self._tx_id(tx, "transaction.id") != tx_id:
+            raise BrokerCommunicationError(
+                "broker answered with a different transaction than the "
+                "fillingTransactionID that was requested",
+                client_order_id=client_order_id,
+            )
+        if tx.get("type") != "ORDER_FILL":
+            raise BrokerCommunicationError(
+                "the filling transaction is not an ORDER_FILL transaction",
+                client_order_id=client_order_id,
+            )
+        if tx.get("orderID") != order.get("id"):
+            raise BrokerCommunicationError(
+                "the filling transaction does not reference the order it was "
+                "fetched for",
+                client_order_id=client_order_id,
+            )
+        if tx.get("clientOrderID") != client_order_id:
+            raise BrokerCommunicationError(
+                "the filling transaction is not correlated to this client "
+                "order id",
                 client_order_id=client_order_id,
             )
         try:
