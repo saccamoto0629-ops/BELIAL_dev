@@ -257,6 +257,7 @@ def fill_response(client_order_id="c-1", units="1", price="155.123"):
             },
             "orderFillTransaction": {
                 "id": "1002",
+                "type": "ORDER_FILL",
                 "orderID": "1001",
                 "clientOrderID": client_order_id,
                 "units": units,
@@ -1848,7 +1849,10 @@ def test_reissue_reject_translates_to_cancelled_on_the_original_id():
     payload["orderReissueRejectTransaction"] = {
         "id": "2002",
         "type": "ORDER_REISSUE_REJECT",
-        "replacesOrderID": "1001",
+        # the reject transaction names the order it ATTEMPTED to replace
+        # (intendedReplacesOrderID) — replacesOrderID belongs to the
+        # successful OrderReissueTransaction (PR #112 re-review)
+        "intendedReplacesOrderID": "1001",
         "clientExtensions": {"id": "c-1"},
         "rejectReason": "MARKET_HALTED",
     }
@@ -1886,6 +1890,10 @@ def test_reissue_with_uncorrelated_or_inconsistent_fields_fails_closed():
         # transaction's fields — PR #112 review)
         {"reissue_overrides": {"clientOrderID": "c-1", "orderID": "1001"},
          "drop_reissue_keys": ("clientExtensions", "replacesOrderID")},
+        # the REJECT transaction's intendedReplacesOrderID must not satisfy
+        # the success branch (PR #112 re-review)
+        {"reissue_overrides": {"intendedReplacesOrderID": "1001"},
+         "drop_reissue_keys": ("replacesOrderID",)},
         # quantity consistency: reissued units must equal the exact remainder
         {"reissue_overrides": {"units": "4"}},
         {"drop_reissue_keys": ("units",)},
@@ -1960,15 +1968,22 @@ def test_reissue_reject_with_broken_correlation_or_schema_fails_closed():
     complete = {
         "id": "2002",
         "type": "ORDER_REISSUE_REJECT",
-        "replacesOrderID": "1001",
+        "intendedReplacesOrderID": "1001",
         "clientExtensions": {"id": "c-1"},
     }
     cases = (
         {**complete, "clientExtensions": {"id": "someone-else"}},
         {**complete, "clientExtensions": {}},
         {key: value for key, value in complete.items() if key != "clientExtensions"},
-        {**complete, "replacesOrderID": "9999"},
-        {key: value for key, value in complete.items() if key != "replacesOrderID"},
+        {**complete, "intendedReplacesOrderID": "9999"},
+        {key: value for key, value in complete.items()
+         if key != "intendedReplacesOrderID"},
+        # the SUCCESS transaction's replacesOrderID must not satisfy the
+        # reject branch (the reject schema names the attempted replacement
+        # as intendedReplacesOrderID — PR #112 re-review)
+        {**{key: value for key, value in complete.items()
+            if key != "intendedReplacesOrderID"},
+         "replacesOrderID": "1001"},
         # missing transaction id / missing or wrong type
         {key: value for key, value in complete.items() if key != "id"},
         {**complete, "id": ""},
@@ -2308,3 +2323,40 @@ def test_filled_order_query_refuses_a_foreign_filling_transaction():
         )
         with pytest.raises(m.BrokerCommunicationError):
             adapter.get_order("c-8")
+
+
+def test_reissue_path_fill_transaction_must_be_an_order_fill():
+    # PR #112 re-review: a mapping under orderFillTransaction with matching
+    # ids but a missing or foreign type must not drive a reissue result —
+    # neither the successful branch (audit chain) nor the reject branch
+    # (terminal CANCELLED).
+    for tx_type in (None, "MARKET_ORDER", "TRADE_CLOSE"):
+        # successful-reissue branch
+        status, payload = reissue_submit_response()
+        if tx_type is None:
+            del payload["orderFillTransaction"]["type"]
+        else:
+            payload["orderFillTransaction"]["type"] = tx_type
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1
+
+        # reissue-reject branch
+        status, payload = fill_response(units="2", price="155.000")
+        if tx_type is None:
+            del payload["orderFillTransaction"]["type"]
+        else:
+            payload["orderFillTransaction"]["type"] = tx_type
+        payload["orderReissueRejectTransaction"] = {
+            "id": "2002",
+            "type": "ORDER_REISSUE_REJECT",
+            "intendedReplacesOrderID": "1001",
+            "clientExtensions": {"id": "c-1"},
+        }
+        adapter, transport = make_adapter((status, payload))
+        with pytest.raises(m.BrokerTimeoutError) as exc_info:
+            adapter.submit_order(make_request(quantity=Decimal("5")))
+        assert "reissue" in str(exc_info.value)
+        assert len(transport.calls) == 1

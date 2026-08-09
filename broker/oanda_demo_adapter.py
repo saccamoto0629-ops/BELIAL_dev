@@ -72,17 +72,20 @@ never leave this module — they are normalized into the common model's
 ``broker_order_id`` (CURRENT actionable id) + ``superseded_broker_order_ids``
 (audited id history) here:
 
-- 2xx submit answer with a partial ``orderFillTransaction`` AND a fully
-  correlated ``orderReissueTransaction`` (type ``ORDER_REISSUE``, our client
-  id echoed as ``clientExtensions.id``, ``replacesOrderID`` = the
-  filled/original order, transaction ``id`` = the NEW order id, ``units`` =
-  the exact remaining quantity) -> ``PARTIALLY_FILLED`` with the reissued
-  id current and the original id in the superseded chain
+- 2xx submit answer with a partial ``orderFillTransaction`` (type
+  ``ORDER_FILL``) AND a fully correlated ``orderReissueTransaction`` (type
+  ``ORDER_REISSUE``, our client id echoed as ``clientExtensions.id``,
+  ``replacesOrderID`` = the filled/original order, transaction ``id`` = the
+  NEW order id, ``units`` = the exact remaining quantity) ->
+  ``PARTIALLY_FILLED`` with the reissued id current and the original id in
+  the superseded chain
 - 2xx submit answer with a partial fill AND a fully correlated
   ``orderReissueRejectTransaction`` (type ``ORDER_REISSUE_REJECT``, a
-  transaction id, ``clientExtensions.id`` / ``replacesOrderID`` correlation)
-  -> the remainder is definitively dead: terminal ``CANCELLED`` with the
-  partial fill kept on the ORIGINAL id
+  transaction id, ``clientExtensions.id`` correlation, and
+  ``intendedReplacesOrderID`` = the filled/original order — the reject
+  transaction names the order it ATTEMPTED to replace) -> the remainder is
+  definitively dead: terminal ``CANCELLED`` with the partial fill kept on
+  the ORIGINAL id
 - ``get_order`` / ``cancel_order`` keep addressing by ``client_order_id``
   (the ``@<id>`` specifier), which OANDA resolves to the CURRENT order of a
   reissue chain; ``get_order`` walks the chain backwards over
@@ -687,19 +690,23 @@ class OandaDemoAdapter:
         - exactly one of ``orderReissueTransaction`` /
           ``orderReissueRejectTransaction`` (both together is contradictory)
         - no coexisting cancel / reject transaction (ambiguous outcome)
-        - the fill transaction: a Mapping echoing OUR ``clientOrderID``,
-          identifying the original order (``orderID``), with a partial
-          quantity (0 < filled < requested) and a well-formed fill
+        - the fill transaction: a Mapping of ``type`` ``ORDER_FILL`` echoing
+          OUR ``clientOrderID``, identifying the original order
+          (``orderID``), with a partial quantity (0 < filled < requested)
+          and a well-formed fill
         - the reissue / reissue-reject transaction, using the fields the
           OANDA transaction schema actually carries (PR #112 review): a
           Mapping with a non-empty transaction ``id``, the expected ``type``
           (``ORDER_REISSUE`` / ``ORDER_REISSUE_REJECT``), OUR client id
-          echoed as ``clientExtensions.id``, and ``replacesOrderID`` naming
-          the SAME original order the fill transaction filled. A successful
-          reissue additionally carries the NEW order id as its transaction
-          ``id`` (the order-creating transaction's id is the new order's id,
-          distinct from the original) plus ``units`` equal to the exact
-          remaining quantity (old/new correlation + quantity consistency).
+          echoed as ``clientExtensions.id``, and the SAME original order the
+          fill transaction filled named by ``replacesOrderID`` (successful
+          reissue) / ``intendedReplacesOrderID`` (reissue reject — the
+          OANDA reject transaction names the order it ATTEMPTED to replace;
+          no replacement ever happened). A successful reissue additionally
+          carries the NEW order id as its transaction ``id`` (the
+          order-creating transaction's id is the new order's id, distinct
+          from the original) plus ``units`` equal to the exact remaining
+          quantity (old/new correlation + quantity consistency).
 
         Success -> ``PARTIALLY_FILLED`` with ``broker_order_id`` = the
         reissued (current) id and the original id in the superseded chain.
@@ -728,6 +735,11 @@ class OandaDemoAdapter:
         fill_tx = payload.get("orderFillTransaction")
         if not isinstance(fill_tx, Mapping):
             refuse("no interpretable partial-fill transaction accompanies it")
+        # The transaction that may drive a reissue interpretation must prove
+        # it IS a fill (PR #112 re-review): a mapping with matching ids but a
+        # missing or foreign type is a malformed response, not a fill.
+        if fill_tx.get("type") != "ORDER_FILL":
+            refuse("the fill transaction is not an ORDER_FILL transaction")
         if fill_tx.get("clientOrderID") != client_order_id:
             refuse("the fill transaction is not correlated to this client order id")
         original_id = fill_tx.get("orderID")
@@ -766,7 +778,13 @@ class OandaDemoAdapter:
             refuse(f"{key} does not carry the expected transaction type")
         if self._client_extension_id(tx) != client_order_id:
             refuse(f"{key} is not correlated to this client order id")
-        if tx.get("replacesOrderID") != original_id:
+        # The replaced-order reference lives in a DIFFERENT field per branch
+        # (PR #112 re-review): a successful OrderReissueTransaction names the
+        # order it replaces as replacesOrderID, while the reject transaction
+        # names the order it ATTEMPTED to replace as intendedReplacesOrderID
+        # (no replacement ever happened).
+        replaces_field = "intendedReplacesOrderID" if has_reissue_reject else "replacesOrderID"
+        if tx.get(replaces_field) != original_id:
             refuse(f"{key} does not reference the partially filled order it replaces")
 
         if has_reissue_reject:
