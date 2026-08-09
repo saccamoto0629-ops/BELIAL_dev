@@ -1384,10 +1384,15 @@ def test_overfill_or_zero_fill_responses_are_communication_errors_not_value_erro
             adapter.submit_order(make_request(quantity=Decimal("5")))
 
 
-def test_inconsistent_filled_order_query_raises_a_common_error_not_value_error():
-    # order says 5 units but the filling transaction reports 3: the common
-    # model's FILLED invariant would raise ValueError; the adapter must wrap
-    # it (PR #101 review).
+def test_filled_order_with_partial_fill_is_the_rejected_reissue_shape():
+    # Issue #102 / PR #112 re-review: a FILLED order whose (fully
+    # correlated) filling transaction covers only part of the order — with
+    # NO replacedByOrderID successor — is exactly what a rejected reissue
+    # leaves behind: the remainder is definitively dead. get_order maps it
+    # to terminal CANCELLED with the partial fill kept, matching the
+    # terminal result the submit answer produced (before Issue #102 this
+    # shape was refused as inconsistent; the reissue world gives it a
+    # defined meaning).
     adapter, _ = make_adapter(
         (
             200,
@@ -1417,6 +1422,36 @@ def test_inconsistent_filled_order_query_raises_a_common_error_not_value_error()
                 }
             },
         ),
+    )
+    result = adapter.get_order("c-8")
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "7001"
+    assert result.superseded_broker_order_ids == ()
+    assert result.filled_quantity == Decimal("3")
+    assert result.remaining_quantity == Decimal("2")
+
+
+def test_filled_order_with_an_overfilled_transaction_is_still_refused():
+    # an over-fill (transaction covering MORE than the order) has no
+    # legitimate reading in the reissue world either — it stays a malformed
+    # response wrapped as a common error (PR #101 review contract)
+    adapter, _ = make_adapter(
+        (
+            200,
+            {
+                "order": {
+                    "id": "7001",
+                    "type": "MARKET",
+                    "instrument": "USD_JPY",
+                    "units": "5",
+                    "state": "FILLED",
+                    "fillingTransactionID": "7002",
+                    "clientExtensions": {"id": "c-8"},
+                }
+            },
+        ),
+        fill_tx_response("7002", "7", order_id="7001", client_order_id="c-8",
+                         price="154.500"),
     )
     with pytest.raises(m.BrokerCommunicationError):
         adapter.get_order("c-8")
@@ -2485,3 +2520,64 @@ def test_plain_filled_query_refuses_an_opposite_signed_filling_transaction():
     with pytest.raises(m.BrokerCommunicationError) as exc_info:
         adapter.get_order("c-8")
     assert "opposite side" in str(exc_info.value)
+
+
+def test_mid_chain_rejected_reissue_reconstructs_as_cancelled():
+    # a reissued order (2001, remainder 3 of root 5) whose OWN next reissue
+    # was rejected: FILLED with a partial own fill (1) and no successor —
+    # the cumulative total 2 + 1 = 3 < 5 maps to terminal CANCELLED with
+    # the chain and every fill kept
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001",
+            filling_tx="9002",
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", replaced_by="2001",
+            filling_tx="9001",
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+        fill_tx_response("9002", "1", order_id="2001"),
+    )
+    result = adapter.get_order("c-9")
+    assert result.state is m.OrderState.CANCELLED
+    assert result.broker_order_id == "2001"
+    assert result.superseded_broker_order_ids == ("1001",)
+    assert result.requested_quantity == Decimal("5")
+    assert result.filled_quantity == Decimal("3")
+    assert result.remaining_quantity == Decimal("2")
+
+
+def test_submit_reissue_reject_then_get_order_satisfies_the_update_contract():
+    # the lifecycle after a rejected reissue: the submit answer is terminal
+    # CANCELLED, and a later query reconstructs the SAME terminal snapshot
+    # (FILLED state + partial fill + no successor), passing the terminal
+    # same-state re-observation contract
+    status, payload = fill_response(client_order_id="c-9", units="2",
+                                    price="155.000")
+    payload["orderReissueRejectTransaction"] = {
+        "id": "2002",
+        "type": "ORDER_REISSUE_REJECT",
+        "intendedReplacesOrderID": "1001",
+        "clientExtensions": {"id": "c-9"},
+        "units": "3",
+    }
+    adapter, _ = make_adapter(
+        (status, payload),
+        (200, {"order": chain_order(
+            "1001", state="FILLED", units="5", order_type="MARKET",
+            filling_tx="1002",
+        )}),
+        fill_tx_response("1002", "2", order_id="1001", price="155.000",
+                         time="2026-01-02T03:04:05.123456789Z"),
+    )
+    submitted = adapter.submit_order(
+        make_request(client_order_id="c-9", quantity=Decimal("5"))
+    )
+    assert submitted.state is m.OrderState.CANCELLED
+    queried = adapter.get_order("c-9")
+    m.validate_order_result_update(submitted, queried)
+    assert queried.state is m.OrderState.CANCELLED
+    assert queried.broker_order_id == "1001"
+    assert queried.superseded_broker_order_ids == ()
+    assert queried.filled_quantity == Decimal("2")

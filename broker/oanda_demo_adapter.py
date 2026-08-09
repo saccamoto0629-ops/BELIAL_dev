@@ -95,7 +95,11 @@ never leave this module — they are normalized into the common model's
   verified: our client id, bidirectional references, the documented
   terminal state FILLED a reissued-away order completes into — OANDA has
   no dedicated "reissued" order state — and per-link quantity
-  consistency) to rebuild the FULL cumulative snapshot
+  consistency) to rebuild the FULL cumulative snapshot. A FILLED current
+  order whose cumulative fills stay below the requested quantity is the
+  REJECTED-reissue shape (a terminal partial fill with no successor) and
+  maps to terminal ``CANCELLED`` with the partial fills kept, matching
+  the submit answer
 - any reissue field that cannot be interpreted — missing / malformed
   transaction, missing or mismatched client correlation, old/new order id
   correlation failure, quantity inconsistency, reissue fields on an error
@@ -1667,10 +1671,23 @@ class OandaDemoAdapter:
             state = OrderState.CANCELLED
             fills = tuple(chain_fills)
         elif oanda_state == "FILLED":
-            state = OrderState.FILLED
             fills = tuple(chain_fills) + (
                 self._fetch_fill(order, client_order_id, side=side),
             )
+            # A FILLED order whose cumulative (fully correlated) fills stay
+            # BELOW the requested quantity is a terminal partial fill with
+            # NO successor — the rejected-reissue shape (PR #112 re-review):
+            # the remainder is definitively dead, which the common model
+            # expresses as CANCELLED with the partial fills kept, matching
+            # the terminal result the submit answer produced. This covers
+            # the original order after its reissue was rejected AND a
+            # mid-chain member whose NEXT reissue was rejected. A cumulative
+            # total ABOVE the requested quantity stays a malformed response
+            # (model invariant -> BrokerCommunicationError below).
+            if sum((f.quantity for f in fills), Decimal(0)) < requested_quantity:
+                state = OrderState.CANCELLED
+            else:
+                state = OrderState.FILLED
         else:
             raise BrokerCommunicationError(
                 f"broker order object carries an unknown state {oanda_state!r}",
