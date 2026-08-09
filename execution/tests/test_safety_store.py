@@ -26,6 +26,7 @@ from execution.safety_gate import (
     SafetyRejectionCode,
     StaticSafetyState,
 )
+from execution.submission_journal import SubmissionJournal
 from execution.safety_store import (
     SafetyIntegrityError,
     SafetySchemaError,
@@ -321,11 +322,14 @@ def _submit_with_path(tmp_path, *, initialized=True, kill_switch=False):
         market_open=True,
         tradable=True,
     )
+    journal_db_path = tmp_path / "journal.sqlite3"
+    SubmissionJournal(journal_db_path).initialize()
     service = LiveOrderSubmissionService(
         connection=BrokerConnection(broker=broker),
         gate=gate,
         decision_db_path=decision_db_path,
         order_db_path=tmp_path / "orders.sqlite3",
+        journal_db_path=journal_db_path,
         clock=lambda: NOW,
     )
     service.register(request, client_order_id="client-flow-1")

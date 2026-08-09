@@ -170,6 +170,7 @@ class SafetyRejectionCode(enum.Enum):
     GATE_INTERNAL_ERROR = "gate_internal_error"
     INTENT_NOT_REGISTERED = "intent_not_registered"
     DUPLICATE_SUBMISSION = "duplicate_submission"
+    SUBMISSION_JOURNAL_FAILED = "submission_journal_failed"
 
 
 def _require_utc(value, field_name: str) -> None:

@@ -1,0 +1,111 @@
+# Submission Journal(Issue #93)
+
+Broker 送信前後の送信試行を、Execution Order DB(Issue #74)とは**独立した耐久媒体**へ記録する Submission Journal の仕様。実装は `execution/submission_journal.py`(store)と `execution/live_submission.py`(唯一の公認送信経路への統合)。
+
+> **重要な位置づけ**
+>
+> - Journal は**記録のみ**を行う。Broker 呼び出し・外部通信・実発注は一切行わない。OANDA Adapter・Live 接続・Live Execution runner・reconciliation の定期実行は引き続き未実装(非スコープ)。
+> - Paper Execution / Paper Signal / Strategy とは無関係・独立である(これらは Broker 境界に触れない)。
+> - 注文状態の唯一の正は既存 `broker.OrderState` のまま。Journal は注文状態機械を新設しない — 記録するのは**送信試行のライフサイクル**(Broker 呼び出しの前後関係と Execution DB 保存の成否)である。
+
+## 目的(なぜ Execution DB と別ファイルか)
+
+`LiveOrderSubmissionService` は Broker 応答を Execution Order DB へ記録し、保存失敗時は state-only UNKNOWN へフォールバックする(Issue #75 review r3)。しかし Execution Order DB **自体**が schema 異常・read-only・破損・ファイル消失で利用不能な場合、結果保存・UNKNOWN 記録・`list_unresolved_submissions()` が同時に失敗し、Broker が保持しうる注文を耐久的に追跡できなくなる。Submission Journal は専用 SQLite ファイル(既定 `execution/data/submission_journal.sqlite3`、`SUBMISSION_JOURNAL_DB_PATH` で上書き)にこの追跡を分離し、Execution DB 全損時にも未解決送信を列挙・restart 後復元できるようにする。
+
+## 記録内容(1 送信試行 = 1 行、`execution_request_id` が PK)
+
+| 列 | 内容 |
+|---|---|
+| `execution_request_id` | PK。送信試行の identity(Issue #74 の intent と 1:1) |
+| `client_order_id` | Broker べき等キー。**テーブル全体で UNIQUE** |
+| `symbol` / `side` / `quantity` | 発注内容の要約(数量は canonical Decimal 文字列) |
+| `execution_mode` / `connection_target` | 型付き接続 identity(`BrokerConnection` から導出された値) |
+| `submission_started_at_utc` | 送信試行の開始時刻(reclaim で更新) |
+| `broker_call_state` | `not_started` → `started` → `responded` \| `unknown` |
+| `broker_response_state` / `broker_order_id` | Broker 応答(`OrderState` 値。`responded` のときのみ非 NULL) |
+| `execution_db_save_state` | `not_attempted` → `saved` \| `failed`(OrderResult の Execution DB 保存) |
+| `outcome` | 機械可読サマリ: `open` → `completed` \| `reconciliation_required` |
+| `last_error` | 失敗理由(unknown / save-failed で必須) |
+| `updated_at_utc` | 最終更新時刻(単調。過去時刻の更新は拒否) |
+
+`started` は **`Broker.submit_order()` 呼び出しの直前**に書かれる。したがって `not_started` は「この intent で Broker が呼ばれたことは一度もない」ことの耐久的な証明であり、`started` 以降は「呼ばれた可能性がある」と保守的に扱う。
+
+ライフサイクルの整合(`completed` ⇔ `saved`、`unknown` / `failed` → `reconciliation_required` + `last_error` 必須、`responded` 以前は応答値を持てない等)は、モデル(`SubmissionJournalEntry.__post_init__`)と DB CHECK 制約の二重で強制される。
+
+## 送信順序と書き込み境界
+
+```text
+service.submit(execution_request_id, market=...)
+    1. 意図復元・phase 検査・Gate 評価・判定の耐久保存 + read-back(Issue #75。従来どおり)
+    2. Journal へ送信試行を記録(record_submission_intent。not_started)
+         失敗 → submission_journal_failed で拒否(Broker は呼ばれない)
+         重複 → duplicate_submission で拒否(下記「二重送信防止」)
+    3. execution store の created → submitting 遷移を獲得(従来どおり)
+    4. Journal を started へ更新(mark_broker_call_started。Broker 呼び出し直前の最後の書き込み)
+         失敗 → submission_journal_failed で拒否(Broker は呼ばれない。entry は not_started のまま = 未送信の証明)
+    5. Broker.submit_order()
+         例外 → Journal へ unknown を記録(best-effort)→ execution store へ UNKNOWN 記録 → re-raise
+    6. Broker 応答を Journal へ記録(record_broker_response。best-effort)
+    7. OrderResult を execution store へ保存(record_order_result)
+         失敗 → Journal へ応答 + 保存失敗を記録(record_execution_db_save_failed =
+                reconciliation_required。best-effort だが Journal が耐久記録の正)
+                → execution store へ UNKNOWN フォールバック(従来どおり)→ re-raise
+    8. Journal を完了へ更新(mark_completed = responded + saved + completed。best-effort)
+```
+
+- **Broker 呼び出し前の Journal 失敗はすべて fail-closed**: `submission_journal_failed`(または `duplicate_submission`)として拒否・監査保存され、`Broker.submit_order()` は呼ばれない。Journal DB の欠損(未初期化)・schema 不一致・書き込み失敗はすべてこの経路に入る。
+- **Broker 呼び出し後の Journal 失敗は best-effort**: critical ログを残して処理を続行する(注文は存在しうるので、Journal 障害を拒否・例外へ変換して結果記録を妨げない)。entry は前の状態に留まり `list_unresolved()` から見え続ける。
+- 手順 6 の応答記録が失われても、手順 7 失敗時の `record_execution_db_save_failed` / 手順 8 の `mark_completed` は `started` からの遷移も受理して応答内容ごと記録する(lost write の自己修復)。
+
+## 二重送信防止(Execution store と独立の第二ガード)
+
+- 主ガードは従来どおり execution store(phase ≠ created → `duplicate_submission`、`created → submitting` は一度きり)。
+- Journal は**独立の**第二ガードを追加する: `record_submission_intent` は、同一 `execution_request_id` の entry が `not_started` 以外(= Broker が呼ばれた可能性がある)なら `SubmissionJournalConflictError` を返し、サービスはこれを `duplicate_submission` で拒否する。payload(client_order_id / symbol / side / quantity / mode / target)不一致、他 request が持つ `client_order_id` も conflict。
+- これにより **Execution Order DB が消失・再作成され同じ intent が再 register された場合でも**、Journal が 2 回目の Broker 呼び出しを構造的に阻止する(受け入れ条件「同一 execution_request_id を再実行しても二重送信されない」の Execution DB 非依存の保証)。
+- 例外は **reclaim** のみ: entry が `not_started`(Broker 未呼び出しの証明)かつ payload 完全一致の場合に限り、同じ行を再利用して attempt 時刻を更新する。Broker に到達しなかった試行(手順 3 のインフラ失敗など)の正当な再実行を、二重送信ハザードなしで許すための規則である。
+
+## クラッシュ境界ごとの扱い(再送 / 照会 / reconciliation)
+
+どの境界でも**自動即時再送は行わない**。「再送可」とは、通常の `submit()` 再実行が既存ガードを通過して安全に送信へ到達しうる、の意味である。
+
+| # | クラッシュ / 障害点 | Journal | Execution DB | 扱い |
+|---|---|---|---|---|
+| 1 | intent 記録(手順 2)前 | entry なし | `created` | Broker 未送信。再 submit 可(通常経路そのもの) |
+| 2 | intent 記録後〜遷移獲得(手順 3)前 | `not_started` / `open` | `created` | Broker 未送信(Journal が証明)。再 submit 可(reclaim) |
+| 3 | 遷移獲得後〜started(手順 4)前 | `not_started` / `open` | `submitting` / `pending` | Broker 未送信(Journal が証明)。ただし execution store の再送禁止(phase ≠ created)が優先され自動再送はない。`list_unresolved_submissions()` と `list_unresolved()` の両方から見え、reconciliation が「Broker に存在しない」ことを確認して閉じる |
+| 4 | started 後〜Broker 応答前(呼び出し中含む) | `started` / `open` | `submitting` / `pending` | **送信結果不明**。両ガードが再送を拒否。`client_order_id` による Broker 照会で解決(reconciliation) |
+| 5 | Broker 応答後〜応答記録(手順 6)前 | `started` / `open` | `submitting` / `pending` | 同上(照会で解決)。プロセスが生存していれば手順 7/8 が応答内容ごと自己修復する |
+| 6 | 応答記録後〜Execution DB 保存(手順 7)前 | `responded` / `open` | `submitting` / `pending` | Broker 応答は Journal に耐久保存済み。reconciliation が Broker 照会・Execution DB への反映(Issue #104 の修復経路)で解決 |
+| 7 | Execution DB 保存失敗(プロセス生存) | `responded` + `failed` / **`reconciliation_required`** | UNKNOWN 記録(それも失敗なら stuck `submitting`/`pending`) | Issue #93 の中核。Journal が応答内容込みで reconciliation required を耐久保持。再送は両ガードが拒否 |
+| 8 | Execution DB 保存後〜完了更新(手順 8)前 | `responded` / `open` | `submitted` + 確定状態 | 実害なし。Journal 上は未解決として残るが、Execution DB との突合(journal `open` × exec `submitted`)で保存済みと機械判定できる。閉じるのは reconciliation(自動 close は非スコープ) |
+| 9 | Journal 自体が利用不能 | — | — | **Broker 呼び出し前**: fail-closed(送信しない)。**Broker 呼び出し後**: critical ログ + Execution DB への記録は継続(注文の事実を失わない)。従来の `list_unresolved_submissions()` が引き続き機能する |
+
+`UNKNOWN`(手順 5 の例外経路)も同様: Journal は `unknown` / `reconciliation_required`、Execution DB は UNKNOWN 記録。解決は後続照会の記録のみで、再送はどの経路でも拒否される。
+
+## 不整合の機械可読な識別
+
+- Journal 単独: `outcome`(`open` / `completed` / `reconciliation_required`)+ `broker_call_state` × `execution_db_save_state` が試行の到達点を機械可読に示す。`list_unresolved()`(`outcome ≠ completed`)と `list_reconciliation_required()` が read API。
+- Journal × Execution DB の突合: `execution_request_id` で対応づけ、`outcome = reconciliation_required`(Broker 応答が Execution DB に無い)、`open` × exec `submitted`(完了更新のみ喪失 = 境界 8)、`not_started` × exec `submitting`(未送信のまま遷移だけ獲得 = 境界 3)を判別できる。突合の自動実行・自動修復は非スコープ(reconciliation 側 Issue)。
+
+## Journal 自身の schema validation と障害時挙動
+
+他 store(execution / safety / shadow / reconciliation store)と同一方針:
+
+- `initialize()` は **pristine な DB のみ**へ schema を新規作成(`sqlite_master` 0 件 + `user_version` 0)。それ以外は完全検証し、不一致なら **DB 無変更で** `SubmissionJournalSchemaError`。
+- 全 read / write が「open → **closed-world schema 検証**(sqlite_master 全 object 集合 + token 正規化 DDL + PRAGMA 構造 signature + version)→ トランザクション」で動作。trigger / view / 制約欠損 lookalike / 他コンポーネント DB は拒否。
+- 書き込みは同一トランザクション内で **commit 前 read-back 検証**(更新行がモデル不変条件を満たして読み戻せること)を行い、失敗は全 rollback。
+- 書き込みは missing DB を暗黙作成しない(未初期化 = 失敗 = 送信されない)。読み取りは **true read-only 接続**(`execution/sqlite_ro.py`)で missing DB を作成せず(missing → 空)、保存行を厳格に再検証して帯域外編集を `SubmissionJournalIntegrityError` で拒否する。
+- Journal store は送信サービス内部に**封印**される: `LiveOrderSubmissionService` のコンストラクタは `journal_db_path`(filesystem パス)しか受け取らず、journal オブジェクトの注入点は存在しない(監査 store と同じ方針。Issue #75 review r3)。
+
+## テスト
+
+`python -m pytest execution/tests -q`(`tmp_path` の SQLite と FakeBroker のみ。外部通信・実発注なし)。
+
+- `test_submission_journal.py` — store のライフサイクル round-trip と reopen(プロセス再起動相当)復元、遷移前提条件・時刻単調性、reclaim と conflict(進行後 / payload 不一致 / client_order_id 競合)、未解決列挙、missing DB(write 失敗 + ファイル非作成 / read 空 + ファイル非作成)、pristine 判定・foreign schema・制約欠損 lookalike・trigger・version 不一致の拒否(DB 無変更)、帯域外改竄の復元時拒否、DB CHECK 発火、モデル不変条件。サービス統合: 正常送信の completed 記録、**Journal 欠損 / schema 破損 / started 書き込み失敗の fail-closed(Broker 呼び出し 0 件)**、**Broker 受理後の Execution DB 障害(ファイル消失 / バイト破損 / schema 改変 / read-only 接続)で Journal に reconciliation_required が残ること**、**Execution DB を消去・再作成しても Journal が再送を阻止すること**、timeout(UNKNOWN)の記録と再送拒否、Broker 呼び出し後の Journal 障害が結果記録を妨げないこと(critical ログ + 未解決列挙)、lost response write の自己修復、遷移インフラ失敗後の reclaim 再実行、プロセス再起動後の未解決復元。
+- 既存 `test_safety_gate.py` / 固定シナリオ(Issue #77)は新しいコンストラクタ引数(`journal_db_path`)へ追随し、従来契約(二重送信防止・UNKNOWN 再送禁止・全拒否経路で Broker 送信 0)を回帰として維持する。
+
+## 非スコープ
+
+- reconciliation runner の定期実行、Journal と Execution DB の突合の自動実行、Broker 照会結果による自動修復・entry の自動 close(`reconciliation_required` の解決は reconciliation 側の後続 Issue)
+- OANDA Adapter・Demo / Live API 接続・実口座への注文
+- 動的な資金管理、Strategy / Paper Signal の変更、Paper Execution への Broker 接続
