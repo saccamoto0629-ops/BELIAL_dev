@@ -2071,7 +2071,7 @@ def test_get_order_after_reissue_rebuilds_the_cumulative_snapshot():
     adapter, transport = make_adapter(
         (200, {"order": chain_order("2001", state="PENDING", units="3", replaces="1001")}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001", filling_tx="9001"
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
         )}),
         fill_tx_response("9001", "2", order_id="1001"),
     )
@@ -2094,7 +2094,7 @@ def test_get_order_after_reissue_final_fill_is_filled_with_all_fills():
             "2001", state="FILLED", units="3", replaces="1001", filling_tx="9002"
         )}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001", filling_tx="9001"
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
         )}),
         fill_tx_response("9001", "2", order_id="1001"),
         fill_tx_response("9002", "3", order_id="2001", price="150.000"),
@@ -2111,7 +2111,7 @@ def test_get_order_after_reissue_cancel_keeps_the_partial_fills():
     adapter, _ = make_adapter(
         (200, {"order": chain_order("2001", state="CANCELLED", units="3", replaces="1001")}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001", filling_tx="9001"
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
         )}),
         fill_tx_response("9001", "2", order_id="1001"),
     )
@@ -2127,11 +2127,11 @@ def test_get_order_resolves_a_repeated_reissue_chain_oldest_first():
     adapter, _ = make_adapter(
         (200, {"order": chain_order("3001", state="PENDING", units="2", replaces="2001")}),
         (200, {"order": chain_order(
-            "2001", state="REISSUED", units="3", replaces="1001",
+            "2001", state="FILLED", units="3", replaces="1001",
             replaced_by="3001", filling_tx="9002",
         )}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001", filling_tx="9001"
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
         )}),
         fill_tx_response("9001", "2", order_id="1001"),
         fill_tx_response("9002", "1", order_id="2001"),
@@ -2147,18 +2147,23 @@ def test_get_order_resolves_a_repeated_reissue_chain_oldest_first():
 
 def test_get_order_reissue_chain_correlation_failures_fail_closed():
     # every unprovable link refuses the whole snapshot (never a partial
-    # guess): back-reference mismatch, wrong state, foreign client id,
-    # missing client extensions, id mismatch against the reference
+    # guess): back-reference mismatch, contradictory state (a reissued-away
+    # order completes as FILLED — a working or cancelled order claiming
+    # replacement cannot be trusted; OANDA has no dedicated "reissued"
+    # state, PR #112 re-review), foreign client id, missing client
+    # extensions, id mismatch against the reference
     predecessors = (
-        chain_order("1001", state="REISSUED", units="5", replaced_by="9999",
+        chain_order("1001", state="FILLED", units="5", replaced_by="9999",
+                    filling_tx="9001"),
+        chain_order("1001", state="PENDING", units="5", replaced_by="2001",
+                    filling_tx="9001"),
+        chain_order("1001", state="CANCELLED", units="5", replaced_by="2001",
                     filling_tx="9001"),
         chain_order("1001", state="FILLED", units="5", replaced_by="2001",
-                    filling_tx="9001"),
-        chain_order("1001", state="REISSUED", units="5", replaced_by="2001",
                     filling_tx="9001", client_order_id="someone-else"),
-        chain_order("1001", state="REISSUED", units="5", replaced_by="2001",
+        chain_order("1001", state="FILLED", units="5", replaced_by="2001",
                     filling_tx="9001", client_extensions=False),
-        chain_order("1002", state="REISSUED", units="5", replaced_by="2001",
+        chain_order("1002", state="FILLED", units="5", replaced_by="2001",
                     filling_tx="9001"),
     )
     for predecessor in predecessors:
@@ -2177,7 +2182,7 @@ def test_get_order_reissue_chain_quantity_inconsistency_fails_closed():
     adapter, _ = make_adapter(
         (200, {"order": chain_order("2001", state="PENDING", units="4", replaces="1001")}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001", filling_tx="9001"
+            "1001", state="FILLED", units="5", replaced_by="2001", filling_tx="9001"
         )}),
         fill_tx_response("9001", "2", order_id="1001"),
     )
@@ -2186,10 +2191,12 @@ def test_get_order_reissue_chain_quantity_inconsistency_fails_closed():
     assert "quantity" in str(exc_info.value)
 
 
-def test_get_order_top_level_reissued_state_is_inconsistent():
-    # the @client specifier must resolve to the CURRENT order of the chain
+def test_get_order_resolving_to_a_replaced_order_is_inconsistent():
+    # the @client specifier must resolve to the CURRENT order of the chain;
+    # an answer carrying replacedByOrderID is a reissued-away order (OANDA
+    # marks replacement via the links, not a dedicated state)
     adapter, _ = make_adapter(
-        (200, {"order": chain_order("1001", state="REISSUED", units="5",
+        (200, {"order": chain_order("1001", state="FILLED", units="5",
                                     replaced_by="2001", filling_tx="9001")}),
     )
     with pytest.raises(m.BrokerCommunicationError) as exc_info:
@@ -2221,13 +2228,13 @@ def test_get_order_reissue_chain_depth_is_bounded():
     for _ in range(oa._MAX_REISSUE_CHAIN + 1):
         responses.append(
             (200, {"order": chain_order(
-                "1001", state="REISSUED", units="5", replaces="2001",
+                "1001", state="FILLED", units="5", replaces="2001",
                 replaced_by="2001", filling_tx="9001",
             )}),
         )
         responses.append(
             (200, {"order": chain_order(
-                "2001", state="REISSUED", units="5", replaces="1001",
+                "2001", state="FILLED", units="5", replaces="1001",
                 replaced_by="1001", filling_tx="9002",
             )}),
         )
@@ -2259,7 +2266,7 @@ def test_submit_reissue_then_get_order_satisfies_the_update_contract():
             order_type="MARKET", filling_tx="9002",
         )}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001",
+            "1001", state="FILLED", units="5", replaced_by="2001",
             order_type="MARKET", filling_tx="1002",
         )}),
         # the SAME fill the submit already observed must come back unchanged
@@ -2304,7 +2311,7 @@ def test_chain_fill_transactions_must_correlate_to_their_chain_member():
             (200, {"order": chain_order("2001", state="PENDING", units="3",
                                         replaces="1001")}),
             (200, {"order": chain_order(
-                "1001", state="REISSUED", units="5", replaced_by="2001",
+                "1001", state="FILLED", units="5", replaced_by="2001",
                 filling_tx="9001"
             )}),
             response,
@@ -2435,7 +2442,7 @@ def test_chain_fill_with_opposite_signed_units_is_refused_despite_arithmetic():
         (200, {"order": chain_order("2001", state="PENDING", units="3",
                                     replaces="1001")}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001",
+            "1001", state="FILLED", units="5", replaced_by="2001",
             filling_tx="9001"
         )}),
         fill_tx_response("9001", "-2", order_id="1001"),
@@ -2453,7 +2460,7 @@ def test_final_fill_with_opposite_signed_units_is_refused():
             filling_tx="9002"
         )}),
         (200, {"order": chain_order(
-            "1001", state="REISSUED", units="5", replaced_by="2001",
+            "1001", state="FILLED", units="5", replaced_by="2001",
             filling_tx="9001"
         )}),
         fill_tx_response("9001", "2", order_id="1001"),

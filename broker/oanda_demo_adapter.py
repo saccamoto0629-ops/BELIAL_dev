@@ -92,8 +92,10 @@ never leave this module — they are normalized into the common model's
   (the ``@<id>`` specifier), which OANDA resolves to the CURRENT order of a
   reissue chain; ``get_order`` walks the chain backwards over
   ``replacesOrderID`` / ``replacedByOrderID`` (bounded depth, every link
-  verified: our client id, bidirectional references, state ``REISSUED``,
-  per-link quantity consistency) to rebuild the FULL cumulative snapshot
+  verified: our client id, bidirectional references, the documented
+  terminal state FILLED a reissued-away order completes into — OANDA has
+  no dedicated "reissued" order state — and per-link quantity
+  consistency) to rebuild the FULL cumulative snapshot
 - any reissue field that cannot be interpreted — missing / malformed
   transaction, missing or mismatched client correlation, old/new order id
   correlation failure, quantity inconsistency, reissue fields on an error
@@ -1596,10 +1598,14 @@ class OandaDemoAdapter:
             else None
         )
         oanda_state = order.get("state")
-        if oanda_state == "REISSUED":
-            # The client-id specifier must resolve to the CURRENT order; a
-            # reissued-away order here means the broker answers are
-            # inconsistent (Issue #102, fail-closed).
+        if order.get("replacedByOrderID") is not None:
+            # The client-id specifier must resolve to the CURRENT order of a
+            # reissue chain. A ``replacedByOrderID`` marks the order as
+            # reissued-away — OANDA has no dedicated order state for it
+            # (PR #112 re-review: the documented states are PENDING /
+            # TRIGGERED / FILLED / CANCELLED; reissue is expressed by the
+            # replacement links) — so an answer carrying one here means the
+            # broker responses are inconsistent (Issue #102, fail-closed).
             raise BrokerCommunicationError(
                 "the client order specifier resolved to a reissued-away order; "
                 "the broker responses are inconsistent",
@@ -1710,8 +1716,11 @@ class OandaDemoAdapter:
           is embedded into a request path)
         - the referenced order must exist, echo OUR client extension id,
           point BACK at its successor via ``replacedByOrderID``
-          (bidirectional correlation) and be in state ``REISSUED`` (only a
-          reissued-away order may sit behind the current one)
+          (bidirectional correlation) and report the documented terminal
+          state ``FILLED`` its partial fill and replacement imply — OANDA
+          has no dedicated "reissued" order state (PR #112 re-review), so
+          the replacement links plus the fill are the reissue evidence, and
+          a working / cancelled order claiming replacement is contradictory
         - the chain depth is bounded (no unbounded fetch loops; a cycle or
           runaway chain is refused)
         """
@@ -1756,9 +1765,18 @@ class OandaDemoAdapter:
                     "trusted",
                     client_order_id=client_order_id,
                 )
-            if predecessor.get("state") != "REISSUED":
+            # OANDA has NO dedicated "reissued" order state (PR #112
+            # re-review): a reissued-away order completed through its
+            # partial fill, so it reports the documented terminal state
+            # FILLED; the reissue itself is evidenced by the verified
+            # replacesOrderID / replacedByOrderID links and the fill
+            # transaction fetched next. Any other state — a working or
+            # cancelled order claiming to have been replaced — is
+            # contradictory.
+            if predecessor.get("state") != "FILLED":
                 raise BrokerCommunicationError(
-                    "an order inside the reissue chain is not in state REISSUED; "
+                    "an order inside the reissue chain does not report the "
+                    "FILLED state its partial fill and replacement imply; "
                     "the chain cannot be trusted",
                     client_order_id=client_order_id,
                 )
