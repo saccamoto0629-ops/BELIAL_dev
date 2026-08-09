@@ -1633,7 +1633,7 @@ class OandaDemoAdapter:
                         client_order_id=client_order_id,
                     )
             superseded.append(member["id"])
-            chain_fills.append(self._fetch_fill(member, client_order_id))
+            chain_fills.append(self._fetch_fill(member, client_order_id, side=side))
             chain_units.append(abs(member_units))
         # Per-link quantity consistency: each reissued-away order's size must
         # equal its own partial fill plus the size reissued to its successor
@@ -1662,7 +1662,9 @@ class OandaDemoAdapter:
             fills = tuple(chain_fills)
         elif oanda_state == "FILLED":
             state = OrderState.FILLED
-            fills = tuple(chain_fills) + (self._fetch_fill(order, client_order_id),)
+            fills = tuple(chain_fills) + (
+                self._fetch_fill(order, client_order_id, side=side),
+            )
         else:
             raise BrokerCommunicationError(
                 f"broker order object carries an unknown state {oanda_state!r}",
@@ -1788,10 +1790,15 @@ class OandaDemoAdapter:
             )
         return order
 
-    def _fetch_fill(self, order: Mapping, client_order_id: str) -> Fill:
-        """Fetch the ORDER_FILL transaction referenced by a FILLED order to
-        recover fill price / quantity / time (transaction & fill results,
-        Issue #79 scope)."""
+    def _fetch_fill(self, order: Mapping, client_order_id: str, *, side: OrderSide) -> Fill:
+        """Fetch the ORDER_FILL transaction referenced by a FILLED (or
+        reissued-away) order to recover fill price / quantity / time
+        (transaction & fill results, Issue #79 scope). ``side`` is the
+        order's direction: the transaction's SIGNED units must lie on that
+        side before they are normalized to the common model's unsigned
+        quantity (PR #112 re-review r4 — an opposite-signed fill that
+        happens to satisfy the chain arithmetic is a contradictory
+        response, never a fill of this order)."""
         tx_id = order.get("fillingTransactionID")
         if not isinstance(tx_id, str) or not tx_id.strip():
             raise BrokerCommunicationError(
@@ -1843,11 +1850,18 @@ class OandaDemoAdapter:
                 "order id",
                 client_order_id=client_order_id,
             )
+        raw_units = _parse_decimal(tx.get("units"), "transaction.units")
+        if (raw_units > 0) != (side is OrderSide.BUY):
+            raise BrokerCommunicationError(
+                "the filling transaction describes units on the opposite side "
+                "of the order",
+                client_order_id=client_order_id,
+            )
         try:
             return Fill(
                 fill_id=self._tx_id(tx, "transaction.id"),
                 price=_parse_decimal(tx.get("price"), "transaction.price"),
-                quantity=abs(_parse_decimal(tx.get("units"), "transaction.units")),
+                quantity=abs(raw_units),
                 filled_at_utc=_parse_utc_time(tx.get("time"), "transaction.time"),
             )
         except BrokerInvalidRequestError as exc:

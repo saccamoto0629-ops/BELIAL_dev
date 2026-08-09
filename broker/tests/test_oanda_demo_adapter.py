@@ -2423,3 +2423,58 @@ def test_sell_reissue_with_consistently_negative_units_is_interpreted():
     assert result.superseded_broker_order_ids == ("1001",)
     assert result.filled_quantity == Decimal("2")
     assert result.remaining_quantity == Decimal("3")
+
+
+def test_chain_fill_with_opposite_signed_units_is_refused_despite_arithmetic():
+    # PR #112 re-review r4: a BUY chain (positive units throughout) whose
+    # predecessor references a SELL-signed fill transaction satisfies the
+    # 5 == |-2| + 3 arithmetic after abs() — the sign must be validated
+    # against the order's side BEFORE normalization, so the contradictory
+    # response fails closed instead of entering the audit snapshot.
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order("2001", state="PENDING", units="3",
+                                    replaces="1001")}),
+        (200, {"order": chain_order(
+            "1001", state="REISSUED", units="5", replaced_by="2001",
+            filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "-2", order_id="1001"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "opposite side" in str(exc_info.value)
+
+
+def test_final_fill_with_opposite_signed_units_is_refused():
+    # the current (final-fill) order's transaction is validated the same way
+    adapter, _ = make_adapter(
+        (200, {"order": chain_order(
+            "2001", state="FILLED", units="3", replaces="1001",
+            filling_tx="9002"
+        )}),
+        (200, {"order": chain_order(
+            "1001", state="REISSUED", units="5", replaced_by="2001",
+            filling_tx="9001"
+        )}),
+        fill_tx_response("9001", "2", order_id="1001"),
+        fill_tx_response("9002", "-3", order_id="2001"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-9")
+    assert "opposite side" in str(exc_info.value)
+
+
+def test_plain_filled_query_refuses_an_opposite_signed_filling_transaction():
+    # the chain-less FILLED query path shares the sign contract: a SELL
+    # order whose filling transaction reports BUY-signed units is refused
+    adapter, _ = make_adapter(
+        (200, {"order": {
+            "id": "7001", "type": "MARKET", "instrument": "USD_JPY",
+            "units": "-5", "state": "FILLED", "fillingTransactionID": "7002",
+            "clientExtensions": {"id": "c-8"},
+        }}),
+        fill_tx_response("7002", "5", order_id="7001", client_order_id="c-8"),
+    )
+    with pytest.raises(m.BrokerCommunicationError) as exc_info:
+        adapter.get_order("c-8")
+    assert "opposite side" in str(exc_info.value)
