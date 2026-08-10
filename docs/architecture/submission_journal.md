@@ -18,7 +18,7 @@ Broker 送信前後の送信試行を、Execution Order DB(Issue #74)とは**独
 |---|---|
 | `execution_request_id` | PK。送信試行の identity(Issue #74 の intent と 1:1) |
 | `client_order_id` | Broker べき等キー。**テーブル全体で UNIQUE** |
-| `symbol` / `side` / `quantity` | 発注内容の要約(数量は canonical Decimal 文字列) |
+| `symbol` / `side` / `order_type` / `quantity` / `requested_price` | **broker へ渡る `OrderRequest` の全内容フィールド**(数量・価格は canonical Decimal 文字列。`requested_price` は LIMIT のときのみ非 NULL — `OrderRequest.limit_price` と同一契約を CHECK で強制) |
 | `execution_mode` / `connection_target` | 型付き接続 identity(`BrokerConnection` から導出された値) |
 | `submission_started_at_utc` | 送信試行の開始時刻(reclaim で更新) |
 | `broker_call_state` | `not_started` → `started` → `responded` \| `unknown` |
@@ -60,9 +60,9 @@ service.submit(execution_request_id, market=...)
 ## 二重送信防止(Execution store と独立の第二ガード)
 
 - 主ガードは従来どおり execution store(phase ≠ created → `duplicate_submission`、`created → submitting` は一度きり)。
-- Journal は**独立の**第二ガードを追加する: `record_submission_intent` は、同一 `execution_request_id` の entry が `not_started` 以外(= Broker が呼ばれた可能性がある)なら `SubmissionJournalConflictError` を返し、サービスはこれを `duplicate_submission` で拒否する。payload(client_order_id / symbol / side / quantity / mode / target)不一致、他 request が持つ `client_order_id` も conflict。
+- Journal は**独立の**第二ガードを追加する: `record_submission_intent` は、同一 `execution_request_id` の entry が `not_started` 以外(= Broker が呼ばれた可能性がある)なら `SubmissionJournalConflictError` を返し、サービスはこれを `duplicate_submission` で拒否する。payload 不一致、他 request が持つ `client_order_id` も conflict。**比較する payload は broker へ渡る `OrderRequest` の全フィールド**(client_order_id / symbol / side / order_type / quantity / requested_price)+ 接続 identity(mode / target)であり(PR #113 レビュー P1)、MARKET → LIMIT の変更や指値の移動など**注文内容が 1 項目でも変わった再登録は reclaim されない**。
 - これにより **Execution Order DB が消失・再作成され同じ intent が再 register された場合でも**、Journal が 2 回目の Broker 呼び出しを構造的に阻止する(受け入れ条件「同一 execution_request_id を再実行しても二重送信されない」の Execution DB 非依存の保証)。
-- 例外は **reclaim** のみ: entry が `not_started`(Broker 未呼び出しの証明)かつ payload 完全一致の場合に限り、同じ行を再利用して attempt 時刻を更新する。Broker に到達しなかった試行(手順 3 のインフラ失敗など)の正当な再実行を、二重送信ハザードなしで許すための規則である。
+- 例外は **reclaim** のみ: entry が `not_started`(Broker 未呼び出しの証明)かつ payload 完全一致の場合に限り、同じ行を再利用して attempt 時刻を更新する。Broker に到達しなかった試行(手順 3 のインフラ失敗など)の正当な再実行を、二重送信ハザードなしで許すための規則である。reclaim も他の更新と同じ**時刻単調性**に従う: `started_at_utc` が保存済み `updated_at_utc` より過去なら拒否し、耐久 timestamp を巻き戻さない(PR #113 レビュー P2)。
 
 ## クラッシュ境界ごとの扱い(再送 / 照会 / reconciliation)
 
@@ -101,7 +101,7 @@ service.submit(execution_request_id, market=...)
 
 `python -m pytest execution/tests -q`(`tmp_path` の SQLite と FakeBroker のみ。外部通信・実発注なし)。
 
-- `test_submission_journal.py` — store のライフサイクル round-trip と reopen(プロセス再起動相当)復元、遷移前提条件・時刻単調性、reclaim と conflict(進行後 / payload 不一致 / client_order_id 競合)、未解決列挙、missing DB(write 失敗 + ファイル非作成 / read 空 + ファイル非作成)、pristine 判定・foreign schema・制約欠損 lookalike・trigger・version 不一致の拒否(DB 無変更)、帯域外改竄の復元時拒否、DB CHECK 発火、モデル不変条件。サービス統合: 正常送信の completed 記録、**Journal 欠損 / schema 破損 / started 書き込み失敗の fail-closed(Broker 呼び出し 0 件)**、**Broker 受理後の Execution DB 障害(ファイル消失 / バイト破損 / schema 改変 / read-only 接続)で Journal に reconciliation_required が残ること**、**Execution DB を消去・再作成しても Journal が再送を阻止すること**、timeout(UNKNOWN)の記録と再送拒否、Broker 呼び出し後の Journal 障害が結果記録を妨げないこと(critical ログ + 未解決列挙)、lost response write の自己修復、遷移インフラ失敗後の reclaim 再実行、プロセス再起動後の未解決復元。
+- `test_submission_journal.py` — store のライフサイクル round-trip と reopen(プロセス再起動相当)復元、遷移前提条件・時刻単調性(**reclaim の時刻後退拒否を含む**)、reclaim と conflict(進行後 / payload 不一致(**order_type 変更・指値移動を含む broker-bound 全フィールド**)/ client_order_id 競合)、未解決列挙、missing DB(write 失敗 + ファイル非作成 / read 空 + ファイル非作成)、pristine 判定・foreign schema・制約欠損 lookalike・trigger・version 不一致の拒否(DB 無変更)、帯域外改竄の復元時拒否、DB CHECK 発火、モデル不変条件。サービス統合: 正常送信の completed 記録、**Journal 欠損 / schema 破損 / started 書き込み失敗の fail-closed(Broker 呼び出し 0 件)**、**Broker 受理後の Execution DB 障害(ファイル消失 / バイト破損 / schema 改変 / read-only 接続)で Journal に reconciliation_required が残ること**、**Execution DB を消去・再作成しても Journal が再送を阻止すること**、timeout(UNKNOWN)の記録と再送拒否、Broker 呼び出し後の Journal 障害が結果記録を妨げないこと(critical ログ + 未解決列挙)、lost response write の自己修復、遷移インフラ失敗後の reclaim 再実行、プロセス再起動後の未解決復元。
 - 既存 `test_safety_gate.py` / 固定シナリオ(Issue #77)は新しいコンストラクタ引数(`journal_db_path`)へ追随し、従来契約(二重送信防止・UNKNOWN 再送禁止・全拒否経路で Broker 送信 0)を回帰として維持する。
 
 ## 非スコープ

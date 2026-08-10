@@ -67,7 +67,9 @@ def intent_kwargs(**overrides):
         client_order_id="client-1",
         symbol="USD_JPY",
         side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
         quantity=Decimal("1"),
+        requested_price=None,
         execution_mode="fake",
         connection_target="fake",
         started_at_utc=NOW,
@@ -175,6 +177,8 @@ def test_intent_round_trips_and_survives_reopen(tmp_path):
     assert restored.client_order_id == "client-1"
     assert restored.symbol == "USD_JPY"
     assert restored.side is OrderSide.BUY
+    assert restored.order_type is OrderType.MARKET
+    assert restored.requested_price is None
     assert restored.quantity == Decimal("1")
     assert restored.execution_mode == "fake"
     assert restored.connection_target == "fake"
@@ -327,9 +331,51 @@ def test_intent_conflicts_on_payload_mismatch(tmp_path):
         {"side": OrderSide.SELL},
         {"symbol": "EUR_USD"},
         {"connection_target": "other-target"},
+        # PR #113 review P1: order CONTENT changes -- MARKET turned LIMIT --
+        # must conflict, never silently reclaim the journaled attempt.
+        {"order_type": OrderType.LIMIT, "requested_price": Decimal("150")},
     ):
         with pytest.raises(SubmissionJournalConflictError, match="payload differs"):
             journal.record_submission_intent(**intent_kwargs(**mismatch))
+
+
+def test_intent_conflicts_on_a_moved_limit_price(tmp_path):
+    # PR #113 review P1: for a LIMIT intent the journaled broker-bound
+    # payload includes the limit price -- a moved price is a different order.
+    journal = journal_at(tmp_path)
+    journal.record_submission_intent(
+        **intent_kwargs(order_type=OrderType.LIMIT, requested_price=Decimal("150"))
+    )
+    with pytest.raises(SubmissionJournalConflictError, match="payload differs"):
+        journal.record_submission_intent(
+            **intent_kwargs(
+                order_type=OrderType.LIMIT,
+                requested_price=Decimal("151"),
+                started_at_utc=LATER,
+            )
+        )
+    # The identical LIMIT payload still reclaims.
+    journal.record_submission_intent(
+        **intent_kwargs(
+            order_type=OrderType.LIMIT, requested_price=Decimal("150"), started_at_utc=LATER
+        )
+    )
+    entry = journal.get_entry("exec-1")
+    assert entry.order_type is OrderType.LIMIT
+    assert entry.requested_price == Decimal("150")
+    assert entry.submission_started_at_utc == LATER
+
+
+def test_reclaim_refuses_a_backward_timestamp(tmp_path):
+    # PR #113 review P2: the reclaim path enforces the same timestamp
+    # monotonicity as every other journal update.
+    journal = journal_at(tmp_path)
+    journal.record_submission_intent(**intent_kwargs(started_at_utc=LATER))
+    with pytest.raises(SubmissionJournalError, match="refusing to reclaim backwards"):
+        journal.record_submission_intent(**intent_kwargs(started_at_utc=NOW))
+    entry = journal.get_entry("exec-1")
+    assert entry.submission_started_at_utc == LATER
+    assert entry.updated_at_utc == LATER
 
 
 def test_intent_conflicts_when_client_order_id_belongs_to_another_request(tmp_path):
@@ -473,7 +519,8 @@ def test_db_check_constraints_reject_inconsistent_lifecycle_rows(tmp_path):
             # completed without a saved Execution DB result
             connection.execute(
                 "INSERT INTO submission_journal VALUES ("
-                "'exec-x', 'client-x', 'USD_JPY', 'buy', '1', 'fake', 'fake', "
+                "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', NULL, "
+                "'fake', 'fake', "
                 "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
                 "'not_attempted', 'completed', NULL, '2026-07-22T01:00:00+00:00')"
             )
@@ -481,11 +528,44 @@ def test_db_check_constraints_reject_inconsistent_lifecycle_rows(tmp_path):
             # unknown without a recorded failure reason
             connection.execute(
                 "INSERT INTO submission_journal VALUES ("
-                "'exec-x', 'client-x', 'USD_JPY', 'buy', '1', 'fake', 'fake', "
+                "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', NULL, "
+                "'fake', 'fake', "
                 "'2026-07-22T01:00:00+00:00', 'unknown', NULL, NULL, "
                 "'not_attempted', 'reconciliation_required', NULL, "
                 "'2026-07-22T01:00:00+00:00')"
             )
+        with pytest.raises(sqlite3.IntegrityError):
+            # a MARKET row carrying a limit price (PR #113 review P1 guard)
+            connection.execute(
+                "INSERT INTO submission_journal VALUES ("
+                "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', '150', "
+                "'fake', 'fake', "
+                "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
+                "'not_attempted', 'open', NULL, '2026-07-22T01:00:00+00:00')"
+            )
+
+
+def test_entry_model_requires_price_exactly_for_limit():
+    kwargs = dict(
+        execution_request_id="exec-1",
+        client_order_id="client-1",
+        symbol="USD_JPY",
+        side=OrderSide.BUY,
+        quantity=Decimal("1"),
+        execution_mode="fake",
+        connection_target="fake",
+        submission_started_at_utc=NOW,
+        broker_call_state=BROKER_CALL_NOT_STARTED,
+        execution_db_save_state=DB_SAVE_NOT_ATTEMPTED,
+        outcome=OUTCOME_OPEN,
+        updated_at_utc=NOW,
+    )
+    with pytest.raises(ValueError, match="requested_price"):
+        SubmissionJournalEntry(
+            order_type=OrderType.MARKET, requested_price=Decimal("150"), **kwargs
+        )
+    with pytest.raises(ValueError, match="requested_price"):
+        SubmissionJournalEntry(order_type=OrderType.LIMIT, requested_price=None, **kwargs)
 
 
 def test_entry_model_enforces_lifecycle_invariants():
@@ -495,6 +575,7 @@ def test_entry_model_enforces_lifecycle_invariants():
             client_order_id="client-1",
             symbol="USD_JPY",
             side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
             quantity=Decimal("1"),
             execution_mode="fake",
             connection_target="fake",
@@ -511,6 +592,7 @@ def test_entry_model_enforces_lifecycle_invariants():
             client_order_id="client-1",
             symbol="USD_JPY",
             side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
             quantity=Decimal("1"),
             execution_mode="fake",
             connection_target="fake",

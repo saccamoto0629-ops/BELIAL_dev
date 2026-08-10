@@ -44,7 +44,15 @@ if the Execution Order DB is wiped and the same intent re-registered from
 scratch, the journal still blocks a second broker call. A ``not_started``
 entry with an IDENTICAL payload is reclaimed instead (the broker was
 provably never called, so a retry after an infrastructure failure is not a
-double-send); reclaiming refreshes the attempt timestamp only.
+double-send); reclaiming refreshes the attempt timestamp only and rejects
+timestamps behind the stored ``updated_at_utc`` (same monotonicity rule as
+every other update). The compared payload covers EVERY broker-bound
+``OrderRequest`` field derivable from the intent -- ``client_order_id``,
+``symbol``, ``side``, ``order_type``, ``quantity``, ``requested_price``
+(the LIMIT price) -- plus the connection identity, so a re-registered
+intent whose order CONTENT changed (e.g. MARKET turned LIMIT, or a moved
+limit price) can never silently reuse the journaled attempt (PR #113
+review P1).
 
 Fail-closed contract (Issue #93): every write raises on ANY failure --
 missing/uninitialized DB, schema mismatch, precondition violation, insert
@@ -83,7 +91,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from broker.broker_models import OrderSide, OrderState
+from broker.broker_models import OrderSide, OrderState, OrderType
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
 from execution.execution_models import _require_non_empty_str, _require_utc
 from execution.sqlite_ro import connect_read_only
@@ -125,7 +133,9 @@ _ENTRY_COLUMNS: tuple[str, ...] = (
     "client_order_id",
     "symbol",
     "side",
+    "order_type",
     "quantity",
+    "requested_price",
     "execution_mode",
     "connection_target",
     "submission_started_at_utc",
@@ -185,6 +195,7 @@ def _create_journal_table_sql() -> str:
     a recorded failure reason, and nothing before ``responded`` may carry a
     broker response."""
     sides = _enum_values_sql(OrderSide)
+    types = _enum_values_sql(OrderType)
     states = _enum_values_sql(OrderState)
     call_states = "', '".join(sorted(BROKER_CALL_STATES))
     save_states = "', '".join(sorted(DB_SAVE_STATES))
@@ -195,7 +206,9 @@ def _create_journal_table_sql() -> str:
             client_order_id TEXT NOT NULL UNIQUE CHECK (trim(client_order_id) <> ''),
             symbol TEXT NOT NULL CHECK (trim(symbol) <> ''),
             side TEXT NOT NULL CHECK (side IN ('{sides}')),
+            order_type TEXT NOT NULL CHECK (order_type IN ('{types}')),
             quantity TEXT NOT NULL CHECK (trim(quantity) <> ''),
+            requested_price TEXT CHECK (requested_price IS NULL OR trim(requested_price) <> ''),
             execution_mode TEXT NOT NULL CHECK (trim(execution_mode) <> ''),
             connection_target TEXT NOT NULL CHECK (trim(connection_target) <> ''),
             submission_started_at_utc TEXT NOT NULL CHECK (submission_started_at_utc LIKE '%+00:00'),
@@ -206,6 +219,7 @@ def _create_journal_table_sql() -> str:
             outcome TEXT NOT NULL CHECK (outcome IN ('{outcomes}')),
             last_error TEXT CHECK (last_error IS NULL OR trim(last_error) <> ''),
             updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00'),
+            CHECK ((order_type = '{OrderType.LIMIT.value}') = (requested_price IS NOT NULL)),
             CHECK ((broker_call_state = '{BROKER_CALL_RESPONDED}') = (broker_response_state IS NOT NULL)),
             CHECK (broker_order_id IS NULL OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
             CHECK (execution_db_save_state = '{DB_SAVE_NOT_ATTEMPTED}' OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
@@ -360,6 +374,7 @@ class SubmissionJournalEntry:
     client_order_id: str
     symbol: str
     side: OrderSide
+    order_type: OrderType
     quantity: Decimal
     execution_mode: str
     connection_target: str
@@ -368,6 +383,7 @@ class SubmissionJournalEntry:
     execution_db_save_state: str
     outcome: str
     updated_at_utc: datetime
+    requested_price: Decimal | None = None
     broker_response_state: OrderState | None = None
     broker_order_id: str | None = None
     last_error: str | None = None
@@ -378,8 +394,25 @@ class SubmissionJournalEntry:
         _require_non_empty_str(self.symbol, "symbol")
         if not isinstance(self.side, OrderSide):
             raise ValueError(f"side must be an OrderSide, got {self.side!r}")
+        if not isinstance(self.order_type, OrderType):
+            raise ValueError(f"order_type must be an OrderType, got {self.order_type!r}")
         if not isinstance(self.quantity, Decimal) or not self.quantity.is_finite() or self.quantity <= 0:
             raise ValueError(f"quantity must be a positive finite Decimal, got {self.quantity!r}")
+        # Mirrors the OrderRequest / ExecutionRequest invariant: LIMIT carries
+        # the price that goes to the broker; MARKET must not carry one.
+        if (self.order_type is OrderType.LIMIT) != (self.requested_price is not None):
+            raise ValueError(
+                "requested_price must be present exactly for LIMIT orders (got "
+                f"order_type {self.order_type!r}, requested_price {self.requested_price!r})"
+            )
+        if self.requested_price is not None and (
+            not isinstance(self.requested_price, Decimal)
+            or not self.requested_price.is_finite()
+            or self.requested_price <= 0
+        ):
+            raise ValueError(
+                f"requested_price must be a positive finite Decimal, got {self.requested_price!r}"
+            )
         _require_non_empty_str(self.execution_mode, "execution_mode")
         _require_non_empty_str(self.connection_target, "connection_target")
         _require_utc(self.submission_started_at_utc, "submission_started_at_utc")
@@ -456,7 +489,9 @@ class SubmissionJournalEntry:
             self.client_order_id,
             self.symbol,
             self.side,
+            self.order_type,
             self.quantity,
+            self.requested_price,
             self.execution_mode,
             self.connection_target,
         )
@@ -467,12 +502,17 @@ def _entry_from_row(row, db_path: Path) -> SubmissionJournalEntry:
         quantity = Decimal(row["quantity"])
         if not quantity.is_finite():
             raise ValueError(f"stored quantity is not finite: {row['quantity']!r}")
+        requested_price = (
+            None if row["requested_price"] is None else Decimal(row["requested_price"])
+        )
         return SubmissionJournalEntry(
             execution_request_id=row["execution_request_id"],
             client_order_id=row["client_order_id"],
             symbol=row["symbol"],
             side=OrderSide(row["side"]),
+            order_type=OrderType(row["order_type"]),
             quantity=quantity,
+            requested_price=requested_price,
             execution_mode=row["execution_mode"],
             connection_target=row["connection_target"],
             submission_started_at_utc=_parse_utc(row["submission_started_at_utc"]),
@@ -545,7 +585,9 @@ class SubmissionJournal:
         client_order_id: str,
         symbol: str,
         side: OrderSide,
+        order_type: OrderType,
         quantity: Decimal,
+        requested_price: Decimal | None,
         execution_mode: str,
         connection_target: str,
         started_at_utc: datetime,
@@ -555,7 +597,12 @@ class SubmissionJournal:
         Inserts the ``not_started`` row, or RECLAIMS an existing
         ``not_started`` row whose payload is IDENTICAL (a prior attempt that
         provably never reached the broker -- reclaiming refreshes the
-        attempt timestamp only). Everything else conflicts
+        attempt timestamp only, and refuses a timestamp behind the stored
+        ``updated_at_utc``, PR #113 review P2). The compared payload covers
+        every broker-bound ``OrderRequest`` field -- ``client_order_id``,
+        ``symbol``, ``side``, ``order_type``, ``quantity``,
+        ``requested_price`` -- plus the connection identity (PR #113 review
+        P1). Everything else conflicts
         (:class:`SubmissionJournalConflictError`): an entry past
         ``not_started`` (a broker call may have happened; re-sending is
         banned), a payload mismatch, or a ``client_order_id`` journaled for
@@ -566,9 +613,20 @@ class SubmissionJournal:
         _require_non_empty_str(symbol, "symbol")
         if not isinstance(side, OrderSide):
             raise SubmissionJournalError(f"side must be an OrderSide, got {side!r}")
+        if not isinstance(order_type, OrderType):
+            raise SubmissionJournalError(f"order_type must be an OrderType, got {order_type!r}")
         if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
             raise SubmissionJournalError(
                 f"quantity must be a positive finite Decimal, got {quantity!r}"
+            )
+        if requested_price is not None and (
+            not isinstance(requested_price, Decimal)
+            or not requested_price.is_finite()
+            or requested_price <= 0
+        ):
+            raise SubmissionJournalError(
+                f"requested_price must be a positive finite Decimal or None, got "
+                f"{requested_price!r}"
             )
         _require_non_empty_str(execution_mode, "execution_mode")
         _require_non_empty_str(connection_target, "connection_target")
@@ -579,7 +637,9 @@ class SubmissionJournal:
             client_order_id=client_order_id,
             symbol=symbol,
             side=side,
+            order_type=order_type,
             quantity=quantity,
+            requested_price=requested_price,
             execution_mode=execution_mode,
             connection_target=connection_target,
             submission_started_at_utc=started_at_utc,
@@ -610,7 +670,13 @@ class SubmissionJournal:
                         candidate.client_order_id,
                         candidate.symbol,
                         candidate.side.value,
+                        candidate.order_type.value,
                         str(candidate.quantity),
+                        (
+                            None
+                            if candidate.requested_price is None
+                            else str(candidate.requested_price)
+                        ),
                         candidate.execution_mode,
                         candidate.connection_target,
                         candidate.submission_started_at_utc.isoformat(),
@@ -639,9 +705,21 @@ class SubmissionJournal:
                         "the journaled payload differs from this attempt "
                         f"(journaled client_order_id {existing.client_order_id!r}, "
                         f"symbol {existing.symbol!r}, side {existing.side.value!r}, "
-                        f"quantity {existing.quantity!r}, mode "
+                        f"order_type {existing.order_type.value!r}, "
+                        f"quantity {existing.quantity!r}, requested_price "
+                        f"{existing.requested_price!r}, mode "
                         f"{existing.execution_mode!r}, target "
                         f"{existing.connection_target!r})",
+                    )
+                if started_at_utc < existing.updated_at_utc:
+                    # Same monotonicity rule as _transition() (PR #113 review
+                    # P2): a reclaim must never move the durable timestamps
+                    # backwards, or unresolved-entry ordering and crash
+                    # chronology become inaccurate.
+                    raise SubmissionJournalError(
+                        f"started_at_utc {started_at_utc.isoformat()} precedes the "
+                        f"stored updated_at_utc {existing.updated_at_utc.isoformat()} "
+                        f"for {execution_request_id!r}; refusing to reclaim backwards"
                     )
                 connection.execute(
                     f"UPDATE {JOURNAL_TABLE} SET submission_started_at_utc = ?, "
