@@ -145,6 +145,7 @@ jobs:
           python -c "from execution.safety_gate import BrokerConnection, SafetyGate, SafetyPolicy"
           python -c "from execution.safety_store import SQLiteSafetyDecisionStore"
           python -c "from execution.live_submission import LiveOrderSubmissionService"
+          python -c "from execution.submission_journal import SubmissionJournal, SubmissionJournalEntry"
           python -c "from execution.scenario_models import load_scenarios, validate_scenario"
           python -c "from execution.scenario_runner import main, run_scenarios"
           python -c "from execution.shadow_models import ShadowResult, intended_order_from_request"

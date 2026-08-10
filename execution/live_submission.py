@@ -44,6 +44,26 @@ Submission contract (docs/architecture/safety_gate.md):
    Whatever remains stuck (phase ``submitting`` / state ``pending`` after a
    crash or a double failure) is retrievable via
    ``execution_store.list_unresolved_submissions()``.
+4. Independently of the execution store, every attempt that survives the
+   gate is journaled in the durable SUBMISSION JOURNAL (Issue #93,
+   ``execution/submission_journal.py`` -- its own SQLite file, sealed
+   inside the service exactly like the audit store): the intent is
+   journaled BEFORE the ``created -> submitting`` transition, the
+   ``started`` mark is written IMMEDIATELY before ``submit_order``, and
+   the broker response / unknown outcome / Execution-DB-save failure /
+   completion are journaled around the calls that produce them. ANY
+   journal failure BEFORE the broker call is fail-closed
+   (``SUBMISSION_JOURNAL_FAILED``, journal conflicts ->
+   ``DUPLICATE_SUBMISSION``): the broker is not called. AFTER the broker
+   call, journal failures are logged critically but never block recording
+   the outcome and are never converted into rejections (the order may
+   exist). When the Execution Order DB itself is unavailable (schema
+   damage, read-only, corruption, file loss), the journal row -- outcome
+   ``reconciliation_required`` -- is the durable record from which
+   ``SubmissionJournal.list_unresolved()`` recovers the attempt, across
+   process restarts. Unresolved / unknown entries are NEVER re-sent; they
+   are resolved by reconciliation (crash-boundary table:
+   docs/architecture/submission_journal.md).
 
 Fail-closed conversions (before any broker call): store lookup failures ->
 ``STATE_QUERY_FAILED``; unregistered intents -> ``INTENT_NOT_REGISTERED``;
@@ -78,6 +98,10 @@ from execution.safety_gate import (
     dedupe_rejections,
 )
 from execution.safety_store import SQLiteSafetyDecisionStore
+from execution.submission_journal import (
+    SubmissionJournal,
+    SubmissionJournalConflictError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +119,7 @@ class LiveOrderSubmissionService:
         gate: SafetyGate,
         decision_db_path: str | Path,
         order_db_path: str | Path,
+        journal_db_path: str | Path,
         clock: Callable[[], datetime],
     ) -> None:
         if not isinstance(connection, BrokerConnection):
@@ -114,12 +139,22 @@ class LiveOrderSubmissionService:
             raise ValueError(
                 f"order_db_path must be a filesystem path, got {type(order_db_path).__name__}"
             )
+        if not isinstance(journal_db_path, (str, Path)):
+            # The submission journal is SEALED like the audit store (Issue
+            # #93): only a filesystem path can be injected, never a journal
+            # object -- no injection point whose writes could be overridden
+            # to forge the durable record.
+            raise ValueError(
+                "journal_db_path must be a filesystem path (the durable submission "
+                f"journal is sealed inside the service), got {type(journal_db_path).__name__}"
+            )
         if not callable(clock):
             raise ValueError(f"clock must be a callable returning a UTC datetime, got {clock!r}")
         self._connection = connection
         self._gate = gate
         self._decision_store = SQLiteSafetyDecisionStore(Path(decision_db_path))
         self._order_db_path = Path(order_db_path)
+        self._journal = SubmissionJournal(Path(journal_db_path))
         self._clock = clock
 
     # --- intent registration -------------------------------------------------
@@ -181,12 +216,30 @@ class LiveOrderSubmissionService:
 
         decision, order_request = prepared
         # ---- past this point the broker may hold the order: failures are
-        # recorded as UNKNOWN and re-raised, never converted to rejections ----
+        # recorded as UNKNOWN and re-raised, never converted to rejections;
+        # journal writes are best-effort (critical log) and never block ----
         try:
             result = self._connection.broker.submit_order(order_request)
         except Exception as exc:
+            self._journal_write(
+                "broker outcome unknown",
+                lambda at: self._journal.record_broker_outcome_unknown(
+                    execution_request_id, error=f"submit outcome lost: {exc}", at_utc=at
+                ),
+                execution_request_id,
+            )
             self._record_unknown_outcome(execution_request_id, exc, context="submit outcome lost")
             raise
+        self._journal_write(
+            "broker response",
+            lambda at: self._journal.record_broker_response(
+                execution_request_id,
+                response_state=result.state,
+                broker_order_id=result.broker_order_id,
+                at_utc=at,
+            ),
+            execution_request_id,
+        )
         try:
             execution_store.record_order_result(
                 execution_request_id,
@@ -197,12 +250,35 @@ class LiveOrderSubmissionService:
         except Exception as exc:
             # The order EXISTS (the broker answered) but its result could not
             # be persisted: it must remain a QUERY TARGET (Issue #75 review
-            # r3). Fall back to a state-only UNKNOWN record, then surface the
+            # r3). The JOURNAL is the durable record when the order DB itself
+            # is down (Issue #93): flag reconciliation_required there FIRST,
+            # then fall back to a state-only UNKNOWN record, then surface the
             # original failure -- never mask it as a rejection.
+            self._journal_write(
+                "execution DB save failure",
+                lambda at: self._journal.record_execution_db_save_failed(
+                    execution_request_id,
+                    response_state=result.state,
+                    broker_order_id=result.broker_order_id,
+                    error=f"broker result persistence failed: {exc}",
+                    at_utc=at,
+                ),
+                execution_request_id,
+            )
             self._record_unknown_outcome(
                 execution_request_id, exc, context="broker result persistence failed"
             )
             raise
+        self._journal_write(
+            "completion",
+            lambda at: self._journal.mark_completed(
+                execution_request_id,
+                response_state=result.state,
+                broker_order_id=result.broker_order_id,
+                at_utc=at,
+            ),
+            execution_request_id,
+        )
         _LOGGER.info(
             "Safety Gate allowed and submitted execution_request_id=%s policy_id=%s "
             "client_order_id=%s state=%s",
@@ -281,6 +357,59 @@ class LiveOrderSubmissionService:
         if not decision.allowed:
             return decision
 
+        # Durable submission journal, FIRST barrier (Issue #93): the intent
+        # must be journaled -- independent of the execution store -- before
+        # any transition toward a broker call. The journal's own duplicate
+        # guard holds even if the order DB was wiped and re-registered.
+        try:
+            self._journal.record_submission_intent(
+                execution_request_id=execution_request_id,
+                client_order_id=row["client_order_id"],
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                quantity=request.quantity,
+                requested_price=request.requested_price,
+                execution_mode=self._connection.execution_mode.value,
+                connection_target=self._connection.connection_target,
+                started_at_utc=self._now(),
+            )
+        except SubmissionJournalConflictError as exc:
+            _LOGGER.warning(
+                "duplicate submission suppressed by the submission journal: "
+                "execution_request_id=%s reason=%s",
+                execution_request_id,
+                exc,
+            )
+            return self._recorded(
+                self._decision(
+                    execution_request_id,
+                    (
+                        SafetyRejection(
+                            SafetyRejectionCode.DUPLICATE_SUBMISSION,
+                            f"the submission journal already holds an attempt for this "
+                            f"intent: {exc}; re-sending is banned -- unresolved journal "
+                            "entries are handed to reconciliation, never re-submitted",
+                        ),
+                    ),
+                    checked_at_utc=self._now(),
+                )
+            )
+        except Exception as exc:
+            return self._recorded(
+                self._decision(
+                    execution_request_id,
+                    (
+                        SafetyRejection(
+                            SafetyRejectionCode.SUBMISSION_JOURNAL_FAILED,
+                            f"submission journal persistence failed: {exc}; the broker "
+                            "was NOT called (fail closed)",
+                        ),
+                    ),
+                    checked_at_utc=self._now(),
+                )
+            )
+
         # The double-submission guard: created -> submitting is entered
         # exactly once (BEGIN IMMEDIATE, Issue #74). Only the winner submits.
         try:
@@ -292,6 +421,31 @@ class LiveOrderSubmissionService:
             )
         except Exception as exc:
             return self._recorded(self._transition_failure_decision(execution_request_id, exc))
+
+        # Durable submission journal, SECOND barrier (Issue #93): the
+        # ``started`` mark is the LAST write before the broker call, so a
+        # ``not_started`` journal entry always proves the broker was never
+        # called. If this write fails the broker is not called; the order
+        # row stays ``submitting``/``pending`` (visible via
+        # list_unresolved_submissions()) while the journal still proves
+        # no broker call happened.
+        try:
+            self._journal.mark_broker_call_started(execution_request_id, at_utc=self._now())
+        except Exception as exc:
+            return self._recorded(
+                self._decision(
+                    execution_request_id,
+                    (
+                        SafetyRejection(
+                            SafetyRejectionCode.SUBMISSION_JOURNAL_FAILED,
+                            f"journal broker-call-start persistence failed: {exc}; the "
+                            "broker was NOT called (fail closed) -- the journal entry "
+                            "remains 'not_started' as durable proof",
+                        ),
+                    ),
+                    checked_at_utc=self._now(),
+                )
+            )
 
         return decision, request.to_order_request(
             client_order_id=row["client_order_id"],
@@ -430,6 +584,30 @@ class LiveOrderSubmissionService:
                 position_count=decision.position_count,
             )
         return decision
+
+    def _journal_write(self, context: str, write, execution_request_id: str) -> None:
+        """Best-effort journal write AFTER the broker call: a journal failure
+        here must never block recording the broker outcome elsewhere and is
+        never converted into a rejection (the order may exist). The entry
+        then stays in its previous state -- still not ``completed``, so it
+        remains visible via ``SubmissionJournal.list_unresolved()``. Uses
+        the wall clock as a last resort: the injected clock may be exactly
+        what is broken, and losing this record over a clock fault would
+        defeat the journal's purpose."""
+        try:
+            try:
+                at = self._now()
+            except Exception:
+                at = datetime.now(timezone.utc)
+            write(at)
+        except Exception:
+            _LOGGER.critical(
+                "failed to journal %s for execution_request_id=%s; the journal entry "
+                "stays unresolved and remains listed by SubmissionJournal."
+                "list_unresolved(); resolve via reconciliation",
+                context,
+                execution_request_id,
+            )
 
     def _record_unknown_outcome(
         self, execution_request_id: str, exc: Exception, *, context: str

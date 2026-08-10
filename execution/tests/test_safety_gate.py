@@ -44,6 +44,7 @@ from execution.safety_gate import (
     dedupe_rejections,
 )
 from execution.safety_store import SQLiteSafetyDecisionStore
+from execution.submission_journal import SubmissionJournal
 
 NOW = datetime(2026, 7, 22, 1, 0, tzinfo=timezone.utc)
 
@@ -129,16 +130,22 @@ def gate(*, state=None, selected_policy=None, clock=None):
     )
 
 
-def make_service(tmp_path, *, conn=None, the_gate=None, initialize_decisions=True):
+def make_service(
+    tmp_path, *, conn=None, the_gate=None, initialize_decisions=True, initialize_journal=True
+):
     decision_db_path = tmp_path / "safety.sqlite3"
     if initialize_decisions:
         SQLiteSafetyDecisionStore(decision_db_path).initialize()
+    journal_db_path = tmp_path / "journal.sqlite3"
+    if initialize_journal:
+        SubmissionJournal(journal_db_path).initialize()
     conn = conn if conn is not None else connection()
     service = LiveOrderSubmissionService(
         connection=conn,
         gate=the_gate or gate(),
         decision_db_path=decision_db_path,
         order_db_path=tmp_path / "orders.sqlite3",
+        journal_db_path=journal_db_path,
         clock=lambda: NOW,
     )
     # Reader handle for assertions only (the service's own store is sealed).
@@ -464,6 +471,7 @@ def test_decision_store_cannot_be_injected_as_an_object(tmp_path):
                 gate=gate(),
                 decision_db_path=not_a_path,
                 order_db_path=tmp_path / "orders.sqlite3",
+                journal_db_path=tmp_path / "journal.sqlite3",
                 clock=lambda: NOW,
             )
 
@@ -1311,6 +1319,8 @@ def test_two_concurrent_services_reach_the_broker_exactly_once(tmp_path, monkeyp
     shared_broker.submitted_requests = ThreadSafeRequestLog()
     req = request()
     order_db = tmp_path / "orders.sqlite3"
+    journal_db = tmp_path / "journal.sqlite3"
+    SubmissionJournal(journal_db).initialize()
     services = []
     for name in ("a", "b"):
         decision_db = tmp_path / f"safety-{name}.sqlite3"
@@ -1321,6 +1331,7 @@ def test_two_concurrent_services_reach_the_broker_exactly_once(tmp_path, monkeyp
                 gate=gate(),
                 decision_db_path=decision_db,
                 order_db_path=order_db,
+                journal_db_path=journal_db,
                 clock=lambda: NOW,
             )
         )

@@ -24,6 +24,7 @@ from execution.safety_gate import (
     resolve_execution_mode,
 )
 from execution.safety_store import SQLiteSafetyDecisionStore
+from execution.submission_journal import SubmissionJournal
 from execution.shadow_execution import (
     ShadowCycleOutcome,
     ShadowCycleStatus,
@@ -604,11 +605,13 @@ def _live_service(tmp_path, broker):
         }
     )
     SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3").initialize()
+    SubmissionJournal(tmp_path / "journal.sqlite3").initialize()
     return LiveOrderSubmissionService(
         connection=BrokerConnection(broker=broker),
         gate=make_gate(policy),
         decision_db_path=tmp_path / "safety.sqlite3",
         order_db_path=tmp_path / "orders.sqlite3",
+        journal_db_path=tmp_path / "journal.sqlite3",
         clock=lambda: NOW,
     )
 

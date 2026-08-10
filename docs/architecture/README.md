@@ -27,6 +27,11 @@ BELIAL の設計資料を置く。
   Strategy / Broker Adapter から独立し、判定の耐久保存 + read-back と execution store の
   created→submitting 遷移(一度きり)に成功した呼び出しだけが `Broker.submit_order()` へ到達する。
   実装は `execution/{safety_gate,safety_store,live_submission}.py`。実発注・Live 接続は引き続き未実装。
+- [Submission Journal](submission_journal.md)(Issue #93): Broker 送信前後の送信試行を Execution Order DB と
+  **独立した耐久媒体**へ記録する Submission Journal。Broker 送信前の Journal 保存失敗は fail-closed
+  (送信されない)、Broker 応答後の Execution DB 保存失敗は `reconciliation_required` として Journal に残り、
+  Execution DB 全損時・プロセス再起動後も未解決送信を列挙できる。クラッシュ境界ごとの再送 / 照会 /
+  reconciliation の扱いを定義する。実装は `execution/submission_journal.py`。
 - [Shadow Mode / Shadow Execution](shadow_execution.md)(Issue #78): 実 Signal・実設定・Safety Gate を
   通常の Production 経路で実行しつつ Broker へは一切送信せず、生成された注文候補と Gate 判定を
   検証記録として保存する Shadow Mode。execution mode(`dry-run` / `shadow` / `fake` / `demo` / `live`)の

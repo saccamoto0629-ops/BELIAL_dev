@@ -37,6 +37,13 @@ SUBMIT_ORDER_ALLOWED = {
     # the ReconcileOnlyBroker facade RAISES on submit/cancel (the assertion
     # itself must call the poisoned method).
     "execution/tests/test_reconciliation_runner_cli.py",
+    # Issue #93: FaultAfterResponseBroker is a FakeBroker SUBCLASS test
+    # double whose override delegates to super().submit_order() and then
+    # injects an Execution-DB fault -- the post-response crash window the
+    # submission journal exists for. The production call site remains the
+    # sanctioned one in live_submission.py; this is fixture delegation,
+    # not a second submission path.
+    "execution/tests/test_submission_journal.py",
 }
 
 # Broker CANCELLATION has no production caller at all: the cancel Execution

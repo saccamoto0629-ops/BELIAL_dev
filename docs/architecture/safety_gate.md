@@ -23,12 +23,18 @@ service.submit(execution_request_id, market=...)
     2. SafetyGate.evaluate()    … 全条件を検査し SafetyDecision(全違反コード)を返す
     3. 判定を SQLite へ耐久保存し、read-back で保存内容を検証
        (保存・read-back の失敗 → decision_persist_failed。allow は拒否へ転じる)
-    4. execution store の created → submitting 遷移を獲得
+    4. Submission Journal へ送信試行を耐久記録(Issue #93。失敗 → submission_journal_failed /
+       既存 entry との衝突 → duplicate_submission。いずれも Broker は呼ばれない)
+    5. execution store の created → submitting 遷移を獲得
        (BEGIN IMMEDIATE で直列化。敗者 → duplicate_submission)
-    5. 遷移に成功した呼び出しだけが to_order_request() → Broker.submit_order() を実行
-    6. 結果を execution store へ記録
-       (OrderResult → record_order_result / submit の例外 → UNKNOWN を記録して re-raise /
-        受領済み OrderResult の保存失敗 → state-only UNKNOWN へフォールバック記録して re-raise)
+    6. Journal を started へ更新(Broker 呼び出し直前の最後の書き込み。
+       失敗 → submission_journal_failed で拒否 = Broker は呼ばれない)
+    7. 遷移に成功した呼び出しだけが to_order_request() → Broker.submit_order() を実行
+    8. 結果を Journal と execution store へ記録
+       (OrderResult → Journal 応答記録(best-effort)+ record_order_result / submit の例外 →
+        Journal unknown 記録(best-effort)+ UNKNOWN を記録して re-raise / 受領済み OrderResult の
+        保存失敗 → Journal へ reconciliation_required を耐久記録 + state-only UNKNOWN へ
+        フォールバック記録して re-raise / 保存成功 → Journal 完了更新(best-effort))
 ```
 
 - **「呼び出し側が気をつける」設計にはしない**: リポジトリ全体の AST 走査テスト(`execution/tests/test_submission_boundary.py`)が、`submit_order` / `to_order_request` の呼び出しを公認箇所(broker 自身のテストと `live_submission.py` の各 1 箇所)以外に存在させないことを回帰として固定する。
@@ -44,6 +50,7 @@ service.submit(execution_request_id, market=...)
 - **UNKNOWN の再送禁止**: timeout・通信失敗を含む submit の例外は UNKNOWN として記録され(「未発注」へ降格しない)、以後の `submit()` は phase≠created により `duplicate_submission` で拒否される。UNKNOWN の解決は後続照会の記録のみ(Issue #74)。
 - **Broker 呼び出し後の失敗は拒否へ変換しない**: 注文が存在しうるため、例外はそのまま伝播する。**受領済み `OrderResult` の保存(`record_order_result`)が失敗した場合も、state-only UNKNOWN へのフォールバック記録を試みてから元例外を re-raise する** — Broker に存在する注文が永続化エラーの陰に消えることはない。フォールバックまで失敗した場合(order DB 全体の障害)は critical ログを残し、注文は phase `submitting` / state `pending` のまま **`execution_store.list_unresolved_submissions()`** で照会対象として取得できる(下記)。
 - **未解決 submission の照会**: `execution_store.list_unresolved_submissions()` は、`state = 'unknown'`(従来の照会対象)に加え、**`phase = 'submitting'` かつ `state = 'pending'`**(遷移獲得後に Broker 観測が一度も記録されないまま停止したケース — 送信前クラッシュ、または結果保存とUNKNOWNフォールバックの二重失敗)を返す read-only API。実注文が存在しうる submission は必ず reconciliation から見える。`created`(送信試行なし)と確定観測済み(phase `submitted`)は含まない。
+- **Execution DB と独立の耐久 Submission Journal(Issue #93)**: Gate を通過した送信試行は、Broker 呼び出しの**前に**専用 SQLite ファイルの Submission Journal へ耐久記録される。Journal への保存失敗は `submission_journal_failed` で fail-closed(Broker は呼ばれない)。Broker 応答後に Execution DB 保存が失敗した場合は Journal 上に `reconciliation_required` が応答内容込みで残り、**Execution DB が schema 異常・read-only・破損・消失で全損していても** `SubmissionJournal.list_unresolved()` から未解決送信を列挙・プロセス再起動後も復元できる。Journal は execution store と独立の二重送信ガードでもある(Execution DB を再作成しても同一 intent の再送信を阻止)。詳細・クラッシュ境界表は [Submission Journal](submission_journal.md) を参照。
 
 ## execution mode と Shadow 評価(Issue #78)
 
@@ -128,6 +135,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 | Broker positions / account 照会の例外・型不正・snapshot 鮮度異常(未来・stale) | `broker_query_failed` |
 | kill switch 照会の例外・bool 以外の戻り値 | `state_query_failed` |
 | 判定の耐久保存失敗・**read-back 検証失敗**(store 未初期化・schema 不正・書き込み消失) | `decision_persist_failed`(元の拒否コードに追記。allow は拒否へ転じる) |
+| Submission Journal への送信試行の耐久保存失敗(Journal 未初期化・schema 不正・書き込み失敗。Issue #93) | `submission_journal_failed`(Journal 上の既存 entry との衝突は `duplicate_submission`) |
 | 準備段階の想定外例外(引数型不正・clock 破損を含む) | `gate_internal_error`(サービスが変換・記録) |
 | 参照価格の欠損・stale・未来時刻 | `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` |
 | 接続先が mode の許可集合にない・identity 不整合 | `execution_mode_mismatch` |
@@ -136,7 +144,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 
 ## 拒否コード一覧(機械可読が正)
 
-`symbol_not_allowed` / `side_not_allowed` / `quantity_limit_exceeded` / `symbol_position_limit_exceeded` / `account_position_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` / `market_snapshot_mismatch` / `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` / `spread_missing` / `spread_limit_exceeded` / `market_closed` / `symbol_not_tradable` / `kill_switch_enabled` / `broker_query_failed` / `state_query_failed` / `decision_persist_failed` / `execution_mode_mismatch` / `gate_internal_error` / `intent_not_registered` / `duplicate_submission`
+`symbol_not_allowed` / `side_not_allowed` / `quantity_limit_exceeded` / `symbol_position_limit_exceeded` / `account_position_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` / `market_snapshot_mismatch` / `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` / `spread_missing` / `spread_limit_exceeded` / `market_closed` / `symbol_not_tradable` / `kill_switch_enabled` / `broker_query_failed` / `state_query_failed` / `decision_persist_failed` / `execution_mode_mismatch` / `gate_internal_error` / `intent_not_registered` / `duplicate_submission` / `submission_journal_failed`
 
 - 拒否理由の正は `SafetyRejectionCode`(enum 値)であり、文字列ログは補助である。ログには拒否コード・`execution_request_id`・`policy_id` を出す。**重複抑止(`duplicate_submission`)時はこれに加えて source `signal_id`・現在の `submission_phase` / `order_state`・抑止理由を WARN で必ず出力する**(Issue #76。store 側の作成時 conflict も同じ項目をログする)。secret・token・口座残高等は出さない。
 - 1 判定内の拒否コードは**順序保持 dedup**される(最初の出現が勝つ)。`SafetyDecision` はコードの一意性を構築時不変条件として強制する。
@@ -180,4 +188,4 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - reconciliation の定期実行(UNKNOWN / 未解決 submission の解決は後続照会記録のみ。照会**対象の取得**は `list_unresolved_submissions()` で可能)
 - 数量ベース・証拠金ベースのポジション上限、部分約定中注文のカウント
 - in-process での故意回避(reflection / monkeypatch)の完全防止(言語的に不可能。上記「迂回防止境界の意味」参照。実 Adapter 導入時の認証情報分離等の運用境界として後続 Issue で設計)
-- order DB 全体が利用不能な場合の耐久フォールバック(サイドカーファイル等。現状は critical ログ + `list_unresolved_submissions()` による検知。後続 Issue)
+- ~~order DB 全体が利用不能な場合の耐久フォールバック~~ → **Issue #93 で実装済み**: 独立した耐久 [Submission Journal](submission_journal.md) が Broker 送信前後を記録し、order DB 全損時にも未解決送信を列挙できる(Journal と Execution DB の突合の自動実行・自動修復は reconciliation 側の後続 Issue)

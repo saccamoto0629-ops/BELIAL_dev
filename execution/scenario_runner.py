@@ -87,6 +87,7 @@ from execution.shadow_composition import run_production_shadow_cycle
 from execution.shadow_config import parse_shadow_execution_config
 from execution.shadow_execution import ShadowCycleStatus, ShadowExecutionService
 from execution.shadow_models import INPUT_ORIGIN_SCENARIO_FIXTURE, ShadowProvenance
+from execution.submission_journal import SubmissionJournal
 from execution.shadow_providers import (
     PaperSignalDbSignalProvider,
     StaticAccountSnapshotProvider,
@@ -393,6 +394,7 @@ class _ScenarioContext:
         self.orders_db = work_dir / "orders.sqlite3"
         self.decisions_db = work_dir / "safety.sqlite3"
         self.shadow_db = work_dir / "shadow.sqlite3"
+        self.journal_db = work_dir / "journal.sqlite3"
         # No store is initialized eagerly (Issue #78): dry-run shadow
         # scenarios observe that NO store file is ever created, so store
         # initialization happens lazily (and idempotently) in the service
@@ -443,11 +445,13 @@ class _ScenarioContext:
         instance (multi-process equivalence); sequential steps just use a
         fresh one, which is stateless beyond its injected paths."""
         SQLiteSafetyDecisionStore(self.decisions_db).initialize()
+        SubmissionJournal(self.journal_db).initialize()
         return LiveOrderSubmissionService(
             connection=self.connection,
             gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=lambda: NOW),
             decision_db_path=self.decisions_db,
             order_db_path=self.orders_db,
+            journal_db_path=self.journal_db,
             clock=lambda: NOW,
         )
 
