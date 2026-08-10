@@ -82,12 +82,21 @@ request-bound(訂正可能)拒否のために、**Broker へ一度も到達し�
 
 **適格条件(すべて満たす場合のみ。ひとつでも欠ければ fail-closed で拒否)**:
 
-1. **親に耐久保存された Gate 拒否判定が存在する**(PR #118 Codex レビュー r2 P2): `safety_gate_decisions` に記録された親の**最新の判定**(`execution_request_id` に紐づく最大 `decision_id`)が `allowed = false` であり、その拒否コードに**訂正可能な request-bound コードを 1 件以上含む**こと。これが無ければ「訂正」ではなく単なる登録のやり直しであり、差し替えとして記録してはならない。参照した `decision_id` は子行に永続化する(下記データモデル)。
+1. **親に耐久保存された Gate 拒否判定が存在する**(PR #118 Codex レビュー r2 P2): `safety_gate_decisions` に記録された親の判定のうち、**訂正可能な request-bound コードを 1 件以上含む拒否**(`allowed = false`)が存在し、かつ**その判定より後に許可判定(`allowed = true`)が存在しない**こと。これが無ければ「訂正」ではなく単なる登録のやり直しであり、差し替えとして記録してはならない。参照した `decision_id` は子行に永続化する(下記データモデル)。判定の読み取りは登録の critical section 内で**最後に再読**する(下記「判定読み取りの競合」)。
 2. 親の `submission_phase = created` かつ `order_state IS NULL` — `Broker.submit_order()` は `created → submitting` 遷移の勝者しか呼べないため、これは「この意図で Broker が呼ばれていない」ことの**構造的証明**である。
 3. 親の Submission Journal entry が**存在しないか `not_started`** — Execution DB が消去・再作成されて同じ意図が再 register された場合、store 上の phase は `created` でも Journal 側は `started` / `responded` / `unknown` でありうる(Broker が注文を保持しうる。[Submission Journal](submission_journal.md) の「二重送信防止」)。**この場合の差し替えは禁止**であり、Journal 検査は冗長な二重確認ではなく、この経路の唯一のガードである。
 4. `initiated_by = manual` のみ(自動には訂正すべき「判断」が存在しない)。
 
-条件 1 は「最新の判定」を見る。過去に拒否があっても最新が許可(送信直前で別要因が失敗した等)であれば訂正の対象ではなく、同一 Request の再 submit が正しい経路である。`safety_gate_decisions` は execution store と別ファイルであり同一トランザクション内から読めないため、条件 1 と 3 は**サービス層の事前条件**、条件 2 は**登録トランザクション内の判定**として実施する(下記フロー)。
+条件 1 が「その後に許可判定がないこと」を要求するのは、過去に拒否があっても最新が許可(送信直前で別要因が失敗した等)であれば訂正の対象ではなく、同一 Request の再 submit が正しい経路だからである。**逆に、より新しい拒否判定は条件 1 を無効化しない** — request は不変なので、request-bound な不備は新しい判定でも依然として存在し、訂正は正当なままである。`safety_gate_decisions` は execution store と別ファイルであり同一トランザクション内から読めないため、条件 1 と 3 は**サービス層の事前条件**、条件 2 は**登録トランザクション内の判定**として実施する(下記フロー)。
+
+##### 判定読み取りの競合(PR #118 Codex レビュー r3 P2)
+
+親が `created` のまま並行 `submit()` が走ると、条件 1 の読み取りと子行の commit の間に新しい判定が追記されうる。**厳密な「判定を進ませない fence」は採用しない**: それには submit() が Gate 評価(内部で Broker の positions / account 照会を行う)を跨いで execution store の書き込みロックを保持する必要があり、「外部 Broker 呼び出し中に SQLite の書き込みトランザクションを保持しない」という既存契約([Execution Request](execution_request.md))に反する。代わりに以下で閉じる。
+
+- **窓の縮小**: 条件 1 の判定読み取りは、登録の `BEGIN IMMEDIATE` critical section に入った**最後**に再実行する。
+- **安全性(二重発注が起きないこと)**: 条件 1 を無効化しうる判定は**許可判定だけ**である。許可判定が出た submit は Journal 記録 → `created → submitting` 遷移へ進むため、その遷移獲得と子行 INSERT は execution store の同一直列化で衝突し、**「親が送信される」か「子が登録される」かのどちらか一方しか成立しない**(子が先なら submit は `intent_superseded`、submit が先なら登録は phase 検査で失敗)。どの interleaving でも二重発注は生じない。
+- **残余(監査メタデータのみ)**: 「許可判定が並行して記録されたが、その submit は遷移を取れず送信されなかった」場合、子行の `reissue_source_decision_id` は最新判定ではなくなる。これは**送信結果に影響しない監査上のズレ**であり、記録から機械的に検出できる(その許可判定に対応する Journal entry が存在せず、親は `created` のまま子を持つ)。登録時の再読で検出した場合は WARN を残す。
+- **検討して見送った案**: 最新 `decision_id` を `execution_orders` 側へ mirror し(repair fence mirror と同じ方式)、登録トランザクション内で CAS する案。採用すると**すべての Gate 拒否が execution store への耐久書き込みを伴う**ことになり、純粋な評価だった拒否経路に新たな失敗モード(execution DB 不調で拒否が記録できない)が持ち込まれる。証拠の絶対的な鮮度が必要になった場合に #116 で再検討する。
 
 **親の退役(二重の live intent を作らない)**: 差し替え後に親が送信されてはならない。親行を書き換えるのではなく、`UNIQUE(reissued_from_execution_request_id)` index を使って **`mark_submitting()` が同一トランザクション内で「自分を親とする子行が存在しないこと」を確認**し、存在すれば送信権を与えない(Safety Gate 側の拒否コードは新設の `intent_superseded`)。競合は既存の `BEGIN IMMEDIATE` 直列化で解決する — 差し替えが先に commit すれば `mark_submitting()` が拒否され、`mark_submitting()` が先に commit すれば親の phase が `created` でなくなるので差し替えが拒否される。**どちらの順序でも「送信された親」と「その子」が同時に存在することはない。**
 
@@ -106,7 +115,7 @@ request-bound(訂正可能)拒否のために、**Broker へ一度も到達し�
 | `strategy_id` | **不変**(仮説の所有者は変わらない) |
 | `symbol` | **不変**(別銘柄は別の取引であり訂正ではない。したがって `symbol_not_allowed` は訂正差し替えの対象外 = policy-bound) |
 | `side` | **不変**(方向の反転は新しい判断であり訂正ではない。したがって `side_not_allowed` は訂正差し替えの対象外 = policy-bound) |
-| `quantity` | 訂正可。ただし**親以下(減少または同値)のみ** — 増量は訂正ではなく新しい判断 |
+| `quantity` | 訂正可。既定は**親以下(減少または同値)のみ** — 増量は訂正ではなく新しい判断。**例外**: 親が `broker_rejected` かつ `rejection_category = parameter` の場合に限り、policy 上限内での**増量を許可**する(下記) |
 | `order_type` / `requested_price` | 訂正可(MARKET ⇔ LIMIT を含む)。両者の整合は従来どおり `ExecutionRequest` の構築時契約が強制する |
 | `stop_loss_price` / `take_profit_price` | 訂正可(方向整合は構築時契約が強制) |
 | `requested_at_utc` | 子は新規作成時刻。**親より過去は拒否**(時刻の逆行禁止) |
@@ -114,6 +123,15 @@ request-bound(訂正可能)拒否のために、**Broker へ一度も到達し�
 
 - 検証は**登録トランザクション内で親行と突き合わせて**行う(親子は同一テーブルにあるため同一 `BEGIN IMMEDIATE` 内で比較できる)。違反は typed error で DB 無変更。
 - **`initiated_by = auto` は全注文パラメータが親と同一**でなければならない。自動再試行が注文内容を書き換えることを構造的に禁止する(`transient` は「同じ注文をもう一度」であり、内容の訂正判断は人間の責務)。
+
+#### 数量増加が必要な `parameter` 拒否(PR #118 Codex レビュー r3 P2)
+
+Broker は「最小取引数量を下回る」「数量の刻み(increment)が不正」といった拒否も `parameter` に分類しうる。これらの訂正には**数量を増やす**必要があり、一律の非増加ルールでは訂正不能になる(カテゴリ表は `parameter` を手動訂正可能と定めているため、この 2 つが矛盾していた)。
+
+- 親が `broker_rejected` かつ `rejection_category = parameter` の場合に限り、**policy 上限内での増量を許可**する(手動のみ。理由の記録必須)。
+- 増量の安全性は「非増加ルール」ではなく **Safety Gate が担保**する: 子は通常どおり `submit()` で Gate を通り、`max_order_quantity` 超過は `quantity_limit_exceeded` として拒否される。非増加ルールの本来の目的は、**再試行に見せかけた裁量的な増し玉**の防止であり、それは「`parameter` 拒否に限る + policy 上限 + 監査必須」で維持できる。
+- 上記以外(`gate_correction`・`transient` / `account` / `instrument` / `broker_internal` / `unclassified` の再発行・自動再試行)は**非増加のまま**である。特に `gate_correction` の `quantity_limit_exceeded` は「大きすぎる」ことが不備なので、増量は定義上あり得ない。
+- policy 上限の具体値(親数量に対する比率上限か絶対上限か)は #116 で確定する。
 
 ## データモデル(schema v5 案・後続 Issue で実装)
 
@@ -184,7 +202,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 
 ## 再発行の登録・送信フロー
 
-0. **事前条件(`gate_correction` のみ・サービス層)**: (i) 親の最新 Gate 判定(`safety_gate_decisions` の最大 `decision_id`)が `allowed = false` かつ訂正可能な request-bound コードを含むことを確認し、その `decision_id` を子行へ渡す。(ii) 親の Submission Journal entry を読み、非存在または `not_started` であることを確認する。`started` / `responded` / `unknown` なら差し替えを拒否する(Broker が注文を保持しうる)。Journal は別 SQLite ファイルであり execution store のトランザクション内から読めない(repair fence と同じ制約。[Execution Request](execution_request.md))ため、この確認はトランザクション外の事前条件として行い、**トランザクション内の判定は親の `submission_phase = created` が担う**(送信権を獲得していない = Broker 未呼び出しの構造的証明)。両者の間に親が送信された場合は、下記の登録トランザクションが phase 変化を検出して拒否する。
+0. **事前条件(サービス層)**: (i) **全 kind 共通** — 対象 signal のチェーンに未解決 discrepancy がないことを reconciliation DB で確認する(1 件でもあれば拒否)。(ii) `gate_correction` のみ — 親の Gate 判定を読み、訂正可能な request-bound コードを含む拒否があり、その後に許可判定がないことを確認し、`decision_id` を子行へ渡す(判定は critical section 内で最後に再読)。(iii) `gate_correction` のみ — 親の Submission Journal entry が非存在または `not_started` であることを確認する。`started` / `responded` / `unknown` なら差し替えを拒否する(Broker が注文を保持しうる)。Journal は別 SQLite ファイルであり execution store のトランザクション内から読めない(repair fence と同じ制約。[Execution Request](execution_request.md))ため、この確認はトランザクション外の事前条件として行い、**トランザクション内の判定は親の `submission_phase = created` が担う**(送信権を獲得していない = Broker 未呼び出しの構造的証明)。両者の間に親が送信された場合は、下記の登録トランザクションが phase 変化を検出して拒否する。
 1. **登録**(後続 Issue の store API `create_reissue_execution_order()`(仮称)/ service API): 単一 `BEGIN IMMEDIATE` トランザクション内で、(a) 親行の存在と **`reissue_kind` に応じた状態要件**(`broker_rejected` → `order_state = rejected` / `gate_correction` → phase `created` かつ `order_state IS NULL`)の確認、(b) attempt 連番・チェーン整合・**フィールド不変条件(親行との突き合わせ)**の検証、(c) policy 上限(手動 / 自動 / 訂正それぞれ)の検証、(d) 新行 INSERT を行う。並行する再発行登録の競合は `UNIQUE(reissued_from_…)` / `UNIQUE(signal_id, signal_attempt)` への衝突で敗者が `ExecutionOrderConflictError`(正常系の抑止・行は増えない)になる。既存の作成時 conflict 分類・WARN ログ契約(Issue #76)をそのまま踏襲する。
    - **`gate_correction` commit 後(best-effort)**: 親の Journal entry(`not_started`)を終端 outcome `abandoned` へ遷移させる。失敗しても entry が `open` のまま残るだけで、二重発注ハザードにはならない。
 2. **送信**: 登録された再発行 Request は phase `created` の通常の Request であり、**既存の `submit()` をそのまま**通る — Safety Gate の全条件再評価(市場状態・ポジション上限・kill switch を含む)、判定の耐久保存 + read-back、Submission Journal への耐久記録(新 entry)、`created → submitting` 一度きりの遷移獲得。**再発行だから緩和・省略される検査は 1 つもない**。
@@ -197,11 +215,13 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 | 初期実装 | **対象**(後続 Issue) | **対象**(後続 Issue) | **対象外**(定義のみ。Live Execution runner 導入後の別 Issue) |
 | 親の終わり方 | Broker が確定拒否(REJECTED) | Broker 未到達(phase `created` + Journal `not_started`) | Broker が確定拒否(REJECTED) |
 | 許可カテゴリ | 全カテゴリ(運用者判断が根拠) | 該当なし(`OrderResult` が存在しない) | `transient` のみ |
-| 注文パラメータの訂正 | 可(不変条件の範囲内) | 可(不変条件の範囲内) | **不可(親と完全同一)** |
+| 注文パラメータの訂正 | 可(不変条件の範囲内。数量は非増加。ただし `parameter` 拒否のみ policy 上限内の増量可) | 可(不変条件の範囲内。数量は非増加) | **不可(親と完全同一)** |
 | 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断 |
 | 記録 | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = auto` + policy 識別子・根拠(必須) |
 | 回数上限 | policy `max_manual_reissues_per_signal`(既定は小さい有限値。後続 Issue で確定) | policy `max_gate_corrections_per_signal`(同上) | policy `max_auto_reissues_per_signal`(**既定 0 = 無効**) |
-| 追加条件 | — | Journal 事前条件(上記)。crash boundary 3 は対象外 | cooldown(連打防止)・kill switch 有効時は不可・対象 signal に未解決の reconciliation discrepancy がないこと |
+| 追加条件 | — | Gate 判定 / Journal 事前条件(上記)。crash boundary 3 は対象外 | cooldown(連打防止)・kill switch 有効時は不可 |
+
+**全経路に共通する hard block**: 対象 signal のチェーンに未解決の reconciliation discrepancy が 1 件でもあれば登録を拒否する(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
 
 - 回数の判定は**常に永続化された行から導出**する(該当 signal の MAX(`signal_attempt`) と `reissue_kind` / `initiated_by` の集計)。in-memory カウンタ・プロセス状態には依存しないため、**プロセス再起動・多重起動後も上限と一意性が維持される**。
 - 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する。
@@ -215,7 +235,12 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 
 ## Reconciliation との整合
 
-- 親の REJECTED が誤りだった場合(内部は REJECTED だが Broker 側に open trade が存在する `internal_closed_broker_open` 型の差分)、再発行は二重建玉を生みうる。このため**自動再試行は「対象 signal のチェーンに未解決 discrepancy がないこと」を前提条件に含める**(fail-closed)。手動再発行は運用者判断だが、実装 Issue で未解決 discrepancy の警告表示を要件に含める。
+- 親の REJECTED が誤りだった場合(内部は REJECTED だが Broker 側に open trade が存在する `internal_closed_broker_open`)、再発行は**二重建玉**を生みうる。この差分種別は resolution category が **`manual_review` 固定で自動修復の対象外**である([Broker Reconciliation](broker_reconciliation.md))ため、放置したまま再発行すると、本モデルが防ごうとしているハザードそのものが発生する。
+- したがって **未解決 discrepancy は自動・手動・訂正のすべてで hard block(fail-closed)** とする(PR #118 Codex レビュー r3 P1)。運用者への警告表示だけで手動再発行を許可する設計は採らない — 警告は助言であって二重建玉を防がない。
+  - **判定範囲**: 対象 signal のチェーンに属する全 `execution_request_id` を `target_id` とする discrepancy(`target_type = execution_order`、および Issue #105 の position 系 discrepancy)のうち、**その注文を観測した最新 run が報告しているもの**。種別・category を問わず 1 件でもあれば登録を拒否する(種別ごとの安全性を再発行側で判断しない)。
+  - **解除方法**: reconciliation を再実行し、**後続 run がその差分を報告しなくなること**(= 原因が実際に解消されたことの耐久的・監査可能な証拠が reconciliation DB に残る)。再発行側の一時的な override フラグ・運用者の口頭判断では解除しない。`auto_repair_candidate` は修復サービスが、`manual_review`(`internal_closed_broker_open` を含む)は運用者が Broker 側の実体を是正したうえで再照合する。
+  - **既知の制約**: reconciliation には現在、`manual_review` の差分を「確認済みとして明示的に閉じる」監査付き API が存在しない(差分は run 単位の append 観測であり、解消は後続 run が報告しないことで表現される)。誤検知だと運用者が判断した差分を閉じる手段が必要になった場合は、**reconciliation 側の後続 Issue**として追加する(再発行側に bypass を作らない)。
+  - `gate_correction` の親は Broker へ到達していないため、この条件は通常は空振りするが、規則としては同一に適用する(fail-closed)。
 - REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order_result` 経由。reconciliation repair が確定させた場合も同じ)。snapshot を持たない「REJECTED らしき状態」から再発行が始まる経路は存在しない。
 
 ## 影響しないもの
@@ -246,7 +271,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 |---|---|---|
 | #114 | [Broker] `RejectionCategory` の定義と `OrderResult.rejection_category`(REJECTED ⇔ 必須の相互制約・旧 snapshot の `unclassified` 読み戻し・FakeBroker / OANDA Demo Adapter の写像) | なし |
 | #115 | [Execution] schema v5(親子関係・attempt / kind 列・一意性制約の置換・v4 → v5 migration・チェーン整合とフィールド不変条件の検証・`mark_submitting()` の子存在検証・読み取り API のチェーン対応) | #114 は不要(独立) |
-| #116 | [Execution] 手動再発行 + 訂正差し替えユースケース(登録 API・eligibility 検証・Journal 事前条件と `abandoned`・`intent_superseded` 拒否コード・監査記録・通常 `submit()` 経路への接続・固定シナリオ・未解決 discrepancy の警告) | #114 #115 |
+| #116 | [Execution] 手動再発行 + 訂正差し替えユースケース(登録 API・eligibility 検証・Gate 判定 / Journal 事前条件と `abandoned`・`intent_superseded` 拒否コード・**未解決 discrepancy の hard block**・監査記録・通常 `submit()` 経路への接続・固定シナリオ) | #114 #115 |
 | #117 | [Execution] `transient` 限定の自動再試行 policy(cooldown・上限・kill switch / discrepancy 前提条件。**既定無効**) | #114 #115 #116 + Live Execution runner(未着手) |
 
 ## 関連ドキュメント
