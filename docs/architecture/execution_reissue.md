@@ -145,8 +145,19 @@ Broker は「最小取引数量を下回る」「数量の刻み(increment)が�
 | `reissue_kind` | TEXT NULL(CHECK: `broker_rejected` / `gate_correction`) | attempt ≥ 2 で必須。親のどの終わり方に対する子か |
 | `reissue_initiated_by` | TEXT NULL(CHECK: `manual` / `auto`) | attempt ≥ 2 で必須。誰の判断による再発行か |
 | `reissue_reason` | TEXT NULL | attempt ≥ 2 で必須・非空。手動: 運用者の識別子と判断理由。自動: 適用 policy の識別子と根拠カテゴリ |
-| `reissue_source_decision_id` | INTEGER NULL | **`gate_correction` で必須**(それ以外では NULL)。適格性の根拠とした `safety_gate_decisions.decision_id`。別 DB ファイルのため FK は張れず**参照値**として保持する(repair fence mirror と同じ割り切り) |
-| `reissue_clearance_run_id` | TEXT NULL | attempt ≥ 2 で必須。**登録**を正当化した clearance evidence(reconciliation run)への参照。**送信を許可した evidence は別途追跡可能に残す**(下記「送信を許可した evidence の追跡可能性」。保存形式は #115) |
+| 訂正の根拠(`gate_correction` で必須) | 適格性の根拠とした Safety Gate 判定への参照。別 DB ファイルのため FK は張れない(下記「クロス DB 参照の安定性」) |
+| 登録時の clearance 根拠(attempt ≥ 2 で必須) | **登録**を正当化した clearance evidence への参照。**送信を許可した evidence は別途追跡可能に残す**(下記「送信を許可した evidence の追跡可能性」) |
+
+列名・型・保存形式は #115 で確定する。
+
+#### クロス DB 参照の安定性(契約)
+
+根拠となる判定・観測は execution store とは**別の DB ファイル**にあり、そのパスは設定で差し替え可能である。**各 DB ローカルの連番(autoincrement 等)を裸で保持しただけでは、DB の再作成・差し替えによって同じ値が別の記録を指しうる**ため、「ID で辿れる」という監査要件を満たさない(PR #118 Codex レビュー P2)。したがって:
+
+- 根拠への参照は、**参照先が意図した記録であることを検証できる形**で保持しなければならない(連番のみに依存しない)。
+- 参照が**解決できない・検証できない場合は fail-closed**(その根拠は無かったものとして扱い、再発行を許可しない)。
+- 監査時に「どの判定・どの観測を根拠にしたか」を**一意に再構成できる**こと。
+- **識別子の構成(安定 identity を持たせるか、内容の snapshot を併置して突き合わせるか等)は #115 で設計する**(Shadow が判定参照に対して内容の突き合わせを併用している先例がある)。
 
 **clearance evidence の保持**: reconciliation DB を execution store のトランザクション内から読むことはできない(ファイルを跨げない)。したがって「送信権を与える判断と同じ場所で clearance の有効性を確認できる」ための耐久的な仕組みが必要になる — 既存の repair fence mirror と同じ問題設定である。**その具体形式(テーブル定義・状態値・世代・claim・更新規則)は後続 Issue(#115)で設計する。** 本 Issue が要求するのは次の性質のみである。
 
@@ -164,10 +175,10 @@ Broker は「最小取引数量を下回る」「数量の刻み(increment)が�
 アプリケーション層 + 復元時 bundle 検証で強制する不変条件(既存パターンどおり二重防御。SQLite の `ALTER TABLE ADD COLUMN` に載せられない相互制約はこちらが正):
 
 - `signal_attempt = 1` ⇔ `reissued_from_execution_request_id IS NULL` ⇔ reissue 監査列(`reissue_kind` / `reissue_initiated_by` / `reissue_reason`)がすべて NULL
-- `reissue_source_decision_id IS NOT NULL` ⇔ `reissue_kind = gate_correction`(訂正の根拠は必ず記録され、訂正以外は根拠を持たない)
-- `reissue_clearance_run_id IS NOT NULL` ⇔ `signal_attempt ≥ 2`(再発行は必ず無差分観測を根拠に持つ)
+- 訂正の根拠が記録されている ⇔ `reissue_kind = gate_correction`(訂正は必ず根拠を持ち、訂正以外は根拠を持たない)
+- 登録時の clearance 根拠が記録されている ⇔ `signal_attempt ≥ 2`(再発行は必ず無差分観測を根拠に持つ)
 - attempt n(≥ 2)の親は、**同一 `signal_id` の attempt n−1 の行**でなければならない(ID による親子関係が正。時刻では関連付けない)
-- **子の request 内容は「子 Request のフィールド不変条件」を満たす**(identity 4 フィールドの一致・数量の非増加・時刻の非逆行)。検証は登録と同一トランザクション内で親行と突き合わせる
+- **子の request 内容は「子 Request のフィールド不変条件」を満たす**(identity 4 フィールドの一致・時刻の非逆行・数量は非増加。**ただし `broker_rejected` × `rejection_category = parameter` の増量例外を含む**)。**登録時の受理条件と復元時の検証条件は同一の規則でなければならない** — 一方だけが例外を知らないと、登録できたチェーンが以後の読み取りで整合性違反として拒否される(PR #118 Codex レビュー P2)。検証は登録と同一トランザクション内で親行と突き合わせる
 - **`reissue_kind` ごとに親の状態要件が異なる**。どちらの要件も再発行登録と同一の `BEGIN IMMEDIATE` トランザクション内で検証する:
 
 | `reissue_kind` | 親の要件 | 根拠 |
@@ -238,7 +249,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 
 ## 監査・再起動耐性・並行実行
 
-- **監査**: 元 Request の行・状態履歴・anchored snapshot は再発行で一切変更されない(`broker_rejected` は terminal 不変により、`gate_correction` は親行を書き換えない設計により)。親子関係は子側の provenance 列(`reissued_from_…` / `signal_attempt` / `reissue_kind` / `initiated_by` / `reason` / `source_decision_id`)で追跡し、チェーン全体は `signal_id` で列挙できる。「どの意図が・誰の判断で・何回目として・どの終わり方に対して再発行されたか」はすべて DB から復元可能。訂正差し替えの場合、根拠となった Gate 拒否判定は `reissue_source_decision_id` から `safety_gate_decisions` の該当行(拒否コード・policy_id・判定時刻)へ**ID で辿れる**(適格条件 1 によりその判定の存在が保証されている)。
+- **監査**: 元 Request の行・状態履歴・anchored snapshot は再発行で一切変更されない(`broker_rejected` は terminal 不変により、`gate_correction` は親行を書き換えない設計により)。親子関係は子側の provenance 列(`reissued_from_…` / `signal_attempt` / `reissue_kind` / `initiated_by` / `reason` / `source_decision_id`)で追跡し、チェーン全体は `signal_id` で列挙できる。「どの意図が・誰の判断で・何回目として・どの終わり方に対して再発行されたか」はすべて DB から復元可能。訂正差し替えの場合、根拠となった Gate 拒否判定(拒否コード・policy_id・判定時刻)へ**検証可能な形で辿れる**こと(適格条件 1 によりその判定の存在が保証され、参照の安定性は上記「クロス DB 参照の安定性」の契約に従う)。
 - **再起動耐性**: すべての不変条件は DB 制約 + トランザクション内検証で強制され、復元時 bundle 検証(既存パターン)にチェーン整合(親子 state・attempt 連番・監査列の相互制約・identity フィールドの一致)を加える。帯域外編集で壊されたチェーンは `ExecutionIntegrityError` で拒否する。
 - **並行実行**: 同一 signal への並行再発行・多重起動は、`UNIQUE(reissued_from_…)` と `UNIQUE(signal_id, signal_attempt)` への `BEGIN IMMEDIATE` 内 INSERT 衝突で直列化され、勝者は高々 1 つ。検証(親の状態要件・フィールド不変条件・上限)と INSERT が同一トランザクションなので、TOCTOU 窓はない。**訂正差し替えと親の送信の競合**も同じ直列化で解決する(先に commit した側が勝ち、他方は phase 変化 / 子の存在を見て拒否される。両方が成立することはない)。
 - **読み取り API への影響**(後続 Issue): `get_execution_order_by_signal_id()` の「高々 1 件」契約は成立しなくなるため、「チェーン(全 attempt)の列挙」と「最新 attempt の取得」へ契約を再定義する。reconciliation の対象抽出(`list_in_flight_orders()` 等)は attempt ごとに独立の行として自然に動作する(変更不要の見込みだが、実装 Issue で影響を確認する)。
