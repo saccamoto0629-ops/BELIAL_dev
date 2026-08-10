@@ -43,7 +43,8 @@
 
 Broker の確定拒否(`OrderState.REJECTED`)には現在、監査用の自由文字列 `reject_reason`(REJECTED のとき必須・非空)だけが付く。再発行可否の判断を Broker 固有文字列の解析に依存させないため、**Broker 境界に正規化分類を追加する**(後続 Issue)。
 
-- `RejectionCategory` は `broker/broker_models.py` に定義する **Broker 中立の閉じた enum** とする。各 Adapter(FakeBroker / OANDA Demo Adapter / 将来の実 Adapter)は、自身の native 拒否コードからこの分類への写像を **Adapter 内部に**持つ。native コード・文字列は従来どおり `reject_reason` に verbatim で残る(監査用)が、execution 層の**判断**には使わない。
+- `RejectionCategory` は `broker/broker_models.py` に定義する **Broker 中立の閉じた enum** とする。各 Adapter(FakeBroker / OANDA Demo Adapter / 将来の実 Adapter)は、自身の native 拒否コードからこの分類への写像を **Adapter 内部に**持つ。分類の**入力**は Adapter 内部で見た native 応答であり、execution 層の**判断**には `reject_reason` の文字列を使わない。
+- **`reject_reason` の秘匿契約は不変**: 監査用に保持される `reject_reason` は、**Adapter が既存の規則で redact したうえで切り詰めた安全な文字列**のままである([Broker Interface](broker_interface.md) の「Secrets」: Broker が echo した token / account id / endpoint を scrub する)。**分類を導入しても native 文字列を verbatim で保持する経路は作らない** — Broker が拒否理由に secret を echo した場合、それを `OrderResult` snapshot として永続化してはならない。
 - `OrderResult` に `rejection_category: RejectionCategory | None` を追加する(REJECTED のとき必須、他状態では None — `reject_reason` と同じ相互制約)。既存の保存済み snapshot(分類フィールドを持たない)は **`unclassified` として読み戻す**(Issue #102 の `superseded_broker_order_ids` 後方互換と同じ「欠落 = 当時の意味」方式)。
 - **写像できない・不明な拒否はすべて `unclassified`**(fail-closed): 自動再発行の対象にならない。
 
@@ -194,7 +195,7 @@ Broker は「最小取引数量を下回る」「数量の刻み(increment)が�
 - 上記以外の親状態(`pending` / `accepted` / `partially_filled` / `unknown`)は**どちらの kind でも登録拒否** — **UNKNOWN / SUBMITTING / ACCEPTED など Broker 受理の可能性が残る状態から意図を再発行する経路は存在しない**(Issue #95 の維持必須契約)
 - 親が `filled` / `cancelled` の場合も登録拒否(fill を得た意図・取り消した意図の「再発行」は別の業務判断であり、本モデルの対象外。キャンセル後の扱いは Issue #99 の進行を待って別途判断する)
 - **`gate_correction` の子を持つ親は送信権を得られない**: `mark_submitting()` は同一トランザクション内で「自分を親とする子行が存在しないこと」を確認し、存在すれば送信権を与えない(Safety Gate 側は `intent_superseded`)。これにより 1 signal に live な intent が 2 つ存在することはない
-- **再発行の子は有効な clearance がなければ送信権を得られない**: 送信権の付与は、その時点で clearance が有効であることの確認と不可分でなければならない(下記「登録から送信までの有効性(契約)」)
+- **再発行の子は有効な clearance がなければ送信権を得られない**: 送信権の付与は、その時点で clearance が有効であること(**送信先が観測対象と同一であることを含む**)の確認と不可分でなければならない(下記「登録から送信までの有効性(契約)」)
 
 ### チェーンのライフサイクル(状態遷移図)
 
@@ -276,10 +277,19 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 1. **照合が実施されたこと**: 対象 signal のチェーンについて、order ドメインと position ドメインの**双方が実際に照合され、その列挙が成功している**こと。**未実施・列挙失敗・fail-safe による対象除外は「差分なし」ではない**(観測していないことを無差分と読まない)。
 2. **差分が無かったこと**: その照合がチェーンについて差分を 1 件も報告していないこと。
 3. **未送信の親については、対応する Broker 注文が存在しないことの positive evidence**(下記)。
-4. **鮮度**: 証拠が policy の定める鮮度窓内であること。
-5. 上記のいずれかが**確認できない場合は fail-closed**(再発行を許可しない)。
+4. **観測対象と送信先が同一であること**(下記「clearance の口座スコープ」)。
+5. **鮮度**: 証拠が policy の定める鮮度窓内であること。
+6. 上記のいずれかが**確認できない場合は fail-closed**(再発行を許可しない)。
 
-チェーンに Broker 側の対応物を持つ注文が 1 件も無い場合(初回 attempt が一度も送信されないまま Gate 拒否された等)、要件 1 のうち order ドメインの比較対象は空になりうるが、**position ドメインの成功照合と要件 3 は依然として必須**である。
+チェーンに Broker 側の対応物を持つ注文が 1 件も無い場合(初回 attempt が一度も送信されないまま Gate 拒否された等)、要件 1 のうち order ドメインの比較対象は空になりうるが、**position ドメインの成功照合と要件 3・4 は依然として必須**である。
+
+#### clearance の口座スコープ(要件 4)
+
+**無差分は「どこで観測したか」と不可分である**(PR #118 Codex レビュー P1)。ある Broker 口座を照合して差分ゼロでも、**別の口座で送信すれば**その口座が同じ signal の注文・ポジションを保持している可能性は否定されない。現行の観測記録はこのスコープを持たない — reconciliation の run 記録には Broker 接続・口座の identity が含まれず、OANDA Demo Adapter の `connection_identity().target` は口座を問わず**定数ラベル**であるため、鮮度と signal のカバレッジだけでは「その証拠が送信先口座を指している」ことを立てられない。
+
+- **契約**: clearance evidence は、**どの Broker / どの口座を観測したかを安定して識別できるスコープ**を伴わなければならない。
+- **送信権の付与時に、実際の送信接続がそのスコープと一致することを照合**する。一致しない・スコープを確認できない場合は **fail-closed**(送信権を与えない)。
+- **識別子の構成(何を口座 identity とするか・接続 identity への含め方・記録先と比較方法)は #115 / #116 で設計する**。口座識別子を扱う際は、既存の表示秘匿契約(`broker_models.safe_account_reference` による非可逆短縮)に従う。
 
 #### 未送信の親に対する positive evidence(`gate_correction`)
 
@@ -305,7 +315,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 - 登録時の根拠と送信時の根拠は**別の事実として両方追跡可能**であること。
 - **保存先・保存形式・送信権付与との原子性の実現方式は後続 Issue(#115)** で設計する。
 
-**残余(明示的な境界)**: 上記の契約は「BELIAL が観測した事実が判断に反映されないまま送信される」ことを禁じるものである。一方、最後の無差分観測から送信までの間に **Broker 側で新たに状態が変わる**可能性は、Broker 側のロックを持たない以上どんな仕組みでも排除できない。これは Safety Gate が市場データに対して `max_reference_age` で受け入れているのと**同じ種類の境界**であり、鮮度窓(要件 4)で bound する。両者は性質が異なる(反映漏れ vs 観測後の外部変化)。
+**残余(明示的な境界)**: 上記の契約は「BELIAL が観測した事実が判断に反映されないまま送信される」ことを禁じるものである。一方、最後の無差分観測から送信までの間に **Broker 側で新たに状態が変わる**可能性は、Broker 側のロックを持たない以上どんな仕組みでも排除できない。これは Safety Gate が市場データに対して `max_reference_age` で受け入れているのと**同じ種類の境界**であり、鮮度窓(要件 5)で bound する。両者は性質が異なる(反映漏れ vs 観測後の外部変化)。
 
 **既知の制約**: reconciliation には現在、`manual_review` の差分を「確認済みとして明示的に閉じる」監査付き API が存在しない。ただし clearance モデルでは**差分を閉じる操作は不要**である — 必要なのは、原因を是正したうえで**両ドメインの照合を成功裡に再実行し、無差分を積極的に観測する**ことだからである。再発行側に bypass は設けない。
 
