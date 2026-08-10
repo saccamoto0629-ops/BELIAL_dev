@@ -103,6 +103,7 @@ def register_child(
     reason="operator op-1: retry after transient rejection",
     clearance=None,
     gate_correction_reference=None,
+    gate_decision_db_path=None,
     **request_overrides,
 ):
     request = child_request(parent_id, child_id, **request_overrides)
@@ -119,6 +120,7 @@ def register_child(
         clearance_generation=clearance["clearance_generation"],
         clearance_evidence_id=clearance["evidence_id"],
         gate_correction_reference=gate_correction_reference,
+        gate_decision_db_path=gate_decision_db_path,
         db_path=db_path,
     )
 
@@ -459,13 +461,14 @@ def test_broker_rejected_reissue_is_allowed_only_from_a_rejected_parent(db_path,
 def test_gate_correction_is_allowed_only_from_a_never_submitted_parent(db_path, state, tmp_path):
     _parent_in_state(db_path, state)
     clearance = record_clearance(db_path, "sig-exec-1")
-    _, reference = gate_reference(tmp_path)
+    safety_path, reference = gate_reference(tmp_path)
     before = full_db_state(db_path)
     register = lambda: register_child(  # noqa: E731
         db_path,
         kind=store.REISSUE_KIND_GATE_CORRECTION,
         clearance=clearance,
         gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
         quantity=Decimal("5"),
     )
     if state == "created":
@@ -487,7 +490,7 @@ def test_gate_correction_requires_a_decision_reference_and_manual_initiation(
 ):
     create_order(db_path)
     clearance = record_clearance(db_path, "sig-exec-1")
-    _, reference = gate_reference(tmp_path)
+    safety_path, reference = gate_reference(tmp_path)
     before = full_db_state(db_path)
     with pytest.raises(ValueError, match="gate-correction basis"):
         register_child(
@@ -500,6 +503,7 @@ def test_gate_correction_requires_a_decision_reference_and_manual_initiation(
             initiated_by=store.REISSUE_INITIATED_AUTO,
             clearance=clearance,
             gate_correction_reference=reference,
+            gate_decision_db_path=safety_path,
         )
     assert full_db_state(db_path) == before
 
@@ -507,11 +511,14 @@ def test_gate_correction_requires_a_decision_reference_and_manual_initiation(
 def test_a_broker_rejected_reissue_must_not_carry_a_correction_basis(db_path, tmp_path):
     reject_parent(db_path)
     clearance = record_clearance(db_path, "sig-exec-1")
-    _, reference = gate_reference(tmp_path)
+    safety_path, reference = gate_reference(tmp_path)
     before = full_db_state(db_path)
     with pytest.raises(ValueError, match="gate-correction basis"):
         register_child(
-            db_path, clearance=clearance, gate_correction_reference=reference
+            db_path,
+            clearance=clearance,
+            gate_correction_reference=reference,
+            gate_decision_db_path=safety_path,
         )
     assert full_db_state(db_path) == before
 
@@ -584,7 +591,7 @@ def test_quantity_increase_is_rejected_for_every_other_category(db_path, categor
 def test_gate_correction_never_allows_a_quantity_increase(db_path, tmp_path):
     create_order(db_path)
     clearance = record_clearance(db_path, "sig-exec-1")
-    _, reference = gate_reference(tmp_path)
+    safety_path, reference = gate_reference(tmp_path)
     before = full_db_state(db_path)
     with pytest.raises(ValueError, match="exceeds the parent"):
         register_child(
@@ -592,6 +599,7 @@ def test_gate_correction_never_allows_a_quantity_increase(db_path, tmp_path):
             kind=store.REISSUE_KIND_GATE_CORRECTION,
             clearance=clearance,
             gate_correction_reference=reference,
+            gate_decision_db_path=safety_path,
             quantity=Decimal("12"),
         )
     assert full_db_state(db_path) == before
@@ -785,12 +793,13 @@ def test_registered_children_restore_identically_after_reopen(db_path, tmp_path)
     db2 = tmp_path / "second.sqlite3"
     create_order(db2)
     clearance = record_clearance(db2, "sig-exec-1")
-    _, reference = gate_reference(tmp_path)
+    safety_path, reference = gate_reference(tmp_path)
     corrected = register_child(
         db2,
         kind=store.REISSUE_KIND_GATE_CORRECTION,
         clearance=clearance,
         gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
         quantity=Decimal("5"),
     )
     assert store.get_execution_order("exec-2", db_path=db2) == {**corrected, "revision": 0}
@@ -802,12 +811,13 @@ def test_registered_children_restore_identically_after_reopen(db_path, tmp_path)
 def test_a_parent_with_a_child_never_gains_submission_authority(db_path, tmp_path):
     create_order(db_path)
     clearance = record_clearance(db_path, "sig-exec-1")
-    _, reference = gate_reference(tmp_path)
+    safety_path, reference = gate_reference(tmp_path)
     register_child(
         db_path,
         kind=store.REISSUE_KIND_GATE_CORRECTION,
         clearance=clearance,
         gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
         quantity=Decimal("5"),
     )
     before = full_db_state(db_path)
@@ -883,7 +893,7 @@ def test_accepted_evidence_is_persisted_atomically_with_the_grant(db_path):
     granted = json.loads(history[0]["clearance_json"])
     assert granted["clearance_generation"] == fresh["clearance_generation"]
     assert granted["evidence_id"] == fresh["evidence_id"]
-    assert granted["evidence_sha256"] == fresh["evidence_sha256"]
+    assert granted["record_sha256"] == fresh["record_sha256"]
     # the registration-time evidence stays separately recorded on the row
     registered = json.loads(
         store.get_execution_order("exec-2", db_path=db_path)["reissue_clearance_json"]
@@ -1004,7 +1014,7 @@ def test_stripping_the_submission_evidence_from_history_is_rejected(db_path):
 def test_clearance_provenance_on_an_attempt_one_history_row_is_rejected(db_path):
     _chain_with_submitted_child(db_path)
     ref = json.dumps(
-        {"clearance_generation": 1, "evidence_id": "ev-x", "evidence_sha256": "0" * 64},
+        {"clearance_generation": 1, "evidence_id": "ev-x", "record_sha256": "0" * 64},
         sort_keys=True,
     )
     _raw(
@@ -1038,6 +1048,7 @@ def test_a_gate_decision_reference_round_trips_and_verifies(db_path, tmp_path):
         kind=store.REISSUE_KIND_GATE_CORRECTION,
         clearance=clearance,
         gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
         quantity=Decimal("5"),
     )
     stored_json = child["gate_correction_ref_json"]
@@ -1136,3 +1147,164 @@ def test_chain_reads_never_create_a_missing_db(tmp_path):
     assert store.get_execution_order_by_signal_id("sig-1", db_path=missing) is None
     assert store.list_reissue_clearances("sig-1", db_path=missing) == []
     assert not missing.exists()
+
+
+# --- PR #121 Codex review fixes ---------------------------------------------------
+
+
+def test_registration_enforces_gate_reference_verification_fail_closed(db_path, tmp_path):
+    """P1: a fabricated / unverifiable correction basis can never be
+    registered -- verification is enforced on the registration path."""
+    create_order(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1")
+    before = full_db_state(db_path)
+    fabricated = store.GateDecisionReference(
+        decision_id=1,
+        execution_request_id="exec-1",
+        allowed=False,
+        checked_at_utc=at(3),
+        policy_id="policy-forged",
+        rejections=(("quantity_limit_exceeded", "forged"),),
+    )
+    # no decision DB at the given path at all
+    with pytest.raises(store.ExecutionEvidenceReferenceError, match="no safety decision DB"):
+        register_child(
+            db_path,
+            kind=store.REISSUE_KIND_GATE_CORRECTION,
+            clearance=clearance,
+            gate_correction_reference=fabricated,
+            gate_decision_db_path=tmp_path / "nowhere.sqlite3",
+        )
+    assert full_db_state(db_path) == before
+
+    # a real DB whose decision content does not match the reference
+    safety_path, _ = gate_reference(tmp_path)  # records decision_id 1, policy-1
+    with pytest.raises(store.ExecutionEvidenceReferenceError, match="not the intended"):
+        register_child(
+            db_path,
+            kind=store.REISSUE_KIND_GATE_CORRECTION,
+            clearance=clearance,
+            gate_correction_reference=fabricated,
+            gate_decision_db_path=safety_path,
+        )
+    assert full_db_state(db_path) == before
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        ("status", "revoked"),
+        ("account_scope", "oanda-demo:acct-OTHER"),
+        ("observed_at_utc", "2026-07-20T13:59:59+00:00"),
+        ("recorded_at_utc", "2026-07-20T13:59:59+00:00"),
+    ],
+)
+def test_tampering_any_authorization_field_of_referenced_evidence_is_detected(
+    db_path, column, value
+):
+    """P1: the reference digest binds the COMPLETE clearance record, so an
+    out-of-band edit of status / scope / observation time on a referenced
+    row fails the referencing child closed -- not just evidence_json."""
+    _chain_with_submitted_child(db_path)
+    _raw(
+        db_path,
+        f"UPDATE {store.CLEARANCES_TABLE} SET {column} = ? WHERE clearance_generation = 1",
+        (value,),
+    )
+    with pytest.raises(store.ExecutionIntegrityError, match="sha256"):
+        store.get_execution_order("exec-2", db_path=db_path)
+
+
+def test_a_parent_with_wiped_history_fails_the_child_closed(db_path):
+    """P1 (reviewer scenario): corruption inside the parent bundle is
+    detected when reading OR submitting the child, not only when reading
+    the parent itself."""
+    reject_parent(db_path)
+    register_child(db_path)
+    record_clearance(db_path, "sig-exec-1")
+    _raw(db_path, f"DELETE FROM {store.HISTORY_TABLE} WHERE execution_request_id = 'exec-1'")
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_execution_order("exec-1", db_path=db_path)
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_execution_order("exec-2", db_path=db_path)  # via the chain walk
+    with pytest.raises(store.ExecutionIntegrityError):
+        submit_child(db_path)  # submission authority is refused too
+
+
+def test_grandparent_corruption_fails_the_whole_chain_closed(db_path):
+    """P1: the chain walk validates EVERY ancestor bundle, not just the
+    immediate parent."""
+    reject_parent(db_path)
+    register_child(db_path)
+    store.mark_submitting(
+        "exec-2",
+        reason="submit",
+        changed_at_utc=at(20),
+        clearance_scope="oanda-demo:acct-1",
+        clearance_observed_after_utc=at(0),
+        db_path=db_path,
+    )
+    store.record_order_result(
+        "exec-2",
+        make_result(
+            OrderState.REJECTED,
+            "exec-2",
+            broker_order_id=None,
+            reject_reason="rejected again",
+            rejection_category=RejectionCategory.TRANSIENT,
+            updated_at=at(21),
+        ),
+        reason="broker rejected",
+        db_path=db_path,
+    )
+    clearance = record_clearance(db_path, "sig-exec-1")
+    store.create_reissue_execution_order(
+        child_request(child_id="exec-3", requested_at_utc=at(30)),
+        client_order_id="client-exec-3",
+        created_at_utc=at(31),
+        parent_execution_request_id="exec-2",
+        reissue_kind=store.REISSUE_KIND_BROKER_REJECTED,
+        reissue_initiated_by=store.REISSUE_INITIATED_MANUAL,
+        reissue_reason="operator op-1: second retry",
+        clearance_generation=clearance["clearance_generation"],
+        clearance_evidence_id=clearance["evidence_id"],
+        db_path=db_path,
+    )
+    # corrupt the ROOT (grandparent of exec-3): swap its stored quantity so
+    # its own bundle validation (snapshot identity check) fails
+    _raw(
+        db_path,
+        f"UPDATE {store.ORDERS_TABLE} SET quantity = '7' WHERE execution_request_id = 'exec-1'",
+    )
+    with pytest.raises(store.ExecutionIntegrityError):
+        store.get_execution_order("exec-3", db_path=db_path)
+
+
+def test_a_generation_gap_blocks_submission_and_registration(db_path):
+    """P2: the complete clearance trail is validated inside the
+    authorization and registration transactions; a deleted intermediate
+    generation fails closed even though the tail row is intact."""
+    reject_parent(db_path)
+    register_child(db_path)  # references generation 1
+    record_clearance(db_path, "sig-exec-1")  # generation 2
+    record_clearance(db_path, "sig-exec-1")  # generation 3 (the valid tail)
+    _raw(db_path, f"DELETE FROM {store.CLEARANCES_TABLE} WHERE clearance_generation = 2")
+    with pytest.raises(store.ExecutionIntegrityError, match="contiguous"):
+        submit_child(db_path)
+    # still phase created, nothing was granted
+    with closing(sqlite3.connect(db_path)) as connection:
+        phase = connection.execute(
+            f"SELECT submission_phase FROM {store.ORDERS_TABLE} "
+            "WHERE execution_request_id = 'exec-2'"
+        ).fetchone()[0]
+    assert phase == "created"
+
+    # registration over a gapped trail is refused the same way
+    db2 = db_path.parent / "second_gap.sqlite3"
+    reject_parent(db2)
+    record_clearance(db2, "sig-exec-1")  # generation 1
+    tail = record_clearance(db2, "sig-exec-1")  # generation 2
+    _raw(db2, f"DELETE FROM {store.CLEARANCES_TABLE} WHERE clearance_generation = 1")
+    with pytest.raises(store.ExecutionIntegrityError, match="contiguous"):
+        register_child(db2, clearance=tail)
+    assert store.get_execution_order("exec-2", db_path=db2) is None

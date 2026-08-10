@@ -154,7 +154,7 @@ Broker は「最小取引数量を下回る」「数量の刻み(increment)が�
 | 訂正の根拠(`gate_correction` で必須) | 適格性の根拠とした Safety Gate 判定への参照。別 DB ファイルのため FK は張れない(下記「クロス DB 参照の安定性」) |
 | 登録時の clearance 根拠(attempt ≥ 2 で必須) | **登録**を正当化した clearance evidence への参照。**送信を許可した evidence は別途追跡可能に残す**(下記「送信を許可した evidence の追跡可能性」) |
 
-列名・型・保存形式は **#115 で確定・実装済み**: 訂正の根拠は `gate_correction_ref_json`(`decision_id` + 判定内容の**完全 snapshot** を持つ strict JSON。`GateDecisionReference` / `execution/reissue_evidence.py` の build / verify ヘルパー)、登録時の clearance 根拠は `reissue_clearance_json`(`{clearance_generation, evidence_id, evidence_sha256}` の内容束縛参照)。列構成の詳細は [Execution Request](execution_request.md) の「テーブル」節が正。
+列名・型・保存形式は **#115 で確定・実装済み**: 訂正の根拠は `gate_correction_ref_json`(`decision_id` + 判定内容の**完全 snapshot** を持つ strict JSON。`GateDecisionReference` / `execution/reissue_evidence.py` の build / verify ヘルパー)、登録時の clearance 根拠は `reissue_clearance_json`(`{clearance_generation, evidence_id, record_sha256}`。sha256 は **evidence 行の全列(status・口座スコープ・観測時刻を含む認可レコード全体)の canonical JSON** に対して計算する — payload だけを束縛すると認可フィールドの帯域外書き換えが検出できないため。PR #121 Codex レビュー P1)。**Gate 判定参照の検証は登録 API が登録前に強制する**(実 DB と全フィールド突き合わせ。検証不能は `ExecutionEvidenceReferenceError` で登録拒否)。列構成の詳細は [Execution Request](execution_request.md) の「テーブル」節が正。
 
 #### クロス DB 参照の安定性(契約)
 
@@ -163,7 +163,7 @@ Broker は「最小取引数量を下回る」「数量の刻み(increment)が�
 - 根拠への参照は、**参照先が意図した記録であることを検証できる形**で保持しなければならない(連番のみに依存しない)。
 - 参照が**解決できない・検証できない場合は fail-closed**(その根拠は無かったものとして扱い、再発行を許可しない)。
 - 監査時に「どの判定・どの観測を根拠にしたか」を**一意に再構成できる**こと。
-- **識別子の構成は #115 で確定・実装済み**(Shadow の内容突き合わせ先例を踏襲): Gate 判定への参照は `decision_id` に**判定内容の完全 snapshot を併置**し、検証(`execution/reissue_evidence.py` の `verify_gate_decision_reference()`)は参照先 DB の実レコードと**全フィールドを突き合わせる** — 参照先 DB の再作成・差し替えで同じ `decision_id` が別内容を指した場合は `ExecutionEvidenceReferenceError`(fail-closed)。同一 DB 内の clearance evidence への参照は `(clearance_generation, evidence_id)` + **保存 payload の sha256** で内容束縛し、登録時・復元時に毎回照合する(不一致・解決不能は typed error / `ExecutionIntegrityError`)。
+- **識別子の構成は #115 で確定・実装済み**(Shadow の内容突き合わせ先例を踏襲): Gate 判定への参照は `decision_id` に**判定内容の完全 snapshot を併置**し、検証(`execution/reissue_evidence.py` の `verify_gate_decision_reference()`)は参照先 DB の実レコードと**全フィールドを突き合わせる** — 参照先 DB の再作成・差し替えで同じ `decision_id` が別内容を指した場合は `ExecutionEvidenceReferenceError`(fail-closed)。同一 DB 内の clearance evidence への参照は `(clearance_generation, evidence_id)` + **evidence 行の全列(認可フィールド含む)に対する sha256** で内容束縛し、登録時・復元時に毎回照合する(不一致・解決不能は typed error / `ExecutionIntegrityError`。参照済み行の status / スコープ / 観測時刻の帯域外書き換えも digest 不一致で検出される)。なお Gate 判定参照の検証は監査用 helper に任せず**登録経路が強制**する(登録 API がトランザクション外の事前条件として実 DB と突き合わせ、失敗は登録拒否)。
 
 **clearance evidence の保持**: reconciliation DB を execution store のトランザクション内から読むことはできない(ファイルを跨げない)。したがって「送信権を与える判断と同じ場所で clearance の有効性を確認できる」ための耐久的な仕組みが必要になる — 既存の repair fence mirror と同じ問題設定である。**具体形式は #115 で確定・実装済み**: execution DB 内の **append-only テーブル `execution_reissue_clearances`**(signal ごとの観測を世代番号つきで追記。`status` = `observing` / `valid` / `revoked`、観測口座スコープ、観測時刻、evidence payload。「現在の clearance」= 最大 generation。詳細は [Execution Request](execution_request.md))。本 Issue が要求した性質は次のとおり満たされる。
 

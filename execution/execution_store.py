@@ -478,12 +478,16 @@ _FILL_JSON_KEYS: frozenset[str] = frozenset({"fill_id", "price", "quantity", "fi
 # stance as the snapshot JSON: unknown or missing keys are rejected.
 #
 # - A CLEARANCE reference points at one row of the same-DB append-only
-#   ``execution_reissue_clearances`` table and is CONTENT-BOUND: it names the
-#   generation, the evidence id and the sha256 of the stored evidence
-#   payload, so a swapped or edited evidence row can never be mistaken for
-#   the referenced one. Used both for the registration reference on the
-#   child order row and for the submission-time reference persisted on the
-#   ``mark_submitting`` history row.
+#   ``execution_reissue_clearances`` table and is CONTENT-BOUND over the
+#   COMPLETE record: it names the generation, the evidence id and the
+#   sha256 of the canonical JSON of ALL stored columns -- status, account
+#   scope and observation time included, not just the evidence payload
+#   (PR #121 Codex review P1) -- so ANY out-of-band edit of a referenced
+#   authorization record (flipping ``revoked`` to ``valid``, swapping the
+#   scope, advancing the observation time) breaks the digest and fails the
+#   referencing order closed. Used both for the registration reference on
+#   the child order row and for the submission-time reference persisted on
+#   the ``mark_submitting`` history row.
 # - A GATE DECISION reference points at one row of the SEPARATE Safety Gate
 #   decision DB (path swappable via SAFETY_GATE_DECISION_DB_PATH, local ids
 #   reusable) and therefore embeds the FULL decision content snapshot next
@@ -492,7 +496,7 @@ _FILL_JSON_KEYS: frozenset[str] = frozenset({"fill_id", "price", "quantity", "fi
 #   ``execution/reissue_evidence.py``; this store validates the shape and
 #   the cross-constraints.
 _CLEARANCE_REF_KEYS: frozenset[str] = frozenset(
-    {"clearance_generation", "evidence_id", "evidence_sha256"}
+    {"clearance_generation", "evidence_id", "record_sha256"}
 )
 _GATE_DECISION_REF_KEYS: frozenset[str] = frozenset({"decision_id", "decision"})
 _GATE_DECISION_CONTENT_KEYS: frozenset[str] = frozenset(
@@ -513,6 +517,17 @@ _GATE_DECISION_REJECTION_KEYS: frozenset[str] = frozenset({"code", "message"})
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _clearance_record_sha256(row: dict) -> str:
+    """Digest of the COMPLETE clearance record (every stored column,
+    canonical JSON). References bind to this, so no part of a referenced
+    authorization record can be rewritten undetected -- binding only the
+    evidence payload would leave status / scope / observation time free to
+    edit (PR #121 Codex review P1)."""
+    return _sha256_text(
+        json.dumps({column: row[column] for column in _CLEARANCE_COLUMNS}, sort_keys=True)
+    )
 
 
 class ExecutionStoreError(RuntimeError):
@@ -848,13 +863,13 @@ def gate_decision_reference_from_json(text: str) -> GateDecisionReference:
 
 
 def _clearance_ref_to_json(
-    *, clearance_generation: int, evidence_id: str, evidence_sha256: str
+    *, clearance_generation: int, evidence_id: str, record_sha256: str
 ) -> str:
     return json.dumps(
         {
             "clearance_generation": clearance_generation,
             "evidence_id": evidence_id,
-            "evidence_sha256": evidence_sha256,
+            "record_sha256": record_sha256,
         },
         sort_keys=True,
     )
@@ -874,7 +889,7 @@ def _clearance_ref_from_json(text: str) -> dict:
         raise ValueError(
             f"clearance reference generation must be an int >= 1, got {generation!r}"
         )
-    for field in ("evidence_id", "evidence_sha256"):
+    for field in ("evidence_id", "record_sha256"):
         if not isinstance(data[field], str) or not data[field].strip():
             raise ValueError(f"clearance reference {field} must be a non-empty string")
     return data
@@ -2074,9 +2089,10 @@ def _resolve_clearance_ref(
     """Content-verify a clearance reference against the same-DB append-only
     evidence table. Returns problems (empty = the reference resolves to the
     intended record). Fail-closed: missing row, different evidence id or a
-    different payload digest all disqualify the reference."""
+    different COMPLETE-record digest (status / scope / observation time
+    included) all disqualify the reference."""
     row = connection.execute(
-        f"SELECT evidence_id, evidence_json FROM {CLEARANCES_TABLE} "
+        f"SELECT * FROM {CLEARANCES_TABLE} "
         "WHERE signal_id = ? AND clearance_generation = ?",
         (signal_id, ref["clearance_generation"]),
     ).fetchone()
@@ -2085,39 +2101,53 @@ def _resolve_clearance_ref(
             f"clearance reference (signal {signal_id!r}, generation "
             f"{ref['clearance_generation']}) does not resolve to a recorded evidence row"
         ]
+    row = dict(row)
     problems = []
     if row["evidence_id"] != ref["evidence_id"]:
         problems.append(
             f"clearance reference evidence_id {ref['evidence_id']!r} does not match "
             f"the recorded evidence row ({row['evidence_id']!r})"
         )
-    if _sha256_text(row["evidence_json"]) != ref["evidence_sha256"]:
+    if _clearance_record_sha256(row) != ref["record_sha256"]:
         problems.append(
-            "clearance reference evidence_sha256 does not match the recorded "
-            "evidence payload (the referenced record is not the intended one)"
+            "clearance reference record_sha256 does not match the recorded evidence "
+            "row content (status / scope / observation time / payload); the "
+            "referenced record is not the intended one"
         )
     return problems
 
 
-def _validate_reissue_chain(
+def _validate_clearance_trail(
+    connection: sqlite3.Connection, signal_id: str
+) -> list[dict]:
+    """Load and strictly validate the signal's COMPLETE clearance trail in
+    the caller's transaction (PR #121 Codex review P2): generations must be
+    contiguous from 1 and every row well-formed, so an out-of-band deletion
+    of an intermediate generation fails closed BEFORE any tail row is
+    trusted. Returns the validated rows, oldest first."""
+    rows = [
+        dict(entry)
+        for entry in connection.execute(
+            f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
+            "ORDER BY clearance_generation ASC",
+            (signal_id,),
+        ).fetchall()
+    ]
+    _validate_clearance_rows(signal_id, rows)
+    return rows
+
+
+def _validate_row_evidence(
     connection: sqlite3.Connection, row: dict, history: list[dict]
 ) -> None:
-    """Restore-time chain / evidence validation for one order bundle
-    (Issue #115) -- runs inside the caller's transaction, AFTER
-    :func:`_validate_bundle`.
-
-    Re-runs the SAME shared rules as registration against the parent row,
-    verifies the registration clearance reference resolves and
-    content-matches, and pins the submission clearance provenance: a
-    reissue child that entered ``submitting`` carries the accepted evidence
-    reference on its FIRST history row (and nowhere else); an attempt-1
-    order never carries one. Any violation is an out-of-band edit and
-    raises :class:`ExecutionIntegrityError`.
-    """
+    """Per-row evidence / provenance validation (Issue #115), inside the
+    caller's transaction: the submission clearance provenance sits exactly
+    on the FIRST history row of a reissue child (and nowhere else, never on
+    an attempt-1 order), and both the submission and the registration
+    references resolve to their recorded evidence rows with a matching
+    complete-record digest. Any violation raises
+    :class:`ExecutionIntegrityError`."""
     request_id = row["execution_request_id"]
-    problems = _reissue_row_problems(row)
-    if problems:
-        raise _integrity(request_id, "; ".join(problems))
     is_child = row["signal_attempt"] >= 2
 
     for position, entry in enumerate(history):
@@ -2156,22 +2186,69 @@ def _validate_reissue_chain(
     if ref_problems:
         raise _integrity(request_id, "; ".join(ref_problems))
 
-    parent = connection.execute(
-        f"SELECT * FROM {ORDERS_TABLE} WHERE execution_request_id = ?",
-        (row["reissued_from_execution_request_id"],),
-    ).fetchone()
-    if parent is None:
-        raise _integrity(
-            request_id,
-            f"parent execution order {row['reissued_from_execution_request_id']!r} "
-            "does not exist",
+
+def _validate_reissue_chain(
+    connection: sqlite3.Connection, row: dict, history: list[dict]
+) -> None:
+    """Restore-time chain / evidence validation for one order bundle
+    (Issue #115) -- runs inside the caller's transaction, AFTER
+    :func:`_validate_bundle`.
+
+    For a reissue child this validates the ENTIRE ancestor chain, not just
+    the immediate parent link (PR #121 Codex review P1): every ancestor is
+    loaded as a FULL bundle (:func:`_validate_bundle` -- history chain,
+    snapshot anchor and all), its own reissue cross-constraints and
+    evidence references are re-checked, and each link re-runs THE SAME
+    shared rules registration uses. The signal's clearance trail is
+    validated for contiguity once per chain. A child can therefore never
+    restore -- or gain submission authority -- on top of a corrupted
+    ancestor; any violation raises :class:`ExecutionIntegrityError`. The
+    walk terminates because every accepted link decrements
+    ``signal_attempt`` by exactly 1 down to attempt 1 (a link that does not
+    raises instead).
+    """
+    request_id = row["execution_request_id"]
+    problems = _reissue_row_problems(row)
+    if problems:
+        raise _integrity(request_id, "; ".join(problems))
+    _validate_row_evidence(connection, row, history)
+    if row["signal_attempt"] < 2:
+        return
+
+    _validate_clearance_trail(connection, row["signal_id"])
+
+    current = row
+    while current["signal_attempt"] >= 2:
+        parent_id = current["reissued_from_execution_request_id"]
+        parent_row = connection.execute(
+            f"SELECT * FROM {ORDERS_TABLE} WHERE execution_request_id = ?",
+            (parent_id,),
+        ).fetchone()
+        if parent_row is None:
+            raise _integrity(
+                current["execution_request_id"],
+                f"parent execution order {parent_id!r} does not exist",
+            )
+        parent = dict(parent_row)
+        parent_history = [
+            dict(entry)
+            for entry in connection.execute(
+                f"SELECT * FROM {HISTORY_TABLE} WHERE execution_request_id = ? "
+                "ORDER BY history_id ASC",
+                (parent_id,),
+            ).fetchall()
+        ]
+        _validate_bundle(parent, parent_history)
+        parent_problems = _reissue_row_problems(parent)
+        if parent_problems:
+            raise _integrity(parent_id, "; ".join(parent_problems))
+        _validate_row_evidence(connection, parent, parent_history)
+        link_problems = _reissue_link_problems(
+            parent, current, _parent_rejection_category(parent)
         )
-    parent = dict(parent)
-    link_problems = _reissue_link_problems(
-        parent, row, _parent_rejection_category(parent)
-    )
-    if link_problems:
-        raise _integrity(request_id, "; ".join(link_problems))
+        if link_problems:
+            raise _integrity(current["execution_request_id"], "; ".join(link_problems))
+        current = parent
 
 
 def _validate_request_columns(row: dict) -> None:
@@ -2741,6 +2818,7 @@ def create_reissue_execution_order(
     clearance_generation: int,
     clearance_evidence_id: str,
     gate_correction_reference: GateDecisionReference | None = None,
+    gate_decision_db_path: Path | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Register an EXPLICIT reissue of ``parent_execution_request_id`` as a
@@ -2754,12 +2832,25 @@ def create_reissue_execution_order(
       ``gate_correction`` -> parent phase ``created`` with no order state;
       EVERY other parent state -- pending / accepted / partially_filled /
       unknown / filled / cancelled -- refuses the registration),
-    - the registration clearance reference is resolved against the same-DB
-      evidence table and content-bound (generation + evidence id + payload
-      sha256); an unresolvable reference is
-      :class:`ExecutionClearanceError` (fail-closed -- the store does NOT
-      judge the clearance requirements themselves, Issue #116 does, but it
-      refuses to record a reference it cannot verify),
+    - a supplied ``gate_correction_reference`` is VERIFIED against the live
+      Safety Gate decision DB (``gate_decision_db_path``, default the
+      configured decision DB) BEFORE the transaction opens -- a missing /
+      swapped DB, an unknown decision id or any content mismatch raises
+      :class:`ExecutionEvidenceReferenceError` and nothing is written
+      (PR #121 Codex review P1: verification is enforced on the
+      registration path, never left to the caller; whether that decision
+      makes the correction ELIGIBLE remains the Issue #116 service
+      judgement). The cross-DB read deliberately happens outside the
+      ``BEGIN IMMEDIATE`` section, so this store's write lock is never held
+      across another DB file,
+    - the signal's clearance trail is validated for contiguity and the
+      registration clearance reference is resolved against the same-DB
+      evidence table and content-bound over the COMPLETE record
+      (generation + evidence id + full-row sha256); an unresolvable
+      reference is :class:`ExecutionClearanceError` (fail-closed -- the
+      store does NOT judge the clearance requirements themselves,
+      Issue #116 does, but it refuses to record a reference it cannot
+      verify),
     - the child field invariants are verified against the parent row via
       THE SAME shared rules restore-time validation runs
       (:func:`_reissue_link_problems`: identity immutability, attempt
@@ -2813,19 +2904,35 @@ def create_reissue_execution_order(
             f"{gate_correction_reference!r}"
         )
     db_path = _existing_db_path(db_path, parent_execution_request_id)
+    if gate_correction_reference is not None:
+        # Enforced fail-closed verification of the correction basis against
+        # the LIVE decision DB (PR #121 Codex review P1). Deferred import:
+        # reissue_evidence imports this module, so a module-level import
+        # here would be circular; at call time this module is fully
+        # initialized and the import is safe.
+        from execution import reissue_evidence
+
+        reissue_evidence.verify_gate_decision_reference(
+            gate_correction_reference, db_path=gate_decision_db_path
+        )
     with _verified_txn(db_path) as connection:
         parent, _parent_history = _require_bundle_for_update(
             connection, parent_execution_request_id
         )
 
         # Resolve + content-bind the registration clearance evidence (same
-        # DB, same transaction). The reference the child row will carry is
-        # built from the COMMITTED evidence row, never from caller input.
-        evidence = connection.execute(
-            f"SELECT evidence_id, evidence_json FROM {CLEARANCES_TABLE} "
-            "WHERE signal_id = ? AND clearance_generation = ?",
-            (request.signal_id, clearance_generation),
-        ).fetchone()
+        # DB, same transaction), after validating the trail's contiguity.
+        # The reference the child row will carry is built from the
+        # COMMITTED evidence row, never from caller input.
+        trail = _validate_clearance_trail(connection, request.signal_id)
+        evidence = next(
+            (
+                entry
+                for entry in trail
+                if entry["clearance_generation"] == clearance_generation
+            ),
+            None,
+        )
         if evidence is None or evidence["evidence_id"] != clearance_evidence_id:
             raise ExecutionClearanceError(
                 f"clearance evidence (signal {request.signal_id!r}, generation "
@@ -2836,7 +2943,7 @@ def create_reissue_execution_order(
         clearance_ref_json = _clearance_ref_to_json(
             clearance_generation=clearance_generation,
             evidence_id=evidence["evidence_id"],
-            evidence_sha256=_sha256_text(evidence["evidence_json"]),
+            record_sha256=_clearance_record_sha256(evidence),
         )
 
         record = _intent_record(
@@ -3091,17 +3198,17 @@ def _verify_submission_clearance(
             "(clearance_scope + clearance_observed_after_utc); without them the "
             "clearance cannot be verified and submission authority is refused"
         )
-    current = connection.execute(
-        f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
-        "ORDER BY clearance_generation DESC LIMIT 1",
-        (signal_id,),
-    ).fetchone()
-    if current is None:
+    # The COMPLETE trail is validated before its tail is trusted (PR #121
+    # Codex review P2): a gap or malformed row in the append-only evidence
+    # history is out-of-band damage and fails closed here, even though the
+    # unreferenced rows themselves are never used for the grant.
+    trail = _validate_clearance_trail(connection, signal_id)
+    if not trail:
         raise ExecutionClearanceError(
             f"reissue child {request_id!r} has no clearance evidence recorded for "
             f"signal {signal_id!r}; absence of evidence is not absence of divergence"
         )
-    current = dict(current)
+    current = trail[-1]
     if current["status"] != CLEARANCE_STATUS_VALID:
         raise ExecutionClearanceError(
             f"reissue child {request_id!r} cannot submit: the current clearance "
@@ -3130,7 +3237,7 @@ def _verify_submission_clearance(
     return _clearance_ref_to_json(
         clearance_generation=current["clearance_generation"],
         evidence_id=current["evidence_id"],
-        evidence_sha256=_sha256_text(current["evidence_json"]),
+        record_sha256=_clearance_record_sha256(current),
     )
 
 
@@ -3907,7 +4014,7 @@ def record_reissue_clearance(
                 signal_id, "clearance row does not hold the intended values; rolling back"
             )
         stored = dict(stored)
-    stored["evidence_sha256"] = _sha256_text(stored["evidence_json"])
+    stored["record_sha256"] = _clearance_record_sha256(stored)
     return stored
 
 
