@@ -417,6 +417,28 @@ def test_native_reject_codes_map_to_categories_inside_the_adapter(native, catego
     assert result.rejection_category is category
 
 
+@pytest.mark.parametrize(
+    "native",
+    [
+        " INSUFFICIENT_LIQUIDITY ",   # padded: not the documented code
+        "INSUFFICIENT_LIQUIDITY\n",
+        "insufficient_liquidity",     # case-folded
+        "INSUFFICIENT_LIQUIDITY_X",
+        "",
+    ],
+)
+def test_non_exact_native_codes_stay_unclassified(native):
+    # PR #119 Codex review P2: the seed table matches the value AS RECEIVED.
+    # Normalizing (trim / case fold) would let a malformed response become
+    # TRANSIENT -- the only category eligible for automatic reissue.
+    adapter, _ = make_adapter(
+        (400, {"orderRejectTransaction": {"id": "5001", "rejectReason": native}})
+    )
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert result.rejection_category is m.RejectionCategory.UNCLASSIFIED
+
+
 def test_rejection_without_a_native_code_is_unclassified():
     # no rejectReason at all: the audit reason falls back to errorMessage,
     # the classification stays fail-closed
