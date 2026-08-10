@@ -1452,6 +1452,8 @@ def _write_schema(db_path, orders_sql, history_sql=None, index_sqls=None):
         connection.execute(history_sql if history_sql is not None else store._create_history_table_sql())
         connection.execute(store._create_fences_table_sql())
         connection.execute(store._create_clearances_table_sql())
+        connection.execute(store._create_clearance_heads_table_sql())
+        connection.execute(store._create_supersessions_table_sql())
         for sql in index_sqls if index_sqls is not None else store._create_index_sql().values():
             connection.execute(sql)
         connection.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
@@ -1625,6 +1627,8 @@ def _downgrade_to_v4(db_path):
             connection.execute(f"ALTER TABLE {store.ORDERS_TABLE} DROP COLUMN {column}")
         connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} DROP COLUMN clearance_json")
         connection.execute(f"DROP TABLE {store.CLEARANCES_TABLE}")
+        connection.execute(f"DROP TABLE {store.CLEARANCE_HEADS_TABLE}")
+        connection.execute(f"DROP TABLE {store.SUPERSESSIONS_TABLE}")
         connection.execute(store._SIGNAL_UNIQUE_INDEX_SQL)
         connection.execute("PRAGMA user_version = 4")
         connection.commit()

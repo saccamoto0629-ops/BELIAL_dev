@@ -1308,3 +1308,152 @@ def test_a_generation_gap_blocks_submission_and_registration(db_path):
     with pytest.raises(store.ExecutionIntegrityError, match="contiguous"):
         register_child(db2, clearance=tail)
     assert store.get_execution_order("exec-2", db_path=db2) is None
+
+
+# --- PR #121 Codex review round 2 fixes --------------------------------------------
+
+
+def test_editing_the_unreferenced_tail_is_detected_by_the_head_commitment(db_path):
+    """r2 P1 (reviewer repro a): gen 1 valid justified the registration,
+    gen 2 revoked was appended later; flipping gen 2 back to valid out of
+    band must not grant submission."""
+    reject_parent(db_path)
+    register_child(db_path)  # references generation 1 (valid)
+    record_clearance(db_path, "sig-exec-1", status=store.CLEARANCE_STATUS_REVOKED)
+    _raw(
+        db_path,
+        f"UPDATE {store.CLEARANCES_TABLE} SET status = 'valid' WHERE clearance_generation = 2",
+    )
+    with pytest.raises(store.ExecutionIntegrityError, match="head commitment"):
+        submit_child(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        phase = connection.execute(
+            f"SELECT submission_phase FROM {store.ORDERS_TABLE} "
+            "WHERE execution_request_id = 'exec-2'"
+        ).fetchone()[0]
+    assert phase == "created"
+
+
+def test_deleting_the_revoking_tail_is_detected_by_the_head_commitment(db_path):
+    """r2 P1 (reviewer repro b): deleting the newest (revoking) generation
+    leaves a contiguous trail ending in the old valid row -- the head
+    commitment still names generation 2, so authorization fails closed."""
+    reject_parent(db_path)
+    register_child(db_path)  # generation 1 valid
+    record_clearance(db_path, "sig-exec-1", status=store.CLEARANCE_STATUS_REVOKED)
+    _raw(db_path, f"DELETE FROM {store.CLEARANCES_TABLE} WHERE clearance_generation = 2")
+    with pytest.raises(store.ExecutionIntegrityError, match="head commitment"):
+        submit_child(db_path)
+    # reads fail closed the same way
+    with pytest.raises(store.ExecutionIntegrityError, match="head commitment"):
+        store.get_reissue_clearance("sig-exec-1", db_path=db_path)
+    with pytest.raises(store.ExecutionIntegrityError, match="head commitment"):
+        store.get_execution_order("exec-2", db_path=db_path)
+
+
+def test_tampering_the_head_commitment_itself_fails_closed(db_path):
+    reject_parent(db_path)
+    register_child(db_path)
+    _raw(db_path, f"DELETE FROM {store.CLEARANCE_HEADS_TABLE} WHERE signal_id = 'sig-exec-1'")
+    with pytest.raises(store.ExecutionIntegrityError, match="without a trail-head"):
+        submit_child(db_path)
+    # recording refuses to extend a damaged trail too
+    with pytest.raises(store.ExecutionIntegrityError, match="without a trail-head"):
+        record_clearance(db_path, "sig-exec-1")
+
+
+def test_the_head_commitment_moves_atomically_with_every_append(db_path):
+    store.init_db(db_path)
+    first = record_clearance(db_path, "sig-1", status=store.CLEARANCE_STATUS_OBSERVING)
+    second = record_clearance(db_path, "sig-1", status=store.CLEARANCE_STATUS_VALID)
+    with closing(sqlite3.connect(db_path)) as connection:
+        head = dict(
+            zip(
+                store._CLEARANCE_HEAD_COLUMNS,
+                connection.execute(
+                    f"SELECT {', '.join(store._CLEARANCE_HEAD_COLUMNS)} FROM "
+                    f"{store.CLEARANCE_HEADS_TABLE} WHERE signal_id = 'sig-1'"
+                ).fetchone(),
+            )
+        )
+    assert head["clearance_generation"] == 2
+    assert head["record_sha256"] == second["record_sha256"]
+    assert head["record_sha256"] != first["record_sha256"]
+
+
+def test_deleting_the_child_row_alone_does_not_resurrect_the_parent(db_path, tmp_path):
+    """r2 P1 (reviewer repro): a freshly registered gate-correction child
+    has no history and nothing referencing its row; deleting it out of
+    band must not let the superseded parent submit."""
+    create_order(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1")
+    safety_path, reference = gate_reference(tmp_path)
+    register_child(
+        db_path,
+        kind=store.REISSUE_KIND_GATE_CORRECTION,
+        clearance=clearance,
+        gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
+        quantity=Decimal("5"),
+    )
+    _raw(db_path, f"DELETE FROM {store.ORDERS_TABLE} WHERE execution_request_id = 'exec-2'")
+    with pytest.raises(store.ExecutionIntegrityError, match="deleted out of band"):
+        store.mark_submitting(
+            "exec-1", reason="submit", changed_at_utc=at(20), db_path=db_path
+        )
+    # and a replacement child cannot be registered on top of the damage
+    with pytest.raises(store.ExecutionIntegrityError, match="does not exist"):
+        register_child(
+            db_path,
+            child_id="exec-3",
+            kind=store.REISSUE_KIND_GATE_CORRECTION,
+            clearance=clearance,
+            gate_correction_reference=reference,
+            gate_decision_db_path=safety_path,
+            quantity=Decimal("5"),
+        )
+
+
+def test_deleting_the_supersession_marker_alone_fails_closed(db_path, tmp_path):
+    create_order(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1")
+    safety_path, reference = gate_reference(tmp_path)
+    register_child(
+        db_path,
+        kind=store.REISSUE_KIND_GATE_CORRECTION,
+        clearance=clearance,
+        gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
+        quantity=Decimal("5"),
+    )
+    _raw(
+        db_path,
+        f"DELETE FROM {store.SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = 'exec-1'",
+    )
+    # the parent still cannot submit (child row present, marker missing)
+    with pytest.raises(store.ExecutionIntegrityError, match="supersession marker"):
+        store.mark_submitting(
+            "exec-1", reason="submit", changed_at_utc=at(20), db_path=db_path
+        )
+    # and the child itself fails restore-time validation
+    with pytest.raises(store.ExecutionIntegrityError, match="supersession marker"):
+        store.get_execution_order("exec-2", db_path=db_path)
+
+
+def test_the_supersession_marker_is_written_atomically_with_the_child(db_path):
+    reject_parent(db_path)
+    child = register_child(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        marker = connection.execute(
+            f"SELECT * FROM {store.SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = 'exec-1'"
+        ).fetchone()
+    assert marker is not None
+    assert marker[1] == child["execution_request_id"]
+    # a marker naming a different child is out-of-band damage
+    _raw(
+        db_path,
+        f"UPDATE {store.SUPERSESSIONS_TABLE} SET child_execution_request_id = 'exec-x' "
+        "WHERE parent_execution_request_id = 'exec-1'",
+    )
+    with pytest.raises(store.ExecutionIntegrityError, match="different child"):
+        store.get_execution_order("exec-2", db_path=db_path)

@@ -270,6 +270,8 @@ BUSY_TIMEOUT_SECONDS = 30
 ORDERS_TABLE = "execution_orders"
 HISTORY_TABLE = "execution_order_state_history"
 CLEARANCES_TABLE = "execution_reissue_clearances"
+CLEARANCE_HEADS_TABLE = "execution_reissue_clearance_heads"
+SUPERSESSIONS_TABLE = "execution_intent_supersessions"
 
 # Reissue provenance vocabularies (Issue #95 / #115). Closed sets, mirrored
 # by DB CHECK constraints.
@@ -371,6 +373,17 @@ _CLEARANCE_COLUMNS: tuple[str, ...] = (
     "observed_at_utc",
     "evidence_json",
     "recorded_at_utc",
+)
+_CLEARANCE_HEAD_COLUMNS: tuple[str, ...] = (
+    "signal_id",
+    "clearance_generation",
+    "record_sha256",
+    "updated_at_utc",
+)
+_SUPERSESSION_COLUMNS: tuple[str, ...] = (
+    "parent_execution_request_id",
+    "child_execution_request_id",
+    "superseded_at_utc",
 )
 _FENCE_COLUMNS: tuple[str, ...] = (
     "execution_request_id",
@@ -1076,6 +1089,57 @@ def _create_clearances_table_sql() -> str:
     """
 
 
+def _create_clearance_heads_table_sql() -> str:
+    """The clearance TRAIL-HEAD COMMITMENT (PR #121 Codex review r2 P1).
+
+    One row per signal naming its current generation and the sha256 of the
+    complete tail record, maintained in the SAME transaction as every
+    evidence append. The trail's own contiguity plus the referenced-row
+    digests cannot authenticate the UNREFERENCED tail -- deleting the
+    newest (e.g. revoking) generation leaves a contiguous trail, and
+    editing it precedes any reference that would pin it. Every trail read
+    therefore requires the head commitment to match the tail exactly;
+    truncating or rewriting the tail without ALSO rewriting this row fails
+    closed. (Without a signing key a fully consistent rewrite of both
+    remains possible -- the same explicit boundary as every other table in
+    this store; the commitment makes tail tampering require coordinated
+    multi-table edits instead of a single UPDATE/DELETE.)"""
+    return f"""
+        CREATE TABLE {CLEARANCE_HEADS_TABLE} (
+            signal_id TEXT PRIMARY KEY NOT NULL CHECK (trim(signal_id) <> ''),
+            clearance_generation INTEGER NOT NULL CHECK (clearance_generation >= 1),
+            record_sha256 TEXT NOT NULL CHECK (trim(record_sha256) <> ''),
+            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00')
+        ) WITHOUT ROWID
+    """
+
+
+def _create_supersessions_table_sql() -> str:
+    """DURABLE supersession provenance (PR #121 Codex review r2 P1).
+
+    Written append-style in the SAME transaction that registers a reissue
+    child: one row per superseded parent naming its child. The parent's
+    permanent loss of submission authority must not derive solely from the
+    child ROW's continued presence -- a freshly registered child has no
+    history and nothing referencing it, so deleting that one row out of
+    band would otherwise resurrect the parent. ``mark_submitting`` refuses
+    when EITHER the child row or this marker exists, and marker <-> child
+    row consistency is cross-validated everywhere (one without the other
+    is out-of-band damage -> :class:`ExecutionIntegrityError`). Rows are
+    never updated or deleted."""
+    return f"""
+        CREATE TABLE {SUPERSESSIONS_TABLE} (
+            parent_execution_request_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES {ORDERS_TABLE} (execution_request_id)
+                CHECK (trim(parent_execution_request_id) <> ''),
+            child_execution_request_id TEXT NOT NULL UNIQUE
+                REFERENCES {ORDERS_TABLE} (execution_request_id)
+                CHECK (trim(child_execution_request_id) <> ''),
+            superseded_at_utc TEXT NOT NULL CHECK (superseded_at_utc LIKE '%+00:00')
+        ) WITHOUT ROWID
+    """
+
+
 def _create_fences_table_sql() -> str:
     """The repair FENCING table (Issue #104 re-review, v4).
 
@@ -1282,7 +1346,7 @@ def _tables_for(version: int) -> tuple[str, ...]:
     if version >= 4:
         tables.append(FENCES_TABLE)
     if version >= 5:
-        tables.append(CLEARANCES_TABLE)
+        tables.extend((CLEARANCES_TABLE, CLEARANCE_HEADS_TABLE, SUPERSESSIONS_TABLE))
     return tuple(tables)
 
 
@@ -1296,6 +1360,8 @@ def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERS
         connection.execute(_create_fences_table_sql())
     if version >= 5:
         connection.execute(_create_clearances_table_sql())
+        connection.execute(_create_clearance_heads_table_sql())
+        connection.execute(_create_supersessions_table_sql())
     for create_sql in _create_index_sql(version=version).values():
         connection.execute(create_sql)
     connection.execute(f"PRAGMA user_version = {version}")
@@ -1655,6 +1721,8 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection, db_path: Path) -> None:
         f"ALTER TABLE {HISTORY_TABLE} ADD COLUMN {_HISTORY_CLEARANCE_COLUMN_DDL}"
     )
     connection.execute(_create_clearances_table_sql())
+    connection.execute(_create_clearance_heads_table_sql())
+    connection.execute(_create_supersessions_table_sql())
     connection.execute(f"DROP INDEX {_SIGNAL_UNIQUE_INDEX}")
     connection.execute(_SIGNAL_ATTEMPT_UNIQUE_INDEX_SQL)
     connection.execute(_REISSUED_FROM_UNIQUE_INDEX_SQL)
@@ -2121,10 +2189,12 @@ def _validate_clearance_trail(
     connection: sqlite3.Connection, signal_id: str
 ) -> list[dict]:
     """Load and strictly validate the signal's COMPLETE clearance trail in
-    the caller's transaction (PR #121 Codex review P2): generations must be
-    contiguous from 1 and every row well-formed, so an out-of-band deletion
-    of an intermediate generation fails closed BEFORE any tail row is
-    trusted. Returns the validated rows, oldest first."""
+    the caller's transaction (PR #121 Codex review P2 + r2 P1): generations
+    must be contiguous from 1, every row well-formed, and the TRAIL-HEAD
+    COMMITMENT must name exactly the tail (generation + complete-record
+    sha256). A deleted intermediate generation, a truncated tail, or an
+    edited tail (e.g. a ``revoked`` flipped to ``valid``) all fail closed
+    BEFORE any row is trusted. Returns the validated rows, oldest first."""
     rows = [
         dict(entry)
         for entry in connection.execute(
@@ -2134,6 +2204,35 @@ def _validate_clearance_trail(
         ).fetchall()
     ]
     _validate_clearance_rows(signal_id, rows)
+    head = connection.execute(
+        f"SELECT * FROM {CLEARANCE_HEADS_TABLE} WHERE signal_id = ?",
+        (signal_id,),
+    ).fetchone()
+    if not rows:
+        if head is not None:
+            raise ExecutionIntegrityError(
+                f"clearance evidence for signal {signal_id!r} failed restore-time "
+                f"validation: a trail-head commitment (generation "
+                f"{head['clearance_generation']}) exists but no evidence rows do; "
+                "the trail was truncated out of band"
+            )
+        return rows
+    if head is None:
+        raise ExecutionIntegrityError(
+            f"clearance evidence for signal {signal_id!r} failed restore-time "
+            "validation: evidence rows exist without a trail-head commitment"
+        )
+    tail = rows[-1]
+    if head["clearance_generation"] != tail["clearance_generation"] or head[
+        "record_sha256"
+    ] != _clearance_record_sha256(tail):
+        raise ExecutionIntegrityError(
+            f"clearance evidence for signal {signal_id!r} failed restore-time "
+            f"validation: the trail-head commitment (generation "
+            f"{head['clearance_generation']}) does not match the trail tail "
+            f"(generation {tail['clearance_generation']}); the newest evidence was "
+            "truncated or rewritten out of band"
+        )
     return rows
 
 
@@ -2185,6 +2284,28 @@ def _validate_row_evidence(
     ref_problems = _resolve_clearance_ref(connection, row["signal_id"], registration_ref)
     if ref_problems:
         raise _integrity(request_id, "; ".join(ref_problems))
+
+    # The durable supersession marker is written atomically with the child
+    # row (PR #121 Codex review r2 P1); a child without its marker -- or
+    # with a marker naming a different child -- is out-of-band damage.
+    marker = connection.execute(
+        f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
+        (row["reissued_from_execution_request_id"],),
+    ).fetchone()
+    if marker is None:
+        raise _integrity(
+            request_id,
+            f"no supersession marker records the reissue of parent "
+            f"{row['reissued_from_execution_request_id']!r}; the marker was deleted "
+            "out of band",
+        )
+    if marker["child_execution_request_id"] != request_id:
+        raise _integrity(
+            request_id,
+            f"the supersession marker for parent "
+            f"{row['reissued_from_execution_request_id']!r} names a different child "
+            f"({marker['child_execution_request_id']!r})",
+        )
 
 
 def _validate_reissue_chain(
@@ -2920,6 +3041,27 @@ def create_reissue_execution_order(
             connection, parent_execution_request_id
         )
 
+        # A supersession marker without its child row is out-of-band damage
+        # (the two are only ever written together); refuse to build a new
+        # chain on top of it (PR #121 Codex review r2 P1).
+        marker = connection.execute(
+            f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
+            (parent_execution_request_id,),
+        ).fetchone()
+        if marker is not None:
+            marked_child = connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+                "WHERE execution_request_id = ?",
+                (marker["child_execution_request_id"],),
+            ).fetchone()
+            if marked_child is None:
+                raise _integrity(
+                    parent_execution_request_id,
+                    f"a supersession marker names child "
+                    f"{marker['child_execution_request_id']!r} but that order row "
+                    "does not exist; the chain was damaged out of band",
+                )
+
         # Resolve + content-bind the registration clearance evidence (same
         # DB, same transaction), after validating the trail's contiguity.
         # The reference the child row will carry is built from the
@@ -2974,6 +3116,40 @@ def create_reissue_execution_order(
             )
 
         _insert_order_record(connection, record)
+        # Durable supersession provenance, in the SAME transaction as the
+        # child row (PR #121 Codex review r2 P1): the parent's loss of
+        # submission authority survives an out-of-band deletion of the
+        # child row -- mark_submitting refuses on EITHER artifact, and one
+        # without the other is an integrity error everywhere.
+        try:
+            connection.execute(
+                f"INSERT INTO {SUPERSESSIONS_TABLE} "
+                f"({', '.join(_SUPERSESSION_COLUMNS)}) VALUES (?, ?, ?)",
+                (
+                    parent_execution_request_id,
+                    request.execution_request_id,
+                    _iso(created_at_utc),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ExecutionOrderConflictError(
+                f"the parent execution order {parent_execution_request_id!r} already "
+                f"carries a supersession marker; one parent is reissued at most once: "
+                f"{exc}"
+            ) from exc
+        written_marker = connection.execute(
+            f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
+            (parent_execution_request_id,),
+        ).fetchone()
+        if written_marker is None or dict(written_marker) != {
+            "parent_execution_request_id": parent_execution_request_id,
+            "child_execution_request_id": request.execution_request_id,
+            "superseded_at_utc": _iso(created_at_utc),
+        }:  # pragma: no cover - defence in depth
+            raise _integrity(
+                request.execution_request_id,
+                "the supersession marker does not hold the intended values; rolling back",
+            )
         created = _validate_writeback(
             connection,
             request.execution_request_id,
@@ -3093,11 +3269,36 @@ def mark_submitting(
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
+        # Supersession is checked against BOTH artifacts written by the
+        # child registration (PR #121 Codex review r2 P1): the child row
+        # and the durable marker. Either alone refuses submission; the two
+        # are only ever committed together, so one without the other is
+        # out-of-band damage and fails as an integrity error rather than
+        # quietly resurrecting the parent.
         child = connection.execute(
             f"SELECT execution_request_id FROM {ORDERS_TABLE} "
             "WHERE reissued_from_execution_request_id = ?",
             (execution_request_id,),
         ).fetchone()
+        marker = connection.execute(
+            f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
+            (execution_request_id,),
+        ).fetchone()
+        if child is not None and marker is None:
+            raise _integrity(
+                execution_request_id,
+                f"reissue child {child['execution_request_id']!r} exists without a "
+                "supersession marker; the two are written atomically, so the marker "
+                "was deleted out of band",
+            )
+        if marker is not None and child is None:
+            raise _integrity(
+                execution_request_id,
+                f"a supersession marker names child "
+                f"{marker['child_execution_request_id']!r} but no reissue child row "
+                "exists; the child row was deleted out of band and the superseded "
+                "parent never regains submission authority",
+            )
         if child is not None:
             raise ExecutionOrderSupersededError(
                 f"execution order {execution_request_id!r} was superseded by its "
@@ -3971,12 +4172,11 @@ def record_reissue_clearance(
             "recorded into an initialized store (call init_db first)"
         )
     with _verified_txn(db_path) as connection:
-        current = connection.execute(
-            f"SELECT MAX(clearance_generation) FROM {CLEARANCES_TABLE} "
-            "WHERE signal_id = ?",
-            (signal_id,),
-        ).fetchone()[0]
-        current = 0 if current is None else int(current)
+        # The pre-existing trail (head commitment included) must be healthy
+        # before it is extended: recording never builds on -- or papers
+        # over -- out-of-band damage.
+        trail = _validate_clearance_trail(connection, signal_id)
+        current = len(trail)
         if expected_generation is not None and current != expected_generation:
             raise ExecutionClearanceError(
                 f"clearance for signal {signal_id!r} is at generation {current}, not "
@@ -4004,17 +4204,31 @@ def record_reissue_clearance(
                 f"clearance evidence for signal {signal_id!r} collides with an "
                 f"existing row (evidence_id {evidence_id!r} already recorded?): {exc}"
             ) from exc
-        stored = connection.execute(
-            f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
-            "AND clearance_generation = ?",
-            (signal_id, current + 1),
-        ).fetchone()
-        if stored is None or dict(stored) != record:  # pragma: no cover - defence
-            raise _integrity(
-                signal_id, "clearance row does not hold the intended values; rolling back"
+        # Move the trail-head commitment to the new tail IN THE SAME
+        # transaction (PR #121 Codex review r2 P1): the commitment and the
+        # append are never observable apart.
+        record_digest = _clearance_record_sha256(record)
+        if current == 0:
+            connection.execute(
+                f"INSERT INTO {CLEARANCE_HEADS_TABLE} "
+                f"({', '.join(_CLEARANCE_HEAD_COLUMNS)}) VALUES (?, ?, ?, ?)",
+                (signal_id, current + 1, record_digest, _iso(recorded_at_utc)),
             )
-        stored = dict(stored)
-    stored["record_sha256"] = _clearance_record_sha256(stored)
+        else:
+            connection.execute(
+                f"UPDATE {CLEARANCE_HEADS_TABLE} SET clearance_generation = ?, "
+                "record_sha256 = ?, updated_at_utc = ? WHERE signal_id = ?",
+                (current + 1, record_digest, _iso(recorded_at_utc), signal_id),
+            )
+        # pre-commit write-back: the appended trail (rows + head) must
+        # validate as a whole and end in exactly the intended record
+        written = _validate_clearance_trail(connection, signal_id)
+        if len(written) != current + 1 or written[-1] != record:
+            raise _integrity(
+                signal_id, "clearance trail does not hold the intended values; rolling back"
+            )
+        stored = written[-1]
+    stored["record_sha256"] = record_digest
     return stored
 
 
@@ -4057,22 +4271,14 @@ def _validate_clearance_rows(signal_id: str, rows: list[dict]) -> None:
 
 def list_reissue_clearances(signal_id: str, *, db_path: Path | None = None) -> list[dict]:
     """The signal's full clearance evidence trail, oldest generation first
-    (validated). Missing DB -> empty list, file never created."""
+    (fully validated: contiguity, row content and the trail-head
+    commitment). Missing DB -> empty list, file never created."""
     _require_non_empty_str(signal_id, "signal_id")
     db_path = Path(db_path) if db_path is not None else execution_db_path()
     if not db_path.exists():
         return []
     with _verified_read(db_path) as connection:
-        rows = [
-            dict(row)
-            for row in connection.execute(
-                f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
-                "ORDER BY clearance_generation ASC",
-                (signal_id,),
-            ).fetchall()
-        ]
-    _validate_clearance_rows(signal_id, rows)
-    return rows
+        return _validate_clearance_trail(connection, signal_id)
 
 
 def get_reissue_clearance(signal_id: str, *, db_path: Path | None = None) -> dict | None:
