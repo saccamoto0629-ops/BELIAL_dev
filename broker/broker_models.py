@@ -146,8 +146,17 @@ class RejectionCategory(enum.Enum):
     A CLOSED vocabulary: adapters map their native rejection codes onto
     these members INSIDE the adapter (the mapping tables live with each
     adapter, and the mapping input is the native response the adapter saw),
-    so broker-specific codes and strings never cross this boundary and the
-    execution layer never parses ``reject_reason`` text to make decisions.
+    so no broker-specific code is ever a DECISION input on this side of the
+    boundary — the execution layer acts on this enum and never parses
+    ``reject_reason`` text.
+
+    ``reject_reason`` is the deliberate exception to "broker strings stay
+    inside the adapter": it is the AUDIT field, and adapters put the
+    broker's own reason there after redacting and truncating it, so an
+    ordinary rejection does carry sanitized native text. That is a
+    pre-existing contract which classification neither widens nor replaces —
+    it adds no new retention path and never an un-redacted one.
+
     Anything an adapter cannot map — unknown codes, missing codes, and
     snapshots written before classification existed — is ``UNCLASSIFIED``,
     which is fail-closed: it never qualifies for automatic reissue
@@ -402,9 +411,10 @@ class OrderResult:
     ``rejection_category`` follows the same cross-constraint (Issue #114:
     required for REJECTED, None for every other state). ``reject_reason``
     stays the ONLY free-text audit field and keeps its safety contract —
-    adapters redact then truncate before it enters this model — while
-    ``rejection_category`` is the machine-checkable classification the
-    execution layer may act on; it never carries broker-native codes.
+    adapters redact then truncate before it enters this model, so it may
+    carry the broker's sanitized reason text — while ``rejection_category``
+    is the machine-checkable classification the execution layer may act on
+    and, being a closed enum, never carries broker-native codes.
     ``average_fill_price`` is not required to equal the recomputed weighted
     average exactly (a real broker may round), but must be present iff any
     fill exists.
