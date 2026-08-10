@@ -12,8 +12,8 @@
 ## 設計判断の要約
 
 1. **REJECTED は同一 Execution Request にとって terminal のまま維持する。** 同一 `execution_request_id` / 同一 `client_order_id` での再送信経路は今後も作らない(`ORDER_STATE_TRANSITIONS` 不変・`mark_submitting()` 一度きり・Journal 第二ガード不変)。
-2. **再発行は「暗黙のリトライ」ではなく「明示的な新しい注文意図」**として扱う: 新しい `execution_request_id` + 新しい `client_order_id` を持つ**別の ExecutionRequest レコード**を、元 Request との親子関係(`reissued_from_execution_request_id` + `signal_attempt`)を永続化して作成する。元 Request の行・履歴・snapshot には一切触れない。親子リンクは `reissue_kind` で 2 種類に区別する — **`broker_rejected`**(Broker が確定拒否した意図の再発行)と **`gate_correction`**(Broker へ一度も到達していない意図の訂正差し替え。下記「Safety Gate 拒否の扱い」)。
-3. **子 Request が親から変更してよいフィールドを限定する**: `signal_id` / `strategy_id` / `symbol` / `side` は identity として不変、注文パラメータ(数量・価格・SL / TP・order type)のみ訂正可能。数量は減少方向のみ。自動再試行は全パラメータ同一を必須とする(下記「子 Request のフィールド不変条件」)。
+2. **再発行は「暗黙のリトライ」ではなく「明示的な新しい注文意図」**として扱う: 新しい `execution_request_id` + 新しい `client_order_id` を持つ**別の ExecutionRequest レコード**を、元 Request との親子関係(`reissued_from_execution_request_id` + `signal_attempt`)を永続化して作成する。元 Request の **Execution 側の行・状態履歴・snapshot** には一切触れない(Broker へ到達していない意図の Submission Journal 記録だけは、訂正差し替え時に終端化の対象になる。下記「Journal 側の後始末(契約のみ)」)。親子リンクは `reissue_kind` で 2 種類に区別する — **`broker_rejected`**(Broker が確定拒否した意図の再発行)と **`gate_correction`**(Broker へ一度も到達していない意図の訂正差し替え。下記「Safety Gate 拒否の扱い」)。
+3. **子 Request が親から変更してよいフィールドを限定する**: `signal_id` / `strategy_id` / `symbol` / `side` は identity として不変、注文パラメータ(数量・価格・SL / TP・order type)のみ訂正可能。数量は原則として減少方向のみ(**例外: 親が `broker_rejected` かつ `rejection_category = parameter` の場合に限り policy 上限内の増量を許可**)。自動再試行は全パラメータ同一を必須とする(下記「子 Request のフィールド不変条件」が正)。
 4. **再発行可否は Broker 中立の正規化拒否分類(`RejectionCategory`)で決める。** Broker 固有の拒否コードは Adapter 内で分類へ写像され、共通モデルへ直接漏れない。分類できない拒否は fail-closed(自動再発行不可)。
 5. **手動再発行を先行し、自動再試行は定義のみ**: 初期実装は手動再発行(と `gate_correction`)のみ。自動再試行は `transient` カテゴリ限定・policy 上限つきの契約として本書で定義するが、Live Execution runner が存在するまで実装せず、policy 既定でも無効(上限 0)とする。
 6. **`signal_id` の一意性契約は「signal_id 全体一意」から「(signal_id, signal_attempt) 一意 + 線形チェーン制約」へ拡張する**(schema v5・後続 Issue)。同一 signal からの意図しない重複生成の防止は、従来どおり DB 制約 + `BEGIN IMMEDIATE` を最終防衛線として維持する。
@@ -232,7 +232,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 1. **登録**(後続 Issue の store API `create_reissue_execution_order()`(仮称)/ service API): 単一 `BEGIN IMMEDIATE` トランザクション内で、(a) 親行の存在と **`reissue_kind` に応じた状態要件**(`broker_rejected` → `order_state = rejected` / `gate_correction` → phase `created` かつ `order_state IS NULL`)の確認、(b) attempt 連番・チェーン整合・**フィールド不変条件(親行との突き合わせ)**の検証、(c) policy 上限(手動 / 自動 / 訂正それぞれ)の検証、(d) 新行 INSERT を行う。並行する再発行登録の競合は `UNIQUE(reissued_from_…)` / `UNIQUE(signal_id, signal_attempt)` への衝突で敗者が `ExecutionOrderConflictError`(正常系の抑止・行は増えない)になる。既存の作成時 conflict 分類・WARN ログ契約(Issue #76)をそのまま踏襲する。
    - **`gate_correction` の commit 後**: 送信されないことが確定した親の Journal intent は、上記の不変条件(監査可能な終端状態への収束・恒久残存の禁止・二重送信防止契約の非侵害)を満たすよう扱う。**具体的な経路・タイミング・再試行方式は #116。**
 2. **送信**: 登録された再発行 Request は phase `created` の通常の Request であり、**既存の `submit()` をそのまま**通る — Safety Gate の全条件再評価(市場状態・ポジション上限・kill switch を含む)、判定の耐久保存 + read-back、Submission Journal への耐久記録(新 entry)、`created → submitting` 一度きりの遷移獲得。**再発行だから緩和・省略される検査は 1 つもない**。
-3. **Journal との関係**: 再発行は新しい `execution_request_id` / `client_order_id` を持つため、Journal 上も**新しい entry**になる(entry の再利用・reclaim は発生しない)。親 attempt の entry は不変のまま残り、`client_order_id` UNIQUE により旧 Broker キーの再利用は Journal 側でも独立に拒否される。
+3. **Journal との関係**: 再発行は新しい `execution_request_id` / `client_order_id` を持つため、Journal 上も**新しい entry**になる(entry の再利用・reclaim は発生しない)。`client_order_id` の一意性により、旧 Broker キーの再利用は Journal 側でも独立に拒否される。親 attempt の記録は原則としてそのまま残るが、**唯一の例外が訂正差し替えである** — 差し替えによって「送信されないことが確定した」親の intent は、上記の不変条件に従って**監査可能な終端状態へ収束させなければならない**(未解決のまま恒久残存させない)。Broker 到達の可能性がある記録は対象外であり、終端化が送信可能性を増やすことはない。
 
 ## 自動再試行と手動再発行の責務分離
 
