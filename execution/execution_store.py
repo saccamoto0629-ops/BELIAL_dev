@@ -207,6 +207,7 @@ from broker.broker_models import (
     OrderSide,
     OrderState,
     OrderType,
+    RejectionCategory,
     TERMINAL_ORDER_STATES,
     validate_order_result_update,
     validate_order_state_transition,
@@ -331,11 +332,16 @@ FENCES_TABLE = "execution_repair_fences"
 
 # Strict snapshot JSON shape (PR #91 review r2 Minor 1): the key sets must
 # match EXACTLY -- unknown fields are rejected, missing fields are rejected.
-# One deliberate exception (Issue #102, backward compatibility): snapshots
-# written BEFORE the reissue support lack "superseded_broker_order_ids";
-# they parse as an empty chain (no reissue had been representable, so the
-# empty chain is exactly what those snapshots meant). Writes always include
-# the key.
+# Two deliberate exceptions ("missing = what the snapshot meant back then",
+# backward compatibility; writes always include every key):
+#
+# - Issue #102: snapshots written BEFORE the reissue support lack
+#   "superseded_broker_order_ids"; they parse as an empty chain (no reissue
+#   had been representable, so the empty chain is exactly what they meant).
+# - Issue #114: snapshots written BEFORE rejection classification lack
+#   "rejection_category"; a REJECTED snapshot parses as UNCLASSIFIED
+#   (fail-closed: never eligible for automatic reissue) and every other
+#   state parses as None (the REJECTED <-> required cross-constraint).
 _RESULT_JSON_KEYS: frozenset[str] = frozenset(
     {
         "client_order_id",
@@ -351,11 +357,15 @@ _RESULT_JSON_KEYS: frozenset[str] = frozenset(
         "average_fill_price",
         "updated_at_utc",
         "reject_reason",
+        "rejection_category",
         "fills",
         "superseded_broker_order_ids",
     }
 )
-_LEGACY_RESULT_JSON_KEYS: frozenset[str] = _RESULT_JSON_KEYS - {
+_PRE_CLASSIFICATION_RESULT_JSON_KEYS: frozenset[str] = _RESULT_JSON_KEYS - {
+    "rejection_category"
+}
+_LEGACY_RESULT_JSON_KEYS: frozenset[str] = _PRE_CLASSIFICATION_RESULT_JSON_KEYS - {
     "superseded_broker_order_ids"
 }
 _FILL_JSON_KEYS: frozenset[str] = frozenset({"fill_id", "price", "quantity", "filled_at_utc"})
@@ -1244,6 +1254,11 @@ def _result_to_json(result: OrderResult) -> str:
             "average_fill_price": dec(result.average_fill_price),
             "updated_at_utc": _iso(result.updated_at_utc),
             "reject_reason": result.reject_reason,
+            "rejection_category": (
+                None
+                if result.rejection_category is None
+                else result.rejection_category.value
+            ),
             "superseded_broker_order_ids": list(result.superseded_broker_order_ids),
             "fills": [
                 {
@@ -1267,8 +1282,13 @@ def _result_from_json(text: str) -> OrderResult:
     data = json.loads(text)
     if not isinstance(data, dict) or set(data) not in (
         _RESULT_JSON_KEYS,
-        # pre-Issue #102 snapshots: no reissue was representable, so the
-        # missing key means exactly "empty chain" (backward compatibility)
+        # pre-Issue #114 snapshots: no classification was representable, so
+        # the missing key means "unclassified" for REJECTED (fail-closed)
+        # and None for every other state (backward compatibility)
+        _PRE_CLASSIFICATION_RESULT_JSON_KEYS,
+        # pre-Issue #102 snapshots: additionally no reissue was
+        # representable, so the missing chain key means exactly "empty
+        # chain" (backward compatibility)
         _LEGACY_RESULT_JSON_KEYS,
     ):
         raise ValueError(
@@ -1283,6 +1303,26 @@ def _result_from_json(text: str) -> OrderResult:
     ):
         raise ValueError(
             "snapshot JSON 'superseded_broker_order_ids' must be a list of strings"
+        )
+    if "rejection_category" in data:
+        raw_category = data["rejection_category"]
+        if raw_category is None:
+            rejection_category = None
+        elif isinstance(raw_category, str):
+            # an unknown value raises ValueError from the closed enum --
+            # a tampered snapshot fails loudly instead of being coerced
+            rejection_category = RejectionCategory(raw_category)
+        else:
+            raise ValueError(
+                "snapshot JSON 'rejection_category' must be a string or null"
+            )
+    else:
+        # pre-Issue #114 snapshot (see _RESULT_JSON_KEYS): REJECTED reads
+        # back fail-closed as UNCLASSIFIED, every other state as None
+        rejection_category = (
+            RejectionCategory.UNCLASSIFIED
+            if data["state"] == OrderState.REJECTED.value
+            else None
         )
     for entry in data["fills"]:
         if not isinstance(entry, dict) or set(entry) != _FILL_JSON_KEYS:
@@ -1318,6 +1358,7 @@ def _result_from_json(text: str) -> OrderResult:
         ),
         reject_reason=data["reject_reason"],
         superseded_broker_order_ids=tuple(superseded),
+        rejection_category=rejection_category,
     )
 
 

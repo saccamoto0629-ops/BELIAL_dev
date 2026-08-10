@@ -37,6 +37,7 @@ from broker.broker_models import (
     OrderSide,
     OrderState,
     OrderType,
+    RejectionCategory,
 )
 from broker.fake_broker import (
     FakeBroker,
@@ -561,6 +562,7 @@ def test_manual_review_targets_are_never_repaired(paths):
         average_fill_price=None,
         updated_at_utc=accepted.updated_at_utc + timedelta(seconds=1),
         reject_reason="rejected later",
+        rejection_category=RejectionCategory.UNCLASSIFIED,
     )
     broker.submit_order(broker_request("stranger"))  # broker-only order
     facade = SnapshotBroker(broker, {client_id("exec-9"): rejected})

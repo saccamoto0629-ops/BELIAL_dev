@@ -14,7 +14,14 @@ from decimal import Decimal
 
 import pytest
 
-from broker.broker_models import Fill, OrderResult, OrderSide, OrderState, OrderType
+from broker.broker_models import (
+    Fill,
+    OrderResult,
+    OrderSide,
+    OrderState,
+    OrderType,
+    RejectionCategory,
+)
 from execution import execution_store as store
 from execution.execution_models import ExecutionRequest
 
@@ -55,9 +62,14 @@ def fill(fill_id, quantity, seconds):
 
 
 def make_result(state, request_id="exec-1", *, broker_order_id="B-1", filled="0",
-                fills=(), updated_at=None, reject_reason=None, **overrides):
+                fills=(), updated_at=None, reject_reason=None,
+                rejection_category=None, **overrides):
     fills = tuple(fills)
     filled_quantity = Decimal(filled)
+    if rejection_category is None and state is OrderState.REJECTED:
+        # Issue #114 cross-constraint: REJECTED requires a category; the
+        # helper defaults fail-closed unless a test pins one explicitly
+        rejection_category = RejectionCategory.UNCLASSIFIED
     kwargs = dict(
         client_order_id=f"client-{request_id}",
         broker_order_id=broker_order_id,
@@ -73,6 +85,7 @@ def make_result(state, request_id="exec-1", *, broker_order_id="B-1", filled="0"
         updated_at_utc=updated_at or at(2),
         fills=fills,
         reject_reason=reject_reason,
+        rejection_category=rejection_category,
     )
     kwargs.update(overrides)
     return OrderResult(**kwargs)
@@ -2682,8 +2695,9 @@ def test_reissue_conflicting_with_another_orders_current_id_is_rolled_back(db_pa
 
 
 def test_legacy_snapshots_without_the_chain_key_still_restore(db_path):
-    # snapshots written BEFORE Issue #102 lack superseded_broker_order_ids;
-    # they must keep parsing as an empty chain (backward compatibility)
+    # snapshots written BEFORE Issue #102 lack superseded_broker_order_ids
+    # (and, being older still than Issue #114, rejection_category too); they
+    # must keep parsing as an empty chain (backward compatibility)
     submit_and_partial_fill(db_path)
     with closing(sqlite3.connect(db_path)) as connection:
         rows = list(connection.execute(
@@ -2692,6 +2706,7 @@ def test_legacy_snapshots_without_the_chain_key_still_restore(db_path):
         for request_id, snapshot_text in rows:
             data = json.loads(snapshot_text)
             data.pop("superseded_broker_order_ids")
+            data.pop("rejection_category")
             legacy = json.dumps(data, sort_keys=True)
             connection.execute(
                 f"UPDATE {store.ORDERS_TABLE} SET last_order_result_json = ? "
@@ -2714,6 +2729,103 @@ def test_legacy_snapshots_without_the_chain_key_still_restore(db_path):
         db_path=db_path,
     )
     assert store.load_order_result("exec-1", db_path=db_path).broker_order_id == "B-2"
+
+
+def test_rejection_category_round_trips_through_the_snapshot(db_path):
+    # Issue #114: the normalized category is persisted with the snapshot and
+    # restored as the enum member; new writes always include the key
+    submit_and_accept(db_path)
+    rejected = make_result(
+        OrderState.REJECTED, reject_reason="insufficient margin",
+        rejection_category=RejectionCategory.ACCOUNT, updated_at=at(3),
+    )
+    store.record_order_result("exec-1", rejected, reason="rejected", db_path=db_path)
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.rejection_category is RejectionCategory.ACCOUNT
+    assert restored == rejected
+    with closing(sqlite3.connect(db_path)) as connection:
+        current = connection.execute(
+            f"SELECT last_order_result_json FROM {store.ORDERS_TABLE} "
+            "WHERE execution_request_id = 'exec-1'"
+        ).fetchone()[0]
+        history = connection.execute(
+            f"SELECT order_result_json FROM {store.HISTORY_TABLE} "
+            "WHERE new_state = 'rejected'"
+        ).fetchone()[0]
+    assert json.loads(current)["rejection_category"] == "account"
+    assert json.loads(history)["rejection_category"] == "account"
+
+
+def test_non_rejected_snapshots_write_an_explicit_null_category(db_path):
+    submit_and_accept(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        text = connection.execute(
+            f"SELECT last_order_result_json FROM {store.ORDERS_TABLE} "
+            "WHERE execution_request_id = 'exec-1'"
+        ).fetchone()[0]
+    data = json.loads(text)
+    assert "rejection_category" in data and data["rejection_category"] is None
+
+
+def test_pre_classification_rejected_snapshot_reads_back_unclassified(db_path):
+    # snapshots written BEFORE Issue #114 lack the rejection_category key: a
+    # REJECTED one restores as UNCLASSIFIED (fail-closed), losslessly for
+    # every other field, and a non-REJECTED one restores as None
+    submit_and_accept(db_path)
+    rejected = make_result(
+        OrderState.REJECTED, reject_reason="insufficient margin",
+        rejection_category=RejectionCategory.ACCOUNT, updated_at=at(3),
+    )
+    store.record_order_result("exec-1", rejected, reason="rejected", db_path=db_path)
+    def strip_category(text):
+        data = json.loads(text)
+        data.pop("rejection_category")
+        return json.dumps(data, sort_keys=True)
+
+    with closing(sqlite3.connect(db_path)) as connection:
+        # the orders table is WITHOUT ROWID: address rows by their own keys
+        for request_id, text in list(connection.execute(
+            f"SELECT execution_request_id, last_order_result_json "
+            f"FROM {store.ORDERS_TABLE} WHERE last_order_result_json IS NOT NULL"
+        )):
+            connection.execute(
+                f"UPDATE {store.ORDERS_TABLE} SET last_order_result_json = ? "
+                "WHERE execution_request_id = ?",
+                (strip_category(text), request_id),
+            )
+        for history_id, text in list(connection.execute(
+            f"SELECT history_id, order_result_json FROM {store.HISTORY_TABLE} "
+            "WHERE order_result_json IS NOT NULL"
+        )):
+            connection.execute(
+                f"UPDATE {store.HISTORY_TABLE} SET order_result_json = ? "
+                "WHERE history_id = ?",
+                (strip_category(text), history_id),
+            )
+        connection.commit()
+    restored = store.load_order_result("exec-1", db_path=db_path)
+    assert restored.rejection_category is RejectionCategory.UNCLASSIFIED
+    assert restored.state is OrderState.REJECTED
+    assert restored.reject_reason == "insufficient margin"
+
+
+def test_snapshot_with_an_invalid_category_value_is_rejected():
+    base = make_result(
+        OrderState.REJECTED, reject_reason="nope", updated_at=at(3)
+    )
+    data = json.loads(store._result_to_json(base))
+    # an unknown token: the closed enum refuses it
+    data["rejection_category"] = "vendor_code_42"
+    with pytest.raises(ValueError):
+        store._result_from_json(json.dumps(data, sort_keys=True))
+    # a non-string, non-null value
+    data["rejection_category"] = 5
+    with pytest.raises(ValueError, match="string or null"):
+        store._result_from_json(json.dumps(data, sort_keys=True))
+    # an explicit null on a REJECTED snapshot violates the cross-constraint
+    data["rejection_category"] = None
+    with pytest.raises(ValueError):
+        store._result_from_json(json.dumps(data, sort_keys=True))
 
 
 def test_tampered_history_chain_is_refused_on_restore(db_path):

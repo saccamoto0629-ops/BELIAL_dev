@@ -63,6 +63,7 @@ from .broker_models import (
     OrderState,
     OrderType,
     PositionInfo,
+    RejectionCategory,
     TERMINAL_ORDER_STATES,
     TradeInfo,
     validate_order_result_update,
@@ -249,12 +250,24 @@ class ReissueInformationLost:
 
 @dataclass(frozen=True)
 class RejectOrder:
-    """Broker definitively rejects the order (state ``REJECTED``)."""
+    """Broker definitively rejects the order (state ``REJECTED``).
+
+    ``category`` is the scripted normalized classification the rejection
+    answers with (Issue #114) — the FakeBroker analogue of a real adapter's
+    internal native-code -> ``RejectionCategory`` mapping: the script IS the
+    fake broker's native answer, so it names the category directly. The
+    default is ``UNCLASSIFIED`` (fail-closed), matching an adapter that
+    cannot map a rejection."""
 
     reason: str = "rejected by broker"
+    category: RejectionCategory = RejectionCategory.UNCLASSIFIED
 
     def __post_init__(self) -> None:
         _require_non_empty_reason(self.reason, "RejectOrder.reason")
+        if not isinstance(self.category, RejectionCategory):
+            raise BrokerInvalidRequestError(
+                f"RejectOrder.category must be a RejectionCategory, got {self.category!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -550,6 +563,7 @@ class FakeBroker:
                 broker_order_id=None,
                 fills=(),
                 reject_reason=script.reason,
+                rejection_category=script.category,
             )
         elif isinstance(script, StayPending):
             broker_order_id = self._resolve_broker_order_id(script, request.client_order_id)
@@ -937,6 +951,7 @@ class FakeBroker:
         fills: tuple[Fill, ...],
         reject_reason: str | None = None,
         superseded_broker_order_ids: tuple[str, ...] = (),
+        rejection_category: RejectionCategory | None = None,
     ) -> OrderResult:
         filled = sum((f.quantity for f in fills), Decimal(0))
         return OrderResult(
@@ -955,4 +970,5 @@ class FakeBroker:
             fills=fills,
             reject_reason=reject_reason,
             superseded_broker_order_ids=superseded_broker_order_ids,
+            rejection_category=rejection_category,
         )

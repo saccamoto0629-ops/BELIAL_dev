@@ -139,6 +139,30 @@ class BrokerRateLimitError(BrokerError):
 # --- enums ------------------------------------------------------------------
 
 
+class RejectionCategory(enum.Enum):
+    """Broker-neutral normalized classification of a definitive order
+    rejection (Issue #114).
+
+    A CLOSED vocabulary: adapters map their native rejection codes onto
+    these members INSIDE the adapter (the mapping tables live with each
+    adapter, and the mapping input is the native response the adapter saw),
+    so broker-specific codes and strings never cross this boundary and the
+    execution layer never parses ``reject_reason`` text to make decisions.
+    Anything an adapter cannot map — unknown codes, missing codes, and
+    snapshots written before classification existed — is ``UNCLASSIFIED``,
+    which is fail-closed: it never qualifies for automatic reissue
+    (``docs/architecture/execution_reissue.md`` owns the category ->
+    reissue-eligibility table).
+    """
+
+    TRANSIENT = "transient"
+    PARAMETER = "parameter"
+    ACCOUNT = "account"
+    INSTRUMENT = "instrument"
+    BROKER_INTERNAL = "broker_internal"
+    UNCLASSIFIED = "unclassified"
+
+
 class OrderSide(enum.Enum):
     BUY = "buy"
     SELL = "sell"
@@ -374,7 +398,13 @@ class OrderResult:
 
     Invariants: fills must sum to ``filled_quantity``; each state constrains
     ``filled_quantity`` (see ``__post_init__``); ``reject_reason`` exists
-    exactly for REJECTED and is then a non-empty string.
+    exactly for REJECTED and is then a non-empty string, and
+    ``rejection_category`` follows the same cross-constraint (Issue #114:
+    required for REJECTED, None for every other state). ``reject_reason``
+    stays the ONLY free-text audit field and keeps its safety contract —
+    adapters redact then truncate before it enters this model — while
+    ``rejection_category`` is the machine-checkable classification the
+    execution layer may act on; it never carries broker-native codes.
     ``average_fill_price`` is not required to equal the recomputed weighted
     average exactly (a real broker may round), but must be present iff any
     fill exists.
@@ -415,6 +445,7 @@ class OrderResult:
     fills: tuple[Fill, ...] = field(default_factory=tuple)
     reject_reason: str | None = None
     superseded_broker_order_ids: tuple[str, ...] = ()
+    rejection_category: RejectionCategory | None = None
 
     def __post_init__(self) -> None:
         # --- field/type validation (caller-supplied data) -> BrokerInvalidRequestError
@@ -436,6 +467,13 @@ class OrderResult:
                 raise BrokerInvalidRequestError(f"every fills entry must be a Fill, got {entry!r}")
         if self.reject_reason is not None:
             _require_non_empty_str(self.reject_reason, "reject_reason")
+        if self.rejection_category is not None and not isinstance(
+            self.rejection_category, RejectionCategory
+        ):
+            raise BrokerInvalidRequestError(
+                f"rejection_category must be a RejectionCategory or None, "
+                f"got {self.rejection_category!r}"
+            )
         if not isinstance(self.superseded_broker_order_ids, tuple):
             raise BrokerInvalidRequestError(
                 "superseded_broker_order_ids must be a tuple, got "
@@ -511,6 +549,10 @@ class OrderResult:
             raise ValueError("cancelled requires filled_quantity < requested_quantity")
         if (state is OrderState.REJECTED) != (self.reject_reason is not None):
             raise ValueError("reject_reason must be set exactly when state is rejected")
+        if (state is OrderState.REJECTED) != (self.rejection_category is not None):
+            raise ValueError(
+                "rejection_category must be set exactly when state is rejected"
+            )
         if state in (OrderState.ACCEPTED, OrderState.PARTIALLY_FILLED, OrderState.FILLED):
             if self.broker_order_id is None:
                 raise ValueError(f"state {state.value!r} requires a broker_order_id")

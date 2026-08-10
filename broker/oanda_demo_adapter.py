@@ -59,7 +59,15 @@ Error translation (everything crossing the boundary is a common type):
 - HTTP 5xx on a read           -> ``BrokerCommunicationError``
 - OANDA order rejection        -> returned ``OrderResult`` with state
   ``REJECTED`` + ``reject_reason`` (a definitive business answer, not an
-  exception — Issue #73 error style)
+  exception — Issue #73 error style) + ``rejection_category`` (Issue #114:
+  the native ``rejectReason`` code is mapped to the broker-neutral
+  ``RejectionCategory`` INSIDE this adapter by EXACT match; unknown,
+  missing, non-string and non-exact codes classify as ``unclassified``,
+  fail-closed. Classification introduces NO new retention of broker text:
+  ``reject_reason`` keeps its existing contract — the broker's reason
+  string redacted THEN truncated, so an ordinary rejection does carry the
+  native code text minus any echoed secret — and only the enum is a
+  decision input; the execution layer never parses the reason string)
 - malformed / unsupported call -> ``BrokerInvalidRequestError``
 - unknown order specifier      -> ``BrokerOrderNotFoundError``
 - refused cancellation         -> ``BrokerCancellationError``
@@ -140,6 +148,7 @@ from .broker_models import (
     PositionInfo,
     PositionSide,
     ProtectionOrderInfo,
+    RejectionCategory,
     TradeInfo,
     weighted_average_price,
 )
@@ -176,6 +185,56 @@ _MAX_REISSUE_CHAIN = 10
 # (Issue #73 / FakeBroker) models a duplicate client_order_id as
 # ``BrokerInvalidRequestError``, not as an ordinary REJECTED result.
 _OANDA_DUPLICATE_ID_REASON = "CLIENT_ORDER_ID_ALREADY_EXISTS"
+
+# Native OANDA ``rejectReason`` code -> normalized ``RejectionCategory``
+# (Issue #114). The mapping lives INSIDE this adapter: the input is the raw
+# code the adapter saw in the reject transaction, and the resulting
+# broker-neutral category is the only classification signal that crosses the
+# boundary — the execution layer never parses broker text to decide.
+# Classification adds NO new retention of broker text: the native reason
+# string may still appear in the pre-existing ``reject_reason`` audit field,
+# which keeps its redact-then-truncate contract unchanged.
+#
+# Deliberately a SMALL seed table matched EXACTLY on the value as received —
+# no trimming, no case folding (PR #119 Codex review P2): a whitespace-padded
+# or otherwise non-exact token is not the documented code, and normalizing it
+# would turn a malformed response into a category (e.g. TRANSIENT) that can
+# later qualify for automatic reissue. Exhaustive OANDA coverage belongs to
+# the live-connection work; any code not listed here — and any missing /
+# non-string / non-exact code — classifies as UNCLASSIFIED (fail-closed:
+# never auto-reissued).
+_OANDA_REJECTION_CATEGORIES: dict[str, RejectionCategory] = {
+    # momentary market conditions
+    "INSUFFICIENT_LIQUIDITY": RejectionCategory.TRANSIENT,
+    "MARKET_HALTED": RejectionCategory.TRANSIENT,
+    # malformed order content (a resend of the same content answers the same)
+    "UNITS_INVALID": RejectionCategory.PARAMETER,
+    "UNITS_PRECISION_EXCEEDED": RejectionCategory.PARAMETER,
+    "UNITS_LIMIT_EXCEEDED": RejectionCategory.PARAMETER,
+    "PRICE_INVALID": RejectionCategory.PARAMETER,
+    "PRICE_PRECISION_EXCEEDED": RejectionCategory.PARAMETER,
+    "PRICE_BOUND_INVALID": RejectionCategory.PARAMETER,
+    "PRICE_BOUND_PRECISION_EXCEEDED": RejectionCategory.PARAMETER,
+    # account-state refusals
+    "INSUFFICIENT_MARGIN": RejectionCategory.ACCOUNT,
+    "ACCOUNT_NOT_ACTIVE": RejectionCategory.ACCOUNT,
+    # instrument availability
+    "INSTRUMENT_NOT_TRADEABLE": RejectionCategory.INSTRUMENT,
+    # the broker answered a DEFINITIVE rejection blaming itself (a 5xx or
+    # timeout stays UNKNOWN via the error taxonomy and never reaches this map)
+    "INTERNAL_SERVER_ERROR": RejectionCategory.BROKER_INTERNAL,
+}
+
+
+def _classify_oanda_rejection(native_reject_reason) -> RejectionCategory:
+    """Map a raw ``rejectReason`` code onto the closed ``RejectionCategory``
+    vocabulary (Issue #114) — EXACT match on the value as received, with no
+    trimming or case folding, so every non-exact token stays fail-closed."""
+    if isinstance(native_reject_reason, str):
+        category = _OANDA_REJECTION_CATEGORIES.get(native_reject_reason)
+        if category is not None:
+            return category
+    return RejectionCategory.UNCLASSIFIED
 
 # Environment variable names (values are read from the process environment
 # only; never hard-code or log the values — docs/operations/operations.md).
@@ -581,9 +640,17 @@ class OandaDemoAdapter:
                     context="orderRejectTransaction",
                 )
                 # A definitive business rejection is a RESULT, not an
-                # exception (Issue #73 error style).
+                # exception (Issue #73 error style). The classification input
+                # is the NATIVE rejectReason code as seen here inside the
+                # adapter (Issue #114); only the broker-neutral category and
+                # the redacted-then-truncated reason cross the boundary.
                 return self._result_from_request(
-                    request, state=OrderState.REJECTED, reject_reason=reason
+                    request,
+                    state=OrderState.REJECTED,
+                    reject_reason=reason,
+                    rejection_category=_classify_oanda_rejection(
+                        reject.get("rejectReason")
+                    ),
                 )
             raise BrokerInvalidRequestError(
                 self._message("order submission was refused as invalid", payload),
@@ -1514,6 +1581,7 @@ class OandaDemoAdapter:
         fills: tuple[Fill, ...] = (),
         reject_reason: str | None = None,
         superseded_broker_order_ids: tuple[str, ...] = (),
+        rejection_category: RejectionCategory | None = None,
     ) -> OrderResult:
         filled = sum((f.quantity for f in fills), Decimal(0))
         try:
@@ -1535,6 +1603,7 @@ class OandaDemoAdapter:
                 fills=fills,
                 reject_reason=reject_reason,
                 superseded_broker_order_ids=superseded_broker_order_ids,
+                rejection_category=rejection_category,
             )
         except (ValueError, BrokerInvalidRequestError) as exc:
             # A broker answer inconsistent with the common-model invariants
