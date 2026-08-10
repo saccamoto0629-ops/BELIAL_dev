@@ -32,6 +32,10 @@ BELIAL の設計資料を置く。
   (送信されない)、Broker 応答後の Execution DB 保存失敗は `reconciliation_required` として Journal に残り、
   Execution DB 全損時・プロセス再起動後も未解決送信を列挙できる。クラッシュ境界ごとの再送 / 照会 /
   reconciliation の扱いを定義する。実装は `execution/submission_journal.py`。
+- [Execution Intent Reissue](execution_reissue.md)(Issue #95 設計・未実装): `REJECTED` で終端した
+  Execution Request の注文意図を、明示的な新 intent(新 `execution_request_id` / 新 `client_order_id` +
+  親子関係の永続化)として再発行するモデル。状態機械は不変(REJECTED は terminal のまま)で、
+  再発行可否は Broker 中立の正規化拒否分類で決める。schema v5・API の実装は後続 Issue。
 - [Shadow Mode / Shadow Execution](shadow_execution.md)(Issue #78): 実 Signal・実設定・Safety Gate を
   通常の Production 経路で実行しつつ Broker へは一切送信せず、生成された注文候補と Gate 判定を
   検証記録として保存する Shadow Mode。execution mode(`dry-run` / `shadow` / `fake` / `demo` / `live`)の
