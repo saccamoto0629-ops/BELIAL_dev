@@ -264,13 +264,17 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 
 したがって条件を反転し、**全 kind 共通の前提として「有効な clearance(無差分の積極的証拠)」を要求**する(fail-closed)。clearance の要件はすべて満たされなければならない:
 
-1. 対象 signal のチェーンに属する**全 `execution_request_id` を照合対象に含む** reconciliation run であること。
+1. チェーンに属する注文のうち **reconciliation の比較対象になりうるもの(= Broker state を持つもの)をすべて照合対象に含む** run であること。
 2. その run が **order スコープと position スコープの両方**を実施していること(`include_position_scope = True`。既定の order-only run は clearance にならない)。
 3. その run の position summary に**列挙エラーが無く**(`internal_exposure_error` / `position_listing_error` / `trade_listing_error` / `closed_trade_listing_error` がすべて NULL)、対象 signal の symbol が `excluded_symbols` に**含まれない**こと。
 4. その run がチェーンについて **discrepancy を 1 件も報告していない**こと(order 系・position 系のいずれも)。
 5. policy の**鮮度窓内**であること(`max_reconciliation_clearance_age`。具体値は #116 で確定)。
 
-`gate_correction` の親は Broker へ到達していないため通常は自明に clean だが、規則は同一に適用する(fail-closed)。
+**要件 1 が「Broker state を持つもの」に限定される理由**(PR #118 Codex レビュー r6 P1): reconciliation の比較対象集合を返す `list_reconciliation_orders()` は **`order_state IS NULL` の `created` intent を構造的に除外**する(送信試行が無いため Broker 側に対応物が存在しない)。したがって「チェーンの**全** `execution_request_id` を照合対象に含むこと」を要求すると、**`gate_correction` の親(定義上 phase `created` / `order_state IS NULL`)は永久に要件を満たせず、この経路が常に fail-closed で機能しなくなる**。
+
+- Broker へ到達していない意図について必要な保証は「その意図に対応する Broker 注文が存在しないこと」であり、それは reconciliation ではなく **Submission Journal の `not_started` 証明(適格条件 3)** が担保する。両者は同じ事実を別の証拠で押さえており、reconciliation に肩代わりさせる必要はない。
+- チェーンに Broker state を持つ注文が 1 件も無い場合(例: 初回 attempt が一度も送信されないまま Gate 拒否された)、要件 1 は空に満たされる。ただし **要件 2・3(position スコープの成功実施と対象シンボルの非除外)は依然として必須**であり、「そのシンボルに BELIAL が知らない Broker 側 exposure が無い」ことは積極的に確認される。
+- `broker_rejected` の親は `order_state = rejected`(terminal)であり、`list_reconciliation_orders()` は terminal も比較対象に含めるため、要件 1 は通常どおり適用される。
 
 ### 登録から送信までの fencing
 
