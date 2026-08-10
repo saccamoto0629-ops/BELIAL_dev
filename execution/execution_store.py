@@ -2308,6 +2308,52 @@ def _validate_row_evidence(
         )
 
 
+def _validate_outgoing_supersession(connection: sqlite3.Connection, row: dict) -> None:
+    """Cross-validate this row's OUTGOING supersession artifacts -- the
+    child row pointing at it and the durable marker naming it -- on EVERY
+    restore, attempt-1 parents included (PR #121 Codex review r3 P2).
+
+    The two artifacts are only ever committed together, so one without the
+    other is out-of-band damage: without this check a dangling marker
+    (child row deleted) would leave the superseded parent readable as the
+    live chain tail, detected only at ``mark_submitting``. Raises
+    :class:`ExecutionIntegrityError`."""
+    request_id = row["execution_request_id"]
+    child = connection.execute(
+        f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+        "WHERE reissued_from_execution_request_id = ?",
+        (request_id,),
+    ).fetchone()
+    marker = connection.execute(
+        f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if child is None and marker is None:
+        return
+    if marker is None:
+        raise _integrity(
+            request_id,
+            f"reissue child {child['execution_request_id']!r} exists without a "
+            "supersession marker; the two are written atomically, so the marker "
+            "was deleted out of band",
+        )
+    if child is None:
+        raise _integrity(
+            request_id,
+            f"a supersession marker names child "
+            f"{marker['child_execution_request_id']!r} but that order row does not "
+            "exist; the child row was deleted out of band and the superseded "
+            "parent never regains submission authority",
+        )
+    if marker["child_execution_request_id"] != child["execution_request_id"]:
+        raise _integrity(
+            request_id,
+            f"the supersession marker names child "
+            f"{marker['child_execution_request_id']!r} but the reissue child row is "
+            f"{child['execution_request_id']!r}",
+        )
+
+
 def _validate_reissue_chain(
     connection: sqlite3.Connection, row: dict, history: list[dict]
 ) -> None:
@@ -2332,6 +2378,7 @@ def _validate_reissue_chain(
     problems = _reissue_row_problems(row)
     if problems:
         raise _integrity(request_id, "; ".join(problems))
+    _validate_outgoing_supersession(connection, row)
     _validate_row_evidence(connection, row, history)
     if row["signal_attempt"] < 2:
         return
@@ -3041,26 +3088,11 @@ def create_reissue_execution_order(
             connection, parent_execution_request_id
         )
 
-        # A supersession marker without its child row is out-of-band damage
-        # (the two are only ever written together); refuse to build a new
-        # chain on top of it (PR #121 Codex review r2 P1).
-        marker = connection.execute(
-            f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
-            (parent_execution_request_id,),
-        ).fetchone()
-        if marker is not None:
-            marked_child = connection.execute(
-                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
-                "WHERE execution_request_id = ?",
-                (marker["child_execution_request_id"],),
-            ).fetchone()
-            if marked_child is None:
-                raise _integrity(
-                    parent_execution_request_id,
-                    f"a supersession marker names child "
-                    f"{marker['child_execution_request_id']!r} but that order row "
-                    "does not exist; the chain was damaged out of band",
-                )
+        # A supersession marker without its child row (out-of-band damage)
+        # was already rejected by the parent bundle load above --
+        # _validate_outgoing_supersession runs on every restore, so a new
+        # chain is never built on top of a dangling marker (PR #121 Codex
+        # review r2/r3).
 
         # Resolve + content-bind the registration clearance evidence (same
         # DB, same transaction), after validating the trail's contiguity.
@@ -3269,36 +3301,18 @@ def mark_submitting(
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
-        # Supersession is checked against BOTH artifacts written by the
-        # child registration (PR #121 Codex review r2 P1): the child row
-        # and the durable marker. Either alone refuses submission; the two
-        # are only ever committed together, so one without the other is
-        # out-of-band damage and fails as an integrity error rather than
-        # quietly resurrecting the parent.
+        # Supersession refuses submission on EITHER artifact written by the
+        # child registration (PR #121 Codex review r2 P1): a consistent
+        # child+marker pair is the typed refusal below, while one artifact
+        # without the other (out-of-band damage) was already rejected as an
+        # ExecutionIntegrityError by the bundle load above
+        # (:func:`_validate_outgoing_supersession` runs on every restore) --
+        # a dangling marker never quietly resurrects the parent.
         child = connection.execute(
             f"SELECT execution_request_id FROM {ORDERS_TABLE} "
             "WHERE reissued_from_execution_request_id = ?",
             (execution_request_id,),
         ).fetchone()
-        marker = connection.execute(
-            f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
-            (execution_request_id,),
-        ).fetchone()
-        if child is not None and marker is None:
-            raise _integrity(
-                execution_request_id,
-                f"reissue child {child['execution_request_id']!r} exists without a "
-                "supersession marker; the two are written atomically, so the marker "
-                "was deleted out of band",
-            )
-        if marker is not None and child is None:
-            raise _integrity(
-                execution_request_id,
-                f"a supersession marker names child "
-                f"{marker['child_execution_request_id']!r} but no reissue child row "
-                "exists; the child row was deleted out of band and the superseded "
-                "parent never regains submission authority",
-            )
         if child is not None:
             raise ExecutionOrderSupersededError(
                 f"execution order {execution_request_id!r} was superseded by its "

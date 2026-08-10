@@ -1457,3 +1457,41 @@ def test_the_supersession_marker_is_written_atomically_with_the_child(db_path):
     )
     with pytest.raises(store.ExecutionIntegrityError, match="different child"):
         store.get_execution_order("exec-2", db_path=db_path)
+
+
+# --- PR #121 Codex review round 3 fix ----------------------------------------------
+
+
+def test_a_dangling_marker_fails_parent_reads_closed(db_path, tmp_path):
+    """r3 P2 (reviewer repro): with the child row deleted out of band and
+    its marker left behind, every read path -- not only mark_submitting --
+    must refuse to expose the superseded parent as the live chain tail."""
+    create_order(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1")
+    safety_path, reference = gate_reference(tmp_path)
+    register_child(
+        db_path,
+        kind=store.REISSUE_KIND_GATE_CORRECTION,
+        clearance=clearance,
+        gate_correction_reference=reference,
+        gate_decision_db_path=safety_path,
+        quantity=Decimal("5"),
+    )
+    _raw(db_path, f"DELETE FROM {store.ORDERS_TABLE} WHERE execution_request_id = 'exec-2'")
+    with pytest.raises(store.ExecutionIntegrityError, match="deleted out of band"):
+        store.get_execution_order("exec-1", db_path=db_path)
+    with pytest.raises(store.ExecutionIntegrityError, match="deleted out of band"):
+        store.get_execution_order_by_signal_id("sig-exec-1", db_path=db_path)
+    with pytest.raises(store.ExecutionIntegrityError, match="deleted out of band"):
+        store.list_execution_order_chain("sig-exec-1", db_path=db_path)
+    # the mirror damage -- marker deleted, child row kept -- fails the
+    # parent's reads too (the child's own reads were already covered)
+    db2 = db_path.parent / "second_marker.sqlite3"
+    reject_parent(db2)
+    register_child(db2)
+    _raw(
+        db2,
+        f"DELETE FROM {store.SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = 'exec-1'",
+    )
+    with pytest.raises(store.ExecutionIntegrityError, match="supersession marker"):
+        store.get_execution_order("exec-1", db_path=db2)
