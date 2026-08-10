@@ -146,20 +146,13 @@ Broker は「最小取引数量を下回る」「数量の刻み(increment)が�
 | `reissue_initiated_by` | TEXT NULL(CHECK: `manual` / `auto`) | attempt ≥ 2 で必須。誰の判断による再発行か |
 | `reissue_reason` | TEXT NULL | attempt ≥ 2 で必須・非空。手動: 運用者の識別子と判断理由。自動: 適用 policy の識別子と根拠カテゴリ |
 | `reissue_source_decision_id` | INTEGER NULL | **`gate_correction` で必須**(それ以外では NULL)。適格性の根拠とした `safety_gate_decisions.decision_id`。別 DB ファイルのため FK は張れず**参照値**として保持する(repair fence mirror と同じ割り切り) |
-| `reissue_clearance_run_id` | TEXT NULL | attempt ≥ 2 で必須。登録時に根拠とした reconciliation run の `run_id`(**参照値**)。送信可否の判定は下記 mirror が正で、この列は監査用の provenance |
+| `reissue_clearance_run_id` | TEXT NULL | attempt ≥ 2 で必須。**登録**を正当化した clearance evidence(reconciliation run)への参照。**送信を許可した evidence は別途追跡可能に残す**(下記「送信を許可した evidence の追跡可能性」。保存形式は #115) |
 
-`execution_reissue_clearances`(WITHOUT ROWID。**reconciliation clearance mirror**):
+**clearance evidence の保持**: reconciliation DB を execution store のトランザクション内から読むことはできない(ファイルを跨げない)。したがって「送信権を与える判断と同じ場所で clearance の有効性を確認できる」ための耐久的な仕組みが必要になる — 既存の repair fence mirror と同じ問題設定である。**その具体形式(テーブル定義・状態値・世代・claim・更新規則)は後続 Issue(#115)で設計する。** 本 Issue が要求するのは次の性質のみである。
 
-| 列 | 意味 |
-|---|---|
-| `signal_id` TEXT PRIMARY KEY | チェーン単位で 1 行 |
-| `sequence` INTEGER NOT NULL(≥ 1) | **単調増加の観測世代**。suspend が `保存値 + 1` を採番し、publish はこの値と `run_id` の一致を CAS 条件とする(古い run による上書きを防ぐ) |
-| `run_id` TEXT NOT NULL | この世代を保持している reconciliation run |
-| `state` TEXT NOT NULL(CHECK: `suspended` / `clear` / `revoked`) | `suspended` = 観測中(送信不可)、`clear` = 要件を満たす無差分観測、`revoked` = 差分あり。**送信を許可するのは `clear` のみ** |
-| `position_scope_verified` INTEGER NOT NULL(0 / 1) | その run が position スコープを**列挙エラー・対象シンボルの除外なしで**実施したか(`clear` で 1 必須) |
-| `observed_at_utc` / `updated_at_utc` TEXT NOT NULL | 鮮度窓の判定に使う観測時刻と更新時刻(UTC) |
-
-reconciliation DB を execution store のトランザクション内から読むことはできない(ファイルを跨げない)ため、**repair fence と同じく execution DB 側へ mirror を置き、送信権の付与と同じトランザクションで照合する**。書き込むのは reconciliation 側だが、対象はこの mirror テーブルのみであり、注文行・履歴には触れない。
+- 送信権の付与と同じ判断単位で clearance の有効性を検証できること。
+- reconciliation 側の書き込みは clearance evidence に限られ、**注文行・状態履歴には触れない**(既存の「修復の書き込みは `record_order_result` だけ」という契約は不変)。
+- 反映・失効の失敗が「送信可能」を維持しないこと(fail-closed)。
 
 一意性制約(すべて DB 制約が最終防衛線):
 
@@ -185,7 +178,7 @@ reconciliation DB を execution store のトランザクション内から読む
 - 上記以外の親状態(`pending` / `accepted` / `partially_filled` / `unknown`)は**どちらの kind でも登録拒否** — **UNKNOWN / SUBMITTING / ACCEPTED など Broker 受理の可能性が残る状態から意図を再発行する経路は存在しない**(Issue #95 の維持必須契約)
 - 親が `filled` / `cancelled` の場合も登録拒否(fill を得た意図・取り消した意図の「再発行」は別の業務判断であり、本モデルの対象外。キャンセル後の扱いは Issue #99 の進行を待って別途判断する)
 - **`gate_correction` の子を持つ親は送信権を得られない**: `mark_submitting()` は同一トランザクション内で「自分を親とする子行が存在しないこと」を確認し、存在すれば送信権を与えない(Safety Gate 側は `intent_superseded`)。これにより 1 signal に live な intent が 2 つ存在することはない
-- **再発行の子は有効な clearance がなければ送信権を得られない**: `mark_submitting()` は同一トランザクション内で clearance mirror(`clear` / position スコープ検証済み / 鮮度窓内)を照合する(上記「登録から送信までの fencing」)
+- **再発行の子は有効な clearance がなければ送信権を得られない**: 送信権の付与は、その時点で clearance が有効であることの確認と不可分でなければならない(下記「登録から送信までの有効性(契約)」)
 
 ### チェーンのライフサイクル(状態遷移図)
 
@@ -238,7 +231,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 | 回数上限 | policy `max_manual_reissues_per_signal`(既定は小さい有限値。後続 Issue で確定) | policy `max_gate_corrections_per_signal`(同上) | policy `max_auto_reissues_per_signal`(**既定 0 = 無効**) |
 | 追加条件 | — | Gate 判定 / Journal 事前条件(上記)。crash boundary 3 は対象外 | cooldown(連打防止)・kill switch 有効時は不可 |
 
-**全経路に共通する前提**: 有効な **reissue clearance**(position スコープを含む run による無差分の積極的証拠・鮮度窓内)が必要であり、登録時だけでなく**送信時にも mirror で再検証**される(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
+**全経路に共通する前提**: 有効な **reissue clearance**(order / position 双方の照合が成功した無差分の積極的証拠・鮮度窓内)が必要であり、登録時だけでなく**送信の瞬間まで有効**でなければならない(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
 
 - 回数の判定は**常に永続化された行から導出**する(該当 signal の MAX(`signal_attempt`) と `reissue_kind` / `initiated_by` の集計)。in-memory カウンタ・プロセス状態には依存しないため、**プロセス再起動・多重起動後も上限と一意性が維持される**。
 - 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する。
@@ -262,44 +255,43 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 - 後続 run が差分を報告しなくても、その run が **order スコープのみ**(`include_position_scope` の既定は **False**)であれば position 側は照合されていない。
 - 列挙が失敗した run・fail-safe で除外されたシンボルも「見ていない」のであって「差分なし」ではない(`PositionReconciliationSummary` は両者を区別するために存在する)。
 
-したがって条件を反転し、**全 kind 共通の前提として「有効な clearance(無差分の積極的証拠)」を要求**する(fail-closed)。clearance の要件はすべて満たされなければならない:
+したがって条件を反転し、**全 kind 共通の前提として「有効な clearance(無差分の積極的証拠)」を要求**する(fail-closed)。**本 Issue が定めるのは以下の契約であり、その実現方式(照合対象の抽出クエリ・証拠の保存形式・並行制御)は後続 Issue(#115 / #116)で設計する。**
 
-1. チェーンに属する注文のうち **reconciliation の比較対象になりうるもの(= Broker state を持つもの)をすべて照合対象に含む** run であること。
-2. その run が **order スコープと position スコープの両方**を実施していること(`include_position_scope = True`。既定の order-only run は clearance にならない)。
-3. その run の position summary に**列挙エラーが無く**(`internal_exposure_error` / `position_listing_error` / `trade_listing_error` / `closed_trade_listing_error` がすべて NULL)、対象 signal の symbol が `excluded_symbols` に**含まれない**こと。
-4. その run がチェーンについて **discrepancy を 1 件も報告していない**こと(order 系・position 系のいずれも)。
-5. policy の**鮮度窓内**であること(`max_reconciliation_clearance_age`。具体値は #116 で確定)。
+1. **照合が実施されたこと**: 対象 signal のチェーンについて、order ドメインと position ドメインの**双方が実際に照合され、その列挙が成功している**こと。**未実施・列挙失敗・fail-safe による対象除外は「差分なし」ではない**(観測していないことを無差分と読まない)。
+2. **差分が無かったこと**: その照合がチェーンについて差分を 1 件も報告していないこと。
+3. **未送信の親については、対応する Broker 注文が存在しないことの positive evidence**(下記)。
+4. **鮮度**: 証拠が policy の定める鮮度窓内であること。
+5. 上記のいずれかが**確認できない場合は fail-closed**(再発行を許可しない)。
 
-**要件 1 が「Broker state を持つもの」に限定される理由**(PR #118 Codex レビュー r6 P1): reconciliation の比較対象集合を返す `list_reconciliation_orders()` は **`order_state IS NULL` の `created` intent を構造的に除外**する(送信試行が無いため Broker 側に対応物が存在しない)。したがって「チェーンの**全** `execution_request_id` を照合対象に含むこと」を要求すると、**`gate_correction` の親(定義上 phase `created` / `order_state IS NULL`)は永久に要件を満たせず、この経路が常に fail-closed で機能しなくなる**。
+チェーンに Broker 側の対応物を持つ注文が 1 件も無い場合(初回 attempt が一度も送信されないまま Gate 拒否された等)、要件 1 のうち order ドメインの比較対象は空になりうるが、**position ドメインの成功照合と要件 3 は依然として必須**である。
 
-- Broker へ到達していない意図について必要な保証は「その意図に対応する Broker 注文が存在しないこと」であり、それは reconciliation ではなく **Submission Journal の `not_started` 証明(適格条件 3)** が担保する。両者は同じ事実を別の証拠で押さえており、reconciliation に肩代わりさせる必要はない。
-- チェーンに Broker state を持つ注文が 1 件も無い場合(例: 初回 attempt が一度も送信されないまま Gate 拒否された)、要件 1 は空に満たされる。ただし **要件 2・3(position スコープの成功実施と対象シンボルの非除外)は依然として必須**であり、「そのシンボルに BELIAL が知らない Broker 側 exposure が無い」ことは積極的に確認される。
-- `broker_rejected` の親は `order_state = rejected`(terminal)であり、`list_reconciliation_orders()` は terminal も比較対象に含めるため、要件 1 は通常どおり適用される。
+#### 未送信の親に対する positive evidence(`gate_correction`)
 
-### 登録から送信までの fencing
+**「送信していないはずだ」という不在の推論では足りない**。`gate_correction` は、親 Request に対応する **Broker 注文が存在しないことを信頼できる positive evidence で確認できない限り fail-closed** とする。
 
-clearance を事前条件として読むだけでは、**読み取り後に discrepancy が commit され、その後に子が登録・送信される**窓が残る(reconciliation DB は別ファイルであり、execution DB の `BEGIN IMMEDIATE` では守れない。r4 P1)。repair fence と同じ **mirror 方式(案 A)** を採るが、**観測を commit してから mirror を更新する「後追い」方式は採らない**(r5 P1): その方式では、差分を記録した run の commit と mirror 更新の間に `mark_submitting()` が古い `clear` を受理でき、mirror 更新に失敗すればそのまま送信可能な状態が残ってしまう。
+- Submission Journal の `not_started` は**必要条件として維持するが、十分条件としては扱わない**(Journal 自体の消失・再作成では entry の不在が未送信を意味しない)。
+- 現行の reconciliation 経路は、この保証を構造的に与えない: 比較対象集合は Broker state を持つ注文に限られ、Broker 側にのみ存在する注文の判定は `created` 行を含む `client_order_id` 集合との突き合わせで行われるため、**親の `client_order_id` を持つ Broker 注文は「既知」と見なされ差分として報告されない**。約定前であれば position / trade ドメインにも現れない。
+- したがって **親の broker 側キーに対する明示的な照会結果**(存在しないことの確認)を evidence として要求する。照会が失敗した場合・注文が存在した場合はいずれも fail-closed。
+- **どの経路で照会し、結果をどう保存・検証するかは後続 Issue(#116)** で設計する。
 
-**書き込み先行(write-ahead)の invalidation** で閉じる。reconciliation 側の順序は次で固定する。
+### 登録から送信までの有効性(契約)
 
-1. **観測の前に mirror を `suspended` にする**(Broker 照会を発行する前)。対象は、その run が照合するチェーンの `signal_id`。これは execution DB への durable な書き込みであり、以後 `mark_submitting()` は再発行の子へ送信権を与えない。
-2. **この suspend に失敗した run は、そのチェーンの観測を行わない**(fail-closed)。したがって **「commit 済みの観測が存在するのに mirror がそれを知らない」状態は原理的に発生しない** — mirror が `clear` を示すことは「未反映の観測が存在しない」ことを含意する。
-3. 観測を reconciliation DB へ commit する。
-4. **commit 後に mirror を publish する**: 差分ゼロかつ clearance 要件(スコープ・列挙エラー・除外シンボル)を満たすなら `clear`、差分を 1 件でも記録したなら `revoked`。**publish に失敗した場合、mirror は `suspended` のまま残る = ブロック継続**(失敗が送信可能状態へ化けない)。
+- clearance は**登録時点だけでなく、実際に Broker へ送信する瞬間まで有効**でなければならない。事前確認だけで送信を許可しない。
+- **差分を観測したという事実が、送信可否の判断に反映されないまま送信される経路が存在してはならない**。観測の反映・失効は、送信権の付与に対して先行または同時に効力を持つ必要がある。
+- **失敗は常に送信不可側へ倒れる**: 証拠の記録・反映・照合のいずれかが失敗した場合、その結果として「送信可能」が維持されてはならない。
+- **権限を下げる情報は常に優先される**(単調性): 差分あり・観測中・不明のいずれも送信を許可しない。権限を与える判断だけが、上記の全要件を満たした場合に成立する。
+- **どのように atomic に保存し、どのように並行観測を直列化し、どのように cross-DB の順序を保証するかは後続 Issue(#115 / #116)** で設計する。
 
-**単調な観測順序による直列化**(r5 P1): mirror は `sequence`(単調増加の観測世代)を持ち、更新は CAS で守る。
+### 送信を許可した evidence の追跡可能性(契約)
 
-- suspend は execution DB の `BEGIN IMMEDIATE` 内で `sequence = 保存値 + 1` を採番し、その値と run identity を mirror へ書く(採番も照合も同一トランザクション)。
-- publish は **自分が採番した `sequence` と run identity が mirror の保存値と一致するときだけ**成功する。より新しい run が既に suspend していれば保存値は進んでいるため、**古い run(や遅延した再試行)は publish に失敗し、`revoked` を `clear` で上書きできない**。
-- これは repair fence の generation / takeover identity の CAS と同じ規則であり、新しい規律を導入していない。
+- 子行に記録される登録時の根拠は「**登録を正当化した evidence**」であり、実際に送信を許可した evidence と同一とは限らない(登録後に新しい観測で更新されうる)。
+- したがって、**実際に submission を許可した clearance evidence を、後から一意に追跡できなければならない**。可変な最新状態だけを見て「どの観測が送信を許可したか」を再構成できる設計にしない。
+- 登録時の根拠と送信時の根拠は**別の事実として両方追跡可能**であること。
+- **保存先・保存形式・送信権付与との原子性の実現方式は後続 Issue(#115)** で設計する。
 
-**`mark_submitting()` の照合**: 対象が再発行の子である場合、同一トランザクション内で mirror が `clear`・position スコープ検証済み・鮮度窓内であることを確認し、満たさなければ**送信権を与えない**(`suspended` / `revoked` / 行なし / 鮮度切れはいずれも拒否。Safety Gate 側の拒否コードは `intent_superseded` と同様に #116 で定義)。これにより clearance は登録時点だけでなく**送信の瞬間まで**有効でなければならない。
+**残余(明示的な境界)**: 上記の契約は「BELIAL が観測した事実が判断に反映されないまま送信される」ことを禁じるものである。一方、最後の無差分観測から送信までの間に **Broker 側で新たに状態が変わる**可能性は、Broker 側のロックを持たない以上どんな仕組みでも排除できない。これは Safety Gate が市場データに対して `max_reference_age` で受け入れているのと**同じ種類の境界**であり、鮮度窓(要件 4)で bound する。両者は性質が異なる(反映漏れ vs 観測後の外部変化)。
 
-reconciliation が書き込むのは mirror テーブルのみで、注文行・履歴には触れない(既存の「修復の書き込みは `record_order_result` だけ」という契約は不変)。登録時に参照した run は `reissue_clearance_run_id` として子行に永続化し、監査で「どの観測を根拠に発行したか」を ID で辿れるようにする。送信時の権限判定は mirror(より新しい clean run による refresh を含む)が正である。
-
-**残余(明示的な境界)**: 上記の write-ahead + CAS により、「**BELIAL が観測した事実**が mirror へ反映されないまま送信される」経路は無くなる。一方、最後の clean 観測から送信までの間に **Broker 側で新たに状態が変わる**可能性は、Broker 側のロックを持たない以上どんな fence でも排除できない。これは Safety Gate が市場データに対して `max_reference_age` で受け入れているのと**同じ種類の境界**であり、鮮度窓(要件 5)で bound する。この残余は「観測の反映漏れ」ではなく「観測後の外部変化」であり、性質が異なる。
-
-**既知の制約**: reconciliation には現在、`manual_review` の差分を「確認済みとして明示的に閉じる」監査付き API が存在しない。ただし clearance モデルでは**差分を閉じる操作は不要**である — 必要なのは、原因を是正したうえで **position スコープを含む run を再実行し、無差分を積極的に観測する**ことだからである。再発行側に bypass は設けない。
+**既知の制約**: reconciliation には現在、`manual_review` の差分を「確認済みとして明示的に閉じる」監査付き API が存在しない。ただし clearance モデルでは**差分を閉じる操作は不要**である — 必要なのは、原因を是正したうえで**両ドメインの照合を成功裡に再実行し、無差分を積極的に観測する**ことだからである。再発行側に bypass は設けない。
 
 REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order_result` 経由。reconciliation repair が確定させた場合も同じ)。snapshot を持たない「REJECTED らしき状態」から再発行が始まる経路は存在しない。
 
@@ -314,14 +306,15 @@ REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order
 ### 本設計が変更を要求するもの(後続 Issue の対象)
 
 - `SafetyRejectionCode` へ **`intent_superseded` を追加**(訂正差し替え済みの親を送信しようとした場合の fail-closed 拒否)+ **clearance 不足に対する拒否コード**(#116 で命名)。既存コードの意味は変えない
-- `mark_submitting()` に「自分を親とする子行が存在しないこと」および「再発行の子は有効な clearance mirror を持つこと」の同一トランザクション内検証を追加(既存の一度きり契約は不変)
-- reconciliation 側に **clearance mirror の write-ahead suspend(観測前)と publish(commit 後)** を追加。suspend に失敗したチェーンは観測しない(fail-closed)。注文行・履歴には触れない
+- `mark_submitting()` が「自分を親とする子行が存在しないこと」と「再発行の子は有効な clearance を持つこと」を送信権の付与と同じ判断単位で検証し、**送信を許可した evidence を追跡可能に残す**こと(既存の一度きり契約は不変。実現方式は #115)
+- reconciliation 側が clearance evidence を発行・失効できること。失敗は送信可能側へ倒れないこと(順序・並行制御の方式は #115 / #116)
+- `gate_correction` のために、**未送信の親に対応する Broker 注文が存在しないことを確認する照会経路**(既存の照会系 API のみ・write 操作なし。方式は #116)
 - Submission Journal に終端 outcome **`abandoned` を追加**(`not_started` からのみ遷移可)。entry のライフサイクル・reclaim 規則・二重送信ガードそのものは不変
-- `OrderResult` への `rejection_category` 追加(#114)、`execution_orders` への 7 列追加・一意性制約の置換・clearance mirror テーブルの新設(#115)
+- `OrderResult` への `rejection_category` 追加(#114)、`execution_orders` への再発行 provenance 列追加・一意性制約の置換・clearance evidence の永続化(#115)
 
 ## 移行方針(v4 → v5・後続 Issue)
 
-- **リリース済み v4 と完全一致した DB のみ**を `init_db()` が migration する(既存方針)。単一トランザクションで: 新 7 列の `ALTER TABLE ADD COLUMN`(`signal_attempt` は `NOT NULL DEFAULT 1` で既存行を attempt 1 として backfill、他 6 列は NULL)→ `idx_execution_orders_signal`(signal 単独 UNIQUE)の DROP → `UNIQUE(signal_id, signal_attempt)` / `UNIQUE(reissued_from_…)` index の CREATE → **`execution_reissue_clearances` テーブルの CREATE**(空で開始 = 既存 signal は clearance を持たず、再発行するには新しい観測が必要 = fail-closed)→ version bump → 完全再検証 → COMMIT。途中失敗は全 rollback。既存行の削除・書き換えなし(旧 UNIQUE が保証していた既存データに attempt 重複はあり得ないため、index 置換で失敗する既存 DB は存在しない)。
+- **リリース済み v4 と完全一致した DB のみ**を `init_db()` が migration する(既存方針)。単一トランザクションで: 新 7 列の `ALTER TABLE ADD COLUMN`(`signal_attempt` は `NOT NULL DEFAULT 1` で既存行を attempt 1 として backfill、他 6 列は NULL)→ `idx_execution_orders_signal`(signal 単独 UNIQUE)の DROP → `UNIQUE(signal_id, signal_attempt)` / `UNIQUE(reissued_from_…)` index の CREATE → **clearance evidence 用の領域の新設**(空で開始 = 既存 signal は clearance を持たず、再発行するには新しい観測が必要 = fail-closed。具体的なテーブル・列構成は #115)→ version bump → 完全再検証 → COMMIT。途中失敗は全 rollback。既存行の削除・書き換えなし(旧 UNIQUE が保証していた既存データに attempt 重複はあり得ないため、index 置換で失敗する既存 DB は存在しない)。
 - index の置換を含むため purely additive ではないが、**テーブル rebuild・行の書き換えは行わない**。単一列の CHECK(`signal_attempt >= 1`・`reissue_kind` / `reissue_initiated_by` の値集合)は `ADD COLUMN` に載せられるが、**複数列にまたがる相互制約(attempt ⇔ 親 NULL ⇔ 監査列、identity フィールドの親子一致)はテーブル制約であり `ALTER TABLE` では追加できない**ため、アプリケーション層 + 復元時 bundle 検証が正となる(既存の phase × `order_state` のような DB CHECK による二重防御は、これらの相互制約については得られないことを明示的な割り切りとして受け入れる)。参照 DDL との token 一致検証は v5 参照 schema で更新する。
 - **読み取り経路は migration しない**(既存方針。v4 DB の読み取りは `init_db()` への誘導を含む `ExecutionSchemaError`)。dry-run の無副作用保証も不変。
 - 旧 snapshot の `rejection_category` 欠落は `unclassified` として読み戻す(broker モデル側の後方互換。上記)。
@@ -331,8 +324,8 @@ REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order
 | Issue | 内容 | 依存 |
 |---|---|---|
 | #114 | [Broker] `RejectionCategory` の定義と `OrderResult.rejection_category`(REJECTED ⇔ 必須の相互制約・旧 snapshot の `unclassified` 読み戻し・FakeBroker / OANDA Demo Adapter の写像) | なし |
-| #115 | [Execution] schema v5(親子関係・attempt / kind 列・一意性制約の置換・**clearance mirror テーブル**・v4 → v5 migration・チェーン整合とフィールド不変条件の検証・`mark_submitting()` の子存在検証と **clearance 照合**・読み取り API のチェーン対応) | #114 は不要(独立) |
-| #116 | [Execution] 手動再発行 + 訂正差し替えユースケース(登録 API・eligibility 検証・Gate 判定 / Journal 事前条件と `abandoned`・`intent_superseded` 拒否コード・**clearance の要件判定と reconciliation 側の mirror 発行 / 失効**・監査記録・通常 `submit()` 経路への接続・固定シナリオ) | #114 #115 |
+| #115 | [Execution] schema v5(親子関係・attempt / kind 列・一意性制約の置換・v4 → v5 migration・チェーン整合とフィールド不変条件の検証・`mark_submitting()` の子存在検証と **clearance 照合**・**clearance evidence の保存形式と送信時 evidence の原子的な記録**・読み取り API のチェーン対応) | #114 は不要(独立) |
+| #116 | [Execution] 手動再発行 + 訂正差し替えユースケース(登録 API・eligibility 検証・Gate 判定 / Journal 事前条件と `abandoned`・`intent_superseded` 拒否コード・**clearance の要件判定 / 発行 / 失効と並行観測の直列化**・**未送信の親に対する Broker 照会**・監査記録・通常 `submit()` 経路への接続・固定シナリオ) | #114 #115 |
 | #117 | [Execution] `transient` 限定の自動再試行 policy(cooldown・上限・kill switch / discrepancy 前提条件。**既定無効**) | #114 #115 #116 + Live Execution runner(未着手) |
 
 ## 関連ドキュメント
