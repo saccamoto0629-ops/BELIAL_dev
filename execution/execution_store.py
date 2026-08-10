@@ -162,6 +162,52 @@ valid v3 nor a valid v2 schema fails exactly as before. Read paths NEVER
 migrate (they refuse a v2 DB with a schema error pointing at ``init_db``),
 so dry-run / read-only contracts keep their no-side-effect guarantee.
 
+Intent reissue persistence (Issue #95 / #115, schema v5): a REJECTED (or
+never-submitted, gate-corrected) intent can be reissued as an EXPLICIT NEW
+ExecutionRequest row that records its provenance -- parent request
+(``reissued_from_execution_request_id``), ``signal_attempt`` (1-based,
+contiguous per signal), ``reissue_kind`` (``broker_rejected`` /
+``gate_correction``), ``reissue_initiated_by`` (``manual`` / ``auto``),
+``reissue_reason``, a verifiable reference to the Safety Gate decision that
+justified a correction (``gate_correction_ref_json``) and a verifiable
+reference to the reissue clearance evidence that justified the registration
+(``reissue_clearance_json``). The old whole-table ``signal_id`` uniqueness
+becomes ``UNIQUE(signal_id, signal_attempt)`` plus
+``UNIQUE(reissued_from_execution_request_id)`` (one parent -> at most one
+child: chains are linear, never trees). Registration
+(:func:`create_reissue_execution_order`) verifies the parent-state
+requirement per kind, the chain arithmetic and the child field invariants
+against the parent row INSIDE the same ``BEGIN IMMEDIATE`` transaction that
+inserts the child; restore-time validation re-runs THE SAME shared rules
+(:func:`_reissue_row_problems` / :func:`_reissue_link_problems`), so a chain
+that registered successfully always restores successfully -- quantity
+exception included (a quantity INCREASE is legal exactly when the parent is
+``broker_rejected`` with ``rejection_category = parameter``).
+
+Reissue clearance evidence (Issue #115): the APPEND-ONLY table
+``execution_reissue_clearances`` holds per-signal reconciliation
+observations as monotonically numbered generations (``status`` =
+``observing`` / ``valid`` / ``revoked``, plus the observed account scope,
+observation time and the evidence payload). The CURRENT clearance of a
+signal is its highest generation; recording a new observation NEVER
+rewrites prior rows, so "the evidence that justified X" stays resolvable
+forever and a failed invalidation can never resurrect an older "valid"
+(the failure leaves the newest recorded row in place -- fail-closed
+ordering discipline on top of that is the service layer's job, enabled by
+the ``observing`` status). :func:`mark_submitting` refuses submission
+authority to any order that HAS a child (``ExecutionOrderSupersededError``)
+and, for a reissue child (attempt >= 2), verifies INSIDE its own
+transaction that the signal's CURRENT clearance is ``valid``, matches the
+caller's submission scope and freshness window, and persists the accepted
+evidence reference onto the very history row that grants the authority
+(``clearance_json`` -- same shape as the registration reference, so the
+registration-time and submission-time evidence are two separately
+traceable facts). All evidence references are content-bound
+(sha256 of the stored evidence payload / full decision snapshot for the
+cross-DB Safety Gate reference, see ``execution/reissue_evidence.py``);
+a reference that cannot be resolved and content-verified is fail-closed:
+``ExecutionIntegrityError`` on restore, typed errors on registration.
+
 Pre-commit write-back validation (PR #91 review r3 Major 1): schema
 verification runs BEFORE the writes, so every write path additionally
 re-reads the target execution bundle INSIDE the same transaction after
@@ -191,6 +237,7 @@ existing file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -222,6 +269,31 @@ BUSY_TIMEOUT_SECONDS = 30
 
 ORDERS_TABLE = "execution_orders"
 HISTORY_TABLE = "execution_order_state_history"
+CLEARANCES_TABLE = "execution_reissue_clearances"
+
+# Reissue provenance vocabularies (Issue #95 / #115). Closed sets, mirrored
+# by DB CHECK constraints.
+REISSUE_KIND_BROKER_REJECTED = "broker_rejected"
+REISSUE_KIND_GATE_CORRECTION = "gate_correction"
+KNOWN_REISSUE_KINDS: frozenset[str] = frozenset(
+    {REISSUE_KIND_BROKER_REJECTED, REISSUE_KIND_GATE_CORRECTION}
+)
+REISSUE_INITIATED_MANUAL = "manual"
+REISSUE_INITIATED_AUTO = "auto"
+KNOWN_REISSUE_INITIATORS: frozenset[str] = frozenset(
+    {REISSUE_INITIATED_MANUAL, REISSUE_INITIATED_AUTO}
+)
+
+# Reissue clearance evidence statuses (Issue #115). ``observing`` exists so
+# the reconciliation side can DOWNGRADE a signal's clearance before running a
+# comparison whose conclusion write might fail: the newest recorded row wins,
+# and anything that is not ``valid`` refuses submission (fail-closed).
+CLEARANCE_STATUS_OBSERVING = "observing"
+CLEARANCE_STATUS_VALID = "valid"
+CLEARANCE_STATUS_REVOKED = "revoked"
+KNOWN_CLEARANCE_STATUSES: frozenset[str] = frozenset(
+    {CLEARANCE_STATUS_OBSERVING, CLEARANCE_STATUS_VALID, CLEARANCE_STATUS_REVOKED}
+)
 
 # BELIAL-internal submission lifecycle (deliberately NOT broker OrderState
 # members -- see the module docstring).
@@ -269,6 +341,13 @@ _ORDER_COLUMNS: tuple[str, ...] = (
     "last_order_result_json",
     "created_at_utc",
     "updated_at_utc",
+    "reissued_from_execution_request_id",
+    "signal_attempt",
+    "reissue_kind",
+    "reissue_initiated_by",
+    "reissue_reason",
+    "gate_correction_ref_json",
+    "reissue_clearance_json",
 )
 _HISTORY_COLUMNS: tuple[str, ...] = (
     "history_id",
@@ -281,6 +360,17 @@ _HISTORY_COLUMNS: tuple[str, ...] = (
     "changed_at_utc",
     "repair_attempt_id",
     "repair_generation",
+    "clearance_json",
+)
+_CLEARANCE_COLUMNS: tuple[str, ...] = (
+    "signal_id",
+    "clearance_generation",
+    "evidence_id",
+    "status",
+    "account_scope",
+    "observed_at_utc",
+    "evidence_json",
+    "recorded_at_utc",
 )
 _FENCE_COLUMNS: tuple[str, ...] = (
     "execution_request_id",
@@ -325,8 +415,22 @@ REQUIRED_HISTORY_COLUMNS: frozenset[str] = frozenset(_HISTORY_COLUMNS)
 #     increment) can never commit a stale repair. Purely additive over v3
 #     (ALTER ADD COLUMN x2 + table + indexes); init_db migrates verified
 #     v2 / v3 DBs in place.
-SCHEMA_VERSION = 4
-_MIGRATABLE_VERSIONS = (3, 2)  # newest first; v2 chains through v3
+# v5 (Issue #95 / #115): intent-reissue chains -- REISSUE PROVENANCE columns
+#     on the orders table (parent reference, ``signal_attempt`` NOT NULL
+#     DEFAULT 1, kind / initiated_by / reason, the gate-correction decision
+#     reference and the registration clearance reference), the submission
+#     clearance provenance column ``clearance_json`` on the history table,
+#     the APPEND-ONLY clearance evidence table
+#     ``execution_reissue_clearances`` (starts EMPTY on migration: existing
+#     signals need a fresh observation before any reissue -- fail-closed),
+#     and the uniqueness re-shape: the whole-table signal_id UNIQUE index is
+#     REPLACED by ``UNIQUE(signal_id, signal_attempt)`` plus
+#     ``UNIQUE(reissued_from_execution_request_id)`` (linear chains, one
+#     parent -> at most one child). ALTER ADD COLUMN + index swap + new
+#     table only -- NO table rebuild, NO row rewrites; init_db migrates
+#     verified v2 / v3 / v4 DBs in place (older versions chain).
+SCHEMA_VERSION = 5
+_MIGRATABLE_VERSIONS = (4, 3, 2)  # newest first; older versions chain up
 
 FENCES_TABLE = "execution_repair_fences"
 
@@ -370,6 +474,46 @@ _LEGACY_RESULT_JSON_KEYS: frozenset[str] = _PRE_CLASSIFICATION_RESULT_JSON_KEYS 
 }
 _FILL_JSON_KEYS: frozenset[str] = frozenset({"fill_id", "price", "quantity", "filled_at_utc"})
 
+# Reissue evidence reference shapes (Issue #115). STRICT key sets, same
+# stance as the snapshot JSON: unknown or missing keys are rejected.
+#
+# - A CLEARANCE reference points at one row of the same-DB append-only
+#   ``execution_reissue_clearances`` table and is CONTENT-BOUND: it names the
+#   generation, the evidence id and the sha256 of the stored evidence
+#   payload, so a swapped or edited evidence row can never be mistaken for
+#   the referenced one. Used both for the registration reference on the
+#   child order row and for the submission-time reference persisted on the
+#   ``mark_submitting`` history row.
+# - A GATE DECISION reference points at one row of the SEPARATE Safety Gate
+#   decision DB (path swappable via SAFETY_GATE_DECISION_DB_PATH, local ids
+#   reusable) and therefore embeds the FULL decision content snapshot next
+#   to the id -- the same identity-plus-content stance the Shadow store
+#   takes. Verification against the live decision DB lives in
+#   ``execution/reissue_evidence.py``; this store validates the shape and
+#   the cross-constraints.
+_CLEARANCE_REF_KEYS: frozenset[str] = frozenset(
+    {"clearance_generation", "evidence_id", "evidence_sha256"}
+)
+_GATE_DECISION_REF_KEYS: frozenset[str] = frozenset({"decision_id", "decision"})
+_GATE_DECISION_CONTENT_KEYS: frozenset[str] = frozenset(
+    {
+        "execution_request_id",
+        "allowed",
+        "checked_at_utc",
+        "policy_id",
+        "execution_mode",
+        "connection_target",
+        "rejections",
+        "account_id",
+        "position_count",
+    }
+)
+_GATE_DECISION_REJECTION_KEYS: frozenset[str] = frozenset({"code", "message"})
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 
 class ExecutionStoreError(RuntimeError):
     """Base class for execution store errors."""
@@ -390,6 +534,45 @@ class ExecutionOrderNotFoundError(ExecutionStoreError):
 class ExecutionOrderConflictError(ExecutionStoreError):
     """An insert/update collided with a UNIQUE constraint
     (execution_request_id / signal_id / client_order_id / broker_order_id)."""
+
+
+class ExecutionOrderSupersededError(ExecutionStoreError):
+    """The order has a reissue child, so it can never gain submission
+    authority (Issue #95 / #115).
+
+    Raised inside the ``mark_submitting`` transaction when a row exists
+    whose ``reissued_from_execution_request_id`` names this order: the
+    intent was explicitly superseded by a correction / reissue, and letting
+    the parent submit would create two live intents for one signal. The
+    transaction rolls back and the DB is untouched (the service layer maps
+    this to the ``intent_superseded`` Safety Gate rejection, Issue #116)."""
+
+
+class ExecutionClearanceError(ExecutionStoreError):
+    """A reissue clearance requirement could not be positively verified
+    (Issue #95 / #115 -- ALWAYS fail-closed).
+
+    Raised when a reissue child asks for submission authority without a
+    clearance to verify against (missing scope / freshness inputs, no
+    evidence recorded for the signal), when the signal's CURRENT clearance
+    is not ``valid`` (observing / revoked), stale, or scoped to a different
+    account than the submission target, and when a clearance reference
+    supplied to registration cannot be resolved and content-verified. The
+    transaction rolls back and the DB is untouched; absence of evidence is
+    never read as absence of divergence."""
+
+
+class ExecutionEvidenceReferenceError(ExecutionStoreError):
+    """An evidence reference cannot be resolved or content-verified
+    (Issue #95 / #115 -- fail-closed).
+
+    Raised by the reference verification helpers
+    (``execution/reissue_evidence.py``) when the referenced record does not
+    exist in the referenced DB, or exists but its content does not match
+    the reference's embedded snapshot / digest -- e.g. after the referenced
+    DB file was re-created or swapped and a local sequence id now points at
+    a different record. An unverifiable reference is treated as no evidence
+    at all."""
 
 
 class ExecutionRepairFenceConflictError(ExecutionStoreError):
@@ -528,6 +711,175 @@ class InstalledRepairFence:
         _require_utc(self.updated_at_utc, "updated_at_utc")
 
 
+@dataclass(frozen=True)
+class GateDecisionReference:
+    """A verifiable reference to one persisted Safety Gate decision
+    (Issue #115 -- the correction basis of a ``gate_correction`` child).
+
+    The decision rows live in a SEPARATE DB file whose path is
+    configurable and whose ``decision_id`` is a local AUTOINCREMENT that a
+    re-created file re-uses, so the id alone cannot prove the reference
+    still points at the intended record. The reference therefore carries
+    the FULL decision content next to the id (the Shadow-store precedent);
+    ``execution/reissue_evidence.py`` verifies it against the live decision
+    DB and fails closed on any mismatch. ``rejections`` are (code, message)
+    string pairs -- kept enum-free so this module stays import-independent
+    from the Safety Gate. A correction basis is by definition a rejection:
+    ``allowed`` must be False and at least one rejection must be present.
+    """
+
+    decision_id: int
+    execution_request_id: str
+    allowed: bool
+    checked_at_utc: datetime
+    policy_id: str
+    rejections: tuple[tuple[str, str], ...]
+    execution_mode: str | None = None
+    connection_target: str | None = None
+    account_id: str | None = None
+    position_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.decision_id, bool) or not isinstance(self.decision_id, int) \
+                or self.decision_id < 1:
+            raise ValueError(f"decision_id must be an int >= 1, got {self.decision_id!r}")
+        _require_non_empty_str(self.execution_request_id, "execution_request_id")
+        if self.allowed is not False:
+            raise ValueError(
+                "a gate-correction basis is a rejection: allowed must be False, "
+                f"got {self.allowed!r}"
+            )
+        _require_utc(self.checked_at_utc, "checked_at_utc")
+        _require_non_empty_str(self.policy_id, "policy_id")
+        if not isinstance(self.rejections, tuple) or not self.rejections:
+            raise ValueError("rejections must be a non-empty tuple of (code, message) pairs")
+        for entry in self.rejections:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not all(isinstance(part, str) and part.strip() for part in entry)
+            ):
+                raise ValueError(
+                    f"each rejection must be a (code, message) pair of non-empty "
+                    f"strings, got {entry!r}"
+                )
+        for name in ("execution_mode", "connection_target", "account_id"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_non_empty_str(value, name)
+        if self.position_count is not None and (
+            isinstance(self.position_count, bool)
+            or not isinstance(self.position_count, int)
+            or self.position_count < 0
+        ):
+            raise ValueError(
+                f"position_count must be a non-negative int or None, got "
+                f"{self.position_count!r}"
+            )
+
+    def to_json(self) -> str:
+        """Canonical JSON for the ``gate_correction_ref_json`` column."""
+        return json.dumps(
+            {
+                "decision_id": self.decision_id,
+                "decision": {
+                    "execution_request_id": self.execution_request_id,
+                    "allowed": self.allowed,
+                    "checked_at_utc": _iso(self.checked_at_utc),
+                    "policy_id": self.policy_id,
+                    "rejections": [
+                        {"code": code, "message": message}
+                        for code, message in self.rejections
+                    ],
+                    "execution_mode": self.execution_mode,
+                    "connection_target": self.connection_target,
+                    "account_id": self.account_id,
+                    "position_count": self.position_count,
+                },
+            },
+            sort_keys=True,
+        )
+
+
+def gate_decision_reference_from_json(text: str) -> GateDecisionReference:
+    """Rebuild a :class:`GateDecisionReference` STRICTLY from its stored
+    JSON: exact key sets at every level, and the dataclass re-runs every
+    invariant. A tampered or truncated reference fails loudly."""
+    data = json.loads(text)
+    if not isinstance(data, dict) or set(data) != _GATE_DECISION_REF_KEYS:
+        raise ValueError(
+            f"gate decision reference keys "
+            f"{sorted(data) if isinstance(data, dict) else type(data).__name__} do not "
+            f"match the expected set {sorted(_GATE_DECISION_REF_KEYS)}"
+        )
+    decision = data["decision"]
+    if not isinstance(decision, dict) or set(decision) != _GATE_DECISION_CONTENT_KEYS:
+        raise ValueError(
+            f"gate decision content keys "
+            f"{sorted(decision) if isinstance(decision, dict) else type(decision).__name__} "
+            f"do not match the expected set {sorted(_GATE_DECISION_CONTENT_KEYS)}"
+        )
+    rejections = decision["rejections"]
+    if not isinstance(rejections, list):
+        raise ValueError("gate decision reference 'rejections' must be a list")
+    pairs = []
+    for entry in rejections:
+        if not isinstance(entry, dict) or set(entry) != _GATE_DECISION_REJECTION_KEYS:
+            raise ValueError(
+                f"gate decision rejection keys "
+                f"{sorted(entry) if isinstance(entry, dict) else type(entry).__name__} do "
+                f"not match the expected set {sorted(_GATE_DECISION_REJECTION_KEYS)}"
+            )
+        pairs.append((entry["code"], entry["message"]))
+    if not isinstance(decision["checked_at_utc"], str):
+        raise ValueError("gate decision reference 'checked_at_utc' must be a string")
+    return GateDecisionReference(
+        decision_id=data["decision_id"],
+        execution_request_id=decision["execution_request_id"],
+        allowed=decision["allowed"],
+        checked_at_utc=_parse_utc(decision["checked_at_utc"]),
+        policy_id=decision["policy_id"],
+        rejections=tuple(pairs),
+        execution_mode=decision["execution_mode"],
+        connection_target=decision["connection_target"],
+        account_id=decision["account_id"],
+        position_count=decision["position_count"],
+    )
+
+
+def _clearance_ref_to_json(
+    *, clearance_generation: int, evidence_id: str, evidence_sha256: str
+) -> str:
+    return json.dumps(
+        {
+            "clearance_generation": clearance_generation,
+            "evidence_id": evidence_id,
+            "evidence_sha256": evidence_sha256,
+        },
+        sort_keys=True,
+    )
+
+
+def _clearance_ref_from_json(text: str) -> dict:
+    """Parse a clearance reference STRICTLY (exact key set, typed values)."""
+    data = json.loads(text)
+    if not isinstance(data, dict) or set(data) != _CLEARANCE_REF_KEYS:
+        raise ValueError(
+            f"clearance reference keys "
+            f"{sorted(data) if isinstance(data, dict) else type(data).__name__} do not "
+            f"match the expected set {sorted(_CLEARANCE_REF_KEYS)}"
+        )
+    generation = data["clearance_generation"]
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError(
+            f"clearance reference generation must be an int >= 1, got {generation!r}"
+        )
+    for field in ("evidence_id", "evidence_sha256"):
+        if not isinstance(data[field], str) or not data[field].strip():
+            raise ValueError(f"clearance reference {field} must be a non-empty string")
+    return data
+
+
 class ExecutionOrderStateConflictError(ExecutionStoreError):
     """The order's CURRENT tracked state or revision differs from what the
     caller conditioned the update on (Issue #104 compare-and-set guard).
@@ -566,17 +918,55 @@ def _enum_values_sql(values) -> str:
     return "', '".join(sorted(v.value for v in values))
 
 
-def _create_orders_table_sql() -> str:
+# Shared between the v5 reference CREATE and the v4 -> v5 ALTERs so a
+# migrated DB token-normalizes identically to a freshly created one (SQLite
+# inserts an added column at the end of the COLUMN list, BEFORE the table
+# constraints -- same technique as _HISTORY_REPAIR_COLUMN_DDLS).
+def _order_reissue_column_ddls() -> tuple[str, ...]:
+    kinds = "', '".join(sorted(KNOWN_REISSUE_KINDS))
+    initiators = "', '".join(sorted(KNOWN_REISSUE_INITIATORS))
+    return (
+        (
+            "reissued_from_execution_request_id TEXT "
+            f"REFERENCES {ORDERS_TABLE} (execution_request_id) "
+            "CHECK (reissued_from_execution_request_id IS NULL "
+            "OR trim(reissued_from_execution_request_id) <> '')"
+        ),
+        "signal_attempt INTEGER NOT NULL DEFAULT 1 CHECK (signal_attempt >= 1)",
+        f"reissue_kind TEXT CHECK (reissue_kind IS NULL OR reissue_kind IN ('{kinds}'))",
+        (
+            "reissue_initiated_by TEXT CHECK (reissue_initiated_by IS NULL "
+            f"OR reissue_initiated_by IN ('{initiators}'))"
+        ),
+        "reissue_reason TEXT CHECK (reissue_reason IS NULL OR trim(reissue_reason) <> '')",
+        (
+            "gate_correction_ref_json TEXT CHECK (gate_correction_ref_json IS NULL "
+            "OR trim(gate_correction_ref_json) <> '')"
+        ),
+        (
+            "reissue_clearance_json TEXT CHECK (reissue_clearance_json IS NULL "
+            "OR trim(reissue_clearance_json) <> '')"
+        ),
+    )
+
+
+def _create_orders_table_sql(*, version: int = SCHEMA_VERSION) -> str:
     """Full current schema. Decimals are stored as canonical TEXT (never REAL:
     live-order arithmetic must not pick up float error, Issue #73/#74). The
     CHECKs mirror the application-level invariants as a second guard.
     NOT NULL on the PRIMARY KEY is explicit (a rowid-table TEXT PRIMARY KEY
-    would admit NULLs) and the table is WITHOUT ROWID."""
+    would admit NULLs) and the table is WITHOUT ROWID. Versions below 5 are
+    used only as in-memory migration references and by migration tests."""
     sides = _enum_values_sql(OrderSide)
     types = _enum_values_sql(OrderType)
     states = _enum_values_sql(OrderState)
     phases = "', '".join(sorted(KNOWN_PHASES))
     broker_ack = "', '".join(sorted(s.value for s in _STATES_REQUIRING_BROKER_ID))
+    reissue_columns = (
+        "".join(f",\n            {ddl}" for ddl in _order_reissue_column_ddls())
+        if version >= 5
+        else ""
+    )
     return f"""
         CREATE TABLE {ORDERS_TABLE} (
             execution_request_id TEXT PRIMARY KEY NOT NULL CHECK (trim(execution_request_id) <> ''),
@@ -597,7 +987,7 @@ def _create_orders_table_sql() -> str:
             last_state_reason TEXT CHECK (last_state_reason IS NULL OR trim(last_state_reason) <> ''),
             last_order_result_json TEXT CHECK (last_order_result_json IS NULL OR trim(last_order_result_json) <> ''),
             created_at_utc TEXT NOT NULL CHECK (created_at_utc LIKE '%+00:00'),
-            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00'),
+            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00'){reissue_columns},
             CHECK ((submission_phase = '{PHASE_CREATED}') = (order_state IS NULL)),
             CHECK ((order_type = '{OrderType.LIMIT.value}') = (requested_price IS NOT NULL)),
             CHECK (order_state IS NULL OR order_state NOT IN ('{broker_ack}') OR broker_order_id IS NOT NULL)
@@ -613,14 +1003,22 @@ _HISTORY_REPAIR_COLUMN_DDLS = (
     "repair_generation INTEGER CHECK (repair_generation IS NULL OR repair_generation >= 1)",
 )
 
+# v5 (Issue #115): the clearance evidence accepted by mark_submitting is
+# persisted on the very history row that grants submission authority --
+# the same append-only provenance pattern as the repair columns above.
+_HISTORY_CLEARANCE_COLUMN_DDL = (
+    "clearance_json TEXT CHECK (clearance_json IS NULL OR trim(clearance_json) <> '')"
+)
+
 
 def _create_history_table_sql(*, version: int = SCHEMA_VERSION) -> str:
     states = _enum_values_sql(OrderState)
-    repair_columns = (
-        "".join(f",\n            {ddl}" for ddl in _HISTORY_REPAIR_COLUMN_DDLS)
-        if version >= 4
-        else ""
-    )
+    extra_column_ddls: tuple[str, ...] = ()
+    if version >= 4:
+        extra_column_ddls += _HISTORY_REPAIR_COLUMN_DDLS
+    if version >= 5:
+        extra_column_ddls += (_HISTORY_CLEARANCE_COLUMN_DDL,)
+    extra_columns = "".join(f",\n            {ddl}" for ddl in extra_column_ddls)
     return f"""
         CREATE TABLE {HISTORY_TABLE} (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -632,8 +1030,34 @@ def _create_history_table_sql(*, version: int = SCHEMA_VERSION) -> str:
             reason TEXT NOT NULL CHECK (trim(reason) <> ''),
             broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
             order_result_json TEXT CHECK (order_result_json IS NULL OR trim(order_result_json) <> ''),
-            changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00'){repair_columns}
+            changed_at_utc TEXT NOT NULL CHECK (changed_at_utc LIKE '%+00:00'){extra_columns}
         )
+    """
+
+
+def _create_clearances_table_sql() -> str:
+    """The APPEND-ONLY reissue clearance evidence table (Issue #115, v5).
+
+    One row per (signal, generation): the reconciliation side records every
+    observation outcome as a NEW generation and never rewrites or deletes a
+    prior row, so the evidence a registration or submission referenced stays
+    resolvable and content-verifiable forever. The signal's CURRENT
+    clearance is its highest generation; ``mark_submitting`` reads it inside
+    its own transaction. Starts EMPTY on migration -- an existing signal has
+    no clearance until a fresh observation is recorded (fail-closed)."""
+    statuses = "', '".join(sorted(KNOWN_CLEARANCE_STATUSES))
+    return f"""
+        CREATE TABLE {CLEARANCES_TABLE} (
+            signal_id TEXT NOT NULL CHECK (trim(signal_id) <> ''),
+            clearance_generation INTEGER NOT NULL CHECK (clearance_generation >= 1),
+            evidence_id TEXT NOT NULL UNIQUE CHECK (trim(evidence_id) <> ''),
+            status TEXT NOT NULL CHECK (status IN ('{statuses}')),
+            account_scope TEXT NOT NULL CHECK (trim(account_scope) <> ''),
+            observed_at_utc TEXT NOT NULL CHECK (observed_at_utc LIKE '%+00:00'),
+            evidence_json TEXT NOT NULL CHECK (trim(evidence_json) <> ''),
+            recorded_at_utc TEXT NOT NULL CHECK (recorded_at_utc LIKE '%+00:00'),
+            PRIMARY KEY (signal_id, clearance_generation)
+        ) WITHOUT ROWID
     """
 
 
@@ -679,6 +1103,20 @@ _HISTORY_REPAIR_INDEX_SQL = (
     f"CREATE UNIQUE INDEX {_HISTORY_REPAIR_INDEX} ON {HISTORY_TABLE} "
     "(repair_attempt_id) WHERE repair_attempt_id IS NOT NULL"
 )
+# Issue #95 / #115 (v5): the signal-wide UNIQUE index is REPLACED by the
+# chain-shaped pair -- one row per (signal, attempt), and one parent may be
+# reissued at most once (SQLite UNIQUE indexes treat NULLs as distinct, so
+# the many attempt-1 rows with a NULL parent coexist).
+_SIGNAL_ATTEMPT_UNIQUE_INDEX = f"idx_{ORDERS_TABLE}_signal_attempt"
+_SIGNAL_ATTEMPT_UNIQUE_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX {_SIGNAL_ATTEMPT_UNIQUE_INDEX} ON {ORDERS_TABLE} "
+    "(signal_id, signal_attempt)"
+)
+_REISSUED_FROM_UNIQUE_INDEX = f"idx_{ORDERS_TABLE}_reissued_from"
+_REISSUED_FROM_UNIQUE_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX {_REISSUED_FROM_UNIQUE_INDEX} ON {ORDERS_TABLE} "
+    "(reissued_from_execution_request_id)"
+)
 
 
 def _create_index_sql(*, version: int = SCHEMA_VERSION) -> dict[str, str]:
@@ -691,10 +1129,13 @@ def _create_index_sql(*, version: int = SCHEMA_VERSION) -> dict[str, str]:
             "(execution_request_id, history_id)"
         ),
     }
-    if version >= 3:
+    if 3 <= version < 5:
         index_sql[_SIGNAL_UNIQUE_INDEX] = _SIGNAL_UNIQUE_INDEX_SQL
     if version >= 4:
         index_sql[_HISTORY_REPAIR_INDEX] = _HISTORY_REPAIR_INDEX_SQL
+    if version >= 5:
+        index_sql[_SIGNAL_ATTEMPT_UNIQUE_INDEX] = _SIGNAL_ATTEMPT_UNIQUE_INDEX_SQL
+        index_sql[_REISSUED_FROM_UNIQUE_INDEX] = _REISSUED_FROM_UNIQUE_INDEX_SQL
     return index_sql
 
 
@@ -825,17 +1266,21 @@ def _tables_for(version: int) -> tuple[str, ...]:
     tables = [ORDERS_TABLE, HISTORY_TABLE]
     if version >= 4:
         tables.append(FENCES_TABLE)
+    if version >= 5:
+        tables.append(CLEARANCES_TABLE)
     return tuple(tables)
 
 
 def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
-    """Create the schema for ``version`` (v2 / v3 are used only as the
+    """Create the schema for ``version`` (v2 / v3 / v4 are used only as the
     in-memory migration references and by migration tests; real DBs are
     created at the current version)."""
-    connection.execute(_create_orders_table_sql())
+    connection.execute(_create_orders_table_sql(version=version))
     connection.execute(_create_history_table_sql(version=version))
     if version >= 4:
         connection.execute(_create_fences_table_sql())
+    if version >= 5:
+        connection.execute(_create_clearances_table_sql())
     for create_sql in _create_index_sql(version=version).values():
         connection.execute(create_sql)
     connection.execute(f"PRAGMA user_version = {version}")
@@ -1163,20 +1608,56 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection, db_path: Path) -> None:
         connection.execute(f"ALTER TABLE {HISTORY_TABLE} ADD COLUMN {column_ddl}")
     connection.execute(_create_fences_table_sql())
     connection.execute(_HISTORY_REPAIR_INDEX_SQL)
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    connection.execute("PRAGMA user_version = 4")
     _LOGGER.info(
-        "migrated execution DB %s from schema v3 to v%d (added history repair provenance "
+        "migrated execution DB %s from schema v3 to v4 (added history repair provenance "
         "columns, fencing table %s and index %s)",
         db_path,
-        SCHEMA_VERSION,
         FENCES_TABLE,
         _HISTORY_REPAIR_INDEX,
     )
 
 
+def _migrate_v4_to_v5(connection: sqlite3.Connection, db_path: Path) -> None:
+    """Migrate a fully verified v4 schema to v5 inside the caller's
+    transaction (Issue #95 / #115): ``ALTER TABLE ... ADD COLUMN`` for the
+    seven orders reissue-provenance columns (``signal_attempt`` is NOT NULL
+    DEFAULT 1, so every existing row is backfilled as attempt 1; the other
+    six stay NULL = "not a reissue") and the history clearance provenance
+    column, creation of the EMPTY clearance evidence table (existing
+    signals hold no clearance until a fresh observation is recorded --
+    fail-closed), and the uniqueness re-shape: DROP the whole-table signal
+    UNIQUE index, CREATE ``UNIQUE(signal_id, signal_attempt)`` and
+    ``UNIQUE(reissued_from_execution_request_id)``. SQLite inserts added
+    columns at the end of the column list BEFORE the table constraints,
+    exactly where the v5 reference CREATE declares them, so the migrated
+    DDL token-normalizes identically. No table rebuild, no row rewrites,
+    nothing deleted; the index swap cannot fail on released data (the old
+    single-column UNIQUE guaranteed no (signal, attempt=1) duplicates)."""
+    for column_ddl in _order_reissue_column_ddls():
+        connection.execute(f"ALTER TABLE {ORDERS_TABLE} ADD COLUMN {column_ddl}")
+    connection.execute(
+        f"ALTER TABLE {HISTORY_TABLE} ADD COLUMN {_HISTORY_CLEARANCE_COLUMN_DDL}"
+    )
+    connection.execute(_create_clearances_table_sql())
+    connection.execute(f"DROP INDEX {_SIGNAL_UNIQUE_INDEX}")
+    connection.execute(_SIGNAL_ATTEMPT_UNIQUE_INDEX_SQL)
+    connection.execute(_REISSUED_FROM_UNIQUE_INDEX_SQL)
+    connection.execute("PRAGMA user_version = 5")
+    _LOGGER.info(
+        "migrated execution DB %s from schema v4 to v5 (added reissue provenance "
+        "columns, clearance table %s, replaced index %s with %s + %s)",
+        db_path,
+        CLEARANCES_TABLE,
+        _SIGNAL_UNIQUE_INDEX,
+        _SIGNAL_ATTEMPT_UNIQUE_INDEX,
+        _REISSUED_FROM_UNIQUE_INDEX,
+    )
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Create the Issue #74 schema, verify an existing one, or migrate a
-    valid v2 / v3 schema to v4 (Issue #76 / #104); idempotent.
+    valid v2 / v3 / v4 schema to v5 (Issue #76 / #104 / #115); idempotent.
 
     - PRISTINE DB only (PR #91 review r2 Major 2): the schema is created only
       when ``sqlite_master`` holds ZERO objects AND ``user_version`` is 0. A
@@ -1185,9 +1666,10 @@ def init_db(db_path: Path | None = None) -> None:
     - A DB that fully matches the CURRENT schema passes verification.
     - A DB that fully matches a released migratable schema -- and ONLY such
       a DB -- is migrated in place (:func:`_migrate_v2_to_v3` /
-      :func:`_migrate_v3_to_v4`; a v2 DB chains through v3): every step, the
-      version bumps and a full v4 re-verification commit in ONE transaction,
-      so a failed migration leaves no half-migrated schema behind.
+      :func:`_migrate_v3_to_v4` / :func:`_migrate_v4_to_v5`; older versions
+      chain upward): every step, the version bumps and a full v5
+      re-verification commit in ONE transaction, so a failed migration
+      leaves no half-migrated schema behind.
     - Anything else: a partial schema, a constraint-less lookalike, an
       unknown version, or a foreign table raises
       :class:`ExecutionSchemaError` WITHOUT modifying the DB (no
@@ -1211,11 +1693,15 @@ def init_db(db_path: Path | None = None) -> None:
                 # the same closed-world verification before it is committed
                 _verify_schema(connection, db_path)
             elif _schema_problems(connection):
-                if not _schema_problems(connection, version=3):
+                if not _schema_problems(connection, version=4):
+                    _migrate_v4_to_v5(connection, db_path)
+                elif not _schema_problems(connection, version=3):
                     _migrate_v3_to_v4(connection, db_path)
+                    _migrate_v4_to_v5(connection, db_path)
                 elif not _schema_problems(connection, version=2):
                     _migrate_v2_to_v3(connection, db_path)
                     _migrate_v3_to_v4(connection, db_path)
+                    _migrate_v4_to_v5(connection, db_path)
                 else:
                     # neither a valid current nor a valid migratable schema:
                     # fail with the full diagnosis, DB untouched
@@ -1369,6 +1855,323 @@ def _integrity(execution_request_id: str, message: str) -> ExecutionIntegrityErr
     return ExecutionIntegrityError(
         f"execution order {execution_request_id!r} failed restore-time validation: {message}"
     )
+
+
+# --- reissue chain validation (Issue #95 / #115) ------------------------------
+# ONE shared implementation for both the registration transaction and the
+# restore-time bundle validation: what registration accepts, restore accepts
+# -- quantity exception included. Each function returns a list of problem
+# strings; the callers wrap them into ValueError (registration) or
+# ExecutionIntegrityError (restore).
+
+
+def _reissue_row_problems(row: dict) -> list[str]:
+    """Row-local reissue cross-constraints (no parent needed).
+
+    attempt 1 <=> no parent reference <=> every reissue audit column NULL;
+    attempt >= 2 requires ALL of them (and a parseable clearance reference);
+    a correction basis is present exactly on ``gate_correction`` children.
+    """
+    problems: list[str] = []
+    attempt = row["signal_attempt"]
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        return [f"signal_attempt must be an int >= 1, got {attempt!r}"]
+    parent_id = row["reissued_from_execution_request_id"]
+    kind = row["reissue_kind"]
+    initiated_by = row["reissue_initiated_by"]
+    reason = row["reissue_reason"]
+    clearance_ref = row["reissue_clearance_json"]
+    correction_ref = row["gate_correction_ref_json"]
+    if attempt == 1:
+        for field in (
+            "reissued_from_execution_request_id",
+            "reissue_kind",
+            "reissue_initiated_by",
+            "reissue_reason",
+            "gate_correction_ref_json",
+            "reissue_clearance_json",
+        ):
+            if row[field] is not None:
+                problems.append(f"attempt 1 must not carry {field} ({row[field]!r})")
+        return problems
+    if not isinstance(parent_id, str) or not parent_id.strip():
+        problems.append(f"attempt {attempt} requires a parent reference")
+    elif parent_id == row["execution_request_id"]:
+        problems.append("an order cannot be its own reissue parent")
+    if kind not in KNOWN_REISSUE_KINDS:
+        problems.append(f"attempt {attempt} requires reissue_kind, got {kind!r}")
+    if initiated_by not in KNOWN_REISSUE_INITIATORS:
+        problems.append(
+            f"attempt {attempt} requires reissue_initiated_by, got {initiated_by!r}"
+        )
+    elif (
+        kind == REISSUE_KIND_GATE_CORRECTION
+        and initiated_by != REISSUE_INITIATED_MANUAL
+    ):
+        problems.append(
+            "a gate correction is a manual judgement: reissue_initiated_by must be "
+            f"{REISSUE_INITIATED_MANUAL!r}, got {initiated_by!r}"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        problems.append(f"attempt {attempt} requires a non-empty reissue_reason")
+    if clearance_ref is None:
+        problems.append(f"attempt {attempt} requires a registration clearance reference")
+    else:
+        try:
+            _clearance_ref_from_json(clearance_ref)
+        except (ValueError, TypeError) as exc:
+            problems.append(f"registration clearance reference is invalid: {exc}")
+    if (correction_ref is not None) != (kind == REISSUE_KIND_GATE_CORRECTION):
+        problems.append(
+            "a gate-correction basis must be recorded exactly when reissue_kind is "
+            f"{REISSUE_KIND_GATE_CORRECTION!r} (kind {kind!r}, basis "
+            f"{'present' if correction_ref is not None else 'absent'})"
+        )
+    elif correction_ref is not None:
+        try:
+            reference = gate_decision_reference_from_json(correction_ref)
+        except (ValueError, TypeError) as exc:
+            problems.append(f"gate-correction reference is invalid: {exc}")
+        else:
+            if reference.execution_request_id != parent_id:
+                problems.append(
+                    "the gate-correction basis must judge the parent request "
+                    f"{parent_id!r}, but judges {reference.execution_request_id!r}"
+                )
+    return problems
+
+
+def _parent_rejection_category(parent: dict) -> RejectionCategory | None:
+    """The parent's rejection category, from its stored snapshot (None when
+    no snapshot is readable -- the quantity exception then never applies:
+    fail-closed)."""
+    snapshot_text = parent["last_order_result_json"]
+    if snapshot_text is None:
+        return None
+    try:
+        return _result_from_json(snapshot_text).rejection_category
+    except Exception:
+        # an unreadable parent snapshot is rejected in depth when the parent
+        # itself is restored; for the child's quantity rule it simply
+        # provides no exception
+        return None
+
+
+def _reissue_link_problems(
+    parent: dict, child: dict, parent_category: RejectionCategory | None
+) -> list[str]:
+    """Parent-child invariants, verified against the PARENT ROW -- the one
+    shared rule set for registration and restore (Issue #115).
+
+    - the parent-state requirement per ``reissue_kind``,
+    - chain arithmetic (same signal, attempt = parent + 1),
+    - identity immutability (signal / strategy / symbol / side),
+    - time monotonicity (``requested_at_utc`` never goes backwards),
+    - the quantity rule: never above the parent, EXCEPT a
+      ``broker_rejected`` parent whose ``rejection_category`` is
+      ``parameter`` (the one sanctioned increase, Issue #95),
+    - ``auto`` reissues must repeat the parent's order parameters exactly.
+    """
+    problems: list[str] = []
+    kind = child["reissue_kind"]
+    if child["reissued_from_execution_request_id"] != parent["execution_request_id"]:
+        problems.append(
+            f"child parent reference {child['reissued_from_execution_request_id']!r} "
+            f"does not name the parent row {parent['execution_request_id']!r}"
+        )
+    if kind == REISSUE_KIND_BROKER_REJECTED:
+        if parent["order_state"] != OrderState.REJECTED.value:
+            problems.append(
+                f"a {REISSUE_KIND_BROKER_REJECTED!r} reissue requires the parent in "
+                f"order_state {OrderState.REJECTED.value!r}, but the parent is in "
+                f"phase {parent['submission_phase']!r} / state {parent['order_state']!r}"
+            )
+    elif kind == REISSUE_KIND_GATE_CORRECTION:
+        if parent["submission_phase"] != PHASE_CREATED or parent["order_state"] is not None:
+            problems.append(
+                f"a {REISSUE_KIND_GATE_CORRECTION!r} correction requires the parent in "
+                f"phase {PHASE_CREATED!r} with no order state (never submitted), but "
+                f"the parent is in phase {parent['submission_phase']!r} / state "
+                f"{parent['order_state']!r}"
+            )
+    if child["signal_id"] != parent["signal_id"]:
+        problems.append(
+            f"child signal_id {child['signal_id']!r} differs from parent signal_id "
+            f"{parent['signal_id']!r}"
+        )
+    if child["signal_attempt"] != parent["signal_attempt"] + 1:
+        problems.append(
+            f"child signal_attempt {child['signal_attempt']} must be exactly the "
+            f"parent's attempt {parent['signal_attempt']} + 1"
+        )
+    for field in ("strategy_id", "symbol", "side"):
+        if child[field] != parent[field]:
+            problems.append(
+                f"identity field {field} may not change in a reissue: parent "
+                f"{parent[field]!r} -> child {child[field]!r}"
+            )
+    try:
+        parent_requested_at = _parse_utc(parent["requested_at_utc"])
+        child_requested_at = _parse_utc(child["requested_at_utc"])
+    except ValueError as exc:
+        problems.append(f"unparseable requested_at_utc: {exc}")
+    else:
+        if child_requested_at < parent_requested_at:
+            problems.append(
+                f"child requested_at_utc {child['requested_at_utc']} precedes the "
+                f"parent's {parent['requested_at_utc']} (time never goes backwards)"
+            )
+    try:
+        parent_quantity = Decimal(parent["quantity"])
+        child_quantity = Decimal(child["quantity"])
+    except (InvalidOperation, TypeError) as exc:
+        problems.append(f"unparseable quantity: {exc}")
+    else:
+        increase_allowed = (
+            kind == REISSUE_KIND_BROKER_REJECTED
+            and parent_category is RejectionCategory.PARAMETER
+        )
+        if child_quantity > parent_quantity and not increase_allowed:
+            problems.append(
+                f"child quantity {child['quantity']} exceeds the parent's "
+                f"{parent['quantity']}; an increase is allowed only when the parent "
+                f"is {REISSUE_KIND_BROKER_REJECTED!r} with rejection_category "
+                f"{RejectionCategory.PARAMETER.value!r} (parent category: "
+                f"{'none' if parent_category is None else parent_category.value})"
+            )
+    if child["reissue_initiated_by"] == REISSUE_INITIATED_AUTO:
+        def _decimal_or_none(value):
+            return None if value is None else Decimal(value)
+
+        for field in (
+            "quantity",
+            "requested_price",
+            "stop_loss_price",
+            "take_profit_price",
+        ):
+            try:
+                same = _decimal_or_none(child[field]) == _decimal_or_none(parent[field])
+            except (InvalidOperation, TypeError):
+                same = False
+            if not same:
+                problems.append(
+                    f"an auto reissue must repeat the parent's order parameters "
+                    f"exactly: {field} parent {parent[field]!r} -> child "
+                    f"{child[field]!r}"
+                )
+        if child["order_type"] != parent["order_type"]:
+            problems.append(
+                f"an auto reissue must repeat the parent's order parameters exactly: "
+                f"order_type parent {parent['order_type']!r} -> child "
+                f"{child['order_type']!r}"
+            )
+    return problems
+
+
+def _resolve_clearance_ref(
+    connection: sqlite3.Connection, signal_id: str, ref: dict
+) -> list[str]:
+    """Content-verify a clearance reference against the same-DB append-only
+    evidence table. Returns problems (empty = the reference resolves to the
+    intended record). Fail-closed: missing row, different evidence id or a
+    different payload digest all disqualify the reference."""
+    row = connection.execute(
+        f"SELECT evidence_id, evidence_json FROM {CLEARANCES_TABLE} "
+        "WHERE signal_id = ? AND clearance_generation = ?",
+        (signal_id, ref["clearance_generation"]),
+    ).fetchone()
+    if row is None:
+        return [
+            f"clearance reference (signal {signal_id!r}, generation "
+            f"{ref['clearance_generation']}) does not resolve to a recorded evidence row"
+        ]
+    problems = []
+    if row["evidence_id"] != ref["evidence_id"]:
+        problems.append(
+            f"clearance reference evidence_id {ref['evidence_id']!r} does not match "
+            f"the recorded evidence row ({row['evidence_id']!r})"
+        )
+    if _sha256_text(row["evidence_json"]) != ref["evidence_sha256"]:
+        problems.append(
+            "clearance reference evidence_sha256 does not match the recorded "
+            "evidence payload (the referenced record is not the intended one)"
+        )
+    return problems
+
+
+def _validate_reissue_chain(
+    connection: sqlite3.Connection, row: dict, history: list[dict]
+) -> None:
+    """Restore-time chain / evidence validation for one order bundle
+    (Issue #115) -- runs inside the caller's transaction, AFTER
+    :func:`_validate_bundle`.
+
+    Re-runs the SAME shared rules as registration against the parent row,
+    verifies the registration clearance reference resolves and
+    content-matches, and pins the submission clearance provenance: a
+    reissue child that entered ``submitting`` carries the accepted evidence
+    reference on its FIRST history row (and nowhere else); an attempt-1
+    order never carries one. Any violation is an out-of-band edit and
+    raises :class:`ExecutionIntegrityError`.
+    """
+    request_id = row["execution_request_id"]
+    problems = _reissue_row_problems(row)
+    if problems:
+        raise _integrity(request_id, "; ".join(problems))
+    is_child = row["signal_attempt"] >= 2
+
+    for position, entry in enumerate(history):
+        clearance_json = entry["clearance_json"]
+        if position == 0 and is_child:
+            if clearance_json is None:
+                raise _integrity(
+                    request_id,
+                    "a reissue child's submission-granting history row must record "
+                    "the accepted clearance evidence, but carries none",
+                )
+            try:
+                submission_ref = _clearance_ref_from_json(clearance_json)
+            except (ValueError, TypeError) as exc:
+                raise _integrity(
+                    request_id, f"submission clearance reference is invalid: {exc}"
+                ) from exc
+            ref_problems = _resolve_clearance_ref(
+                connection, row["signal_id"], submission_ref
+            )
+            if ref_problems:
+                raise _integrity(request_id, "; ".join(ref_problems))
+        elif clearance_json is not None:
+            raise _integrity(
+                request_id,
+                f"history row {entry['history_id']} carries clearance provenance, "
+                "which belongs only on the submission-granting first history row "
+                "of a reissue child",
+            )
+
+    if not is_child:
+        return
+
+    registration_ref = _clearance_ref_from_json(row["reissue_clearance_json"])
+    ref_problems = _resolve_clearance_ref(connection, row["signal_id"], registration_ref)
+    if ref_problems:
+        raise _integrity(request_id, "; ".join(ref_problems))
+
+    parent = connection.execute(
+        f"SELECT * FROM {ORDERS_TABLE} WHERE execution_request_id = ?",
+        (row["reissued_from_execution_request_id"],),
+    ).fetchone()
+    if parent is None:
+        raise _integrity(
+            request_id,
+            f"parent execution order {row['reissued_from_execution_request_id']!r} "
+            "does not exist",
+        )
+    parent = dict(parent)
+    link_problems = _reissue_link_problems(
+        parent, row, _parent_rejection_category(parent)
+    )
+    if link_problems:
+        raise _integrity(request_id, "; ".join(link_problems))
 
 
 def _validate_request_columns(row: dict) -> None:
@@ -1662,6 +2465,7 @@ def _fetch_and_validate(
         return None
     row = dict(row)
     _validate_bundle(row, history)
+    _validate_reissue_chain(connection, row, history)
     # The order's REVISION (Issue #104): the count of history rows. Every
     # write path appends exactly one history row (enforced by the pre-commit
     # write-back validation), so the revision increments on EVERY change --
@@ -1763,15 +2567,41 @@ def _classify_create_conflicts(
     happens to be checked first.
     """
     conflicts: list[tuple[str, str, dict]] = []
-    for column, reason in (
-        ("execution_request_id", "execution_request_id is already persisted"),
-        ("signal_id", "source signal already produced an execution request"),
-        ("client_order_id", "client_order_id is already bound to an execution request"),
-    ):
+    checks: list[tuple[str, str, str, tuple]] = [
+        (
+            "execution_request_id",
+            "execution_request_id is already persisted",
+            "execution_request_id = ?",
+            (record["execution_request_id"],),
+        ),
+        (
+            "signal_id",
+            f"source signal already produced attempt {record['signal_attempt']}",
+            "signal_id = ? AND signal_attempt = ?",
+            (record["signal_id"], record["signal_attempt"]),
+        ),
+        (
+            "client_order_id",
+            "client_order_id is already bound to an execution request",
+            "client_order_id = ?",
+            (record["client_order_id"],),
+        ),
+    ]
+    if record["reissued_from_execution_request_id"] is not None:
+        checks.append(
+            (
+                "reissued_from_execution_request_id",
+                "the parent execution request already has a reissue child "
+                "(one parent -> at most one child)",
+                "reissued_from_execution_request_id = ?",
+                (record["reissued_from_execution_request_id"],),
+            )
+        )
+    for column, reason, predicate, params in checks:
         row = connection.execute(
             f"SELECT execution_request_id, signal_id, submission_phase, order_state "
-            f"FROM {ORDERS_TABLE} WHERE {column} = ?",
-            (record[column],),
+            f"FROM {ORDERS_TABLE} WHERE {predicate}",
+            params,
         ).fetchone()
         if row is not None:
             conflicts.append((column, reason, dict(row)))
@@ -1807,7 +2637,27 @@ def create_execution_order(
     _require_utc(created_at_utc, "created_at_utc")
     db_path = Path(db_path) if db_path is not None else execution_db_path()
     init_db(db_path)
-    record = {
+    record = _intent_record(
+        request, client_order_id=client_order_id, created_at_utc=created_at_utc
+    )
+    with _verified_txn(db_path) as connection:
+        _insert_order_record(connection, record)
+        created = _validate_writeback(
+            connection,
+            request.execution_request_id,
+            prior_history=[],
+            expected_row={**record, "revision": 0},
+            expected_entry=None,
+        )
+    return created
+
+
+def _intent_record(
+    request: ExecutionRequest, *, client_order_id: str, created_at_utc: datetime
+) -> dict:
+    """The full attempt-1 orders row for a new intent (reissue columns at
+    their defaults: attempt 1, no provenance)."""
+    return {
         "execution_request_id": request.execution_request_id,
         "signal_id": request.signal_id,
         "strategy_id": request.strategy_id,
@@ -1829,40 +2679,194 @@ def create_execution_order(
         "last_order_result_json": None,
         "created_at_utc": _iso(created_at_utc),
         "updated_at_utc": _iso(created_at_utc),
+        "reissued_from_execution_request_id": None,
+        "signal_attempt": 1,
+        "reissue_kind": None,
+        "reissue_initiated_by": None,
+        "reissue_reason": None,
+        "gate_correction_ref_json": None,
+        "reissue_clearance_json": None,
     }
+
+
+def _insert_order_record(connection: sqlite3.Connection, record: dict) -> None:
+    """INSERT one orders row; a UNIQUE collision becomes the classified,
+    WARN-logged :class:`ExecutionOrderConflictError` (Issue #76 contract,
+    shared by the initial-intent and the reissue registration paths)."""
     insert_sql = (
         f"INSERT INTO {ORDERS_TABLE} ({', '.join(_ORDER_COLUMNS)}) "
         f"VALUES ({', '.join('?' for _ in _ORDER_COLUMNS)})"
     )
+    try:
+        connection.execute(insert_sql, tuple(record[col] for col in _ORDER_COLUMNS))
+    except sqlite3.IntegrityError as exc:
+        conflicts = _classify_create_conflicts(connection, record)
+        if not conflicts:
+            # CHECK / NOT NULL / FK or an unknown future constraint is a
+            # persistence failure, not successful duplicate suppression.
+            raise
+        reason = "; ".join(item[1] for item in conflicts)
+        existing = conflicts[0][2]
+        _LOGGER.warning(
+            "duplicate execution order suppressed: execution_request_id=%s "
+            "signal_id=%s signal_attempt=%s existing_execution_request_id=%s "
+            "existing_submission_phase=%s existing_order_state=%s "
+            "conflicting_keys=%s reason=%s",
+            record["execution_request_id"],
+            record["signal_id"],
+            record["signal_attempt"],
+            existing["execution_request_id"],
+            existing["submission_phase"],
+            existing["order_state"],
+            ",".join(item[0] for item in conflicts),
+            reason,
+        )
+        raise ExecutionOrderConflictError(
+            f"execution order {record['execution_request_id']!r} (signal_id "
+            f"{record['signal_id']!r} / signal_attempt {record['signal_attempt']} / "
+            f"client_order_id {record['client_order_id']!r}) collides with an "
+            f"existing row ({reason}): {exc}"
+        ) from exc
+
+
+def create_reissue_execution_order(
+    request: ExecutionRequest,
+    *,
+    client_order_id: str,
+    created_at_utc: datetime,
+    parent_execution_request_id: str,
+    reissue_kind: str,
+    reissue_initiated_by: str,
+    reissue_reason: str,
+    clearance_generation: int,
+    clearance_evidence_id: str,
+    gate_correction_reference: GateDecisionReference | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """Register an EXPLICIT reissue of ``parent_execution_request_id`` as a
+    new intent row -- the Issue #95 / #115 registration API.
+
+    Everything happens in ONE ``BEGIN IMMEDIATE`` transaction:
+
+    - the parent bundle is loaded and fully validated, and the parent-state
+      requirement for ``reissue_kind`` is verified against it
+      (``broker_rejected`` -> parent ``order_state = rejected``;
+      ``gate_correction`` -> parent phase ``created`` with no order state;
+      EVERY other parent state -- pending / accepted / partially_filled /
+      unknown / filled / cancelled -- refuses the registration),
+    - the registration clearance reference is resolved against the same-DB
+      evidence table and content-bound (generation + evidence id + payload
+      sha256); an unresolvable reference is
+      :class:`ExecutionClearanceError` (fail-closed -- the store does NOT
+      judge the clearance requirements themselves, Issue #116 does, but it
+      refuses to record a reference it cannot verify),
+    - the child field invariants are verified against the parent row via
+      THE SAME shared rules restore-time validation runs
+      (:func:`_reissue_link_problems`: identity immutability, attempt
+      arithmetic, time monotonicity, the quantity rule with the
+      ``broker_rejected`` x ``parameter`` increase exception, auto =
+      identical parameters), so a registered chain always restores,
+    - the child row is INSERTed; racing registrations for the same parent /
+      attempt collide on ``UNIQUE(reissued_from_execution_request_id)`` /
+      ``UNIQUE(signal_id, signal_attempt)`` and the loser gets the
+      classified, WARN-logged :class:`ExecutionOrderConflictError` -- at
+      most one child row ever exists, process restarts and concurrent
+      runners included.
+
+    The child starts in phase ``created`` like any other intent and gains
+    submission authority only through :func:`mark_submitting`, which
+    re-verifies the signal's CURRENT clearance at that moment. Attempt caps
+    and eligibility (Gate decision recency, Journal preconditions, broker
+    non-existence evidence) are the service layer's preconditions
+    (Issue #116); violations of the persistable contracts here raise
+    ``ValueError`` with the DB untouched.
+    """
+    if not isinstance(request, ExecutionRequest):
+        raise ValueError(f"request must be an ExecutionRequest, got {request!r}")
+    _require_non_empty_str(client_order_id, "client_order_id")
+    _require_utc(created_at_utc, "created_at_utc")
+    _require_non_empty_str(parent_execution_request_id, "parent_execution_request_id")
+    if reissue_kind not in KNOWN_REISSUE_KINDS:
+        raise ValueError(
+            f"reissue_kind must be one of {sorted(KNOWN_REISSUE_KINDS)}, got {reissue_kind!r}"
+        )
+    if reissue_initiated_by not in KNOWN_REISSUE_INITIATORS:
+        raise ValueError(
+            f"reissue_initiated_by must be one of {sorted(KNOWN_REISSUE_INITIATORS)}, "
+            f"got {reissue_initiated_by!r}"
+        )
+    _require_non_empty_str(reissue_reason, "reissue_reason")
+    if (
+        isinstance(clearance_generation, bool)
+        or not isinstance(clearance_generation, int)
+        or clearance_generation < 1
+    ):
+        raise ValueError(
+            f"clearance_generation must be an int >= 1, got {clearance_generation!r}"
+        )
+    _require_non_empty_str(clearance_evidence_id, "clearance_evidence_id")
+    if gate_correction_reference is not None and not isinstance(
+        gate_correction_reference, GateDecisionReference
+    ):
+        raise ValueError(
+            f"gate_correction_reference must be a GateDecisionReference or None, got "
+            f"{gate_correction_reference!r}"
+        )
+    db_path = _existing_db_path(db_path, parent_execution_request_id)
     with _verified_txn(db_path) as connection:
-        try:
-            connection.execute(insert_sql, tuple(record[col] for col in _ORDER_COLUMNS))
-        except sqlite3.IntegrityError as exc:
-            conflicts = _classify_create_conflicts(connection, record)
-            if not conflicts:
-                # CHECK / NOT NULL / FK or an unknown future constraint is a
-                # persistence failure, not successful duplicate suppression.
-                raise
-            reason = "; ".join(item[1] for item in conflicts)
-            existing = conflicts[0][2]
-            _LOGGER.warning(
-                "duplicate execution order suppressed: execution_request_id=%s "
-                "signal_id=%s existing_execution_request_id=%s "
-                "existing_submission_phase=%s existing_order_state=%s "
-                "conflicting_keys=%s reason=%s",
-                request.execution_request_id,
-                request.signal_id,
-                existing["execution_request_id"],
-                existing["submission_phase"],
-                existing["order_state"],
-                ",".join(item[0] for item in conflicts),
-                reason,
+        parent, _parent_history = _require_bundle_for_update(
+            connection, parent_execution_request_id
+        )
+
+        # Resolve + content-bind the registration clearance evidence (same
+        # DB, same transaction). The reference the child row will carry is
+        # built from the COMMITTED evidence row, never from caller input.
+        evidence = connection.execute(
+            f"SELECT evidence_id, evidence_json FROM {CLEARANCES_TABLE} "
+            "WHERE signal_id = ? AND clearance_generation = ?",
+            (request.signal_id, clearance_generation),
+        ).fetchone()
+        if evidence is None or evidence["evidence_id"] != clearance_evidence_id:
+            raise ExecutionClearanceError(
+                f"clearance evidence (signal {request.signal_id!r}, generation "
+                f"{clearance_generation}, evidence_id {clearance_evidence_id!r}) does "
+                "not resolve to a recorded evidence row; an unverifiable clearance "
+                "reference never justifies a reissue (nothing was changed)"
             )
-            raise ExecutionOrderConflictError(
-                f"execution order {request.execution_request_id!r} (signal_id "
-                f"{request.signal_id!r} / client_order_id {client_order_id!r}) collides "
-                f"with an existing row ({reason}): {exc}"
-            ) from exc
+        clearance_ref_json = _clearance_ref_to_json(
+            clearance_generation=clearance_generation,
+            evidence_id=evidence["evidence_id"],
+            evidence_sha256=_sha256_text(evidence["evidence_json"]),
+        )
+
+        record = _intent_record(
+            request, client_order_id=client_order_id, created_at_utc=created_at_utc
+        )
+        record.update(
+            reissued_from_execution_request_id=parent_execution_request_id,
+            signal_attempt=parent["signal_attempt"] + 1,
+            reissue_kind=reissue_kind,
+            reissue_initiated_by=reissue_initiated_by,
+            reissue_reason=reissue_reason,
+            gate_correction_ref_json=(
+                None
+                if gate_correction_reference is None
+                else gate_correction_reference.to_json()
+            ),
+            reissue_clearance_json=clearance_ref_json,
+        )
+
+        problems = _reissue_row_problems(record) + _reissue_link_problems(
+            parent, record, _parent_rejection_category(parent)
+        )
+        if problems:
+            raise ValueError(
+                f"reissue registration for parent {parent_execution_request_id!r} "
+                f"violates the chain contract (nothing was changed): "
+                + "; ".join(problems)
+            )
+
+        _insert_order_record(connection, record)
         created = _validate_writeback(
             connection,
             request.execution_request_id,
@@ -1909,12 +2913,14 @@ def _append_history(
     changed_at_utc: datetime,
     repair_attempt_id: str | None = None,
     repair_generation: int | None = None,
+    clearance_json: str | None = None,
 ) -> None:
     connection.execute(
         f"INSERT INTO {HISTORY_TABLE} "
         "(execution_request_id, previous_state, new_state, reason, broker_order_id, "
-        "order_result_json, changed_at_utc, repair_attempt_id, repair_generation) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "order_result_json, changed_at_utc, repair_attempt_id, repair_generation, "
+        "clearance_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             execution_request_id,
             None if previous_state is None else previous_state.value,
@@ -1925,6 +2931,7 @@ def _append_history(
             _iso(changed_at_utc),
             repair_attempt_id,
             repair_generation,
+            clearance_json,
         ),
     )
 
@@ -1934,6 +2941,8 @@ def mark_submitting(
     *,
     reason: str,
     changed_at_utc: datetime,
+    clearance_scope: str | None = None,
+    clearance_observed_after_utc: datetime | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Move ``created -> submitting`` and start broker-state tracking at PENDING.
@@ -1944,12 +2953,50 @@ def mark_submitting(
     change, the PENDING state, and the first history row (previous_state
     NULL) commit in one transaction. Under two racing connections the
     ``BEGIN IMMEDIATE`` transaction serializes them and exactly one wins.
+
+    Reissue guards (Issue #95 / #115), all INSIDE this same transaction:
+
+    - an order that HAS a reissue child never gains submission authority
+      (:class:`ExecutionOrderSupersededError`) -- the supersession commit
+      and this transition serialize on the store's write lock, so either
+      the child registration sees a non-``created`` parent and fails, or
+      this call sees the child and fails: a submitted parent and its child
+      can never coexist;
+    - a reissue CHILD (``signal_attempt >= 2``) must present the submission
+      target scope and the freshness cutoff, and the signal's CURRENT
+      clearance (highest generation) must be ``valid``, scoped to exactly
+      that target, and observed at/after the cutoff -- anything else
+      (missing inputs, no evidence, ``observing`` / ``revoked``, scope
+      mismatch, stale) is :class:`ExecutionClearanceError` and nothing
+      changes (fail-closed);
+    - the ACCEPTED evidence is persisted as a content-bound reference on
+      the very history row that grants the authority (``clearance_json``),
+      so the evidence that allowed each submission stays independently
+      traceable from the evidence that justified the registration.
+
+    An attempt-1 order takes no clearance inputs (passing them is a
+    caller error).
     """
     _require_non_empty_str(reason, "reason")
     _require_utc(changed_at_utc, "changed_at_utc")
+    if clearance_scope is not None:
+        _require_non_empty_str(clearance_scope, "clearance_scope")
+    if clearance_observed_after_utc is not None:
+        _require_utc(clearance_observed_after_utc, "clearance_observed_after_utc")
     db_path = _existing_db_path(db_path, execution_request_id)
     with _verified_txn(db_path) as connection:
         row, history = _require_bundle_for_update(connection, execution_request_id)
+        child = connection.execute(
+            f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+            "WHERE reissued_from_execution_request_id = ?",
+            (execution_request_id,),
+        ).fetchone()
+        if child is not None:
+            raise ExecutionOrderSupersededError(
+                f"execution order {execution_request_id!r} was superseded by its "
+                f"reissue child {child['execution_request_id']!r} and can never gain "
+                "submission authority (nothing was changed)"
+            )
         if row["submission_phase"] != PHASE_CREATED:
             raise ValueError(
                 f"execution order {execution_request_id!r} is in phase "
@@ -1959,6 +3006,19 @@ def mark_submitting(
             raise ValueError(
                 f"updated_at_utc must not go backwards: {row['updated_at_utc']} -> "
                 f"{_iso(changed_at_utc)}"
+            )
+        clearance_json: str | None = None
+        if row["signal_attempt"] >= 2:
+            clearance_json = _verify_submission_clearance(
+                connection,
+                row,
+                clearance_scope=clearance_scope,
+                clearance_observed_after_utc=clearance_observed_after_utc,
+            )
+        elif clearance_scope is not None or clearance_observed_after_utc is not None:
+            raise ValueError(
+                f"execution order {execution_request_id!r} is attempt 1; clearance "
+                "verification inputs apply only to reissue children"
             )
         connection.execute(
             f"UPDATE {ORDERS_TABLE} SET submission_phase = ?, order_state = ?, "
@@ -1980,6 +3040,7 @@ def mark_submitting(
             broker_order_id=None,
             order_result_json=None,
             changed_at_utc=changed_at_utc,
+            clearance_json=clearance_json,
         )
         expected_row = dict(row)
         expected_row.update(
@@ -2004,9 +3065,73 @@ def mark_submitting(
                 "changed_at_utc": _iso(changed_at_utc),
                 "repair_attempt_id": None,
                 "repair_generation": None,
+                "clearance_json": clearance_json,
             },
         )
     return updated
+
+
+def _verify_submission_clearance(
+    connection: sqlite3.Connection,
+    row: dict,
+    *,
+    clearance_scope: str | None,
+    clearance_observed_after_utc: datetime | None,
+) -> str:
+    """Verify the signal's CURRENT clearance for a reissue child inside the
+    ``mark_submitting`` transaction; returns the content-bound reference to
+    persist on the granting history row. EVERY failure is
+    :class:`ExecutionClearanceError` (fail-closed): downgrading information
+    always wins, and only a fully verified grant authorizes."""
+    request_id = row["execution_request_id"]
+    signal_id = row["signal_id"]
+    if clearance_scope is None or clearance_observed_after_utc is None:
+        raise ExecutionClearanceError(
+            f"reissue child {request_id!r} requires clearance verification inputs "
+            "(clearance_scope + clearance_observed_after_utc); without them the "
+            "clearance cannot be verified and submission authority is refused"
+        )
+    current = connection.execute(
+        f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
+        "ORDER BY clearance_generation DESC LIMIT 1",
+        (signal_id,),
+    ).fetchone()
+    if current is None:
+        raise ExecutionClearanceError(
+            f"reissue child {request_id!r} has no clearance evidence recorded for "
+            f"signal {signal_id!r}; absence of evidence is not absence of divergence"
+        )
+    current = dict(current)
+    if current["status"] != CLEARANCE_STATUS_VALID:
+        raise ExecutionClearanceError(
+            f"reissue child {request_id!r} cannot submit: the current clearance "
+            f"(generation {current['clearance_generation']}) is "
+            f"{current['status']!r}, not {CLEARANCE_STATUS_VALID!r}"
+        )
+    if current["account_scope"] != clearance_scope:
+        raise ExecutionClearanceError(
+            f"reissue child {request_id!r} cannot submit: the clearance was observed "
+            f"for scope {current['account_scope']!r}, but the submission target is "
+            f"{clearance_scope!r} (evidence must cover the account it authorizes)"
+        )
+    try:
+        observed_at = _parse_utc(current["observed_at_utc"])
+    except ValueError as exc:
+        raise ExecutionClearanceError(
+            f"reissue child {request_id!r} cannot submit: the clearance carries an "
+            f"unreadable observation time ({exc})"
+        ) from exc
+    if observed_at < clearance_observed_after_utc:
+        raise ExecutionClearanceError(
+            f"reissue child {request_id!r} cannot submit: the clearance was observed "
+            f"at {current['observed_at_utc']}, before the freshness cutoff "
+            f"{_iso(clearance_observed_after_utc)}"
+        )
+    return _clearance_ref_to_json(
+        clearance_generation=current["clearance_generation"],
+        evidence_id=current["evidence_id"],
+        evidence_sha256=_sha256_text(current["evidence_json"]),
+    )
 
 
 def _apply_state_update(
@@ -2095,6 +3220,7 @@ def _apply_state_update(
             "changed_at_utc": _iso(changed_at_utc),
             "repair_attempt_id": repair_attempt_id,
             "repair_generation": repair_generation,
+            "clearance_json": None,
         },
     )
 
@@ -2665,6 +3791,191 @@ def _fence_identity_diff(
     return sorted(column for column, value in actual.items() if value != wanted[column])
 
 
+# --- reissue clearance evidence (Issue #115) ----------------------------------
+
+
+def record_reissue_clearance(
+    signal_id: str,
+    *,
+    evidence_id: str,
+    status: str,
+    account_scope: str,
+    observed_at_utc: datetime,
+    evidence_json: str,
+    recorded_at_utc: datetime,
+    expected_generation: int | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """APPEND one clearance observation for ``signal_id`` as the next
+    generation (Issue #115).
+
+    This is the ONLY write the reconciliation side performs against the
+    execution DB: it never touches order rows or state history. Prior
+    generations are never rewritten or deleted, so every reference issued
+    against them stays resolvable; the signal's CURRENT clearance is simply
+    the highest generation. ``BEGIN IMMEDIATE`` serializes concurrent
+    observers, so generations are gapless and strictly ordered; a caller
+    that must build on a specific predecessor passes
+    ``expected_generation`` (the generation it observed; 0 for "none") and
+    gets :class:`ExecutionClearanceError` with the DB untouched when a
+    newer observation was recorded in between -- the newest information
+    always wins and is never silently overridden.
+
+    ``status`` semantics (the ordering discipline is the service layer's,
+    Issue #116; the store guarantees only monotonic append + fail-closed
+    reads): ``observing`` = a comparison is underway, submission refused;
+    ``valid`` = positive no-divergence evidence for ``account_scope`` as of
+    ``observed_at_utc``; ``revoked`` = divergence / invalidation.
+    ``evidence_json`` is the caller's canonical observation payload (a JSON
+    object); references bind to it by sha256. The DB must already exist and
+    be at the current schema -- clearance recording never creates or
+    migrates a DB (fail-closed, same stance as the safety store).
+    """
+    _require_non_empty_str(signal_id, "signal_id")
+    _require_non_empty_str(evidence_id, "evidence_id")
+    if status not in KNOWN_CLEARANCE_STATUSES:
+        raise ValueError(
+            f"status must be one of {sorted(KNOWN_CLEARANCE_STATUSES)}, got {status!r}"
+        )
+    _require_non_empty_str(account_scope, "account_scope")
+    _require_utc(observed_at_utc, "observed_at_utc")
+    _require_utc(recorded_at_utc, "recorded_at_utc")
+    if not isinstance(evidence_json, str) or not evidence_json.strip():
+        raise ValueError("evidence_json must be a non-empty JSON object string")
+    try:
+        payload = json.loads(evidence_json)
+    except ValueError as exc:
+        raise ValueError(f"evidence_json is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("evidence_json must encode a non-empty JSON object")
+    if expected_generation is not None and (
+        isinstance(expected_generation, bool)
+        or not isinstance(expected_generation, int)
+        or expected_generation < 0
+    ):
+        raise ValueError(
+            f"expected_generation must be a non-negative int or None, got "
+            f"{expected_generation!r}"
+        )
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        raise ExecutionStoreError(
+            f"execution DB at {db_path} does not exist; clearance evidence is only "
+            "recorded into an initialized store (call init_db first)"
+        )
+    with _verified_txn(db_path) as connection:
+        current = connection.execute(
+            f"SELECT MAX(clearance_generation) FROM {CLEARANCES_TABLE} "
+            "WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()[0]
+        current = 0 if current is None else int(current)
+        if expected_generation is not None and current != expected_generation:
+            raise ExecutionClearanceError(
+                f"clearance for signal {signal_id!r} is at generation {current}, not "
+                f"the expected {expected_generation}; a newer observation was recorded "
+                "and is never silently overridden (nothing was changed)"
+            )
+        record = {
+            "signal_id": signal_id,
+            "clearance_generation": current + 1,
+            "evidence_id": evidence_id,
+            "status": status,
+            "account_scope": account_scope,
+            "observed_at_utc": _iso(observed_at_utc),
+            "evidence_json": evidence_json,
+            "recorded_at_utc": _iso(recorded_at_utc),
+        }
+        try:
+            connection.execute(
+                f"INSERT INTO {CLEARANCES_TABLE} ({', '.join(_CLEARANCE_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _CLEARANCE_COLUMNS)})",
+                tuple(record[col] for col in _CLEARANCE_COLUMNS),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ExecutionOrderConflictError(
+                f"clearance evidence for signal {signal_id!r} collides with an "
+                f"existing row (evidence_id {evidence_id!r} already recorded?): {exc}"
+            ) from exc
+        stored = connection.execute(
+            f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
+            "AND clearance_generation = ?",
+            (signal_id, current + 1),
+        ).fetchone()
+        if stored is None or dict(stored) != record:  # pragma: no cover - defence
+            raise _integrity(
+                signal_id, "clearance row does not hold the intended values; rolling back"
+            )
+        stored = dict(stored)
+    stored["evidence_sha256"] = _sha256_text(stored["evidence_json"])
+    return stored
+
+
+def _validate_clearance_rows(signal_id: str, rows: list[dict]) -> None:
+    """Strict restore-time validation of one signal's clearance history:
+    contiguous generations from 1, known statuses, UTC timestamps, JSON
+    object payloads, non-empty identity fields. An out-of-band edited
+    evidence trail raises :class:`ExecutionIntegrityError`."""
+    for position, row in enumerate(rows, start=1):
+        if row["clearance_generation"] != position:
+            raise ExecutionIntegrityError(
+                f"clearance evidence for signal {signal_id!r} failed restore-time "
+                f"validation: generations are not contiguous from 1 "
+                f"(found {row['clearance_generation']} at position {position})"
+            )
+        problems = []
+        if row["status"] not in KNOWN_CLEARANCE_STATUSES:
+            problems.append(f"unknown status {row['status']!r}")
+        for field in ("evidence_id", "account_scope"):
+            if not isinstance(row[field], str) or not row[field].strip():
+                problems.append(f"{field} is empty or not a string")
+        for field in ("observed_at_utc", "recorded_at_utc"):
+            try:
+                _parse_utc(row[field])
+            except (ValueError, TypeError) as exc:
+                problems.append(f"unparseable {field}: {exc}")
+        try:
+            payload = json.loads(row["evidence_json"])
+            if not isinstance(payload, dict) or not payload:
+                problems.append("evidence_json is not a non-empty JSON object")
+        except (ValueError, TypeError) as exc:
+            problems.append(f"unparseable evidence_json: {exc}")
+        if problems:
+            raise ExecutionIntegrityError(
+                f"clearance evidence for signal {signal_id!r} (generation "
+                f"{row['clearance_generation']}) failed restore-time validation: "
+                + "; ".join(problems)
+            )
+
+
+def list_reissue_clearances(signal_id: str, *, db_path: Path | None = None) -> list[dict]:
+    """The signal's full clearance evidence trail, oldest generation first
+    (validated). Missing DB -> empty list, file never created."""
+    _require_non_empty_str(signal_id, "signal_id")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    with _verified_read(db_path) as connection:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                f"SELECT * FROM {CLEARANCES_TABLE} WHERE signal_id = ? "
+                "ORDER BY clearance_generation ASC",
+                (signal_id,),
+            ).fetchall()
+        ]
+    _validate_clearance_rows(signal_id, rows)
+    return rows
+
+
+def get_reissue_clearance(signal_id: str, *, db_path: Path | None = None) -> dict | None:
+    """The signal's CURRENT clearance (highest generation), or None while no
+    observation was ever recorded. Validates the whole trail it summarizes.
+    Read-only: missing DB -> None, file never created."""
+    rows = list_reissue_clearances(signal_id, db_path=db_path)
+    return rows[-1] if rows else None
+
+
 def get_repair_fence(execution_request_id: str, *, db_path: Path | None = None) -> dict | None:
     """The order's current repair fencing row, or None. Missing DB -> None;
     the file is never created (read-only contract)."""
@@ -2699,13 +4010,15 @@ def get_execution_order(execution_request_id: str, *, db_path: Path | None = Non
 def get_execution_order_by_signal_id(
     signal_id: str, *, db_path: Path | None = None
 ) -> dict | None:
-    """The execution order created from this source signal, or None.
+    """The signal's LATEST attempt (highest ``signal_attempt``), or None.
 
-    At most one can exist (Issue #76: ``signal_id`` is UNIQUE), so callers
-    can look up what a signal already produced -- e.g. to report why a new
-    intent was suppressed. Same read contract as every other read helper:
-    schema verification first, full bundle validation, missing DB -> None
-    without creating the file.
+    Issue #95 / #115 re-defines the old "at most one row per signal"
+    contract: a signal may now hold a linear reissue chain, and this lookup
+    returns its tail -- the only row that can still be live. Callers that
+    need the whole chain use :func:`list_execution_order_chain`. Same read
+    contract as every other read helper: schema verification first, full
+    bundle validation (chain links included), missing DB -> None without
+    creating the file.
     """
     _require_non_empty_str(signal_id, "signal_id")
     db_path = Path(db_path) if db_path is not None else execution_db_path()
@@ -2713,11 +4026,49 @@ def get_execution_order_by_signal_id(
         return None
     with _verified_read(db_path) as connection:
         row = connection.execute(
-            f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE signal_id = ?",
+            f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE signal_id = ? "
+            "ORDER BY signal_attempt DESC LIMIT 1",
             (signal_id,),
         ).fetchone()
         bundle = None if row is None else _fetch_and_validate(connection, row[0])
     return None if bundle is None else bundle[0]
+
+
+def list_execution_order_chain(signal_id: str, *, db_path: Path | None = None) -> list[dict]:
+    """The signal's FULL reissue chain, attempt 1 first (Issue #95 / #115).
+
+    Every row passes full bundle validation (which re-runs the shared
+    parent-child rules per child), and the chain as a whole must be
+    CONTIGUOUS from attempt 1 -- a gap means out-of-band damage and raises
+    :class:`ExecutionIntegrityError`. Missing DB -> empty list, file never
+    created.
+    """
+    _require_non_empty_str(signal_id, "signal_id")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    rows: list[dict] = []
+    with _verified_read(db_path) as connection:
+        ids = [
+            row["execution_request_id"]
+            for row in connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} WHERE signal_id = ? "
+                "ORDER BY signal_attempt ASC",
+                (signal_id,),
+            ).fetchall()
+        ]
+        for request_id in ids:
+            bundle = _fetch_and_validate(connection, request_id)
+            if bundle is not None:
+                rows.append(bundle[0])
+    for position, row in enumerate(rows, start=1):
+        if row["signal_attempt"] != position:
+            raise ExecutionIntegrityError(
+                f"execution chain for signal {signal_id!r} failed restore-time "
+                f"validation: attempts are not contiguous from 1 (found attempt "
+                f"{row['signal_attempt']} at position {position})"
+            )
+    return rows
 
 
 def get_execution_order_by_broker_order_id(
