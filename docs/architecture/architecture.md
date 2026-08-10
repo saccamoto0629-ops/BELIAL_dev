@@ -175,6 +175,7 @@ Paper Execution の dry-run は完全無副作用であり、読み取りエラ�
 - [Strategy 定義仕様](strategy_definition.md)
 - [Broker Interface](broker_interface.md)
 - [Execution Request / Order Persistence](execution_request.md)
+- [Execution Intent Reissue](execution_reissue.md)(Issue #95 設計・未実装)
 - [Broker Reconciliation](broker_reconciliation.md)
 - [Backtest](../backtest.md)
 - [Operations](../operations/operations.md)

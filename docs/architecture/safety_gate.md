@@ -146,6 +146,10 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 
 `symbol_not_allowed` / `side_not_allowed` / `quantity_limit_exceeded` / `symbol_position_limit_exceeded` / `account_position_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` / `market_snapshot_mismatch` / `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` / `spread_missing` / `spread_limit_exceeded` / `market_closed` / `symbol_not_tradable` / `kill_switch_enabled` / `broker_query_failed` / `state_query_failed` / `decision_persist_failed` / `execution_mode_mismatch` / `gate_internal_error` / `intent_not_registered` / `duplicate_submission` / `submission_journal_failed`
 
+- **拒否の解決経路(訂正差し替えは設計のみ・未実装)**: 永続化された `ExecutionRequest` は不変であり(request 内容を更新する store API は存在しない)、`submit()` は毎回同じ内容を読み直して全条件を再評価する。したがって拒否コードによって解決経路が異なる。
+  - 市場・口座・運用状態・呼び出し側の入力に起因する拒否 — 条件解消後に**同一 Request を再 submit**する(現行仕様で可能)。
+  - `symbol_not_allowed` / `side_not_allowed` — 注文内容は source signal に忠実であり、禁止しているのは policy 側である。解決は**明示的な policy 変更(監査対象の安全判断)後の再 submit**、またはその signal を執行しないことであり、注文内容の書き換えでは解決しない。
+  - `quantity_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` — 注文内容の不備であり、**内容を訂正した新しい意図へ差し替える**モデルが Issue #95 で設計済み([Execution Intent Reissue](execution_reissue.md)。`gate_correction` + 新拒否コード `intent_superseded`)。**実装は後続 Issue のため、現時点では訂正経路が存在しない**(policy 側の緩和でも解消しうるが、それは安全ポリシーの変更である)。
 - 拒否理由の正は `SafetyRejectionCode`(enum 値)であり、文字列ログは補助である。ログには拒否コード・`execution_request_id`・`policy_id` を出す。**重複抑止(`duplicate_submission`)時はこれに加えて source `signal_id`・現在の `submission_phase` / `order_state`・抑止理由を WARN で必ず出力する**(Issue #76。store 側の作成時 conflict も同じ項目をログする)。secret・token・口座残高等は出さない。
 - 1 判定内の拒否コードは**順序保持 dedup**される(最初の出現が勝つ)。`SafetyDecision` はコードの一意性を構築時不変条件として強制する。
 

@@ -51,7 +51,7 @@ execution_store                 ← execution/execution_store.py(SQLite 永続�
 - `execution_request_id` — BELIAL 内部の発注**意図**の ID。execution store の主キーで、状態履歴のキー。
 - `client_order_id` — Broker 境界(submit / cancel / query, Issue #73)の呼び出し側キー。この意図に対する Broker 側注文 1 件を指す。
 
-store は両者を **1:1 で固定**する(`client_order_id` は NOT NULL + UNIQUE、保存後は不変)。UNKNOWN(結果不明)後の照会は**保存済みの `client_order_id`** で行う。同じ意図を**新しい `client_order_id` で再送することが二重発注の正体**であるため、モデル・store は client order ID を暗黙に生成・更新・ローテーションしない。再送(意図の再発行)は新しい `execution_request_id` + 新しい `client_order_id` を持つ別レコードとして UNKNOWN の解決と区別されるが、**Issue #76 以降は同一 source signal からの新レコード作成自体が `signal_id` の UNIQUE 制約で拒否される**: 暗黙の再発行経路は存在せず、将来再発行フローを作る場合(非スコープ)は明示的な運用判断・migration を伴う設計にしなければならない。
+store は両者を **1:1 で固定**する(`client_order_id` は NOT NULL + UNIQUE、保存後は不変)。UNKNOWN(結果不明)後の照会は**保存済みの `client_order_id`** で行う。同じ意図を**新しい `client_order_id` で再送することが二重発注の正体**であるため、モデル・store は client order ID を暗黙に生成・更新・ローテーションしない。再送(意図の再発行)は新しい `execution_request_id` + 新しい `client_order_id` を持つ別レコードとして UNKNOWN の解決と区別されるが、**Issue #76 以降は同一 source signal からの新レコード作成自体が `signal_id` の UNIQUE 制約で拒否される**: 暗黙の再発行経路は存在しない。REJECTED 後に限り明示的な新 intent として再発行するモデルは **Issue #95 で設計が確定**した([Execution Intent Reissue](execution_reissue.md)。親子関係の永続化・`(signal_id, signal_attempt)` 一意への拡張・schema v5 migration を伴う)が、**実装は後続 Issue であり、実装されるまで本書の現行契約(schema v4・signal_id 全体一意・再発行経路の不存在)が正である**。
 
 ## ExecutionRequest(`execution_models.py`)
 
@@ -227,7 +227,7 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 
 - **一意性の最終防衛線は DB 制約 + トランザクション**: `execution_request_id`(PRIMARY KEY)・`signal_id`(UNIQUE index)・`client_order_id`(UNIQUE)。事前 SELECT は失敗後の分類にのみ使い、重複判定そのものは `BEGIN IMMEDIATE` トランザクション内の INSERT / UPDATE が制約に衝突するかどうかで確定する。既存行とのキー一致を確認できた並行 creator の敗者だけを `ExecutionOrderConflictError`(正常系の抑止)へ分類し、CHECK / NOT NULL や未知制約の `sqlite3.IntegrityError` は重複として扱わず障害として伝播する。複数キーが異なる既存行と同時に衝突した場合は全キーを報告する。
 - **送信権の獲得は短いトランザクションで完了してから Broker を呼ぶ**: `mark_submitting()`(created → submitting、`order_state = pending` の永続化)が `BEGIN IMMEDIATE` で直列化され一度しか成功しないため、Broker を呼べる実行主体は最大 1 つ。外部 Broker 呼び出し中に SQLite の書き込みトランザクションを保持しない。
-- **再処理の抑止**: phase が `created` 以外(submitting / submitted。order_state が pending / accepted / partially_filled / filled / unknown / terminal のいずれでも)の Request は再送信されない([Safety Gate](safety_gate.md) の `duplicate_submission`)。**REJECTED も同一意図での再送は不可**(判断根拠: `client_order_id` は 1:1 不変で `mark_submitting` は一度きり、かつ再発行レコードは `signal_id` UNIQUE が拒否する。暗黙の再送可能状態は存在しない)。
+- **再処理の抑止**: phase が `created` 以外(submitting / submitted。order_state が pending / accepted / partially_filled / filled / unknown / terminal のいずれでも)の Request は再送信されない([Safety Gate](safety_gate.md) の `duplicate_submission`)。**REJECTED も同一意図での再送は不可**(判断根拠: `client_order_id` は 1:1 不変で `mark_submitting` は一度きり、かつ再発行レコードは `signal_id` UNIQUE が拒否する。暗黙の再送可能状態は存在しない)。REJECTED 後の**明示的な新 intent としての再発行**は Issue #95 で設計済み([Execution Intent Reissue](execution_reissue.md)。未実装)であり、同一 Request の再送を許す設計ではない。
 - **タイムアウト・結果不明は UNKNOWN として保存**され、即時再送しない(上記「UNKNOWN の扱い」)。
 - **重複抑止ログ**: 抑止時は WARN で `execution_request_id`・`signal_id`・現在の `submission_phase` / `order_state`・抑止理由を必ず出力する(store の作成時 conflict と送信サービスの `duplicate_submission` の両方)。
 - `get_execution_order_by_signal_id()`: signal からの逆引き read helper(高々 1 件)。missing DB はファイルを作らず None。
