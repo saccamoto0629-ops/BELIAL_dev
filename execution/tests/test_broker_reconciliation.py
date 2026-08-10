@@ -33,6 +33,7 @@ from broker.broker_models import (
     OrderSide,
     OrderState,
     OrderType,
+    RejectionCategory,
 )
 from broker.fake_broker import (
     FakeBroker,
@@ -457,6 +458,7 @@ def test_conflicting_terminal_states_are_reconciled_for_manual_review(paths):
         cancelled,
         state=OrderState.REJECTED,
         reject_reason="broker now reports rejection",
+        rejection_category=RejectionCategory.UNCLASSIFIED,
         updated_at_utc=cancelled.updated_at_utc + timedelta(seconds=1),
     )
 

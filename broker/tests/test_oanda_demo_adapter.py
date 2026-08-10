@@ -388,8 +388,51 @@ def test_submit_broker_rejection_is_a_result_not_an_exception():
     result = adapter.submit_order(make_request())
     assert result.state is m.OrderState.REJECTED
     assert result.reject_reason == "INSUFFICIENT_MARGIN"
+    # Issue #114: the native code maps to the broker-neutral category
+    assert result.rejection_category is m.RejectionCategory.ACCOUNT
     assert result.broker_order_id is None
     assert result.filled_quantity == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    "native, category",
+    [
+        ("INSUFFICIENT_LIQUIDITY", m.RejectionCategory.TRANSIENT),
+        ("MARKET_HALTED", m.RejectionCategory.TRANSIENT),
+        ("UNITS_PRECISION_EXCEEDED", m.RejectionCategory.PARAMETER),
+        ("PRICE_BOUND_INVALID", m.RejectionCategory.PARAMETER),
+        ("INSUFFICIENT_MARGIN", m.RejectionCategory.ACCOUNT),
+        ("INSTRUMENT_NOT_TRADEABLE", m.RejectionCategory.INSTRUMENT),
+        ("INTERNAL_SERVER_ERROR", m.RejectionCategory.BROKER_INTERNAL),
+        # unknown / never-seen codes are fail-closed (Issue #114)
+        ("SOME_FUTURE_REJECT_CODE", m.RejectionCategory.UNCLASSIFIED),
+    ],
+)
+def test_native_reject_codes_map_to_categories_inside_the_adapter(native, category):
+    adapter, _ = make_adapter(
+        (400, {"orderRejectTransaction": {"id": "5001", "rejectReason": native}})
+    )
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert result.rejection_category is category
+
+
+def test_rejection_without_a_native_code_is_unclassified():
+    # no rejectReason at all: the audit reason falls back to errorMessage,
+    # the classification stays fail-closed
+    adapter, _ = make_adapter(
+        (
+            400,
+            {
+                "orderRejectTransaction": {"id": "5001"},
+                "errorMessage": "order was rejected",
+            },
+        )
+    )
+    result = adapter.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert result.reject_reason == "order was rejected"
+    assert result.rejection_category is m.RejectionCategory.UNCLASSIFIED
 
 
 def test_submit_invalid_request_without_reject_transaction_raises():
@@ -874,6 +917,10 @@ def test_broker_echoed_reject_reason_is_redacted_in_the_result():
     assert ACCOUNT not in result.reject_reason
     assert TOKEN not in result.reject_reason
     assert oa.OANDA_DEMO_API_URL not in result.reject_reason
+    # Issue #114: a secret-echoing reason is no known native code, so the
+    # classification stays fail-closed — and the category never carries the
+    # native text at all
+    assert result.rejection_category is m.RejectionCategory.UNCLASSIFIED
 
 
 def test_zero_or_negative_fill_price_is_a_communication_error():

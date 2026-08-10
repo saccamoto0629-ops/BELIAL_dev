@@ -293,6 +293,8 @@ def test_weighted_average_price_of_no_fills_is_none():
         {"state": m.OrderState.REJECTED},
         # reject_reason forbidden outside REJECTED
         {"reject_reason": "nope"},
+        # rejection_category forbidden outside REJECTED (Issue #114)
+        {"rejection_category": m.RejectionCategory.ACCOUNT},
         # average price without fills
         {"filled_quantity": Decimal("0"), "remaining_quantity": Decimal("10"),
          "fills": (), "state": m.OrderState.ACCEPTED},
@@ -321,10 +323,92 @@ def test_order_result_rejects_wrong_field_types_as_invalid_request():
         {"fills": (object(),)},             # non-Fill entry
         {"reject_reason": ""},
         {"reject_reason": "   "},
+        {"rejection_category": "account"},  # raw string instead of enum
     ]
     for overrides in cases:
         with pytest.raises(m.BrokerInvalidRequestError):
             make_result(**overrides)
+
+
+# --- RejectionCategory (Issue #114) -----------------------------------------
+
+
+def test_rejection_category_is_a_closed_broker_neutral_vocabulary():
+    values = {c.value for c in m.RejectionCategory}
+    assert values == {
+        "transient", "parameter", "account", "instrument",
+        "broker_internal", "unclassified",
+    }
+
+
+def make_rejected(**overrides):
+    kwargs = dict(
+        state=m.OrderState.REJECTED, broker_order_id=None,
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+        average_fill_price=None, fills=(), reject_reason="rejected",
+        rejection_category=m.RejectionCategory.UNCLASSIFIED,
+    )
+    kwargs.update(overrides)
+    return make_result(**kwargs)
+
+
+def test_rejected_result_carries_its_category():
+    result = make_rejected(rejection_category=m.RejectionCategory.ACCOUNT)
+    assert result.rejection_category is m.RejectionCategory.ACCOUNT
+
+
+def test_rejected_without_a_category_is_inconsistent():
+    # REJECTED <-> rejection_category required, mirroring reject_reason
+    with pytest.raises(ValueError):
+        make_rejected(rejection_category=None)
+
+
+def test_category_without_a_reject_reason_is_inconsistent():
+    with pytest.raises(ValueError):
+        make_rejected(reject_reason=None)
+
+
+@pytest.mark.parametrize(
+    "state", [s for s in m.OrderState if s is not m.OrderState.REJECTED]
+)
+def test_category_is_forbidden_for_every_non_rejected_state(state):
+    # every non-REJECTED state must carry None; reuse a state-consistent
+    # snapshot and add only the forbidden category
+    consistent = {
+        m.OrderState.PENDING: dict(
+            broker_order_id=None, filled_quantity=Decimal("0"),
+            remaining_quantity=Decimal("10"), average_fill_price=None, fills=(),
+        ),
+        m.OrderState.ACCEPTED: dict(
+            filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
+            average_fill_price=None, fills=(),
+        ),
+        m.OrderState.PARTIALLY_FILLED: dict(
+            filled_quantity=Decimal("4"), remaining_quantity=Decimal("6"),
+            fills=(m.Fill("f-1", Decimal("2400.50"), Decimal("4"), UTC_NOW),),
+        ),
+        m.OrderState.FILLED: dict(),
+        m.OrderState.CANCELLED: dict(
+            filled_quantity=Decimal("4"), remaining_quantity=Decimal("6"),
+            fills=(m.Fill("f-1", Decimal("2400.50"), Decimal("4"), UTC_NOW),),
+        ),
+        m.OrderState.UNKNOWN: dict(),
+    }[state]
+    with pytest.raises(ValueError):
+        make_result(
+            state=state,
+            rejection_category=m.RejectionCategory.TRANSIENT,
+            **consistent,
+        )
+
+
+def test_terminal_reobservation_rejects_a_lone_category_change():
+    # a settled rejection's classification can never be rewritten afterwards
+    old = make_rejected(rejection_category=m.RejectionCategory.ACCOUNT)
+    with pytest.raises(ValueError):
+        m.validate_order_result_update(
+            old, make_rejected(rejection_category=m.RejectionCategory.TRANSIENT)
+        )
 
 
 # --- UNKNOWN contract (PR #87) ----------------------------------------------
@@ -416,6 +500,7 @@ def rejected_zero_fill(**overrides):
         state=m.OrderState.REJECTED, broker_order_id=None,
         filled_quantity=Decimal("0"), remaining_quantity=Decimal("10"),
         average_fill_price=None, fills=(), reject_reason="rejected",
+        rejection_category=m.RejectionCategory.UNCLASSIFIED,
     )
     kwargs.update(overrides)
     return make_result(**kwargs)

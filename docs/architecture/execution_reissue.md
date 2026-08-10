@@ -41,7 +41,7 @@
 
 ## 正規化拒否分類(`RejectionCategory`)
 
-Broker の確定拒否(`OrderState.REJECTED`)には現在、監査用の自由文字列 `reject_reason`(REJECTED のとき必須・非空)だけが付く。再発行可否の判断を Broker 固有文字列の解析に依存させないため、**Broker 境界に正規化分類を追加する**(後続 Issue)。
+Broker の確定拒否(`OrderState.REJECTED`)には現在、監査用の自由文字列 `reject_reason`(REJECTED のとき必須・非空)だけが付く。再発行可否の判断を Broker 固有文字列の解析に依存させないため、**Broker 境界に正規化分類を追加する**(Issue #114 で実装済み: `broker/broker_models.py` の `RejectionCategory` と `OrderResult.rejection_category`、FakeBroker / OANDA Demo Adapter の Adapter 内部写像、execution store snapshot の後方互換読み戻し)。
 
 - `RejectionCategory` は `broker/broker_models.py` に定義する **Broker 中立の閉じた enum** とする。各 Adapter(FakeBroker / OANDA Demo Adapter / 将来の実 Adapter)は、自身の native 拒否コードからこの分類への写像を **Adapter 内部に**持つ。分類の**入力**は Adapter 内部で見た native 応答であり、execution 層の**判断**には `reject_reason` の文字列を使わない。
 - **`reject_reason` の秘匿契約は不変**: 監査用に保持される `reject_reason` は、**Adapter が既存の規則で redact したうえで切り詰めた安全な文字列**のままである([Broker Interface](broker_interface.md) の「Secrets」: Broker が echo した token / account id / endpoint を scrub する)。**分類を導入しても native 文字列を verbatim で保持する経路は作らない** — Broker が拒否理由に secret を echo した場合、それを `OrderResult` snapshot として永続化してはならない。
@@ -350,7 +350,7 @@ REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order
 - reconciliation 側が clearance evidence を発行・失効できること。失敗は送信可能側へ倒れないこと(順序・並行制御の方式は #115 / #116)
 - `gate_correction` のために、**未送信の親に対応する Broker 注文が存在しないことを確認する照会経路**(既存の照会系 API のみ・write 操作なし。方式は #116)
 - Submission Journal に、**送信されないことが確定した intent を監査可能な終端状態へ収束させる仕組み**(Broker 到達の可能性がある intent は対象外)。entry のライフサイクル・reclaim 規則・二重送信ガードそのものは不変(遷移値・タイミング・再試行方式は #116)
-- `OrderResult` への `rejection_category` 追加(#114)、`execution_orders` への再発行 provenance 列追加・一意性制約の置換・clearance evidence の永続化(#115)
+- `OrderResult` への `rejection_category` 追加(#114 で**実装済み**)、`execution_orders` への再発行 provenance 列追加・一意性制約の置換・clearance evidence の永続化(#115)
 
 ## 移行方針(v4 → v5・後続 Issue)
 
@@ -363,7 +363,7 @@ REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order
 
 | Issue | 内容 | 依存 |
 |---|---|---|
-| #114 | [Broker] `RejectionCategory` の定義と `OrderResult.rejection_category`(REJECTED ⇔ 必須の相互制約・旧 snapshot の `unclassified` 読み戻し・FakeBroker / OANDA Demo Adapter の写像) | なし |
+| #114 | [Broker] `RejectionCategory` の定義と `OrderResult.rejection_category`(REJECTED ⇔ 必須の相互制約・旧 snapshot の `unclassified` 読み戻し・FakeBroker / OANDA Demo Adapter の写像)— **実装済み** | なし |
 | #115 | [Execution] schema v5(親子関係・attempt / kind 列・一意性制約の置換・v4 → v5 migration・チェーン整合とフィールド不変条件の検証・`mark_submitting()` の子存在検証と **clearance 照合**・**clearance evidence の保存形式と送信時 evidence の原子的な記録**・読み取り API のチェーン対応) | #114 は不要(独立) |
 | #116 | [Execution] 手動再発行 + 訂正差し替えユースケース(登録 API・eligibility 検証・**policy 同一性の識別方式**・Gate 判定 / Journal 事前条件・**superseded intent の終端化(競合・再試行を含む)**・`intent_superseded` 拒否コード・**clearance の要件判定 / 発行 / 失効と並行観測の直列化**・**未送信の親に対する Broker 照会**・監査記録・通常 `submit()` 経路への接続・固定シナリオ) | #114 #115 |
 | #117 | [Execution] `transient` 限定の自動再試行 policy(cooldown・上限・kill switch / discrepancy 前提条件。**既定無効**) | #114 #115 #116 + Live Execution runner(未着手) |

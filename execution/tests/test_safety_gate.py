@@ -26,6 +26,7 @@ from broker.broker_models import (
     OrderType,
     PositionInfo,
     PositionSide,
+    RejectionCategory,
 )
 from broker.fake_broker import FailCommunication, FakeBroker, RejectOrder, TimeoutOrder
 from execution import execution_store
@@ -1099,6 +1100,7 @@ def result_for_suppressed_state(state):
         OrderState.FILLED,
     } else None
     reject_reason = None
+    rejection_category = None
     if state is OrderState.PARTIALLY_FILLED:
         filled = Decimal("0.5")
         fills = (Fill("fill-1", Decimal("150"), filled, NOW),)
@@ -1109,6 +1111,7 @@ def result_for_suppressed_state(state):
         average = Decimal("150")
     elif state is OrderState.REJECTED:
         reject_reason = "broker rejected"
+        rejection_category = RejectionCategory.UNCLASSIFIED
     return OrderResult(
         client_order_id="client-1",
         broker_order_id=broker_order_id,
@@ -1124,6 +1127,7 @@ def result_for_suppressed_state(state):
         updated_at_utc=NOW,
         fills=fills,
         reject_reason=reject_reason,
+        rejection_category=rejection_category,
     )
 
 

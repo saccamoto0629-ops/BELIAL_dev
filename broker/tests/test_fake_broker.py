@@ -113,9 +113,31 @@ def test_rejected_order_is_a_result_state_with_a_reason_not_an_exception():
     result = broker.submit_order(make_request())
     assert result.state is m.OrderState.REJECTED
     assert result.reject_reason == "insufficient margin"
+    # Issue #114: an unscripted category defaults fail-closed
+    assert result.rejection_category is m.RejectionCategory.UNCLASSIFIED
     assert result.filled_quantity == Decimal("0")
     # a definitive rejection is queryable afterwards
     assert broker.get_order("c-1").state is m.OrderState.REJECTED
+
+
+def test_rejection_scenario_returns_the_scripted_category():
+    # Issue #114: the script IS the fake broker's native answer, so it names
+    # the normalized category directly (the adapter-mapping analogue)
+    broker = fb.FakeBroker()
+    broker.script_order(
+        "c-1",
+        fb.RejectOrder(reason="insufficient margin",
+                       category=m.RejectionCategory.ACCOUNT),
+    )
+    result = broker.submit_order(make_request())
+    assert result.state is m.OrderState.REJECTED
+    assert result.rejection_category is m.RejectionCategory.ACCOUNT
+    assert broker.get_order("c-1").rejection_category is m.RejectionCategory.ACCOUNT
+
+
+def test_reject_script_refuses_a_non_category_value_at_construction():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.RejectOrder(reason="nope", category="account")
 
 
 # --- タイムアウト (outcome unknown, NOT a rejection) --------------------------
