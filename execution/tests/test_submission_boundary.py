@@ -139,17 +139,51 @@ def test_to_order_request_is_called_only_by_the_safety_gate_and_model_tests():
     assert _offenders("to_order_request", TO_ORDER_REQUEST_ALLOWED) == []
 
 
+def _local_names_for(tree: ast.AST, class_name: str) -> set[str]:
+    """Every LOCAL name bound to ``class_name`` in this module: the plain
+    name plus any ``from ... import Foo as Alias`` binding (PR #122 Codex
+    review r4)."""
+    names = {class_name}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == class_name and alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def _construction_sites_in_source(source: str, class_name: str) -> list[int]:
+    """Lines constructing ``class_name`` in ``source``, in every static form
+    (PR #122 Codex review r4 -- the pin the sharing guarantee relies on must
+    not be bypassable by how the class is imported):
+
+    - bare name: ``ReissueService(...)``
+    - aliased import: ``from ... import ReissueService as R`` then ``R(...)``
+    - module-qualified: ``reissue_service.ReissueService(...)`` and
+      ``import ... as rs`` -> ``rs.ReissueService(...)`` (any attribute
+      access whose final attribute IS the class name)
+
+    Residual (same limit the ``submit_order`` pin has always had, and the
+    same one ``docs/architecture/safety_gate.md`` lists as non-scope):
+    fully dynamic construction -- ``getattr(module, "ReissueService")()``
+    or a stashed constructor -- is not statically visible to any AST scan.
+    """
+    tree = ast.parse(source)
+    local_names = _local_names_for(tree, class_name)
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in local_names:
+            sites.append(node.lineno)
+        elif isinstance(func, ast.Attribute) and func.attr == class_name:
+            sites.append(node.lineno)
+    return sorted(sites)
+
+
 def _construction_sites(path: pathlib.Path, class_name: str) -> list[int]:
-    """Lines constructing ``class_name`` by bare name (``Foo(...)``) -- the
-    form every call site in this repository uses."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    return [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == class_name
-    ]
+    return _construction_sites_in_source(path.read_text(encoding="utf-8"), class_name)
 
 
 def _construction_offenders(class_name: str, allowed: set[str]) -> list[str]:
@@ -174,6 +208,53 @@ def test_reissue_boundary_services_are_built_only_by_the_composition_root(class_
     assert (
         _construction_offenders(class_name, REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED) == []
     )
+
+
+@pytest.mark.parametrize(
+    "label, source",
+    [
+        (
+            "bare name",
+            "from execution.reissue_service import ReissueService\n"
+            "ReissueService(execution_db_path='x')\n",
+        ),
+        (
+            "aliased import",
+            "from execution.reissue_service import ReissueService as _R\n"
+            "_R(execution_db_path='x')\n",
+        ),
+        (
+            "module-qualified",
+            "from execution import reissue_service\n"
+            "reissue_service.ReissueService(execution_db_path='x')\n",
+        ),
+        (
+            "aliased module",
+            "import execution.reissue_service as _rs\n"
+            "_rs.ReissueService(execution_db_path='x')\n",
+        ),
+    ],
+)
+def test_the_boundary_pin_detects_every_static_construction_form(label, source):
+    """PR #122 Codex review r4: the sharing guarantee RELIES on this pin, so
+    the pin itself is tested. A scan that only matched ``ast.Name`` let a
+    module-qualified or aliased construction through -- i.e. the two
+    services could still be built with independent policies while the pin
+    stayed green."""
+    assert _construction_sites_in_source(source, "ReissueService") == [2], label
+
+
+def test_the_boundary_pin_does_not_flag_unrelated_constructions():
+    """The pin must not fire on other classes (including the policy object
+    itself, which every composer legitimately constructs)."""
+    source = (
+        "from execution.reissue_service import ReissuePolicy\n"
+        "from execution.reissue_composition import ReissueBoundary\n"
+        "ReissuePolicy()\n"
+        "ReissueBoundary(submission=None, registration=None, policy=None)\n"
+    )
+    assert _construction_sites_in_source(source, "ReissueService") == []
+    assert _construction_sites_in_source(source, "LiveOrderSubmissionService") == []
 
 
 def test_the_composition_root_hands_back_one_shared_policy_instance():
