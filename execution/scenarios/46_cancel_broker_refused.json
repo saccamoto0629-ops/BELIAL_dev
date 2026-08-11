@@ -1,0 +1,81 @@
+{
+  "scenario_id": "cancel_broker_refused",
+  "description": "キャンセル失敗(Broker確定拒否): BrokerCancellationErrorでは状態遷移を起こさず、注文はACCEPTEDのままin-flightとしてreconciliation対象に残る(Issue #99)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-1"
+      }
+    },
+    "cancel_scripts": {
+      "client-1": {
+        "behavior": "fail_cancellation",
+        "reason": "broker-side hold"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "broker_refused"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "accepted",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "accepted",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-1"
+      }
+    ],
+    "broker_submit_calls": 1,
+    "broker_cancel_calls": 1,
+    "order_rows": 1,
+    "history_rows": 2,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "broker_order_id": "BRK-1",
+    "filled_quantity": "0",
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

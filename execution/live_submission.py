@@ -65,6 +65,31 @@ Submission contract (docs/architecture/safety_gate.md):
    are resolved by reconciliation (crash-boundary table:
    docs/architecture/submission_journal.md).
 
+Cancellation contract (Issue #99): ``cancel()`` is THE single sanctioned
+path from a registered intent to ``Broker.cancel_order`` -- pinned by the
+same repository-wide AST tests. Only a broker-confirmed, still-working
+order (phase ``submitted``, state ACCEPTED / PARTIALLY_FILLED) reaches the
+broker; everything else is refused BEFORE any broker call with a typed
+``CancelRefusalCode`` (already CANCELLED -> idempotent duplicate refusal;
+terminal -> nothing to cancel; PENDING / UNKNOWN -> unresolved outcomes are
+resolved by queries / reconciliation, never by more broker calls). A
+definitive broker refusal (``BrokerCancellationError``) leaves the stored
+state untouched and is returned as ``BROKER_REFUSED``; ANY other broker
+exception and ANY failure to persist a received post-cancel result record
+state-only UNKNOWN (best-effort) and re-raise -- the mirror of the submit
+contract above. Every cancel attempt is additionally claimed in the durable
+CANCELLATION JOURNAL (PR #124 Codex review P1; same sealed SQLite file as
+the submission journal, own table): the claim is journaled BEFORE any
+broker call and the ``started`` mark is the last write before
+``cancel_order``, so a caller that crashed after the broker call -- or a
+concurrent second caller -- can never send a second broker cancel even
+while the order row still reads cancellable (journal conflicts ->
+``ATTEMPT_UNRESOLVED``; journal failures -> ``JOURNAL_FAILED``, fail
+closed). After the broker call, journal writes are best-effort and never
+block recording the outcome; unresolved claims are listed by
+``SubmissionJournal.list_unresolved_cancellations()`` and are resolved by
+reconciliation, never by re-sending.
+
 Reissue policy (Issue #116 / PR #122 review r2): ``reissue_policy`` is a
 MANDATORY constructor argument -- the SAME ``ReissuePolicy`` instance the
 registration service (``execution/reissue_service.py``) uses. The clearance
@@ -88,12 +113,19 @@ may exist).
 
 from __future__ import annotations
 
+import enum
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from broker.broker_models import OrderResult, OrderState
+from broker.broker_models import (
+    BrokerCancellationError,
+    OrderResult,
+    OrderState,
+    TERMINAL_ORDER_STATES,
+)
 from execution import execution_store
 from execution.execution_models import ExecutionRequest
 from execution.reissue_clearance import ClearanceScopeError, derive_account_scope
@@ -116,6 +148,138 @@ from execution.submission_journal import (
 _LOGGER = logging.getLogger(__name__)
 
 _SUBMIT_REASON = "live submission via safety gate"
+_CANCEL_REASON = "live cancellation via sanctioned cancel path"
+_CANCEL_UNKNOWN_CONTEXT_LOST = "cancel outcome lost"
+_CANCEL_UNKNOWN_CONTEXT_PERSIST = "cancel result persistence failed"
+
+# The order states a cancel may be sent for: broker-confirmed, still working.
+# Everything else is refused BEFORE any broker call (see ``cancel()``).
+_CANCELLABLE_STATES: frozenset[OrderState] = frozenset(
+    {OrderState.ACCEPTED, OrderState.PARTIALLY_FILLED}
+)
+
+
+class CancelStatus(enum.Enum):
+    """Machine-readable outcome classes of one ``cancel()`` call (Issue #99).
+
+    ``CANCELLED``       -- the broker confirmed the cancel and the terminal
+                           CANCELLED observation was durably recorded.
+    ``REFUSED``         -- refused LOCALLY, before any broker call
+                           (``refusal_code`` says why; the broker cancel
+                           call count did not change).
+    ``BROKER_REFUSED``  -- the broker DEFINITIVELY refused the cancel
+                           (``BrokerCancellationError``, e.g. the order
+                           settled broker-side). The stored state is
+                           unchanged; the order stays in-flight and the
+                           divergence is reconciliation's to observe.
+
+    Outcomes that are none of these -- timeout, communication failure,
+    unknown order, persistence failure after a received result -- are NOT
+    statuses: they RE-RAISE (after conservatively recording UNKNOWN), the
+    same way ``submit()`` never converts a post-broker failure into a
+    rejection.
+    """
+
+    CANCELLED = "cancelled"
+    REFUSED = "refused"
+    BROKER_REFUSED = "broker_refused"
+
+
+class CancelRefusalCode(enum.Enum):
+    """Why a ``cancel()`` was refused before any broker call (closed set)."""
+
+    #: The execution store could not even be read (fail closed).
+    STATE_QUERY_FAILED = "cancel_state_query_failed"
+    #: No persisted execution order exists under this id.
+    INTENT_NOT_REGISTERED = "cancel_intent_not_registered"
+    #: Phase ``created``: no submit attempt was ever made, so no broker
+    #: order can exist to cancel.
+    NOT_SUBMITTED = "cancel_not_submitted"
+    #: Phase ``submitting`` / state ``pending``: a submit attempt started but
+    #: no broker observation exists yet (in-flight call, or a crash left the
+    #: attempt stuck). Whether the broker holds the order is exactly what is
+    #: unresolved -- cancelling blind is banned; reconciliation resolves it.
+    SUBMISSION_UNRESOLVED = "cancel_submission_unresolved"
+    #: State ``unknown`` (lost submit outcome, lost cancel outcome, or a
+    #: result whose persistence failed): re-sending anything while the
+    #: outcome is unresolved is banned -- resolved by queries, never by a
+    #: second broker call. This is also the duplicate-cancel guard after a
+    #: cancel whose outcome was lost.
+    OUTCOME_UNRESOLVED = "cancel_outcome_unresolved"
+    #: The durable cancellation journal already holds an attempt for this
+    #: order that may have reached (or provably reached) the broker -- the
+    #: crash-window / concurrent-caller guard (PR #124 Codex review P1):
+    #: even when the ORDER row still reads cancellable (the process died
+    #: after the broker cancel but before any outcome write, or another
+    #: caller is mid-flight), the claim cannot be re-acquired and no second
+    #: broker cancel is sent. Resolved by reconciliation
+    #: (``SubmissionJournal.list_unresolved_cancellations()``).
+    ATTEMPT_UNRESOLVED = "cancel_attempt_unresolved"
+    #: The durable cancellation journal could not record the claim (or the
+    #: started mark): the broker is NOT called (fail closed) -- without the
+    #: durable claim a crash could make the attempt re-sendable.
+    JOURNAL_FAILED = "cancel_journal_failed"
+    #: State ``cancelled``: the cancel already succeeded. Refusing (instead
+    #: of re-sending) makes re-running the same cancel idempotent.
+    ALREADY_CANCELLED = "cancel_already_cancelled"
+    #: State ``filled`` / ``rejected``: terminal states are never left again
+    #: (``TERMINAL_ORDER_STATES``), so there is nothing a cancel could do.
+    TERMINAL_STATE = "cancel_terminal_state"
+
+
+@dataclass(frozen=True)
+class CancelOutcome:
+    """The typed result of one ``cancel()`` call (Issue #99).
+
+    Cross-field invariants (validated at construction):
+
+    - ``CANCELLED``      <-> ``result`` present, no ``refusal_code``,
+                             ``broker_called`` True
+    - ``REFUSED``        <-> ``refusal_code`` present, no ``result``,
+                             ``broker_called`` False
+    - ``BROKER_REFUSED`` <-> no ``result``, no ``refusal_code``,
+                             ``broker_called`` True
+    - ``detail`` is always a non-empty human-readable explanation.
+    """
+
+    execution_request_id: str
+    status: CancelStatus
+    detail: str
+    refusal_code: CancelRefusalCode | None = None
+    result: OrderResult | None = None
+    broker_called: bool = False
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.execution_request_id, "execution_request_id")
+        if not isinstance(self.status, CancelStatus):
+            raise ValueError(f"status must be a CancelStatus, got {self.status!r}")
+        _require_non_empty_str(self.detail, "detail")
+        if self.refusal_code is not None and not isinstance(self.refusal_code, CancelRefusalCode):
+            raise ValueError(
+                f"refusal_code must be a CancelRefusalCode or None, got {self.refusal_code!r}"
+            )
+        if self.result is not None and not isinstance(self.result, OrderResult):
+            raise ValueError(f"result must be an OrderResult or None, got {self.result!r}")
+        if not isinstance(self.broker_called, bool):
+            raise ValueError(f"broker_called must be a bool, got {self.broker_called!r}")
+        if self.status is CancelStatus.CANCELLED:
+            if self.result is None or self.refusal_code is not None or not self.broker_called:
+                raise ValueError(
+                    "a CANCELLED outcome requires a result, no refusal_code and "
+                    "broker_called=True"
+                )
+        elif self.status is CancelStatus.REFUSED:
+            if self.result is not None or self.refusal_code is None or self.broker_called:
+                raise ValueError(
+                    "a REFUSED outcome requires a refusal_code, no result and "
+                    "broker_called=False"
+                )
+        else:  # BROKER_REFUSED
+            if self.result is not None or self.refusal_code is not None or not self.broker_called:
+                raise ValueError(
+                    "a BROKER_REFUSED outcome requires no result, no refusal_code and "
+                    "broker_called=True"
+                )
 
 
 class LiveOrderSubmissionService:
@@ -323,6 +487,388 @@ class LiveOrderSubmissionService:
             result.state.value,
         )
         return decision, result
+
+    # --- cancellation --------------------------------------------------------
+
+    def cancel(self, execution_request_id: str) -> CancelOutcome:
+        """Cancel the broker order behind a registered intent -- THE single
+        sanctioned path to ``Broker.cancel_order`` (Issue #99), pinned
+        repository-wide by the same AST tests that pin ``submit_order``.
+
+        Symmetric with ``submit()`` wherever the contracts overlap:
+
+        - Everything BEFORE the broker call fails closed into a typed
+          ``REFUSED`` outcome; a refused cancel provably never reached the
+          broker (``broker_called=False``).
+        - Only a broker-confirmed, still-working order (phase ``submitted``,
+          state ACCEPTED / PARTIALLY_FILLED) may be cancelled. CANCELLED is
+          refused as ``ALREADY_CANCELLED`` (duplicate-cancel idempotency:
+          re-running a completed cancel never re-calls the broker); other
+          terminal states are refused (nothing to cancel); ``pending`` /
+          ``unknown`` are refused as unresolved -- an uncertain outcome is
+          resolved by later queries / reconciliation, never by sending more
+          broker calls (the submit-side UNKNOWN contract, applied to
+          cancel).
+        - ``BrokerCancellationError`` is the broker's DEFINITIVE refusal:
+          the stored state stays untouched (no synthetic transition), the
+          failure is WARN-logged with ids/state/reason and returned as
+          ``BROKER_REFUSED``. The order remains in-flight, so the
+          store/broker divergence that caused the refusal (e.g. filled
+          broker-side) stays visible to reconciliation
+          (``list_in_flight_orders`` / ``list_reconciliation_orders``).
+          A later ``cancel()`` is a NEW attempt, not a duplicate: a
+          definitively refused cancel leaves nothing pending at the broker.
+        - ANY other exception from ``cancel_order`` (timeout, communication
+          failure, unknown order, unexpected) means the cancel outcome --
+          and therefore the ORDER outcome -- is lost: state-only UNKNOWN is
+          recorded (best-effort, critically logged on failure) and the
+          exception re-raises. Never converted into a refusal; never
+          re-sent -- the UNKNOWN row is a query target
+          (``list_unknown_orders`` / ``list_unresolved_submissions``) and
+          any later ``cancel()`` refuses with ``OUTCOME_UNRESOLVED``.
+        - A received post-cancel ``OrderResult`` whose persistence fails is
+          NEVER lost silently: the response is journaled as
+          ``reconciliation_required`` (durable even with the order DB down),
+          state-only UNKNOWN is recorded (the order becomes a query target
+          whose broker-side truth -- CANCELLED -- a later query re-observes)
+          and the original persistence failure re-raises.
+        - Every attempt is CLAIMED in the durable cancellation journal
+          BEFORE the broker call (PR #124 Codex review P1): concurrent
+          callers serialize on the claim and its one-shot ``not_started ->
+          started`` transition, and a caller restarted after a possibly-sent
+          cancel finds the durable claim and is refused
+          (``ATTEMPT_UNRESOLVED``) even while the order row still reads
+          cancellable. A claim that provably never reached the broker
+          (``not_started``) is reclaimable; a definitively refused attempt
+          (``broker_refused``) is reclaimable as a NEW attempt. Journal
+          failures before the broker call refuse fail-closed
+          (``JOURNAL_FAILED``); after it they are logged critically and
+          never block.
+        """
+        _require_non_empty_str(execution_request_id, "execution_request_id")
+        try:
+            row = execution_store.get_execution_order(
+                execution_request_id, db_path=self._order_db_path
+            )
+        except Exception as exc:
+            # ANY lookup failure -- typed store errors and unexpected ones
+            # alike (e.g. a corrupted DB file) -- fails closed before the
+            # broker can be reached (submit's GATE_INTERNAL_ERROR catch-all,
+            # collapsed into the one query-failure refusal cancel needs).
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.STATE_QUERY_FAILED,
+                f"execution store lookup failed: {exc}",
+                phase=None,
+                state=None,
+                signal_id=None,
+            )
+        if row is None:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.INTENT_NOT_REGISTERED,
+                "no persisted execution order for this id; nothing to cancel",
+                phase=None,
+                state=None,
+                signal_id=None,
+            )
+        phase = row["submission_phase"]
+        state = None if row["order_state"] is None else OrderState(row["order_state"])
+        signal_id = row["signal_id"]
+        if phase == execution_store.PHASE_CREATED:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.NOT_SUBMITTED,
+                "no submit attempt was ever made (phase 'created'), so no broker "
+                "order can exist to cancel",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        if state is OrderState.UNKNOWN:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.OUTCOME_UNRESOLVED,
+                "the order's outcome is UNKNOWN; re-sending is banned while the "
+                "outcome is uncertain -- it is resolved by later queries / "
+                "reconciliation, never by another broker call",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        if state is OrderState.PENDING:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.SUBMISSION_UNRESOLVED,
+                "a submit attempt started but no broker observation exists yet "
+                "(phase 'submitting'/state 'pending'); whether the broker holds "
+                "the order is exactly what is unresolved -- reconciliation "
+                "resolves it, a blind cancel does not",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        if state is OrderState.CANCELLED:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.ALREADY_CANCELLED,
+                "the order is already CANCELLED; re-running the same cancel is "
+                "an idempotent no-op and never re-calls the broker",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        if state in TERMINAL_ORDER_STATES:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.TERMINAL_STATE,
+                f"the order is terminal ({state.value}); terminal states are "
+                "never left again, so there is nothing a cancel could do",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        if state not in _CANCELLABLE_STATES:
+            # Defensive closed-world guard: every OrderState is handled above;
+            # a state added to the enum without a cancel decision fails closed.
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.OUTCOME_UNRESOLVED,
+                f"state {state.value!r} has no defined cancel semantics (fail closed)",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+
+        # Durable cancel claim, FIRST barrier (PR #124 Codex review P1): the
+        # attempt is journaled -- independent of the order row's state --
+        # before any broker call. Concurrent callers serialize on the
+        # journal's write transaction, and a restarted caller finds the
+        # durable claim: a possibly-sent cancel can never be sent again,
+        # even while the order row still reads ACCEPTED (the crash window
+        # between the broker call and the outcome writes).
+        try:
+            self._journal.record_cancellation_intent(
+                execution_request_id=execution_request_id,
+                client_order_id=row["client_order_id"],
+                started_at_utc=self._now(),
+            )
+        except SubmissionJournalConflictError as exc:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.ATTEMPT_UNRESOLVED,
+                f"the cancellation journal already holds an attempt for this order: "
+                f"{exc}; re-sending is banned -- unresolved cancel attempts are "
+                "handed to reconciliation, never re-sent",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        except Exception as exc:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.JOURNAL_FAILED,
+                f"cancellation journal persistence failed: {exc}; the broker was NOT "
+                "called (fail closed)",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        # SECOND barrier: the ``started`` mark is the LAST write before the
+        # broker call, entered exactly once per claim (``not_started ->
+        # started`` serializes in the journal's transaction) -- of two
+        # racing callers holding the same claim, only one reaches the
+        # broker; a ``not_started`` row remains durable proof the broker
+        # cancel was never sent and is reclaimable by a later attempt.
+        try:
+            self._journal.mark_cancel_broker_call_started(
+                execution_request_id, at_utc=self._now()
+            )
+        except Exception as exc:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.JOURNAL_FAILED,
+                f"journal cancel-call-start persistence failed: {exc}; the broker was "
+                "NOT called (fail closed) -- a 'not_started' claim remains as durable "
+                "proof and a later cancel may reclaim it",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+
+        # ---- past this point the broker is called: failures are recorded
+        # conservatively as UNKNOWN and re-raised, never converted into
+        # refusals (mirror of the submit contract); journal writes are
+        # best-effort (critical log) and never block -----------------------
+        try:
+            result = self._connection.broker.cancel_order(row["client_order_id"])
+        except BrokerCancellationError as exc:
+            # The broker's DEFINITIVE refusal: the order was NOT cancelled and
+            # the broker answered authoritatively -- nothing is uncertain, so
+            # nothing is recorded into the state machine (the stored state
+            # stays valid) and nothing re-raises. The failure is recorded on
+            # the outcome and in the log (Issue #76 log contract style).
+            _LOGGER.warning(
+                "broker refused cancellation: execution_request_id=%s signal_id=%s "
+                "client_order_id=%s submission_phase=%s order_state=%s reason=%s",
+                execution_request_id,
+                signal_id,
+                row["client_order_id"],
+                phase,
+                state.value,
+                exc,
+            )
+            self._journal_write(
+                "cancel broker refusal",
+                lambda at: self._journal.mark_cancel_broker_refused(
+                    execution_request_id, error=f"broker refused cancellation: {exc}", at_utc=at
+                ),
+                execution_request_id,
+                recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
+            )
+            return CancelOutcome(
+                execution_request_id=execution_request_id,
+                status=CancelStatus.BROKER_REFUSED,
+                detail=f"the broker definitively refused the cancellation: {exc}",
+                broker_called=True,
+            )
+        except Exception as exc:
+            # Timeout / communication failure / unknown order / anything
+            # unexpected: the cancel outcome is LOST, so the order outcome is
+            # lost with it (conservative: a "not found" or "communication
+            # failure" claim never downgrades what the broker may hold).
+            self._journal_write(
+                "cancel outcome unknown",
+                lambda at: self._journal.record_cancel_broker_outcome_unknown(
+                    execution_request_id, error=f"cancel outcome lost: {exc}", at_utc=at
+                ),
+                execution_request_id,
+                recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
+            )
+            self._record_unknown_outcome(
+                execution_request_id, exc, context=_CANCEL_UNKNOWN_CONTEXT_LOST
+            )
+            raise
+        self._journal_write(
+            "cancel broker response",
+            lambda at: self._journal.record_cancel_broker_response(
+                execution_request_id,
+                response_state=result.state,
+                broker_order_id=result.broker_order_id,
+                at_utc=at,
+            ),
+            execution_request_id,
+            recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
+        )
+        try:
+            execution_store.record_order_result(
+                execution_request_id,
+                result,
+                reason=_CANCEL_REASON,
+                db_path=self._order_db_path,
+            )
+        except Exception as exc:
+            # The broker ANSWERED (the order is settled broker-side) but the
+            # result could not be persisted: the order must remain a QUERY
+            # TARGET whose broker-side truth a later query re-observes --
+            # never lost behind a persistence error (Issue #75 review r3
+            # contract, applied to cancel). The JOURNAL keeps the durable
+            # record -- response content included -- even when the order DB
+            # itself is down.
+            self._journal_write(
+                "cancel execution DB save failure",
+                lambda at: self._journal.record_cancel_execution_db_save_failed(
+                    execution_request_id,
+                    response_state=result.state,
+                    broker_order_id=result.broker_order_id,
+                    error=f"cancel result persistence failed: {exc}",
+                    at_utc=at,
+                ),
+                execution_request_id,
+                recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
+            )
+            self._record_unknown_outcome(
+                execution_request_id, exc, context=_CANCEL_UNKNOWN_CONTEXT_PERSIST
+            )
+            raise
+        self._journal_write(
+            "cancel completion",
+            lambda at: self._journal.mark_cancel_completed(
+                execution_request_id,
+                response_state=result.state,
+                broker_order_id=result.broker_order_id,
+                at_utc=at,
+            ),
+            execution_request_id,
+            recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
+        )
+        if result.state is not OrderState.CANCELLED:
+            # Defensive: the Broker contract returns the post-cancel snapshot
+            # of a SUCCESSFUL cancel. A conforming observation was recorded
+            # above either way (the audit trail keeps the truth), but the
+            # outcome must not claim a cancellation that did not happen.
+            _LOGGER.warning(
+                "cancel returned a non-cancelled snapshot: execution_request_id=%s "
+                "signal_id=%s state=%s (recorded as-is; not reported as cancelled)",
+                execution_request_id,
+                signal_id,
+                result.state.value,
+            )
+            return CancelOutcome(
+                execution_request_id=execution_request_id,
+                status=CancelStatus.BROKER_REFUSED,
+                detail=(
+                    f"the broker's post-cancel snapshot is {result.state.value!r}, "
+                    "not 'cancelled'; the snapshot was recorded but no "
+                    "cancellation is claimed"
+                ),
+                broker_called=True,
+            )
+        _LOGGER.info(
+            "cancelled execution_request_id=%s signal_id=%s client_order_id=%s "
+            "broker_order_id=%s",
+            execution_request_id,
+            signal_id,
+            row["client_order_id"],
+            result.broker_order_id,
+        )
+        return CancelOutcome(
+            execution_request_id=execution_request_id,
+            status=CancelStatus.CANCELLED,
+            detail="the broker confirmed the cancellation and CANCELLED was durably recorded",
+            result=result,
+            broker_called=True,
+        )
+
+    def _refused_cancel(
+        self,
+        execution_request_id: str,
+        code: CancelRefusalCode,
+        detail: str,
+        *,
+        phase: str | None,
+        state: OrderState | None,
+        signal_id: str | None,
+    ) -> CancelOutcome:
+        """A cancel refused BEFORE any broker call, WARN-logged with the ids,
+        the current phase/state and the refusal reason (the Issue #76
+        suppression-log contract, applied to cancels)."""
+        _LOGGER.warning(
+            "cancellation refused: execution_request_id=%s signal_id=%s "
+            "submission_phase=%s order_state=%s code=%s reason=%s",
+            execution_request_id,
+            signal_id,
+            phase,
+            None if state is None else state.value,
+            code.value,
+            detail,
+        )
+        return CancelOutcome(
+            execution_request_id=execution_request_id,
+            status=CancelStatus.REFUSED,
+            detail=detail,
+            refusal_code=code,
+        )
 
     # --- internals -----------------------------------------------------------
 
@@ -733,15 +1279,26 @@ class LiveOrderSubmissionService:
             )
         return decision
 
-    def _journal_write(self, context: str, write, execution_request_id: str) -> None:
+    def _journal_write(
+        self,
+        context: str,
+        write,
+        execution_request_id: str,
+        *,
+        recovery_surface: str = "SubmissionJournal.list_unresolved()",
+    ) -> None:
         """Best-effort journal write AFTER the broker call: a journal failure
         here must never block recording the broker outcome elsewhere and is
         never converted into a rejection (the order may exist). The entry
-        then stays in its previous state -- still not ``completed``, so it
-        remains visible via ``SubmissionJournal.list_unresolved()``. Uses
-        the wall clock as a last resort: the injected clock may be exactly
-        what is broken, and losing this record over a clock fault would
-        defeat the journal's purpose."""
+        then stays in its previous state -- still not terminal, so it
+        remains visible via ``recovery_surface`` (the SUBMISSION queue
+        ``SubmissionJournal.list_unresolved()`` by default; cancel-side call
+        sites name ``list_unresolved_cancellations()`` instead, PR #124
+        Codex review r2 P2 -- the recovery message must point at the queue
+        that actually lists the entry). Uses the wall clock as a last
+        resort: the injected clock may be exactly what is broken, and
+        losing this record over a clock fault would defeat the journal's
+        purpose."""
         try:
             try:
                 at = self._now()
@@ -751,10 +1308,10 @@ class LiveOrderSubmissionService:
         except Exception:
             _LOGGER.critical(
                 "failed to journal %s for execution_request_id=%s; the journal entry "
-                "stays unresolved and remains listed by SubmissionJournal."
-                "list_unresolved(); resolve via reconciliation",
+                "stays unresolved and remains listed by %s; resolve via reconciliation",
                 context,
                 execution_request_id,
+                recovery_surface,
             )
 
     def _record_unknown_outcome(

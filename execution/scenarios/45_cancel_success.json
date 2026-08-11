@@ -1,0 +1,84 @@
+{
+  "scenario_id": "cancel_success",
+  "description": "キャンセル成功: ACCEPTED注文を公認cancel API経由でキャンセルし、Broker確認済みCANCELLEDが状態機械契約どおり永続化される(Issue #99)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-1"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "cancelled",
+        "state": "cancelled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "cancelled",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "accepted",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-1"
+      },
+      {
+        "previous_state": "accepted",
+        "new_state": "cancelled",
+        "reason": "live cancellation via sanctioned cancel path",
+        "broker_order_id": "BRK-1"
+      }
+    ],
+    "broker_submit_calls": 1,
+    "broker_cancel_calls": 1,
+    "order_rows": 1,
+    "history_rows": 3,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "broker_order_id": "BRK-1",
+    "filled_quantity": "0",
+    "average_fill_price": null,
+    "reject_reason": null,
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

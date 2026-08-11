@@ -96,6 +96,15 @@ service.submit(execution_request_id, market=...)
 
 `UNKNOWN`(手順 5 の例外経路)も同様: Journal は `unknown` / `reconciliation_required`、Execution DB は UNKNOWN 記録。解決は後続照会の記録のみで、再送はどの経路でも拒否される。
 
+## Cancellation Journal(schema v3 / Issue #99)
+
+公認キャンセル経路(`LiveOrderSubmissionService.cancel()`、[Safety Gate / Live Order Submission](safety_gate.md) の「公認キャンセル経路」)の**耐久 cancel claim**。同一 SQLite ファイル内の専用テーブル `cancellation_journal`(1 注文 = 1 claim 行、`execution_request_id` PK・`client_order_id` UNIQUE)であり、submit 側と同じライフサイクル(`not_started` → `started` → `responded` | `unknown`、`started` は `Broker.cancel_order` 直前の最後の書き込み)を持つ。
+
+- **なぜ必要か(PR #124 CodeX レビュー P1)**: 注文状態だけでは「Broker cancel を送った後・outcome を書く前にプロセスが停止した」クラッシュ窓を塞げない(row は ACCEPTED のままで、再実行が事前検査を通過して二重 cancel を送ってしまう)。並行 2 呼び出しが同時に事前検査を通過する窓も同様。claim の一意獲得(`BEGIN IMMEDIATE` 直列化)と `not_started → started` の一度きり遷移が、この両方を構造的に阻止する。
+- **outcome**: `open` → `completed`(post-cancel 結果を Execution DB へ耐久保存)/ `reconciliation_required`(cancel outcome 消失、または応答受領後の Execution DB 保存失敗 = 応答内容込みで耐久記録)/ **`broker_refused`**(確定拒否 `BrokerCancellationError` の terminal。応答 snapshot なし・拒否理由を記録)。`superseded` は cancel には存在しない。
+- **reclaim**: `not_started`(Broker cancel が送られていないことの耐久的証明)は同一 claim として、terminal `broker_refused`(Broker に係属中の cancel なし)は **新規試行**(`attempt_count` + 1)として reclaim できる。それ以外(`started` / `unknown` / `reconciliation_required` / `completed`)は conflict = 公認経路が `cancel_attempt_unresolved` で拒否し、Broker は呼ばれない。時刻後退 reclaim・別 `client_order_id` への束縛替えは拒否。
+- **read API**: `get_cancellation_entry()` / `list_unresolved_cancellations()`(terminal = `completed` / `broker_refused` 以外を旧い順に列挙)。Execution Order DB が全損していても未解決 cancel を列挙できる。突合の自動実行・自動修復は submit 側と同じく非スコープ(reconciliation 側 Issue)。
+
 ## 不整合の機械可読な識別
 
 - Journal 単独: `outcome`(`open` / `completed` / `reconciliation_required` / `superseded`)+ `broker_call_state` × `execution_db_save_state` が試行の到達点を機械可読に示す。`list_unresolved()`(`outcome` が terminal = `completed` / `superseded` 以外)と `list_reconciliation_required()` が read API。
@@ -106,7 +115,7 @@ service.submit(execution_request_id, market=...)
 他 store(execution / safety / shadow / reconciliation store)と同一方針:
 
 - `initialize()` は **pristine な DB のみ**へ schema を新規作成(`sqlite_master` 0 件 + `user_version` 0)。それ以外は完全検証し、不一致なら **DB 無変更で** `SubmissionJournalSchemaError`。
-- **schema version は v2**(v1 = Issue #93 初版、**v2 = Issue #116 で `superseded` outcome + `superseded_by_execution_request_id` 列 + ライフサイクル CHECK の置換**)。**v1 → v2 migration**: `initialize()` が「完全な構造検証で v1 と一致した DB のみ」を単一 `BEGIN IMMEDIATE` トランザクションで migration する。v2 はテーブル本体の inline CHECK を書き換えるため(SQLite の `ALTER TABLE` では不可能)、journal テーブルを **rebuild** する(v2 テーブル新設 → 全行を無変更コピー(新列 NULL。v2 制約は v1 の緩和なので全 v1 行が満たす)→ 行数検証 → 旧テーブル DROP → index 再作成 → version bump → v2 完全再検証 → 全行のモデル再検証 → COMMIT)。途中失敗は全 rollback で v1 ファイル無変更。読み取り経路は migration しない。
+- **schema version は v3**(v1 = Issue #93 初版、**v2 = Issue #116 で `superseded` outcome + `superseded_by_execution_request_id` 列 + ライフサイクル CHECK の置換**、**v3 = Issue #99 / PR #124 レビュー P1 で cancellation journal テーブルの追加**)。**v1 → v2 migration**: `initialize()` が「完全な構造検証で v1 と一致した DB のみ」を単一 `BEGIN IMMEDIATE` トランザクションで migration する。v2 はテーブル本体の inline CHECK を書き換えるため(SQLite の `ALTER TABLE` では不可能)、journal テーブルを **rebuild** する(v2 テーブル新設 → 全行を無変更コピー(新列 NULL。v2 制約は v1 の緩和なので全 v1 行が満たす)→ 行数検証 → 旧テーブル DROP → index 再作成 → version bump → v2 完全再検証 → 全行のモデル再検証 → COMMIT)。**v2 → v3 migration は purely additive**(空の `cancellation_journal` テーブル + index の追加のみ。既存 submission 行は無変更・v1 からは連鎖 migration)。途中失敗は全 rollback で旧バージョンのファイル無変更。読み取り経路は migration しない。
 - 全 read / write が「open → **closed-world schema 検証**(sqlite_master 全 object 集合 + token 正規化 DDL + PRAGMA 構造 signature + version)→ トランザクション」で動作。trigger / view / 制約欠損 lookalike / 他コンポーネント DB は拒否。
 - 書き込みは同一トランザクション内で **commit 前 read-back 検証**(更新行がモデル不変条件を満たして読み戻せること)を行い、失敗は全 rollback。
 - 書き込みは missing DB を暗黙作成しない(未初期化 = 失敗 = 送信されない)。読み取りは **true read-only 接続**(`execution/sqlite_ro.py`)で missing DB を作成せず(missing → 空)、保存行を厳格に再検証して帯域外編集を `SubmissionJournalIntegrityError` で拒否する。
@@ -118,6 +127,7 @@ service.submit(execution_request_id, market=...)
 
 - `test_submission_journal.py` — store のライフサイクル round-trip と reopen(プロセス再起動相当)復元、遷移前提条件・時刻単調性(**reclaim の時刻後退拒否を含む**)、reclaim と conflict(進行後 / payload 不一致(**order_type 変更・指値移動を含む broker-bound 全フィールド**)/ client_order_id 競合)、未解決列挙、missing DB(write 失敗 + ファイル非作成 / read 空 + ファイル非作成)、pristine 判定・foreign schema・制約欠損 lookalike・trigger・version 不一致の拒否(DB 無変更)、帯域外改竄の復元時拒否、DB CHECK 発火、モデル不変条件。サービス統合: 正常送信の completed 記録、**Journal 欠損 / schema 破損 / started 書き込み失敗の fail-closed(Broker 呼び出し 0 件)**、**Broker 受理後の Execution DB 障害(ファイル消失 / バイト破損 / schema 改変 / read-only 接続)で Journal に reconciliation_required が残ること**、**Execution DB を消去・再作成しても Journal が再送を阻止すること**、timeout(UNKNOWN)の記録と再送拒否、Broker 呼び出し後の Journal 障害が結果記録を妨げないこと(critical ログ + 未解決列挙)、lost response write の自己修復、遷移インフラ失敗後の reclaim 再実行、プロセス再起動後の未解決復元。
 - `test_submission_journal.py`(Issue #116 追加分)— `mark_superseded` の終端化(not_started 限定・冪等 no-op・別 provenance の conflict・possibly-sent 全状態の拒否・entry 不在 / 時刻後退 / 自己参照の拒否)、superseded 後の reclaim / 遷移拒否、`list_unresolved` からの terminal 除外、v2 の DB CHECK 発火(started × superseded / superseded × 参照 NULL / open × 参照あり)、**v1 → v2 migration**(rebuild 後の全行保持・migration 後の通常ライフサイクル・冪等性・検証失敗時の完全 rollback と retry 成功)。
+- `test_submission_journal.py`(Issue #99 追加分)— cancellation journal: claim の round-trip と reopen 復元、`started` 後の再取得拒否(クラッシュ窓)、unknown / save-failed 後の conflict と `list_unresolved_cancellations()` への出現、`not_started` reclaim と時刻後退拒否、`broker_refused` 終端化 + 新規試行 reclaim(`attempt_count` 増分)、started の一度きり遷移、client_order_id 束縛、`CancellationJournalEntry` 不変条件、**v2 → v3 migration**(additive・既存行無変更・冪等・検証失敗時の完全 rollback と retry 成功)。サービス統合は `test_cancel_submission.py`([Safety Gate / Live Order Submission](safety_gate.md) の「テスト」)。
 - 既存 `test_safety_gate.py` / 固定シナリオ(Issue #77)は新しいコンストラクタ引数(`journal_db_path`)へ追随し、従来契約(二重送信防止・UNKNOWN 再送禁止・全拒否経路で Broker 送信 0)を回帰として維持する。
 
 ## 非スコープ

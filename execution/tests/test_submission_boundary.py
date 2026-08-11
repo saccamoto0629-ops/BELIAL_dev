@@ -55,13 +55,15 @@ SUBMIT_ORDER_ALLOWED = {
     "execution/tests/test_reissue_clearance.py",
 }
 
-# Broker CANCELLATION has no production caller at all: the cancel Execution
-# use case is not implemented (Issue #99), reconciliation (Issue #103) is
-# detection-only and repair (Issue #104) only updates the internal DB.
-# Pinning it repository-wide means a future module cannot quietly start
-# cancelling broker orders.
+# Broker CANCELLATION has exactly ONE production caller (Issue #99):
+# ``LiveOrderSubmissionService.cancel()`` in execution/live_submission.py --
+# the same single-boundary design as submit_order. Reconciliation (Issue
+# #103) stays detection-only and repair (Issue #104) only updates the
+# internal DB. Pinning it repository-wide means no other module can quietly
+# start cancelling broker orders.
 CANCEL_ORDER_ALLOWED = {
     "broker/tests",
+    "execution/live_submission.py",
     "execution/tests/test_broker_reconciliation.py",
     "execution/tests/test_broker_reconciliation_repair.py",
     # Issue #105: pins that ReconcileOnlyBroker.cancel_order RAISES.
@@ -281,6 +283,18 @@ def test_submission_service_holds_exactly_one_submit_order_call():
     assert len(sites) == 1, (
         "execution/live_submission.py must hold exactly one Broker.submit_order call "
         f"(the gated one in LiveOrderSubmissionService.submit), found lines {sites}"
+    )
+
+
+def test_submission_service_holds_exactly_one_cancel_order_call():
+    """Issue #99: the sanctioned cancel boundary mirrors the submit one --
+    ONE ``Broker.cancel_order`` call inside ``LiveOrderSubmissionService.
+    cancel()``, and none anywhere else in production code (the
+    repository-wide scan above)."""
+    sites = _method_call_sites(REPO_ROOT / "execution" / "live_submission.py", "cancel_order")
+    assert len(sites) == 1, (
+        "execution/live_submission.py must hold exactly one Broker.cancel_order call "
+        f"(the gated one in LiveOrderSubmissionService.cancel), found lines {sites}"
     )
 
 

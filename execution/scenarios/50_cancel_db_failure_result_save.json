@@ -1,0 +1,94 @@
+{
+  "scenario_id": "cancel_db_failure_result_save",
+  "description": "キャンセル結果のDB保存失敗: 受領済みCANCELLED結果の保存が失敗してもstate-only UNKNOWNフォールバックで照会対象として可視化され、再実行のcancelは再送されない(Issue #99)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-1"
+      }
+    }
+  },
+  "faults": [
+    {
+      "boundary": "record_order_result",
+      "after_calls": 1
+    }
+  ],
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "at_offset_seconds": 60,
+      "expect": {
+        "outcome": "error",
+        "error_type": "ExecutionStoreError"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "refused",
+        "refusal_code": "cancel_outcome_unresolved"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "unknown",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "accepted",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-1"
+      },
+      {
+        "previous_state": "accepted",
+        "new_state": "unknown"
+      }
+    ],
+    "broker_submit_calls": 1,
+    "broker_cancel_calls": 1,
+    "order_rows": 1,
+    "history_rows": 3,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "broker_order_id": "BRK-1",
+    "listed_unknown": true,
+    "listed_unresolved": true
+  }
+}

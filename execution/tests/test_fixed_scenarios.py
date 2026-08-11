@@ -60,14 +60,17 @@ REQUIRED_SCENARIO_IDS = {
     "reissue_parameter_quantity_increase_filled",
     "gate_correction_quantity_reduced_filled",
     "gate_correction_submitted_parent_refused",
+    # Issue #99 cancel scenarios, RESTORED via the production public cancel
+    # API (LiveOrderSubmissionService.cancel) -- the restoration PR #96
+    # review r1 deferred until the use case existed. The runner still
+    # synthesizes no cancel path of its own.
+    "cancel_success",
+    "cancel_broker_refused",
+    "cancel_terminal_state_refused",
+    "cancel_duplicate_suppressed",
+    "cancel_timeout_unknown_no_resend",
+    "cancel_db_failure_result_save",
 }
-
-# Cancel scenarios are deliberately NOT part of the fixed suite (PR #96
-# review r1): no production cancel Execution use case exists yet, so a fixed
-# scenario could only exercise a runner-synthesized path. FakeBroker cancel
-# behaviour is covered by broker/tests/test_fake_broker.py and the store's
-# cancel transitions by execution/tests/test_execution_store.py
-# (test_accepted_to_cancelled and the terminal-state invariants).
 
 
 def test_all_required_scenarios_are_bundled():
