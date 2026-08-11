@@ -11,7 +11,11 @@ State machine (Issue #49):
 
     (none) --receive signal--> pending --entry fill--> open --SL/TP/max hold--> closed
                                  |  \--entry timeout------------------------> expired
-                                 \----invalid/manual------------------------> cancelled
+                                 \----invalid/manual/position-limit---------> cancelled
+
+An intake refused by the Issue #85 concurrent-position cap is recorded as a
+terminal ``cancelled`` position (``terminal_reason = position_limit``) directly,
+without ever being ``pending`` -- never a silent skip.
 
 - ``pending`` / ``open`` are non-terminal; ``closed`` / ``expired`` / ``cancelled``
   are terminal and are NEVER left again (no re-open, no re-close). The store
@@ -43,20 +47,21 @@ KNOWN_STATES: frozenset[str] = frozenset(
 NON_TERMINAL_STATES: frozenset[str] = frozenset({STATE_PENDING, STATE_OPEN})
 TERMINAL_STATES: frozenset[str] = frozenset({STATE_CLOSED, STATE_EXPIRED, STATE_CANCELLED})
 
-# --- terminal reasons (closed set, Issue #49) -------------------------------
+# --- terminal reasons (closed set, Issue #49; position_limit added by #85) ---
 REASON_TAKE_PROFIT = "take_profit"
 REASON_STOP_LOSS = "stop_loss"
 REASON_MAX_HOLDING_TIME = "max_holding_time"
 REASON_ENTRY_TIMEOUT = "entry_timeout"
 REASON_INVALID_INPUT = "invalid_input"
 REASON_MANUAL = "manual"
+REASON_POSITION_LIMIT = "position_limit"  # Issue #85: intake refused by the concurrent-position cap
 
 # The authoritative state x terminal_reason closed set (Issue #49). The store's
 # DB CHECK constraint mirrors this exactly.
 STATE_TERMINAL_REASONS: dict[str, frozenset[str]] = {
     STATE_CLOSED: frozenset({REASON_TAKE_PROFIT, REASON_STOP_LOSS, REASON_MAX_HOLDING_TIME}),
     STATE_EXPIRED: frozenset({REASON_ENTRY_TIMEOUT}),
-    STATE_CANCELLED: frozenset({REASON_INVALID_INPUT, REASON_MANUAL}),
+    STATE_CANCELLED: frozenset({REASON_INVALID_INPUT, REASON_MANUAL, REASON_POSITION_LIMIT}),
 }
 
 # --- side -------------------------------------------------------------------
@@ -247,10 +252,12 @@ def create_cancelled_position(
     position_id: str | None = None,
     created_at: str | None = None,
 ) -> VirtualPosition:
-    """Build a terminal ``cancelled`` position for an invalid/withdrawn signal.
+    """Build a terminal ``cancelled`` position for an invalid/withdrawn/refused signal.
 
     Issue #49: an invalid signal is not silently skipped -- it is RECORDED as
-    ``cancelled`` (``invalid_input`` or ``manual``). ``side``/``symbol``/
+    ``cancelled`` (``invalid_input`` or ``manual``; Issue #85 adds
+    ``position_limit`` for a signal refused by the concurrent-position cap).
+    ``side``/``symbol``/
     ``timeframe`` may be blank when the input was malformed; they are coerced to
     ``""`` rather than validated, since the whole point is to record the reject.
     """

@@ -2,7 +2,7 @@
 
 Issue #49 の成果物。Paper Signal から仮想ポジションを生成し、決済まで追跡する **Paper Execution 層**の最小責務と状態遷移を定義する設計文書である。
 
-**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。状態遷移の Discord通知は Issue #83 で**実装済み**(末尾の「Discord通知(Issue #83)」を参照)、Broker API連携・実注文は恒久的に対象外。
+**本書の本文は Issue #49 時点の設計を記述する。** DBテーブル・Repository・Open / Close判定コードは、後続の Issue #50 / #51 で `paper-execution/` に**実装済み**である(末尾の「実装状況」を参照)。ただし、設計にある `(symbol, timeframe)` 別profileマッピングは内部APIとしてのみ利用可能で、設定ファイルやCLIからマッピングをロードする通常運用経路は未実装である。状態遷移の Discord通知は Issue #83 で**実装済み**(末尾の「Discord通知(Issue #83)」を参照)、同一 symbol / timeframe / side の同時ポジション制御は Issue #85 で**実装済み**(「同時ポジション制御(Issue #85)」を参照)、Broker API連携・実注文は恒久的に対象外。
 
 ## 目的と位置づけ
 
@@ -99,7 +99,7 @@ Paper Execution が保持する中心データは **仮想ポジション(paper 
 |---|---|
 | `closed` | `take_profit` / `stop_loss` / `max_holding_time` |
 | `expired` | `entry_timeout` |
-| `cancelled` | `invalid_input`(入力不整合。`status` が `"paper_only"` でない、必須項目の欠損等)/ `manual`(運用上の取消)。**v1 で許可するのはこの2値のみ** |
+| `cancelled` | `invalid_input`(入力不整合。`status` が `"paper_only"` でない、必須項目の欠損等)/ `manual`(運用上の取消)/ `position_limit`(同時ポジション制御による取り込み拒否。Issue #85 で追加。下記「同時ポジション制御」) |
 | `pending` / `open`(非終端) | NULL |
 
 `terminal_reason` の語彙は上表で閉じた集合とする。値を追加する場合は本設計文書の更新を伴う(実装側で自由な文字列を書き込まない)。
@@ -212,12 +212,52 @@ Paper Signal 側は既に `(strategy_profile, symbol, timeframe, target_candle_u
 - 各ポジションは「どの確定足まで評価済みか」の watermark を持ち、再実行・プロセス再起動時は未評価の確定足からのみ評価を再開する。評価済みの足を再評価しても結果が変わらないこと(冪等)を実装時のテスト観点とする。
 - 終端状態(`closed` / `expired` / `cancelled`)のポジションは再実行で変更されない。
 
+## 同時ポジション制御(Issue #85)
+
+### 背景と現行挙動の明文化
+
+Issue #85 時点までの Paper Execution は **Signal 単位の完全独立ポジション**であった: 重複防止は `signal_id` UNIQUE のみで、同一 `symbol` / `timeframe` / `side` の Signal が連続すると、それぞれ独立の pending / open position が際限なく積み上がる(実運用確認では USDJPY 1h short が 8 件同時 open)。これは「Signal 1件あたりの素の成績」の検証としては成立するが、Paper Execution を**現在進行の仮想執行・仮想口座評価**として使う運用では、集計結果を単一口座の成績として解釈できず、将来の Live Execution 設計へそのまま転用すると過剰な集中ポジションにつながる。
+
+### 採用方針
+
+**`(symbol, timeframe, side)` スコープごとの同時 active 上限(既定 1 件)** を Paper Execution の Signal 取り込み時ゲートとして実装する。
+
+| 項目 | 決定 | 理由 |
+|---|---|---|
+| position scope | `(symbol, timeframe, side)` | Signal 生成と足評価の単位が `(symbol, timeframe)` であり、方向は独立の仮説であるため side まで含めてスコープとする |
+| 計上対象 | **pending + open**(非終端 = active) | pending も約定待ちの建玉予約であり、放置すると同時 open に転化するため双方を対象にする |
+| terminal の扱い | `closed` / `expired` / `cancelled` は**一切計上しない** | 終端 position が新規 Signal を阻害しない(受け入れ条件) |
+| 同一方向 Signal | active 数が上限未満なら受理、上限到達なら拒否 | 積み上がり問題(Issue #85 の主訴)への直接の対処 |
+| 反対方向 Signal | **ブロックしない**(自 side のスコープで独立に判定) | 反対方向は独立の仮説であり、抑制すると Signal 検証情報を失う。既存 close(netting)は実口座のネッティング仕様への踏み込みになるため非採用 |
+| 上限到達 Signal の扱い | terminal な `cancelled` position(`terminal_reason = position_limit`)として**記録**し、cancelled 通知 outbox 行も同一トランザクションで作成 | 「invalid は黙って skip せず cancelled で記録する」既存原則(Issue #49)と同型。記録された `signal_id` 行が拒否自体の冪等性も担保する |
+| 設定 | execution_profile の `max_active_positions_per_side`(既定 `1`、`None` = 無制限)。CLI は `--max-active-positions-per-side`(`0` = 無制限) | 執行規則の可変パラメータは execution_profile に置く既存方針に従い、新しい設定体系を作らない |
+
+**既定挙動の変更(意図的)**: 既定を無制限(従来挙動)ではなく 1 件とする。Issue #85 の運用上の問題(同方向の際限ない積み上がり)は既定のままで解消すべきであり、「Signal 単位の独立検証」はフィルタなしの Backtest run と、`max_active_positions_per_side` の引き上げ / `None`(CLI `0`)でいつでも再現できるため。
+
+### 検討した代替案と非採用理由
+
+1. **Signal 単位で完全独立(現状維持)**: 積み上がり問題が解消せず、仮想口座評価として集計を解釈できないため非採用。無制限設定(`None`)として挙動自体は残す。
+2. **`(symbol, timeframe)` 単位で side 無差別に 1 件**: 反対方向 Signal をブロックまたは既存 close する必要が生じる。前者は独立仮説の検証情報を失い、後者は実口座の netting / hedging 仕様(非スコープ)へ踏み込むため非採用。
+3. **上限到達 Signal を記録なしで skip**: 「受理しなかった事実」が残らず、後から容量が空いたときに同一 Signal が cycle タイミング依存で pending になり得て決定論・冪等性が壊れるため非採用。terminal `cancelled` / `position_limit` として即時記録する(entry deadline のある Signal を遅延受理しても意味論が壊れる点も同様)。
+
+### 判定・並行性・冪等性の保証
+
+- 取り込み判定は store の `create_position_capacity_guarded` が行う: **`signal_id` 既存チェック → スコープ内 active 件数チェック → INSERT(pending または cancelled/position_limit + cancelled outbox 行)を単一の `BEGIN IMMEDIATE` トランザクション**で実行する。SQLite の single-writer により並行 runner は直列化され、「チェックしてから INSERT」の間に別 runner が INSERT する TOCTOU 競合で上限を突破することはできない。`signal_id` UNIQUE と outbox の `event_key` PRIMARY KEY が第二の防壁として残る。
+- 上限到達で記録された `cancelled` / `position_limit` は terminal であり、後で容量が空いても遡って再受理しない(`signal_id` 行が存在するため duplicate skip)。同一 Signal 再取込み・同一 cycle 再実行・多重起動のいずれでも、position 追加ゼロ・通知追加ゼロで結果は不変。
+- `max_active_positions_per_side` は **snapshot しない唯一の profile パラメータ**である: これは「他 position の現在状態を踏まえて新規 Signal を受理するか」という取り込み時ゲートであり、個々の position の判定規則ではない。既存 position の Entry / Close 評価には一切影響しない。
+- dry-run は snapshot DB の active 件数 + 同一 cycle 内で受理予定の would-be pending を加算して同じ判定を投影し、書き込み・通知・migration を一切行わない(完全無副作用)。
+
+### migration(schema v4)
+
+`cancelled` の `terminal_reason` CHECK 閉集合に `position_limit` が加わるため、`virtual_positions` テーブルの CHECK 制約が変わる = **schema v4**。v3 以前の DB は既存の transactional table rebuild(CREATE → 検証コピー → DROP → RENAME、1 トランザクション・失敗時全 rollback)で移行する。v3 の全行は v4 の CHECK(上位集合)を満たすため行はそのまま保持される。dry-run は v3 DB を `legacy`(migration required)として読み込みを拒否し、DB へは触れない(既存契約どおり)。
+
 ## cooldown / re-entry / Market State との責務境界
 
-Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(Issue #38 / #39)に相当する採用抑制は、**Paper Execution の責務としない**。
+Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(Issue #38 / #39)に相当する**戦略レベルの採用抑制**は、引き続き **Paper Execution の責務としない**。
 
-- Paper Execution v1 は「保存された Paper Signal を1件ずつ、独立に、無条件で執行対象にする」層である。どの Signal を生成するか(Market State / freshness / confidence によるゲート)は Paper Signal Generator の責務、複数ポジションの同時保有制限・cooldown・ポートフォリオ制約は将来の Portfolio / Risk 層(または Signal 採用層)の責務として切り出す。
-- この分離により、Paper Execution の結果は「Signal 1件あたりの素の成績」となり、Backtest のフィルタなし run と直接比較できる。抑制ロジックを Paper Execution に混ぜると、Signal品質の評価と執行規則の評価が分離できなくなるため採らない。
+- どの Signal を生成するか(Market State / freshness / confidence によるゲート)は Paper Signal Generator の責務、cooldown・re-entry 抑制・ポートフォリオ横断のリスク制約は将来の Portfolio / Risk 層(または Signal 採用層)の責務として切り出す。
+- Issue #85 で Paper Execution が持つことになったのは、**自レイヤーの評価単位(仮想口座としての解釈可能性)を守るための取り込み時の同時建玉上限のみ**である(前節)。これは Signal の品質・戦略の優劣に基づく採用判断ではなく、Signal 内容を一切評価しない容量ゲートであるため、上記の責務分離とは矛盾しない。
+- 「Signal 1件あたりの素の成績」を評価したい場合は、フィルタなしの Backtest run、または `max_active_positions_per_side` を `None`(CLI `0`)にした Paper Execution run を用いる。
 - Market State は Signal 生成側の入力であり、Paper Execution はEntry / Close判定に参照しない(記録用の引き継ぎのみ将来検討)。
 
 ## 実発注・Broker API との分離(明記)
@@ -256,9 +296,9 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 
 本設計は `paper-execution/` に実装済み(Issue #50: データモデル・保存層、Issue #51: Open / Close 判定エンジン)。本設計との対応:
 
-- `position_models.py` — 状態(`pending` / `open` / `closed` / `expired` / `cancelled`)と `state × terminal_reason` の閉集合をアプリ層で検証。
+- `position_models.py` — 状態(`pending` / `open` / `closed` / `expired` / `cancelled`)と `state × terminal_reason` の閉集合をアプリ層で検証(Issue #85 で `cancelled` に `position_limit` を追加)。
 - `position_store.py` — 独立SQLite。`state` 集合・`state × terminal_reason` 閉集合・`same_candle_priority` 語彙・`signal_id` UNIQUE をDBの CHECK / UNIQUE 制約で担保。終端遷移は全て CAS(`WHERE state=...`)で、終端からの再遷移を拒否。close と watermark 前進は同一 UPDATE(watermark CAS で競合防止)。legacy schema からの移行は `PRAGMA user_version` + **table rebuild**(CREATE→検証コピー→DROP→RENAME、1トランザクション・失敗時 rollback)で CHECK/UNIQUE/NOT NULL を実際に付与し、安全に変換できない legacy row は明示的に migration 失敗させる。
-- `execution_profile.py` — 執行規則プロファイル。内部APIは呼び出し側から渡された `(symbol, timeframe)` overridesを解決し、`strategy_profile` は解決キーにしない。通常CLIは単一default profileを使用し、symbol/timeframe別マッピングの設定ファイル/CLIロードは未実装。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。
+- `execution_profile.py` — 執行規則プロファイル。内部APIは呼び出し側から渡された `(symbol, timeframe)` overridesを解決し、`strategy_profile` は解決キーにしない。通常CLIは単一default profileを使用し、symbol/timeframe別マッピングの設定ファイル/CLIロードは未実装。`size` 含む適用値を position へスナップショットし、後からの設定変更が既存 position の判定を変えないことを保証。`max_active_positions_per_side`(Issue #85)のみ取り込み時ゲートとして live profile で評価し、スナップショットしない(上記「同時ポジション制御」)。
 - `execution_engine.py` — 純粋判定。Entry = 根拠足の次の確定足の open、Entry期限超過 / 週末持ち越しは `expired`(`entry_timeout`)、Close は gap → intrabar → `max_hold_deadline_utc` の順、曖昧足は position 保存の `same_candle_priority`。損益は `gross_pnl`(コスト前, raw価格)、`net_pnl`(entry/exit コスト各1回 + commission を控除)、`r_multiple`(net / (初期リスク×size)、初期リスク≤0 は None)を算出。`pnl` は `net_pnl` の後方互換エイリアス。
 - `execution_runner.py` / `paper_execution_bot.py` — runner / 常駐ループ。Chart DB は **strict read**(`load_candles_range_strict`)で読み、DB破損・candles table欠損・OperationalError を空データ扱いせず cycle failure として計上し、該当 position は無変更のままにする(期限切れへ誤遷移しない)。失敗を握り潰さず件数を数え、`--once` は失敗時に非0終了。dry-run は完全無副作用(読取エラーも成功扱いしない)。
 
@@ -369,7 +409,7 @@ outbox 永続化障害は「通知保証そのものが成立していない」�
 - **WAL 対応**: dry-run の schema probe と position 読み取りは、実 DB へ SQLite 接続を一切張らない。DB 本体と `-wal` / `-shm` sidecar を一時ディレクトリへコピーし、**snapshot 側**を読む。通常の `sqlite3.connect(path)` は WAL DB を checkpoint して本体を書き換え `-wal` を消し得るため、read-only URI ではなく snapshot 方式を採る。dry-run 前後で DB 本体・`-wal`・`-shm` の内容・size・mtime・hash・schema・user_version が完全不変であることをテストで実ファイルの hash/mtime まで検証する
 - **接続の明示 close(Windows)**: read helper(`_read_one` / `_read_many`)は `contextlib.closing()` で SQLite connection を必ず close する。sqlite3 の connection context manager は transaction を終えるだけで connection を close しないため、Windows では snapshot DB のファイルハンドルが残り `TemporaryDirectory.cleanup()` が `WinError 32` で失敗する。close を保証することで dry-run 後の snapshot 削除が全 OS で成功する(Windows CI job で検証)
 
-### migration経路(v3)
+### migration経路(v3 / v4)
 
 `position_store.py` の既存契約(`PRAGMA user_version` + 実スキーマ検証)に統合する。
 
@@ -377,4 +417,5 @@ outbox 永続化障害は「通知保証そのものが成立していない」�
 - `v1`(outbox テーブル無し)→ `v3`: additive(既存 `virtual_positions` を rebuild せず、1トランザクションで outbox テーブル作成 + index + `user_version=3`)
 - `v2 prototype`(claim 列無し・旧 status 集合の outbox テーブル)→ `v3`: outbox テーブルの **transactional rebuild**(CREATE→検証コピー→DROP→RENAME)。既存 notification 行(delivery_status / attempt_count / last_error 等)を保持し、新列は NULL 埋め。変換不能な行(不正 event_type 等)は明示的に migration 失敗
 - legacy positions rebuild 経路でも同一トランザクション内で outbox テーブルを整える
+- `v3` → `v4`(Issue #85): `cancelled` の terminal_reason CHECK に `position_limit` が加わるため、`virtual_positions` の **transactional rebuild** で移行する(v3 の全行は v4 CHECK の上位集合を満たすため行は保持)。v3 以前の DB は positions rebuild 経路に乗る(v1→v3 の「positions を rebuild しない additive」経路は、v4 で positions の CHECK 自体が変わったため pre-v4 DB には適用されない)
 - いずれも失敗時は全 rollback(user_version・既存行とも不変)

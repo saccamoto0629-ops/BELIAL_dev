@@ -179,8 +179,12 @@ _ALL_COLUMNS: tuple[str, ...] = (
 # v2 (Issue #83 prototype): + paper_execution_notifications (no claim columns).
 # v3 (Issue #83 review): outbox claim/lease columns (claimed_by, claimed_until_utc)
 #     and the processing / dead_letter delivery statuses.
-POSITIONS_SCHEMA_VERSION = 1
-CURRENT_SCHEMA_VERSION = 3
+# v4 (Issue #85): `position_limit` added to the cancelled terminal_reason closed
+#     set. The state x terminal_reason CHECK changes, so the positions table
+#     itself must be rebuilt: POSITIONS_SCHEMA_VERSION is raised to v4 so a v3
+#     DB (old CHECK) is migrated via the transactional table rebuild.
+POSITIONS_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 4
 
 REQUIRED_COLUMNS: frozenset[str] = frozenset(_ALL_COLUMNS)
 
@@ -498,11 +502,13 @@ def _create_indexes(connection: sqlite3.Connection) -> None:
 
 
 def _positions_schema_current(connection: sqlite3.Connection) -> bool:
-    """True when ``virtual_positions`` itself needs no rebuild (v1 constraints present).
+    """True when ``virtual_positions`` itself needs no rebuild (v4 constraints present).
 
     ``user_version >= POSITIONS_SCHEMA_VERSION`` distinguishes a properly
-    constrained v1 table from a constraint-less legacy table that merely has all
-    columns (which reports ``user_version = 0`` and must be rebuilt).
+    constrained current table from (a) a constraint-less legacy table that
+    merely has all columns (``user_version = 0``) and (b) a v1..v3 table whose
+    terminal_reason CHECK predates ``position_limit`` (Issue #85) -- both must
+    be rebuilt.
     """
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version < POSITIONS_SCHEMA_VERSION:
@@ -910,6 +916,101 @@ def create_position(record: dict, *, db_path: Path | None = None) -> bool:
     with _connect(db_path) as connection:
         cursor = connection.execute(_INSERT_SQL, _row_tuple(record))
     return cursor.rowcount > 0
+
+
+# --- concurrent-position cap (Issue #85) --------------------------------------
+# Capacity scope: (symbol, timeframe, side). Non-terminal (pending / open)
+# positions count; terminal ones (closed / expired / cancelled) never do.
+
+ACTIVE_STATES: tuple[str, str] = (models.STATE_PENDING, models.STATE_OPEN)
+
+CAPACITY_RESULT_PENDING = "pending"        # intake accepted: pending row inserted
+CAPACITY_RESULT_CANCELLED = "cancelled"    # cap reached: recorded as cancelled/position_limit
+CAPACITY_RESULT_DUPLICATE = "duplicate"    # signal_id already tracked: nothing written
+
+_COUNT_ACTIVE_SQL = (
+    f"SELECT COUNT(*) FROM {POSITIONS_TABLE} "
+    "WHERE symbol = ? AND timeframe = ? AND side = ? AND state IN (?, ?)"
+)
+
+
+def count_active_positions(symbol: str, timeframe: str, side: str, *, db_path: Path | None = None) -> int:
+    """Count non-terminal (pending / open) positions in one ``(symbol, timeframe, side)`` scope.
+
+    Read helper for the Issue #85 capacity decision preview (dry-run) and
+    monitoring. Missing DB -> 0 (dry-run safe); an OperationalError on an
+    existing file propagates (never masqueraded as "no data"). The
+    authoritative, race-free check lives in
+    :func:`create_position_capacity_guarded` -- never enforce the cap from this
+    read alone.
+    """
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    if not db_path.exists():
+        return 0
+    with closing(sqlite3.connect(db_path)) as connection:  # see _read_one re: closing()
+        row = connection.execute(_COUNT_ACTIVE_SQL, (symbol, timeframe, side, *ACTIVE_STATES)).fetchone()
+    return int(row[0])
+
+
+def create_position_capacity_guarded(
+    record: dict, *, max_active_per_side: int | None, db_path: Path | None = None
+) -> tuple[str, dict | None]:
+    """Insert one intake record under the Issue #85 concurrent-position cap, atomically.
+
+    ``record`` must be a ``pending`` position (the would-be intake). Everything
+    happens inside ONE ``BEGIN IMMEDIATE`` transaction -- SQLite's single-writer
+    lock strictly serializes concurrent runners, so the capacity check and the
+    INSERT commit together and a check-then-insert (TOCTOU) race cannot
+    overshoot the cap:
+
+    1. ``signal_id`` already tracked (any state) -> ``("duplicate", None)``;
+       nothing is written, no outbox row (idempotent re-import / re-run).
+    2. the scope ``(symbol, timeframe, side)`` already holds
+       ``max_active_per_side`` non-terminal (pending / open) positions -> the
+       record is stored as a terminal ``cancelled`` position
+       (``terminal_reason = position_limit``) TOGETHER with its ``cancelled``
+       outbox row (Issue #83 atomicity) -> ``("cancelled", stored_record)``.
+       A refused signal is recorded, never silently skipped, and its
+       ``signal_id`` row makes the refusal itself idempotent.
+    3. otherwise the ``pending`` row is inserted -> ``("pending", record)``
+       (pending creation is deliberately NOT a notification event).
+
+    ``max_active_per_side=None`` disables the cap (case 2 never happens);
+    terminal positions never count toward it. Opposite-side positions live in
+    their own scope and are never consulted here.
+    """
+    if record.get("state") != models.STATE_PENDING:
+        raise ValueError(
+            f"create_position_capacity_guarded requires state='pending', got {record.get('state')!r}"
+        )
+    models.validate_state_reason(record["state"], record.get("terminal_reason"))
+    if max_active_per_side is not None and int(max_active_per_side) < 1:
+        raise ValueError(f"max_active_per_side must be >= 1 or None, got {max_active_per_side!r}")
+    db_path = Path(db_path) if db_path is not None else position_db_path()
+    init_db(db_path)
+    now = models.utc_now_iso()
+    with _immediate_txn(db_path) as connection:
+        existing = connection.execute(
+            f"SELECT 1 FROM {POSITIONS_TABLE} WHERE signal_id = ?", (record["signal_id"],)
+        ).fetchone()
+        if existing is not None:
+            return CAPACITY_RESULT_DUPLICATE, None
+        if max_active_per_side is not None:
+            active = connection.execute(
+                _COUNT_ACTIVE_SQL,
+                (record["symbol"], record["timeframe"], record["side"], *ACTIVE_STATES),
+            ).fetchone()[0]
+            if active >= int(max_active_per_side):
+                refused = {
+                    **record,
+                    "state": models.STATE_CANCELLED,
+                    "terminal_reason": models.REASON_POSITION_LIMIT,
+                }
+                connection.execute(_INSERT_SQL, _row_tuple(refused))
+                _enqueue_notification(connection, refused["position_id"], NOTIFY_EVENT_CANCELLED, now)
+                return CAPACITY_RESULT_CANCELLED, refused
+        connection.execute(_INSERT_SQL, _row_tuple(record))
+        return CAPACITY_RESULT_PENDING, record
 
 
 def transition_to_open(
