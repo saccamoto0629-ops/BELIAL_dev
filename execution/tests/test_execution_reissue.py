@@ -1495,3 +1495,43 @@ def test_a_dangling_marker_fails_parent_reads_closed(db_path, tmp_path):
     )
     with pytest.raises(store.ExecutionIntegrityError, match="supersession marker"):
         store.get_execution_order("exec-1", db_path=db2)
+
+
+# --- PR #121 Codex review round 4 fix ----------------------------------------------
+
+
+def test_an_unopenable_decision_db_path_is_reported_fail_closed(tmp_path):
+    """r4 P2 (reviewer repro): a path that EXISTS but cannot be opened as a
+    SQLite file (here: it's a directory) must surface as
+    ExecutionEvidenceReferenceError, not a raw sqlite3.Error the caller
+    cannot classify."""
+    directory_as_db = tmp_path / "safety_gate_decisions.sqlite3"
+    directory_as_db.mkdir()
+    fabricated = store.GateDecisionReference(
+        decision_id=1,
+        execution_request_id="exec-1",
+        allowed=False,
+        checked_at_utc=at(3),
+        policy_id="policy-1",
+        rejections=(("market_closed", "m"),),
+    )
+    with pytest.raises(store.ExecutionEvidenceReferenceError, match="unreadable"):
+        reissue_evidence.verify_gate_decision_reference(
+            fabricated, db_path=directory_as_db
+        )
+    # the same failure is reported the same way when reached from the
+    # registration path (create_reissue_execution_order enforces
+    # verification before opening its own transaction; DB stays untouched)
+    create_order(tmp_path / "orders.sqlite3")
+    clearance = record_clearance(tmp_path / "orders.sqlite3", "sig-exec-1")
+    before = full_db_state(tmp_path / "orders.sqlite3")
+    with pytest.raises(store.ExecutionEvidenceReferenceError, match="unreadable"):
+        register_child(
+            tmp_path / "orders.sqlite3",
+            kind=store.REISSUE_KIND_GATE_CORRECTION,
+            clearance=clearance,
+            gate_correction_reference=fabricated,
+            gate_decision_db_path=directory_as_db,
+            quantity=Decimal("5"),
+        )
+    assert full_db_state(tmp_path / "orders.sqlite3") == before

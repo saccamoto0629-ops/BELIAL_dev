@@ -30,6 +30,7 @@ the reference shape itself stays validatable there.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from execution.execution_store import (
@@ -109,7 +110,16 @@ def verify_gate_decision_reference(
     store = SQLiteSafetyDecisionStore(path)
     try:
         decisions = store.list_for_request_with_ids(reference.execution_request_id)
-    except SafetyStoreError as exc:
+    except (SafetyStoreError, sqlite3.Error) as exc:
+        # A path that EXISTS but cannot be opened as a SQLite file (a
+        # directory, a permission-denied file, ...) raises a raw
+        # sqlite3.Error straight out of the underlying connection --
+        # SQLiteSafetyDecisionStore does not wrap every open failure into
+        # SafetyStoreError. Catching sqlite3.Error too keeps the documented
+        # contract (every unreadable-store case is
+        # ExecutionEvidenceReferenceError, never a leaked driver exception
+        # a caller cannot classify) true regardless of which layer the
+        # failure surfaces at (PR #121 Codex review r4 P2).
         raise ExecutionEvidenceReferenceError(
             f"gate decision reference (decision_id {reference.decision_id}) cannot be "
             f"verified: the safety decision DB at {path} is unreadable ({exc})"
