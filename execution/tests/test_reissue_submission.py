@@ -22,6 +22,7 @@ from broker.fake_broker import FakeBroker
 from execution import execution_store as store
 from execution.live_submission import LiveOrderSubmissionService
 from execution.reissue_clearance import derive_account_scope
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
@@ -96,7 +97,7 @@ def make_market(seconds=95):
 
 
 def make_submission_service(
-    tmp_path, db_path, *, broker=None, clock=None, clearance_max_age=None
+    tmp_path, db_path, *, broker=None, clock=None, reissue_policy=None
 ):
     broker = broker if broker is not None else make_broker()
     decision_db = tmp_path / "safety_gate_decisions.sqlite3"
@@ -105,8 +106,8 @@ def make_submission_service(
     SubmissionJournal(journal_db).initialize()
     clock = clock or (lambda: at(100))
     kwargs = {}
-    if clearance_max_age is not None:
-        kwargs["clearance_max_age"] = clearance_max_age
+    if reissue_policy is not None:
+        kwargs["reissue_policy"] = reissue_policy
     service = LiveOrderSubmissionService(
         connection=BrokerConnection(broker=broker),
         gate=SafetyGate(policy=make_policy(), state_provider=StaticSafetyState(), clock=clock),
@@ -231,7 +232,7 @@ def test_a_stale_clearance_is_refused_at_the_submission_instant(tmp_path, db_pat
         db_path,
         broker=broker,
         clock=lambda: at(1000),
-        clearance_max_age=timedelta(seconds=60),
+        reissue_policy=ReissuePolicy(clearance_max_age=timedelta(seconds=60)),
     )
     decision, result = service.submit("exec-2", market=make_market(seconds=995))
     assert result is None
@@ -350,3 +351,36 @@ def test_attempt_one_orders_still_submit_without_clearance_inputs(tmp_path, db_p
     decision, result = service.submit("exec-1", market=make_market())
     assert decision.allowed and result is not None
     assert result.state is OrderState.FILLED
+
+
+# --- PR #122 Codex review: one policy governs both freshness boundaries ------
+
+
+def test_a_narrow_reissue_policy_governs_the_submission_cutoff(tmp_path, db_path):
+    """P2: a nondefault ``ReissuePolicy.clearance_max_age`` must bind the
+    SUBMISSION cutoff too. Under a 30-second policy, evidence that was
+    fresh at registration cannot authorize a submit two minutes later --
+    the service must not fall back to its own wider default."""
+    broker = make_broker(seconds=130)
+    make_reissue_child(db_path, broker)  # clearance observed at at(5)
+    policy = ReissuePolicy(clearance_max_age=timedelta(seconds=30))
+    service, _, _ = make_submission_service(
+        tmp_path, db_path, broker=broker, clock=lambda: at(125), reissue_policy=policy
+    )
+    decision, result = service.submit("exec-2", market=make_market(seconds=120))
+    assert result is None
+    assert decision.rejection_codes == ("reissue_clearance_invalid",)
+    # the SAME submission succeeds under the default (5-minute) policy,
+    # proving the refusal came from the policy window and nothing else
+    service, broker, _ = make_submission_service(
+        tmp_path, db_path, broker=make_broker(seconds=130), clock=lambda: at(125)
+    )
+    decision, result = service.submit("exec-2", market=make_market(seconds=120))
+    assert decision.allowed and result is not None
+
+
+def test_the_submission_service_rejects_a_non_policy_object(tmp_path, db_path):
+    with pytest.raises(ValueError, match="reissue_policy"):
+        make_submission_service(
+            tmp_path, db_path, reissue_policy=timedelta(seconds=30)
+        )

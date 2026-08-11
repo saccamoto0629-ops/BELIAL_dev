@@ -1535,3 +1535,71 @@ def test_an_unopenable_decision_db_path_is_reported_fail_closed(tmp_path):
             quantity=Decimal("5"),
         )
     assert full_db_state(tmp_path / "orders.sqlite3") == before
+
+
+# --- PR #122 Codex review: clearance currency at registration ----------------
+
+
+def test_registration_refuses_a_clearance_that_is_no_longer_current(db_path):
+    """A concurrent observer appended a NEWER generation between the
+    caller's pre-check and this transaction: the referenced (historical)
+    evidence still resolves, but it is no longer the signal's current
+    clearance, so the registration is refused with the DB untouched."""
+    reject_parent(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1")  # generation 1
+    record_clearance(db_path, "sig-exec-1")  # generation 2 lands concurrently
+    before = full_db_state(db_path)
+    with pytest.raises(store.ExecutionClearanceError, match="no longer the current"):
+        register_child(db_path, clearance=clearance)
+    assert full_db_state(db_path) == before
+
+
+@pytest.mark.parametrize(
+    "status", [store.CLEARANCE_STATUS_OBSERVING, store.CLEARANCE_STATUS_REVOKED]
+)
+def test_registration_refuses_a_current_clearance_that_is_not_valid(db_path, status):
+    """The observation that landed concurrently is a DOWNGRADE (a
+    comparison underway, or a hazard found): the registration -- which
+    retires the parent -- must not commit on it."""
+    reject_parent(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1", status=status)
+    before = full_db_state(db_path)
+    with pytest.raises(store.ExecutionClearanceError, match=f"is {status!r}, not"):
+        register_child(db_path, clearance=clearance)
+    assert full_db_state(db_path) == before
+
+
+def test_registration_refuses_a_clearance_older_than_the_supplied_cutoff(db_path):
+    reject_parent(db_path)
+    clearance = record_clearance(db_path, "sig-exec-1", observed_at=at(5))
+    before = full_db_state(db_path)
+    with pytest.raises(store.ExecutionClearanceError, match="before the freshness cutoff"):
+        store.create_reissue_execution_order(
+            child_request(),
+            client_order_id="client-exec-2",
+            created_at_utc=at(11),
+            parent_execution_request_id="exec-1",
+            reissue_kind=store.REISSUE_KIND_BROKER_REJECTED,
+            reissue_initiated_by=store.REISSUE_INITIATED_MANUAL,
+            reissue_reason="operator op-1: stale evidence",
+            clearance_generation=clearance["clearance_generation"],
+            clearance_evidence_id=clearance["evidence_id"],
+            clearance_observed_after_utc=at(100),
+            db_path=db_path,
+        )
+    assert full_db_state(db_path) == before
+    # the same registration inside the window succeeds
+    child = store.create_reissue_execution_order(
+        child_request(),
+        client_order_id="client-exec-2",
+        created_at_utc=at(11),
+        parent_execution_request_id="exec-1",
+        reissue_kind=store.REISSUE_KIND_BROKER_REJECTED,
+        reissue_initiated_by=store.REISSUE_INITIATED_MANUAL,
+        reissue_reason="operator op-1: fresh evidence",
+        clearance_generation=clearance["clearance_generation"],
+        clearance_evidence_id=clearance["evidence_id"],
+        clearance_observed_after_utc=at(0),
+        db_path=db_path,
+    )
+    assert child["signal_attempt"] == 2

@@ -81,7 +81,7 @@ may exist).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -89,7 +89,7 @@ from broker.broker_models import OrderResult, OrderState
 from execution import execution_store
 from execution.execution_models import ExecutionRequest
 from execution.reissue_clearance import ClearanceScopeError, derive_account_scope
-from execution.reissue_service import DEFAULT_CLEARANCE_MAX_AGE
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     MarketSafetySnapshot,
@@ -123,7 +123,7 @@ class LiveOrderSubmissionService:
         order_db_path: str | Path,
         journal_db_path: str | Path,
         clock: Callable[[], datetime],
-        clearance_max_age: timedelta = DEFAULT_CLEARANCE_MAX_AGE,
+        reissue_policy: ReissuePolicy | None = None,
     ) -> None:
         if not isinstance(connection, BrokerConnection):
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
@@ -153,9 +153,9 @@ class LiveOrderSubmissionService:
             )
         if not callable(clock):
             raise ValueError(f"clock must be a callable returning a UTC datetime, got {clock!r}")
-        if not isinstance(clearance_max_age, timedelta) or clearance_max_age <= timedelta(0):
+        if reissue_policy is not None and not isinstance(reissue_policy, ReissuePolicy):
             raise ValueError(
-                f"clearance_max_age must be a positive timedelta, got {clearance_max_age!r}"
+                f"reissue_policy must be a ReissuePolicy or None, got {reissue_policy!r}"
             )
         self._connection = connection
         self._gate = gate
@@ -163,7 +163,12 @@ class LiveOrderSubmissionService:
         self._order_db_path = Path(order_db_path)
         self._journal = SubmissionJournal(Path(journal_db_path))
         self._clock = clock
-        self._clearance_max_age = clearance_max_age
+        # ONE reissue policy governs both boundaries (PR #122 Codex review
+        # P2): the registration freshness window (ReissueService) and the
+        # submission freshness cutoff enforced here are the SAME value, so a
+        # composer cannot configure a narrow registration window while
+        # submissions silently authorize evidence under a wider default.
+        self._reissue_policy = reissue_policy or ReissuePolicy()
 
     # --- intent registration -------------------------------------------------
 
@@ -393,7 +398,9 @@ class LiveOrderSubmissionService:
                 )
             clearance_kwargs = dict(
                 clearance_scope=submission_scope,
-                clearance_observed_after_utc=self._now() - self._clearance_max_age,
+                clearance_observed_after_utc=(
+                    self._now() - self._reissue_policy.clearance_max_age
+                ),
             )
 
         # Durable submission journal, FIRST barrier (Issue #93): the intent

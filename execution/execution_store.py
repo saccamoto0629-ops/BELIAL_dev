@@ -2985,6 +2985,7 @@ def create_reissue_execution_order(
     reissue_reason: str,
     clearance_generation: int,
     clearance_evidence_id: str,
+    clearance_observed_after_utc: datetime | None = None,
     gate_correction_reference: GateDecisionReference | None = None,
     gate_decision_db_path: Path | None = None,
     db_path: Path | None = None,
@@ -3014,11 +3015,22 @@ def create_reissue_execution_order(
     - the signal's clearance trail is validated for contiguity and the
       registration clearance reference is resolved against the same-DB
       evidence table and content-bound over the COMPLETE record
-      (generation + evidence id + full-row sha256); an unresolvable
-      reference is :class:`ExecutionClearanceError` (fail-closed -- the
-      store does NOT judge the clearance requirements themselves,
-      Issue #116 does, but it refuses to record a reference it cannot
-      verify),
+      (generation + evidence id + full-row sha256); the referenced
+      evidence must additionally still be the signal's CURRENT clearance
+      (highest generation) and be ``valid`` AT INSERT TIME, and -- when
+      the caller supplies ``clearance_observed_after_utc`` -- observed
+      at/after that cutoff. A concurrent observer that appended
+      ``observing`` / ``revoked`` between the caller's pre-check and this
+      transaction therefore refuses the registration
+      (:class:`ExecutionClearanceError`, PR #122 Codex review P2): the
+      registration retires the parent, so it must not commit on evidence
+      a newer observation already invalidated. WHICH requirements make a
+      clearance grantable stays Issue #116's judgement; the store
+      enforces only that the recorded conclusion referenced here is the
+      current one (fail-closed). The account-scope match deliberately
+      stays a SUBMISSION-time check (``mark_submitting``): per Issue #95
+      it binds the evidence to the connection that actually submits, and
+      the registration use case owns no broker connection,
     - the child field invariants are verified against the parent row via
       THE SAME shared rules restore-time validation runs
       (:func:`_reissue_link_problems`: identity immutability, attempt
@@ -3064,6 +3076,8 @@ def create_reissue_execution_order(
             f"clearance_generation must be an int >= 1, got {clearance_generation!r}"
         )
     _require_non_empty_str(clearance_evidence_id, "clearance_evidence_id")
+    if clearance_observed_after_utc is not None:
+        _require_utc(clearance_observed_after_utc, "clearance_observed_after_utc")
     if gate_correction_reference is not None and not isinstance(
         gate_correction_reference, GateDecisionReference
     ):
@@ -3114,6 +3128,49 @@ def create_reissue_execution_order(
                 "not resolve to a recorded evidence row; an unverifiable clearance "
                 "reference never justifies a reissue (nothing was changed)"
             )
+        # The referenced evidence must still be the signal's CURRENT
+        # clearance AT INSERT TIME (PR #122 Codex review P2): a service-layer
+        # pre-check is separated from this transaction by a window in which
+        # a concurrent observer can append ``observing`` (a comparison is
+        # underway) or ``revoked`` (a hazard was found). Resolving a
+        # historical row proves only that the row existed, never that its
+        # conclusion still stands -- so without this check a registration
+        # (which retires the parent and terminalizes its intent) could
+        # commit on evidence a concurrent observation had already
+        # invalidated. Verifying currency + status here puts the
+        # registration under the SAME serialization as the observation
+        # appends, exactly like mark_submitting does for the grant.
+        current = trail[-1]
+        if current["clearance_generation"] != clearance_generation:
+            raise ExecutionClearanceError(
+                f"clearance evidence (signal {request.signal_id!r}, generation "
+                f"{clearance_generation}) is no longer the current clearance "
+                f"(generation {current['clearance_generation']}, status "
+                f"{current['status']!r}); a newer observation was recorded while this "
+                "registration was being prepared and the newest information always "
+                "wins (nothing was changed)"
+            )
+        if current["status"] != CLEARANCE_STATUS_VALID:
+            raise ExecutionClearanceError(
+                f"the current clearance of signal {request.signal_id!r} (generation "
+                f"{clearance_generation}) is {current['status']!r}, not "
+                f"{CLEARANCE_STATUS_VALID!r}; a reissue is registered only against "
+                "positive no-divergence evidence (nothing was changed)"
+            )
+        if clearance_observed_after_utc is not None:
+            try:
+                observed_at = _parse_utc(evidence["observed_at_utc"])
+            except ValueError as exc:
+                raise ExecutionClearanceError(
+                    f"the clearance of signal {request.signal_id!r} carries an "
+                    f"unreadable observation time ({exc})"
+                ) from exc
+            if observed_at < clearance_observed_after_utc:
+                raise ExecutionClearanceError(
+                    f"the clearance of signal {request.signal_id!r} was observed at "
+                    f"{evidence['observed_at_utc']}, before the freshness cutoff "
+                    f"{_iso(clearance_observed_after_utc)} (nothing was changed)"
+                )
         clearance_ref_json = _clearance_ref_to_json(
             clearance_generation=clearance_generation,
             evidence_id=evidence["evidence_id"],

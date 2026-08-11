@@ -244,6 +244,7 @@ class ReissueService:
             reissue_reason=f"operator {operator_id}: {reason}",
             clearance_generation=clearance["clearance_generation"],
             clearance_evidence_id=clearance["evidence_id"],
+            clearance_observed_after_utc=self._clearance_cutoff(),
             db_path=self._execution_db_path,
         )
         _LOGGER.info(
@@ -290,11 +291,26 @@ class ReissueService:
                 f"{parent_execution_request_id!r} is in phase "
                 f"{parent['submission_phase']!r} / state {parent['order_state']!r}"
             )
+        self._require_parent_journal_unsent(parent_execution_request_id)
+        self._require_parent_absence_evidence(parent, clearance)
+        # The Gate decision is read LAST, immediately before the
+        # registration transaction (Issue #95's window narrowing): a
+        # concurrent submit() may persist a newer decision at any moment,
+        # and Issue #95 deliberately does NOT adopt a strict decision-store
+        # fence -- that would require holding this store's write lock
+        # across the other DB file while submit() performs broker queries,
+        # which the Execution Request contract forbids. The narrowing plus
+        # the post-commit re-read below is the sanctioned closure; the
+        # SAFETY argument is unchanged: of the decisions that could
+        # invalidate this precondition, only an ALLOW can reach a
+        # submission, and an allowed submit must win created -> submitting,
+        # which serializes against this child INSERT -- so either the
+        # parent submits (and the registration fails on the phase check) or
+        # the child registers (and the submit is refused with
+        # intent_superseded). Never both.
         gate_reference = self._require_correctable_latest_decision(
             parent_execution_request_id
         )
-        self._require_parent_journal_unsent(parent_execution_request_id)
-        self._require_parent_absence_evidence(parent, clearance)
         child = execution_store.create_reissue_execution_order(
             request,
             client_order_id=client_order_id,
@@ -305,9 +321,15 @@ class ReissueService:
             reissue_reason=f"operator {operator_id}: {reason}",
             clearance_generation=clearance["clearance_generation"],
             clearance_evidence_id=clearance["evidence_id"],
+            clearance_observed_after_utc=self._clearance_cutoff(),
             gate_correction_reference=gate_reference,
             gate_decision_db_path=self._decision_db_path,
             db_path=self._execution_db_path,
+        )
+        self._warn_if_correction_basis_went_stale(
+            parent_execution_request_id,
+            gate_reference.decision_id,
+            request.execution_request_id,
         )
         _LOGGER.info(
             "gate correction registered: signal_id=%s parent=%s child=%s attempt=%s "
@@ -466,6 +488,59 @@ class ReissueService:
                 f"the gate correction cap is reached: {gate_corrections} "
                 f"correction(s) are persisted and max_gate_corrections_per_signal is "
                 f"{policy.max_gate_corrections_per_signal}"
+            )
+
+    def _clearance_cutoff(self) -> datetime:
+        """The freshness cutoff the REGISTRATION transaction enforces (the
+        same window the pre-check used). Passing it into the store binds
+        currency, status and freshness to the child INSERT atomically
+        (PR #122 Codex review P2)."""
+        return self._now() - self._reissue_policy.clearance_max_age
+
+    def _warn_if_correction_basis_went_stale(
+        self, parent_id: str, decision_id: int, child_id: str
+    ) -> None:
+        """Issue #95's residual detection: re-read the parent's decisions
+        after the registration committed and WARN when the referenced
+        rejection is no longer the latest.
+
+        This is deliberately NOT a refusal. Per Issue #95 the residual is an
+        AUDIT-ONLY skew (the child is re-evaluated by the Gate under the
+        current policy on its own submit, and a concurrent ALLOW cannot both
+        submit the parent and let this child exist), so turning it into a
+        rollback would buy no safety while making a routine race fail. The
+        WARN makes the skew machine-detectable, which is what the contract
+        asks for. Never raises: the registration is already committed."""
+        try:
+            records = SQLiteSafetyDecisionStore(
+                self._decision_db_path
+            ).list_for_request_records(parent_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOGGER.warning(
+                "could not re-read the Safety Gate decisions of parent %s after "
+                "registering correction child %s: %s; the recorded correction basis "
+                "(decision_id %s) could not be confirmed as the latest",
+                parent_id,
+                child_id,
+                exc,
+                decision_id,
+            )
+            return
+        if records and records[-1][0] != decision_id:
+            latest_id, latest_decision, _snapshot = records[-1]
+            _LOGGER.warning(
+                "the correction basis of child %s (parent %s, decision_id %s) is no "
+                "longer the parent's latest Safety Gate decision (now decision_id %s, "
+                "allowed=%s, codes=%s): a decision was recorded concurrently with the "
+                "registration. The child is still re-evaluated by the Gate under the "
+                "current policy on its own submit, and the parent can never submit "
+                "(supersession marker), so this is an audit-metadata skew only",
+                child_id,
+                parent_id,
+                decision_id,
+                latest_id,
+                latest_decision.allowed,
+                latest_decision.rejection_codes,
             )
 
     def _require_fresh_valid_clearance(self, signal_id: str) -> dict:

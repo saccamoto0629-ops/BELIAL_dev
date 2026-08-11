@@ -86,6 +86,7 @@ from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore
 from execution.reissue_clearance import ReissueClearanceService, ReissueClearanceError
 from execution.reissue_service import (
     ReissueEligibilityError,
+    ReissuePolicy,
     ReissueService,
 )
 from execution.shadow_composition import run_production_shadow_cycle
@@ -415,6 +416,11 @@ class _ScenarioContext:
         self.broker = _build_broker(definition)
         self.connection = BrokerConnection(broker=self.broker)
         self.policy = _build_policy(definition)
+        # ONE reissue policy for BOTH boundaries (PR #122 Codex review P2):
+        # the same object governs the registration freshness window and the
+        # submission cutoff, so the scenarios exercise the wiring a composer
+        # must use -- never two independently defaulted windows.
+        self.reissue_policy = ReissuePolicy()
         self.market = _build_market(definition)
         self.state = StaticSafetyState(
             kill_switch_enabled=definition.gate.get("kill_switch", False)
@@ -466,6 +472,7 @@ class _ScenarioContext:
             order_db_path=self.orders_db,
             journal_db_path=self.journal_db,
             clock=lambda: NOW,
+            reissue_policy=self.reissue_policy,
         )
 
     def make_reissue_service(self) -> ReissueService:
@@ -480,6 +487,7 @@ class _ScenarioContext:
             journal_db_path=self.journal_db,
             decision_db_path=self.decisions_db,
             current_policy=self.policy,
+            reissue_policy=self.reissue_policy,
             clock=lambda: NOW,
         )
 

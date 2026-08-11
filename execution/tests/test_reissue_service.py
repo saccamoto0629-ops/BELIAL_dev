@@ -7,6 +7,7 @@ sleep, no real orders anywhere in this suite.
 """
 
 import json
+import logging
 from datetime import timedelta
 from decimal import Decimal
 
@@ -720,3 +721,182 @@ def test_correctable_code_set_matches_the_field_invariant_closure():
         SafetyRejectionCode.SYMBOL_NOT_ALLOWED,
         SafetyRejectionCode.SIDE_NOT_ALLOWED,
     }
+
+
+# --- PR #122 Codex review: concurrency between pre-check and registration ----
+
+
+@pytest.mark.parametrize(
+    "status", [store.CLEARANCE_STATUS_OBSERVING, store.CLEARANCE_STATUS_REVOKED]
+)
+def test_a_concurrent_observation_refuses_the_manual_registration(
+    db_path, journal_path, safety_path, monkeypatch, status
+):
+    """観測前の clearance invalidation が登録にも反映される: an observer
+    that claims (``observing``) or revokes the signal AFTER the service's
+    pre-check but BEFORE the child INSERT refuses the registration -- the
+    parent is not retired on evidence a newer observation invalidated."""
+    reject_parent(db_path)
+    record_clearance(db_path, "sig-exec-1")
+    service = make_service(db_path, journal_path, safety_path)
+    real_create = store.create_reissue_execution_order
+
+    def concurrent_observation(*args, **kwargs):
+        record_clearance(db_path, "sig-exec-1", status=status)
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "execution.reissue_service.execution_store.create_reissue_execution_order",
+        concurrent_observation,
+    )
+    with pytest.raises(store.ExecutionClearanceError):
+        service.register_manual_reissue(
+            manual_child(),
+            client_order_id="client-exec-2",
+            parent_execution_request_id="exec-1",
+            operator_id="op-1",
+            reason="retry",
+        )
+    assert store.get_execution_order("exec-2", db_path=db_path) is None
+    assert store.list_intent_supersessions(db_path=db_path) == []
+
+
+def test_a_concurrent_observation_refuses_the_gate_correction_and_keeps_the_parent(
+    db_path, journal_path, safety_path, monkeypatch
+):
+    """The same protection on the correction path, where the registration
+    would additionally retire the parent and terminalize its intent: a
+    concurrent hazard observation leaves the parent live and its journal
+    intent untouched."""
+    create_order(db_path)
+    record_decision(safety_path)
+    record_correction_clearance(db_path)
+    journal = SubmissionJournal(journal_path)
+    journal.initialize()
+    journal.record_submission_intent(
+        execution_request_id="exec-1", client_order_id="client-exec-1",
+        symbol="XAUUSD", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+        quantity=Decimal("10"), requested_price=Decimal("2400.00"),
+        execution_mode="fake", connection_target="fake", started_at_utc=at(2),
+    )
+    service = make_service(db_path, journal_path, safety_path)
+    real_create = store.create_reissue_execution_order
+
+    def concurrent_hazard(*args, **kwargs):
+        store.record_reissue_clearance(
+            "sig-exec-1",
+            evidence_id="ev-hazard",
+            status=store.CLEARANCE_STATUS_REVOKED,
+            account_scope="oanda-demo:acct-1",
+            observed_at_utc=at(6),
+            evidence_json=json.dumps({"hazards": ["broker holds an unexplained order"]}),
+            recorded_at_utc=at(6),
+            db_path=db_path,
+        )
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "execution.reissue_service.execution_store.create_reissue_execution_order",
+        concurrent_hazard,
+    )
+    with pytest.raises(store.ExecutionClearanceError):
+        register_correction(service)
+
+    assert store.get_execution_order("exec-2", db_path=db_path) is None
+    assert store.list_intent_supersessions(db_path=db_path) == []
+    parent = store.get_execution_order("exec-1", db_path=db_path)
+    assert parent["submission_phase"] == "created"  # still live, not retired
+    assert journal.get_entry("exec-1").outcome == OUTCOME_OPEN  # not terminalized
+
+
+def test_registration_enforces_the_policy_freshness_window_in_the_transaction(
+    db_path, journal_path, safety_path, monkeypatch
+):
+    """The cutoff handed to the store is the POLICY window, so evidence that
+    ages past it between the pre-check and the INSERT is refused there too."""
+    reject_parent(db_path)
+    record_clearance(db_path, "sig-exec-1", observed_at=at(5))
+    policy = ReissuePolicy(clearance_max_age=timedelta(seconds=30))
+    captured: dict = {}
+    real_create = store.create_reissue_execution_order
+
+    def capture(*args, **kwargs):
+        captured.update(kwargs)
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "execution.reissue_service.execution_store.create_reissue_execution_order", capture
+    )
+    service = make_service(
+        db_path, journal_path, safety_path, reissue_policy=policy, clock=lambda: at(20)
+    )
+    service.register_manual_reissue(
+        manual_child(),
+        client_order_id="client-exec-2",
+        parent_execution_request_id="exec-1",
+        operator_id="op-1",
+        reason="retry",
+    )
+    assert captured["clearance_observed_after_utc"] == at(20) - timedelta(seconds=30)
+
+
+# --- PR #122 Codex review: Issue #95 decision-read narrowing -----------------
+
+
+def test_a_concurrently_recorded_newer_decision_is_warned_not_silently_accepted(
+    db_path, journal_path, safety_path, monkeypatch, caplog
+):
+    """Issue #95 deliberately does NOT fence the decision store (it would
+    hold this store's write lock across another DB file while submit()
+    performs broker queries). Its sanctioned closure is the window
+    narrowing plus a post-commit re-read that makes the residual
+    machine-detectable: the registration stands (the child is re-evaluated
+    by the Gate on its own submit and the parent can never submit), and the
+    skew is WARN-logged."""
+    create_order(db_path)
+    basis_id = record_decision(safety_path)
+    record_correction_clearance(db_path)
+    service = make_service(db_path, journal_path, safety_path)
+    real_create = store.create_reissue_execution_order
+
+    def concurrent_allow(*args, **kwargs):
+        # a concurrent submit() persists a NEWER (allowed) decision AFTER
+        # the basis was read but BEFORE the child INSERT commits
+        record_decision(safety_path, allowed=True, seconds=4)
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "execution.reissue_service.execution_store.create_reissue_execution_order",
+        concurrent_allow,
+    )
+    with caplog.at_level(logging.WARNING, logger="execution.reissue_service"):
+        child = register_correction(service)
+    monkeypatch.undo()
+    assert basis_id is not None
+
+    assert child["signal_attempt"] == 2  # the registration stands
+    assert any(
+        "no longer the parent's latest Safety Gate decision" in record.getMessage()
+        for record in caplog.records
+    )
+    # the safety argument holds: the parent can never gain submission authority
+    with pytest.raises(store.ExecutionOrderSupersededError):
+        store.mark_submitting(
+            "exec-1", reason="must fail", changed_at_utc=at(40), db_path=db_path
+        )
+
+
+def test_no_warning_when_the_correction_basis_is_still_the_latest(
+    db_path, journal_path, safety_path, caplog
+):
+    create_order(db_path)
+    record_decision(safety_path)
+    record_correction_clearance(db_path)
+    service = make_service(db_path, journal_path, safety_path)
+    with caplog.at_level(logging.WARNING, logger="execution.reissue_service"):
+        register_correction(service)
+    assert not [
+        record
+        for record in caplog.records
+        if "no longer the parent's latest" in record.getMessage()
+    ]

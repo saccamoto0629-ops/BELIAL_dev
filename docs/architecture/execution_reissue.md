@@ -101,6 +101,7 @@ request-bound(訂正可能)拒否のために、**Broker へ一度も到達し�
 - **安全性(二重発注が起きないこと)**: 条件 1 を無効化しうる判定(許可・非訂正可能な拒否・policy 変更後の判定)のうち、**送信に至りうるのは許可判定だけ**である。許可判定が出た submit は Journal 記録 → `created → submitting` 遷移へ進むため、その遷移獲得と子行 INSERT は execution store の同一直列化で衝突し、**「親が送信される」か「子が登録される」かのどちらか一方しか成立しない**(子が先なら submit は `intent_superseded`、submit が先なら登録は phase 検査で失敗)。どの interleaving でも二重発注は生じない。
 - **残余(監査メタデータのみ)**: 並行して新しい判定が記録され、それが条件 1 を満たさない種類だった場合、子行が保持する訂正根拠は最新判定ではなくなる。これは**送信結果に影響しない監査上のズレ**であり(子はいずれにせよ通常の Gate を通り、現在の policy で再評価される)、記録から機械的に検出できる(親は `created` のまま子を持ち、当該判定に対応する Journal entry や phase 変化が存在しない)。登録時の再読で検出した場合は WARN を残す。
 - **証拠の絶対的な鮮度を要求する方式**(最新判定を execution store 側へ複製して同一トランザクションで突き合わせる等)は、**すべての Gate 拒否に耐久書き込みを課す**という副作用があるため本 Issue では採らない。必要になった場合の再検討は #116 に委ねる。
+- **#116 での実装(PR #122 Codex レビュー P2 への回答)**: 上記の縮小策をそのまま実装した — (a) `register_gate_correction()` は Gate 判定の読み取りを**他の全事前条件より後、登録トランザクションの直前**に行い、(b) commit 後に判定を再読して参照した拒否が最新でなくなっていれば **WARN**(child / parent / 参照 decision_id / 現在の最新 decision_id と内容)を残す。**厳密な decision store fence は引き続き採らない**: それは submit() の Gate 評価(Broker 照会を含む)を跨いで execution store の書き込みロックを保持することを要求し、[Execution Request](execution_request.md) の契約に反する。残余が監査メタデータに限られることの根拠は上の「安全性」節のとおりで、実装もそれを回帰テストで固定している(WARN が出ても親は supersession marker により送信権を得られない)。
 
 **親の退役(二重の live intent を作らない)**: 差し替え後に親が送信されてはならない。親行を書き換えるのではなく、`UNIQUE(reissued_from_execution_request_id)` index を使って **`mark_submitting()` が同一トランザクション内で「自分を親とする子行と耐久 supersession marker(#115 実装: 子登録と同一トランザクションで追記される `execution_intent_supersessions` 行)のいずれも存在しないこと」を確認**し、存在すれば送信権を与えない(Safety Gate 側の拒否コードは新設の `intent_superseded`。marker により、履歴を持たない子行 1 行の帯域外削除では親は復活しない)。競合は既存の `BEGIN IMMEDIATE` 直列化で解決する — 差し替えが先に commit すれば `mark_submitting()` が拒否され、`mark_submitting()` が先に commit すれば親の phase が `created` でなくなるので差し替えが拒否される。**どちらの順序でも「送信された親」と「その子」が同時に存在することはない。**
 
@@ -251,7 +252,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 **全経路に共通する前提**: 有効な **reissue clearance**(order / position 双方の照合が成功した無差分の積極的証拠・鮮度窓内)が必要であり、登録時だけでなく**送信の瞬間まで有効**でなければならない(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
 
 - 回数の判定は**常に永続化された行から導出**する(該当 signal の MAX(`signal_attempt`) と `reissue_kind` / `initiated_by` の集計)。in-memory カウンタ・プロセス状態には依存しないため、**プロセス再起動・多重起動後も上限と一意性が維持される**。
-- 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する(`max_total_attempts_per_signal`、**既定 4**)。clearance の**鮮度窓は `ReissuePolicy.clearance_max_age`(既定 5 分)**であり、登録時(`ReissueService`)と送信時(`LiveOrderSubmissionService` が `mark_submitting()` へ渡す cutoff)の両方で判定される。
+- 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する(`max_total_attempts_per_signal`、**既定 4**)。clearance の**鮮度窓は `ReissuePolicy.clearance_max_age`(既定 5 分)**であり、登録時(`ReissueService`。事前確認 + 登録トランザクション内の cutoff 照合)と送信時(`LiveOrderSubmissionService` が `mark_submitting()` へ渡す cutoff)の両方で判定される。**両境界は同一の `ReissuePolicy` オブジェクトを共有する**(PR #122 Codex レビュー P2): 送信サービスは `reissue_policy` を受け取り、独自の既定値を持たない — composer が狭い登録窓を設定しながら送信側が広い既定窓で認可してしまう構成を作れないようにするためである。
 
 ## 監査・再起動耐性・並行実行
 
@@ -323,6 +324,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 - **差分を観測したという事実が、送信可否の判断に反映されないまま送信される経路が存在してはならない**。観測の反映・失効は、送信権の付与に対して先行または同時に効力を持つ必要がある。
 - **失敗は常に送信不可側へ倒れる**: 証拠の記録・反映・照合のいずれかが失敗した場合、その結果として「送信可能」が維持されてはならない。
 - **権限を下げる情報は常に優先される**(単調性): 差分あり・観測中・不明のいずれも送信を許可しない。権限を与える判断だけが、上記の全要件を満たした場合に成立する。
+- **登録時の clearance も同一トランザクション内で current 照合する(PR #122 Codex レビュー P2)**: サービス層の事前確認と子行 INSERT の間には窓があり、その間に別 observer が `observing`(照合開始)や `revoked`(ハザード検出)を追記しうる。参照先の evidence 行が解決できることは「その行が存在した」ことしか証明しないため、`create_reissue_execution_order()` は**参照する世代が trail の末尾(current)であること + status が `valid` であること + (呼び出し側が cutoff を渡した場合)鮮度窓内であること**を子行 INSERT と**同一トランザクション**で検証する(不一致は `ExecutionClearanceError` で DB 無変更)。これにより登録は観測の追記と同じ直列化に載り、**新しい観測が無効化した evidence の上で親が退役することはない**。なお**口座スコープの照合は送信時のまま**である(#95 の要件 4 は「送信接続と観測対象の一致」であり、登録ユースケースは Broker 接続を持たない)。
 - **並行観測の直列化と順序(#116 で確定・実装済み。`ReissueClearanceService`)**:
   1. **write-ahead 無効化 = 排他的観測 claim**: Broker 照会の**前**に `observing` 世代を追記する。この行自体が claim であり、payload に observer_id と **lease 期限**(既定 5 分)を持ち、追記は store の `expected_generation` CAS で直列化される — 同一 signal に対して同時に進行できる観測は高々 1 つ。claim を取得できない(未失効の `observing` が存在する / CAS 敗北)場合は**観測しない**(`ClearanceClaimUnavailableError`)。lease が読めない `observing` 行は未失効として扱う(fail-closed)。takeover は **lease 満了時のみ**(新しい `observing` 世代の CAS 追記)。
   2. 観測: 既存の `BrokerOrderReconciliationService.run(include_position_scope=True)` をそのまま実行し(run_id = `reissue-clearance-<signal>-g<claim世代>`)、run 前後のチェーン読み取り(comparable 行の id / revision / state)一致で照合カバレッジを証明する。
