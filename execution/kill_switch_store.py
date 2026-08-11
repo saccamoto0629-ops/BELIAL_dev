@@ -75,6 +75,16 @@ The store never creates WAL databases itself; an out-of-band conversion is
 fail-closed until reverted (``PRAGMA journal_mode=DELETE``), and nothing
 recorded is lost.
 
+Scope of the no-side-file read property (review r4 r2): reads create no
+``-wal`` / ``-shm`` for a NON-WAL database -- the normal case, and the only
+one the store itself ever produces. If a database is converted to WAL out
+of band exactly between the pre-open header probe and the open, the open
+does materialize the sidecars before the refusal. That is accepted, not
+overlooked: reading WAL content requires the WAL index, so the only
+sidecar-free open is one that cannot see committed ``-wal`` rows -- exactly
+the stale OFF Issue #81 forbids. Safety wins; the file-system property is
+stated with its real boundary instead of being claimed unconditionally.
+
 Every state read validates the COMPLETE history, not merely the newest row
 (review r2): otherwise a malformed older row could hide behind a valid
 newer ``disable`` and let the gate read OFF from a database the operator
@@ -340,6 +350,27 @@ def _refuse_wal_header(db_path: Path) -> None:
     races the open (review r1/r3). It only removes the side effect for the
     case that is decidable without opening anything; correctness still
     rests on :func:`_refuse_wal` under a held lock.
+
+    RESIDUAL, and deliberately not closed (review r4 r2): a conversion that
+    lands BETWEEN this probe and the open still materializes the sidecars,
+    because the two properties cannot be had at once. Measured on one
+    WAL-header file:
+
+    ==========================  ========================  ==============
+    open                        sees WAL rows / reports   sidecars
+    ==========================  ========================  ==============
+    ``mode=ro``                 yes / ``'wal'``           CREATED
+    ``mode=ro&immutable=1``     stale / ``'delete'``      none
+    ==========================  ========================  ==============
+
+    Reading WAL content requires the WAL index (``-shm``), so the only
+    sidecar-free open is the one that cannot see committed ``-wal`` rows and
+    cannot even report that the file is WAL -- i.e. the one that can answer
+    a stale DISABLED. Between "never touch the filesystem" and "never read a
+    stale OFF", Issue #81 makes the second non-negotiable. So in that narrow
+    race the sidecars appear and the store still fails closed; the no-side-
+    file property is documented as holding for non-WAL databases rather than
+    silently assumed (docs/architecture/safety_gate.md).
     """
     if _is_wal_header(db_path):
         raise KillSwitchSchemaError(

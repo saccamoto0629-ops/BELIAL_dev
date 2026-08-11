@@ -156,7 +156,12 @@ def connect_read_only(
     makes SQLite recreate its ``-wal`` / ``-shm`` sidecars -- the module's
     no-side-file guarantee holds for the DEFAULT path only. A caller that
     opts out and still must not touch the filesystem has to reject WAL files
-    BEFORE calling this (``kill_switch_store._refuse_wal_header``).
+    BEFORE calling this (``kill_switch_store._refuse_wal_header``), and even
+    then a conversion racing that probe leaves the sidecars behind: reading
+    WAL content requires the WAL index, so no open both sees ``-wal`` rows
+    and creates nothing. Opting out therefore trades the unconditional
+    no-side-file property for the guarantee of never reading a stale
+    committed value.
 
     The caller owns closing the connection (use ``contextlib.closing``).
     """

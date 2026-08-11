@@ -527,6 +527,53 @@ def test_refusing_a_wal_db_creates_no_sidecars_on_any_path(tmp_path):
         assert kill_switch_files(path) == before
 
 
+def test_a_conversion_racing_the_open_stays_fail_closed(tmp_path, monkeypatch):
+    """PR #126 Codex review P2 (r4 r2): the pre-open header probe cannot see
+    a conversion that lands between it and the open, so in THAT race the
+    sidecars do appear before the refusal. The boundary is accepted and
+    pinned here rather than left implicit:
+
+    - SAFETY is absolute -- the store still fails closed, so no stale OFF
+      can ever be read (this is what the assertions enforce).
+    - The no-side-file property is scoped to non-WAL databases. Reading WAL
+      content requires the WAL index, so the only sidecar-free open is the
+      one that cannot see committed ``-wal`` rows; Issue #81 makes that
+      trade non-negotiable in favour of safety.
+    """
+    import execution.kill_switch_store as module
+
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    real_connect = module.connect_read_only
+
+    def convert_then_connect(db_path, **kwargs):
+        # Lands after _refuse_wal_header has already passed. The converter
+        # closes, so its sidecars are gone again by the time we open.
+        converter = sqlite3.connect(path)
+        try:
+            converter.execute("PRAGMA journal_mode=WAL")
+        finally:
+            converter.close()
+        return real_connect(db_path, **kwargs)
+
+    monkeypatch.setattr(module, "connect_read_only", convert_then_connect)
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.current_state()
+    with pytest.raises(KillSwitchStoreError):
+        PersistentKillSwitchStateProvider(path).is_kill_switch_enabled()
+    monkeypatch.undo()
+
+    # The accepted residual: this race may leave the sidecars behind. It is
+    # recorded (not asserted away) so a future change that closes it is a
+    # visible improvement rather than a silent contract shift.
+    assert set(kill_switch_files(path)) <= {
+        path.name,
+        f"{path.name}-wal",
+        f"{path.name}-shm",
+    }
+
+
 def test_cli_status_on_a_wal_db_creates_no_sidecars(tmp_path, capsys):
     path = ks_db(tmp_path)
     SQLiteKillSwitchStore(path).initialize()
