@@ -15,6 +15,7 @@ from broker.broker_models import AccountState, OrderSide, OrderType
 from broker.fake_broker import FakeBroker
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
@@ -331,6 +332,7 @@ def _submit_with_path(tmp_path, *, initialized=True, kill_switch=False):
         order_db_path=tmp_path / "orders.sqlite3",
         journal_db_path=journal_db_path,
         clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
     )
     service.register(request, client_order_id="client-flow-1")
     decision, result = service.submit(request.execution_request_id, market=market)
@@ -363,3 +365,125 @@ def test_uninitialized_store_fails_closed_through_the_submission_path(tmp_path):
     assert decision.rejection_codes == (SafetyRejectionCode.DECISION_PERSIST_FAILED.value,)
     assert result is None
     assert broker.submitted_requests == []
+
+
+# --- Issue #116: policy content snapshots and the v1 -> v2 migration ---------
+
+
+def _snapshot_policy():
+    from datetime import timedelta
+    from decimal import Decimal
+
+    from broker.broker_models import OrderSide
+    from execution.safety_gate import ExecutionMode, SafetyPolicy
+
+    return SafetyPolicy(
+        policy_id="policy-1",
+        allowed_symbols=frozenset({"XAUUSD"}),
+        allowed_sides=frozenset({OrderSide.BUY}),
+        max_order_quantity=Decimal("10"),
+        max_positions_per_symbol=2,
+        max_positions_account=5,
+        max_reference_age=timedelta(seconds=30),
+        max_spread_by_symbol={"XAUUSD": Decimal("0.5")},
+        allowed_connection_targets={ExecutionMode.FAKE: frozenset({"fake"})},
+    )
+
+
+def test_policy_snapshot_round_trips_next_to_the_decision(tmp_path):
+    store = store_at(tmp_path)
+    policy = _snapshot_policy()
+    decision = rejected_decision()
+    decision_id = store.record(decision, policy_snapshot=policy.to_snapshot())
+    records = store.list_for_request_records(decision.execution_request_id)
+    assert records == ((decision_id, decision, policy.to_snapshot()),)
+    # decisions recorded WITHOUT a snapshot read back as None
+    second = rejected_decision()
+    second_id = store.record(second)
+    assert store.list_for_request_records(decision.execution_request_id)[-1] == (
+        second_id,
+        second,
+        None,
+    )
+
+
+def test_record_rejects_a_non_dict_policy_snapshot(tmp_path):
+    store = store_at(tmp_path)
+    with pytest.raises(SafetyStoreError, match="policy_snapshot"):
+        store.record(rejected_decision(), policy_snapshot="not-a-dict")
+    with pytest.raises(SafetyStoreError, match="policy_snapshot"):
+        store.record(rejected_decision(), policy_snapshot={})
+
+
+def test_tampered_policy_snapshot_fails_restore(tmp_path):
+    store = store_at(tmp_path)
+    decision = rejected_decision()
+    store.record(decision, policy_snapshot=_snapshot_policy().to_snapshot())
+    _tamper(store, "UPDATE safety_gate_decisions SET policy_snapshot_json = '[]'")
+    with pytest.raises(SafetyIntegrityError, match="restore-time validation"):
+        store.list_for_request_records(decision.execution_request_id)
+
+
+def _build_v1_decision_db(path):
+    from contextlib import closing
+
+    from execution import safety_store as ss
+
+    with closing(sqlite3.connect(path)) as connection:
+        ss._create_schema(connection, version=1)
+        connection.execute(
+            "INSERT INTO safety_gate_decisions (execution_request_id, allowed, "
+            "checked_at_utc, policy_id, execution_mode, connection_target, "
+            "rejections_json, account_id, position_count) VALUES "
+            "('exec-1', 1, '2026-07-22T01:00:00+00:00', 'policy-1', 'fake', 'fake', "
+            "'[]', NULL, 0)"
+        )
+        connection.commit()
+
+
+def test_v1_to_v2_migration_adds_the_snapshot_column_and_keeps_rows(tmp_path):
+    path = tmp_path / "safety.sqlite3"
+    _build_v1_decision_db(path)
+    store = SQLiteSafetyDecisionStore(path)
+    store.initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    records = store.list_for_request_records("exec-1")
+    assert len(records) == 1
+    decision_id, decision, snapshot = records[0]
+    assert decision.allowed is True
+    assert snapshot is None  # pre-v2 rows carry no snapshot (fail-closed later)
+    store.initialize()  # idempotent
+    # and new rows on the migrated DB can carry snapshots
+    new_id = store.record(rejected_decision(), policy_snapshot=_snapshot_policy().to_snapshot())
+    assert new_id > decision_id
+
+
+def test_v1_to_v2_migration_rolls_back_completely_on_failure(tmp_path, monkeypatch):
+    from execution import safety_store as ss
+
+    path = tmp_path / "safety.sqlite3"
+    _build_v1_decision_db(path)
+    with sqlite3.connect(path) as connection:
+        before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+
+    real_verify = ss._verify_schema
+
+    def fail_v2(connection, db_path, *, version=ss.SCHEMA_VERSION):
+        if version == ss.SCHEMA_VERSION:
+            raise ss.SafetySchemaError("injected post-migration failure")
+        return real_verify(connection, db_path, version=version)
+
+    monkeypatch.setattr(ss, "_verify_schema", fail_v2)
+    with pytest.raises(SafetySchemaError, match="injected"):
+        SQLiteSafetyDecisionStore(path).initialize()
+    monkeypatch.undo()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall() == before
+    SQLiteSafetyDecisionStore(path).initialize()  # a clean retry succeeds

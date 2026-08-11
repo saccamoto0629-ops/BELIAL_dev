@@ -1,0 +1,107 @@
+{
+  "scenario_id": "reissue_manual_after_reject_filled",
+  "description": "手動再発行の主経路 (Issue #116): Broker確定拒否 -> clearance観測(両ドメイン成功・無矛盾) -> 運用者の明示的再発行 -> 新client_order_idの子が通常のsubmit()経路で約定する",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "reject",
+        "reason": "temporarily untradable",
+        "category": "transient"
+      },
+      "client-2": {
+        "behavior": "fill_immediately",
+        "broker_order_id": "BRK-2"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "rejected"
+      }
+    },
+    {
+      "action": "grant_clearance",
+      "signal_id": "signal-1",
+      "expect": {
+        "outcome": "granted"
+      }
+    },
+    {
+      "action": "manual_reissue",
+      "request": {
+        "execution_request_id": "exec-2",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-2",
+      "parent_execution_request_id": "exec-1",
+      "operator_id": "op-1",
+      "reason": "transient rejection cleared; reissue the same intent",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-2",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "rejected",
+    "broker_submit_calls": 2,
+    "order_rows": 2,
+    "chain": [
+      {
+        "execution_request_id": "exec-1",
+        "signal_attempt": 1,
+        "submission_phase": "submitted",
+        "order_state": "rejected"
+      },
+      {
+        "execution_request_id": "exec-2",
+        "signal_attempt": 2,
+        "submission_phase": "submitted",
+        "order_state": "filled"
+      }
+    ],
+    "journal_outcomes": {
+      "exec-1": "completed",
+      "exec-2": "completed"
+    },
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

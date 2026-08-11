@@ -20,6 +20,7 @@ from broker.fake_broker import FakeBroker, TimeoutOrder
 from execution import execution_store, sqlite_ro
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
@@ -40,6 +41,7 @@ from execution.submission_journal import (
     OUTCOME_COMPLETED,
     OUTCOME_OPEN,
     OUTCOME_RECONCILIATION_REQUIRED,
+    OUTCOME_SUPERSEDED,
     SubmissionJournal,
     SubmissionJournalConflictError,
     SubmissionJournalEntry,
@@ -160,6 +162,7 @@ def make_service(
         order_db_path=order_db if order_db is not None else tmp_path / "orders.sqlite3",
         journal_db_path=journal_db,
         clock=lambda: NOW,
+        reissue_policy=ReissuePolicy(),
     )
     return service, broker, SubmissionJournal(journal_db)
 
@@ -522,7 +525,7 @@ def test_db_check_constraints_reject_inconsistent_lifecycle_rows(tmp_path):
                 "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', NULL, "
                 "'fake', 'fake', "
                 "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
-                "'not_attempted', 'completed', NULL, '2026-07-22T01:00:00+00:00')"
+                "'not_attempted', 'completed', NULL, '2026-07-22T01:00:00+00:00', NULL)"
             )
         with pytest.raises(sqlite3.IntegrityError):
             # unknown without a recorded failure reason
@@ -532,7 +535,7 @@ def test_db_check_constraints_reject_inconsistent_lifecycle_rows(tmp_path):
                 "'fake', 'fake', "
                 "'2026-07-22T01:00:00+00:00', 'unknown', NULL, NULL, "
                 "'not_attempted', 'reconciliation_required', NULL, "
-                "'2026-07-22T01:00:00+00:00')"
+                "'2026-07-22T01:00:00+00:00', NULL)"
             )
         with pytest.raises(sqlite3.IntegrityError):
             # a MARKET row carrying a limit price (PR #113 review P1 guard)
@@ -541,7 +544,7 @@ def test_db_check_constraints_reject_inconsistent_lifecycle_rows(tmp_path):
                 "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', '150', "
                 "'fake', 'fake', "
                 "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
-                "'not_attempted', 'open', NULL, '2026-07-22T01:00:00+00:00')"
+                "'not_attempted', 'open', NULL, '2026-07-22T01:00:00+00:00', NULL)"
             )
 
 
@@ -896,3 +899,222 @@ def test_unresolved_entries_survive_a_process_restart(tmp_path):
     assert [e.execution_request_id for e in entries] == ["exec-1"]
     assert entries[0].outcome == OUTCOME_RECONCILIATION_REQUIRED
     assert entries[0].client_order_id == "client-1"
+
+
+# --- Issue #116: the terminal ``superseded`` outcome --------------------------
+
+
+def _record_not_started(journal, request_id="exec-1", client_order_id="client-1"):
+    journal.record_submission_intent(
+        **intent_kwargs(execution_request_id=request_id, client_order_id=client_order_id)
+    )
+
+
+def test_mark_superseded_terminalizes_a_not_started_intent(tmp_path):
+    journal = journal_at(tmp_path)
+    _record_not_started(journal)
+    assert journal.mark_superseded(
+        "exec-1", superseded_by_execution_request_id="exec-2", at_utc=LATER
+    ) is True
+    entry = journal.get_entry("exec-1")
+    assert entry.outcome == OUTCOME_SUPERSEDED
+    assert entry.broker_call_state == BROKER_CALL_NOT_STARTED
+    assert entry.superseded_by_execution_request_id == "exec-2"
+    # 恒久残存しない: terminal entries leave the unresolved report
+    assert journal.list_unresolved() == ()
+
+
+def test_mark_superseded_is_idempotent_for_the_same_provenance(tmp_path):
+    journal = journal_at(tmp_path)
+    _record_not_started(journal)
+    journal.mark_superseded("exec-1", superseded_by_execution_request_id="exec-2", at_utc=LATER)
+    assert journal.mark_superseded(
+        "exec-1", superseded_by_execution_request_id="exec-2", at_utc=LATER
+    ) is False  # no-op: recovery sweeps re-run safely
+
+
+def test_mark_superseded_conflicts_on_a_different_provenance(tmp_path):
+    journal = journal_at(tmp_path)
+    _record_not_started(journal)
+    journal.mark_superseded("exec-1", superseded_by_execution_request_id="exec-2", at_utc=LATER)
+    with pytest.raises(SubmissionJournalConflictError, match="already superseded by"):
+        journal.mark_superseded(
+            "exec-1", superseded_by_execution_request_id="exec-3", at_utc=LATER
+        )
+
+
+@pytest.mark.parametrize("progress", ["started", "responded", "unknown", "completed"])
+def test_mark_superseded_never_touches_a_possibly_sent_intent(tmp_path, progress):
+    """Broker 到達可能性がある intent は終端化できない (fail-closed)."""
+    journal = journal_at(tmp_path)
+    _record_not_started(journal)
+    journal.mark_broker_call_started("exec-1", at_utc=LATER)
+    if progress == "responded":
+        journal.record_broker_response(
+            "exec-1", response_state=OrderState.ACCEPTED, broker_order_id="B-1", at_utc=LATER
+        )
+    elif progress == "unknown":
+        journal.record_broker_outcome_unknown("exec-1", error="lost", at_utc=LATER)
+    elif progress == "completed":
+        journal.mark_completed(
+            "exec-1", response_state=OrderState.FILLED, broker_order_id="B-1", at_utc=LATER
+        )
+    with pytest.raises(SubmissionJournalError, match="only a 'not_started' entry"):
+        journal.mark_superseded(
+            "exec-1", superseded_by_execution_request_id="exec-2", at_utc=LATER
+        )
+
+
+def test_mark_superseded_requires_an_existing_entry_and_monotonic_time(tmp_path):
+    journal = journal_at(tmp_path)
+    with pytest.raises(SubmissionJournalError, match="nothing to supersede"):
+        journal.mark_superseded(
+            "exec-1", superseded_by_execution_request_id="exec-2", at_utc=NOW
+        )
+    _record_not_started(journal)
+    with pytest.raises(SubmissionJournalError, match="precedes the stored"):
+        journal.mark_superseded(
+            "exec-1",
+            superseded_by_execution_request_id="exec-2",
+            at_utc=NOW - timedelta(seconds=1),
+        )
+    with pytest.raises(SubmissionJournalError, match="cannot be superseded by itself"):
+        journal.mark_superseded(
+            "exec-1", superseded_by_execution_request_id="exec-1", at_utc=LATER
+        )
+
+
+def test_a_superseded_entry_is_never_reclaimed_and_never_progresses(tmp_path):
+    """終端化は送信可能性を増やさない: neither the reclaim path nor any
+    lifecycle transition accepts a superseded entry."""
+    journal = journal_at(tmp_path)
+    _record_not_started(journal)
+    journal.mark_superseded("exec-1", superseded_by_execution_request_id="exec-2", at_utc=LATER)
+    with pytest.raises(SubmissionJournalConflictError, match="never reclaimed"):
+        _record_not_started(journal)
+    with pytest.raises(SubmissionJournalError, match="terminally"):
+        journal.mark_broker_call_started("exec-1", at_utc=LATER + timedelta(seconds=1))
+
+
+def test_v2_db_checks_reject_inconsistent_superseded_rows(tmp_path):
+    journal = journal_at(tmp_path)
+    with sqlite3.connect(journal.path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            # superseded after the broker call may have happened
+            connection.execute(
+                "INSERT INTO submission_journal VALUES ("
+                "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', NULL, "
+                "'fake', 'fake', "
+                "'2026-07-22T01:00:00+00:00', 'started', NULL, NULL, "
+                "'not_attempted', 'superseded', NULL, '2026-07-22T01:00:00+00:00', "
+                "'exec-y')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            # superseded without naming the superseding request
+            connection.execute(
+                "INSERT INTO submission_journal VALUES ("
+                "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', NULL, "
+                "'fake', 'fake', "
+                "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
+                "'not_attempted', 'superseded', NULL, '2026-07-22T01:00:00+00:00', NULL)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            # a superseding reference on a non-superseded outcome
+            connection.execute(
+                "INSERT INTO submission_journal VALUES ("
+                "'exec-x', 'client-x', 'USD_JPY', 'buy', 'market', '1', NULL, "
+                "'fake', 'fake', "
+                "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
+                "'not_attempted', 'open', NULL, '2026-07-22T01:00:00+00:00', 'exec-y')"
+            )
+
+
+# --- Issue #116: v1 -> v2 migration ------------------------------------------
+
+
+def _build_v1_journal(path):
+    """A released-v1 journal DB holding one not_started and one completed
+    row (written through the v1 schema directly)."""
+    from execution import submission_journal as sj
+
+    connection = sqlite3.connect(path)
+    try:
+        sj._create_schema(connection, version=1)
+        connection.execute(
+            "INSERT INTO submission_journal VALUES ("
+            "'exec-1', 'client-1', 'USD_JPY', 'buy', 'market', '1', NULL, "
+            "'fake', 'fake', "
+            "'2026-07-22T01:00:00+00:00', 'not_started', NULL, NULL, "
+            "'not_attempted', 'open', NULL, '2026-07-22T01:00:00+00:00')"
+        )
+        connection.execute(
+            "INSERT INTO submission_journal VALUES ("
+            "'exec-2', 'client-2', 'USD_JPY', 'buy', 'market', '1', NULL, "
+            "'fake', 'fake', "
+            "'2026-07-22T01:00:00+00:00', 'responded', 'filled', 'B-1', "
+            "'saved', 'completed', NULL, '2026-07-22T01:00:01+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v1_to_v2_migration_rebuilds_and_keeps_every_row(tmp_path):
+    path = tmp_path / "journal.sqlite3"
+    _build_v1_journal(path)
+    journal = SubmissionJournal(path)
+    journal.initialize()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        rows = connection.execute(
+            "SELECT execution_request_id, outcome, superseded_by_execution_request_id "
+            "FROM submission_journal ORDER BY execution_request_id"
+        ).fetchall()
+    assert rows == [("exec-1", "open", None), ("exec-2", "completed", None)]
+    # migrated rows restore through the normal validated read path
+    assert journal.get_entry("exec-1").broker_call_state == BROKER_CALL_NOT_STARTED
+    assert journal.get_entry("exec-2").outcome == OUTCOME_COMPLETED
+    journal.initialize()  # idempotent
+    # and the v2 lifecycle works on the migrated DB
+    journal.mark_superseded("exec-1", superseded_by_execution_request_id="exec-9", at_utc=LATER)
+    assert journal.get_entry("exec-1").outcome == OUTCOME_SUPERSEDED
+
+
+def test_v1_to_v2_migration_rolls_back_completely_on_failure(tmp_path, monkeypatch):
+    from execution import submission_journal as sj
+
+    path = tmp_path / "journal.sqlite3"
+    _build_v1_journal(path)
+    with sqlite3.connect(path) as connection:
+        before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        rows_before = connection.execute(
+            "SELECT * FROM submission_journal ORDER BY execution_request_id"
+        ).fetchall()
+
+    real_verify = sj._verify_schema
+
+    def fail_v2_verification(connection, db_path, *, version=sj.SCHEMA_VERSION):
+        if version == sj.SCHEMA_VERSION:
+            raise sj.SubmissionJournalSchemaError("injected post-migration failure")
+        return real_verify(connection, db_path, version=version)
+
+    monkeypatch.setattr(sj, "_verify_schema", fail_v2_verification)
+    with pytest.raises(SubmissionJournalSchemaError, match="injected"):
+        SubmissionJournal(path).initialize()
+    monkeypatch.undo()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall() == before
+        assert connection.execute(
+            "SELECT * FROM submission_journal ORDER BY execution_request_id"
+        ).fetchall() == rows_before
+    # and a clean retry succeeds
+    SubmissionJournal(path).initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2

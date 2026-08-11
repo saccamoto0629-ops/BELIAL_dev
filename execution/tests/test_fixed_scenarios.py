@@ -52,6 +52,14 @@ REQUIRED_SCENARIO_IDS = {
     "multiple_gate_violations",
     "invalid_state_transition_rejected_by_store",
     "same_request_id_different_payload_suppressed",
+    # Issue #116 intent-reissue scenarios:
+    "reissue_manual_after_reject_filled",
+    "reissue_manual_rejected_again",
+    "reissue_manual_cap_reached",
+    "reissue_parent_not_rejected_refused",
+    "reissue_parameter_quantity_increase_filled",
+    "gate_correction_quantity_reduced_filled",
+    "gate_correction_submitted_parent_refused",
 }
 
 # Cancel scenarios are deliberately NOT part of the fixed suite (PR #96

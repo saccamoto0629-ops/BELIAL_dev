@@ -617,6 +617,10 @@ recovered = repairer.recover_pending_attempts()                         # lease 
 
 `detect()` は reconciliation DB を作成しない(dry-run 的な確認に使える)。`run()` は `init_reconciliation_db()`(冪等)の後に append する。`repair()` は**保存済み run のみ**を入力とし、APPLY モードでは既存 DB を検証(必要なら v1 → v2 migration)してから処理する(DB が存在しなければエラー。新規作成はしない)。run-level 停止時は `ReconciliationRepairRunError.attempts` に完了済み attempt が添付される(監査 DB からも取得可能)。`recover_pending_attempts()` は **lease が切れた pending だけ**を対象にするので、live な repair pass と同時に走らせても安全である(何度呼んでも、回収済み = finalized の attempt には二度と触れない)。
 
+### reissue clearance からの利用(Issue #116)
+
+intent reissue の clearance 観測(`execution/reissue_clearance.py` の `ReissueClearanceService.observe_signal()`)は、本サービスの `run(include_position_scope=True)` を**そのまま**呼んで観測を行い(run_id = `reissue-clearance-<signal>-g<世代>`)、その結果を内部状態 × 観測の組合せで判定して execution DB の clearance evidence(`record_reissue_clearance()`)へ結論を追記する。本サービス側に変更はない — 照合は従来どおり read-only であり、clearance が加えるのは「run の結果をどう解釈するか」というサービス層の判定と、チェーン末尾が未送信の場合の `Broker.get_order()` による明示的な不在照会(照会系のみ)だけである。判定の分類・claim / lease・失効の単調性は [Execution Intent Reissue](execution_reissue.md) が正。
+
 ## 非スコープ(Issue #105 時点)
 
 Broker への注文送信・キャンセル・replace・close(修復は内部 DB のみ)、Broker 側のみの注文・position・trade の自動採用、Broker に存在しない内部 position の自動 close、SL / TP 注文の自動再作成・自動変更、Broker 状態の推測(照会失敗・曖昧一致からの状態確定を含む)、無条件の自動決済、position / trade / SL・TP ドメインへの修復拡張(検出 + `manual_review` のみ)、scheduler / 常駐 Bot への組み込み、Live 接続解禁、position 数量レベルの不一致検出(presence 比較のみ。per-trade 検査が細粒度を担う)。

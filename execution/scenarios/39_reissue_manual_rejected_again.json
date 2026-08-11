@@ -1,0 +1,104 @@
+{
+  "scenario_id": "reissue_manual_rejected_again",
+  "description": "手動再発行後の再拒否 (Issue #116): 再発行された子も通常経路でBrokerに拒否され、チェーンは両attemptともREJECTEDの監査可能な終端として残る",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "reject",
+        "reason": "temporarily untradable",
+        "category": "transient"
+      },
+      "client-2": {
+        "behavior": "reject",
+        "reason": "still untradable",
+        "category": "transient"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "rejected"
+      }
+    },
+    {
+      "action": "grant_clearance",
+      "signal_id": "signal-1",
+      "expect": {
+        "outcome": "granted"
+      }
+    },
+    {
+      "action": "manual_reissue",
+      "request": {
+        "execution_request_id": "exec-2",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-2",
+      "parent_execution_request_id": "exec-1",
+      "operator_id": "op-1",
+      "reason": "retry after transient rejection",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-2",
+      "expect": {
+        "outcome": "submitted",
+        "state": "rejected"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "rejected",
+    "broker_submit_calls": 2,
+    "order_rows": 2,
+    "chain": [
+      {
+        "execution_request_id": "exec-1",
+        "signal_attempt": 1,
+        "submission_phase": "submitted",
+        "order_state": "rejected"
+      },
+      {
+        "execution_request_id": "exec-2",
+        "signal_attempt": 2,
+        "submission_phase": "submitted",
+        "order_state": "rejected"
+      }
+    ],
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

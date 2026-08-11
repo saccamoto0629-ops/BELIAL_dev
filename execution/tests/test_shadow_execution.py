@@ -15,6 +15,7 @@ import pytest
 from broker import fake_broker
 from execution import execution_store, shadow_store
 from execution.live_submission import LiveOrderSubmissionService
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     AccountSafetySnapshot,
     BROKER_TYPE_BY_MODE,
@@ -613,6 +614,7 @@ def _live_service(tmp_path, broker):
         order_db_path=tmp_path / "orders.sqlite3",
         journal_db_path=tmp_path / "journal.sqlite3",
         clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
     )
 
 

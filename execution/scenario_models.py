@@ -59,10 +59,16 @@ _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
     "partially_fill_then_reissue": frozenset(
         {"fills", "broker_order_id", "reissued_broker_order_id"}
     ),
-    "reject": frozenset({"reason"}),
+    # ``category`` (Issue #114/#116): the scripted normalized rejection
+    # classification (a ``RejectionCategory`` value); default unclassified.
+    "reject": frozenset({"reason", "category"}),
     "timeout": frozenset(),
     "fail_communication": frozenset(),
 }
+
+_REJECTION_CATEGORY_VALUES = frozenset(
+    {"transient", "parameter", "account", "instrument", "broker_internal", "unclassified"}
+)
 
 # DB boundaries where a fault can be injected (Issue #77): each maps to one
 # store function the runner substitutes for the scenario's duration. Issue #78
@@ -91,6 +97,11 @@ _STEP_ACTIONS = frozenset(
         "shadow",
         "shadow_concurrent",
         "shadow_production",
+        # Issue #95 / #116 intent-reissue steps: the runner drives the
+        # PRODUCTION ReissueClearanceService / ReissueService only.
+        "grant_clearance",
+        "manual_reissue",
+        "gate_correction",
     }
 )
 
@@ -102,6 +113,9 @@ _STEP_OUTCOMES: dict[str, frozenset[str]] = {
     "mark_submitting": frozenset({"ok", "error"}),
     "shadow": frozenset({"recorded", "duplicate", "dry_run", "conflict", "error"}),
     "shadow_production": frozenset({"recorded", "duplicate", "dry_run", "conflict", "error"}),
+    "grant_clearance": frozenset({"granted", "not_granted", "error"}),
+    "manual_reissue": frozenset({"registered", "refused", "error"}),
+    "gate_correction": frozenset({"registered", "refused", "error"}),
 }
 
 _REQUEST_REQUIRED_KEYS = frozenset(
@@ -173,7 +187,18 @@ _STEP_EXTRA_KEYS: dict[str, frozenset[str]] = {
     ),
     "shadow_concurrent": frozenset({"request", "client_order_id", "timeframe", "workers"}),
     "shadow_production": frozenset({"signal_id", "owner_id", "at_offset_seconds", "dry_run"}),
+    "grant_clearance": frozenset({"signal_id"}),
+    "manual_reissue": frozenset(
+        {"request", "client_order_id", "parent_execution_request_id", "operator_id", "reason"}
+    ),
+    "gate_correction": frozenset(
+        {"request", "client_order_id", "parent_execution_request_id", "operator_id", "reason"}
+    ),
 }
+
+_REISSUE_STEP_REQUIRED_KEYS = frozenset(
+    {"request", "client_order_id", "parent_execution_request_id", "operator_id", "reason"}
+)
 
 # History-entry expectation keys (PR #96 review Minor 1): entries are objects
 # so reason / broker reference can be declared; ``changed_at_utc`` presence
@@ -218,7 +243,21 @@ EXPECTED_KEYS = frozenset(
         "shadow_phase",
         "shadow_account_id",
         "shadow_safety_decision_id",
+        # Issue #116 intent-reissue observations: the primary signal's full
+        # chain (attempt order) and the journal outcome per intent.
+        "chain",
+        "journal_outcomes",
     }
+)
+
+# One expected chain entry declares ALL of these (exact comparison).
+_CHAIN_ENTRY_KEYS = frozenset(
+    {"execution_request_id", "signal_attempt", "submission_phase", "order_state"}
+)
+
+# Journal outcome values (kept in lockstep with execution.submission_journal).
+_JOURNAL_OUTCOME_VALUES = frozenset(
+    {"open", "completed", "reconciliation_required", "superseded"}
 )
 
 _SUBMITTED_REQUEST_KEYS = frozenset(
@@ -355,6 +394,12 @@ def _validate_script(spec, name: str, scenario: str, *, table: dict[str, frozens
         )
     if "reason" in script:
         _require_non_empty_str(script["reason"], f"{name}.reason", scenario)
+    if "category" in script and script["category"] not in _REJECTION_CATEGORY_VALUES:
+        raise _fail(
+            scenario,
+            f"{name}.category must be one of {sorted(_REJECTION_CATEGORY_VALUES)}, "
+            f"got {script['category']!r}",
+        )
     if behaviour in ("partially_fill", "partially_fill_then_reissue"):
         fills = script.get("fills")
         if not isinstance(fills, list) or not fills:
@@ -606,6 +651,15 @@ def _validate_step(spec, index: int, scenario: str) -> ScenarioStep:
             _require_int(step["at_offset_seconds"], f"{name}.at_offset_seconds", scenario)
         if "dry_run" in step:
             _require_bool(step["dry_run"], f"{name}.dry_run", scenario)
+    elif action == "grant_clearance":
+        _require_non_empty_str(step.get("signal_id"), f"{name}.signal_id", scenario)
+    elif action in ("manual_reissue", "gate_correction"):
+        missing = _REISSUE_STEP_REQUIRED_KEYS - set(step)
+        if missing:
+            raise _fail(scenario, f"{name} is missing required keys {sorted(missing)}")
+        params["request"] = _validate_request(step.get("request"), f"{name}.request", scenario)
+        for key in ("client_order_id", "parent_execution_request_id", "operator_id", "reason"):
+            _require_non_empty_str(step.get(key), f"{name}.{key}", scenario)
     elif action in ("submit", "record_unknown", "mark_submitting", "submit_concurrent"):
         _require_non_empty_str(step.get("execution_request_id"), f"{name}.execution_request_id", scenario)
         if action == "submit_concurrent":
@@ -756,6 +810,40 @@ def _validate_expected(spec, scenario: str) -> dict:
         _require_non_empty_str(expected["broker_order_id"], "expected.broker_order_id", scenario)
     if "reject_reason" in expected and expected["reject_reason"] is not None:
         _require_non_empty_str(expected["reject_reason"], "expected.reject_reason", scenario)
+    if "chain" in expected:
+        chain = expected["chain"]
+        if not isinstance(chain, list) or not chain:
+            raise _fail(scenario, "expected.chain must be a non-empty list of chain entries")
+        for index, entry in enumerate(chain):
+            name = f"expected.chain[{index}]"
+            entry = _require_mapping(entry, name, scenario)
+            _require_known_keys(entry, _CHAIN_ENTRY_KEYS, name, scenario)
+            missing = _CHAIN_ENTRY_KEYS - set(entry)
+            if missing:
+                raise _fail(scenario, f"{name} is missing required keys {sorted(missing)}")
+            _require_non_empty_str(entry["execution_request_id"], f"{name}.execution_request_id", scenario)
+            _require_int(entry["signal_attempt"], f"{name}.signal_attempt", scenario, minimum=1)
+            if entry["submission_phase"] not in KNOWN_PHASES:
+                raise _fail(
+                    scenario, f"{name}.submission_phase must be one of {sorted(KNOWN_PHASES)}"
+                )
+            if entry["order_state"] is not None and entry["order_state"] not in _ORDER_STATE_VALUES:
+                raise _fail(
+                    scenario,
+                    f"{name}.order_state must be one of {sorted(_ORDER_STATE_VALUES)} or null",
+                )
+    if "journal_outcomes" in expected:
+        outcomes = _require_mapping(expected["journal_outcomes"], "expected.journal_outcomes", scenario)
+        if not outcomes:
+            raise _fail(scenario, "expected.journal_outcomes must declare at least one intent")
+        for request_id, outcome in outcomes.items():
+            _require_non_empty_str(request_id, "expected.journal_outcomes key", scenario)
+            if outcome is not None and outcome not in _JOURNAL_OUTCOME_VALUES:
+                raise _fail(
+                    scenario,
+                    f"expected.journal_outcomes[{request_id}] must be one of "
+                    f"{sorted(_JOURNAL_OUTCOME_VALUES)} or null (no entry)",
+                )
     return expected
 
 

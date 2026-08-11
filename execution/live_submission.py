@@ -65,6 +65,14 @@ Submission contract (docs/architecture/safety_gate.md):
    are resolved by reconciliation (crash-boundary table:
    docs/architecture/submission_journal.md).
 
+Reissue policy (Issue #116 / PR #122 review r2): ``reissue_policy`` is a
+MANDATORY constructor argument -- the SAME ``ReissuePolicy`` instance the
+registration service (``execution/reissue_service.py``) uses. The clearance
+freshness window is enforced at both boundaries, and a submission window
+wider than the registration one would silently authorize evidence the
+registration policy already treats as stale; refusing to default it here
+makes that mismatch unconstructable rather than merely discouraged.
+
 Fail-closed conversions (before any broker call): store lookup failures ->
 ``STATE_QUERY_FAILED``; unregistered intents -> ``INTENT_NOT_REGISTERED``;
 decision persistence or read-back failures -> ``DECISION_PERSIST_FAILED``;
@@ -88,6 +96,8 @@ from typing import Callable
 from broker.broker_models import OrderResult, OrderState
 from execution import execution_store
 from execution.execution_models import ExecutionRequest
+from execution.reissue_clearance import ClearanceScopeError, derive_account_scope
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     MarketSafetySnapshot,
@@ -121,6 +131,7 @@ class LiveOrderSubmissionService:
         order_db_path: str | Path,
         journal_db_path: str | Path,
         clock: Callable[[], datetime],
+        reissue_policy: ReissuePolicy,
     ) -> None:
         if not isinstance(connection, BrokerConnection):
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
@@ -150,12 +161,36 @@ class LiveOrderSubmissionService:
             )
         if not callable(clock):
             raise ValueError(f"clock must be a callable returning a UTC datetime, got {clock!r}")
+        # ONE reissue policy governs both boundaries, and naming it is
+        # MANDATORY (PR #122 Codex review r2): a silent default here would
+        # let a composer configure a narrow registration window
+        # (ReissueService) while submissions kept authorizing evidence
+        # under the wider default window -- the mismatch is invisible
+        # precisely because nobody wrote it down. Requiring the argument
+        # makes "both boundaries share one policy object" a property the
+        # code enforces instead of a convention the docs merely ask for.
+        # ``reissue_policy`` is exposed as a read-only property so the
+        # registration service can be built from the very same instance.
+        if not isinstance(reissue_policy, ReissuePolicy):
+            raise ValueError(
+                f"reissue_policy must be a ReissuePolicy (the SAME instance the "
+                f"registration side uses; there is deliberately no default, so the "
+                f"two freshness windows cannot silently diverge), got {reissue_policy!r}"
+            )
         self._connection = connection
         self._gate = gate
         self._decision_store = SQLiteSafetyDecisionStore(Path(decision_db_path))
         self._order_db_path = Path(order_db_path)
         self._journal = SubmissionJournal(Path(journal_db_path))
         self._clock = clock
+        self._reissue_policy = reissue_policy
+
+    @property
+    def reissue_policy(self) -> ReissuePolicy:
+        """The reissue policy this submission boundary enforces. Compose the
+        registration service from THIS object so both boundaries provably
+        share one policy."""
+        return self._reissue_policy
 
     # --- intent registration -------------------------------------------------
 
@@ -357,6 +392,39 @@ class LiveOrderSubmissionService:
         if not decision.allowed:
             return decision
 
+        # Reissue child (Issue #95 / #116): submission authority requires
+        # the signal's CURRENT clearance to be valid, fresh and scoped to
+        # THIS connection's broker/account. The scope is derived here from
+        # the actual submission connection (identity + account query) and
+        # verified by mark_submitting inside its transaction; a scope that
+        # cannot be derived is fail-closed BEFORE the journal or any
+        # transition is touched.
+        clearance_kwargs: dict = {}
+        if row["signal_attempt"] >= 2:
+            try:
+                submission_scope = derive_account_scope(self._connection.broker)
+            except ClearanceScopeError as exc:
+                return self._recorded(
+                    self._decision(
+                        execution_request_id,
+                        (
+                            SafetyRejection(
+                                SafetyRejectionCode.REISSUE_CLEARANCE_INVALID,
+                                f"the submission connection's broker/account scope "
+                                f"could not be derived: {exc}; a reissue child never "
+                                "submits under an unverifiable scope (fail closed)",
+                            ),
+                        ),
+                        checked_at_utc=self._now(),
+                    )
+                )
+            clearance_kwargs = dict(
+                clearance_scope=submission_scope,
+                clearance_observed_after_utc=(
+                    self._now() - self._reissue_policy.clearance_max_age
+                ),
+            )
+
         # Durable submission journal, FIRST barrier (Issue #93): the intent
         # must be journaled -- independent of the execution store -- before
         # any transition toward a broker call. The journal's own duplicate
@@ -412,12 +480,58 @@ class LiveOrderSubmissionService:
 
         # The double-submission guard: created -> submitting is entered
         # exactly once (BEGIN IMMEDIATE, Issue #74). Only the winner submits.
+        # For a reissue child the same transaction re-verifies the signal's
+        # CURRENT clearance (valid / scope / freshness) and persists the
+        # accepted evidence onto the granting history row (Issue #115/#116).
         try:
             execution_store.mark_submitting(
                 execution_request_id,
                 reason=_SUBMIT_REASON,
                 changed_at_utc=self._now(),
                 db_path=self._order_db_path,
+                **clearance_kwargs,
+            )
+        except execution_store.ExecutionOrderSupersededError as exc:
+            # The intent was retired by a reissue child (possibly registered
+            # while this submit was in flight). The journal intent recorded
+            # above is provably unsent (not_started) -- terminalize it
+            # best-effort so it does not linger as unresolved; the durable
+            # sweep (ReissueService.terminalize_superseded_intents) recovers
+            # a failed cleanup.
+            _LOGGER.warning(
+                "submission refused, intent superseded: execution_request_id=%s "
+                "signal_id=%s reason=%s",
+                execution_request_id,
+                row["signal_id"],
+                exc,
+            )
+            self._terminalize_superseded_intent(execution_request_id)
+            return self._recorded(
+                self._decision(
+                    execution_request_id,
+                    (
+                        SafetyRejection(
+                            SafetyRejectionCode.INTENT_SUPERSEDED,
+                            f"the intent was superseded by a reissue child and can "
+                            f"never gain submission authority: {exc}",
+                        ),
+                    ),
+                    checked_at_utc=self._now(),
+                )
+            )
+        except execution_store.ExecutionClearanceError as exc:
+            return self._recorded(
+                self._decision(
+                    execution_request_id,
+                    (
+                        SafetyRejection(
+                            SafetyRejectionCode.REISSUE_CLEARANCE_INVALID,
+                            f"no valid reissue clearance covers this submission: "
+                            f"{exc} (fail closed)",
+                        ),
+                    ),
+                    checked_at_utc=self._now(),
+                )
             )
         except Exception as exc:
             return self._recorded(self._transition_failure_decision(execution_request_id, exc))
@@ -541,6 +655,34 @@ class LiveOrderSubmissionService:
             connection_target=self._connection.connection_target,
         )
 
+    def _terminalize_superseded_intent(self, execution_request_id: str) -> None:
+        """Best-effort terminalization of THIS submit's freshly journaled,
+        provably-unsent intent after losing to a supersession (Issue #116).
+        Never raises: the durable supersession marker keeps the parent
+        unsendable regardless, and the recovery sweep heals a failure."""
+        try:
+            markers = execution_store.list_intent_supersessions(
+                parent_execution_request_id=execution_request_id,
+                db_path=self._order_db_path,
+            )
+            if not markers:
+                return
+            self._journal.mark_superseded(
+                execution_request_id,
+                superseded_by_execution_request_id=markers[0][
+                    "child_execution_request_id"
+                ],
+                at_utc=self._now(),
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                "journal terminalization for superseded intent %s failed: %s; the "
+                "entry stays visible via list_unresolved() until "
+                "ReissueService.terminalize_superseded_intents() recovers it",
+                execution_request_id,
+                exc,
+            )
+
     def _recorded(self, decision: SafetyDecision) -> SafetyDecision:
         """Durably record the decision and VERIFY it by read-back; only a
         decision that survives both may allow a submit (Issue #75 review r1).
@@ -555,7 +697,13 @@ class LiveOrderSubmissionService:
         survives a re-read -- being the newest row is not part of the
         contract and made the check racy."""
         try:
-            self._decision_store.record(decision)
+            # The FULL policy content snapshot is persisted next to every
+            # decision (Issue #116): "which policy produced this decision"
+            # is bound by content, so the gate-correction eligibility check
+            # can identify policy identity beyond the mutable id.
+            self._decision_store.record(
+                decision, policy_snapshot=self._gate.policy.to_snapshot()
+            )
             stored = self._decision_store.list_for_request(decision.execution_request_id)
             if decision not in stored:
                 raise RuntimeError(

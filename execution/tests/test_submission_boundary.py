@@ -10,6 +10,8 @@ repository-wide, that no other module grows a direct ``submit_order`` /
 import ast
 import pathlib
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # The only files that may CALL <something>.submit_order(...):
@@ -44,6 +46,13 @@ SUBMIT_ORDER_ALLOWED = {
     # sanctioned one in live_submission.py; this is fixture delegation,
     # not a second submission path.
     "execution/tests/test_submission_journal.py",
+    # Issue #116: seeds the FakeBroker with the broker-side orders a
+    # clearance observation must judge (broker-only order, a ghost order
+    # under an unsubmitted parent's key), plus the QueryOnlyBroker facade
+    # whose delegation exists so a wrapper WITHOUT the listing
+    # capabilities still satisfies the Broker protocol. Fixture
+    # provisioning only -- the clearance service itself never submits.
+    "execution/tests/test_reissue_clearance.py",
 }
 
 # Broker CANCELLATION has no production caller at all: the cancel Execution
@@ -57,6 +66,9 @@ CANCEL_ORDER_ALLOWED = {
     "execution/tests/test_broker_reconciliation_repair.py",
     # Issue #105: pins that ReconcileOnlyBroker.cancel_order RAISES.
     "execution/tests/test_reconciliation_runner_cli.py",
+    # Issue #116: the QueryOnlyBroker facade's pure delegation (see
+    # SUBMIT_ORDER_ALLOWED above); no test there cancels anything.
+    "execution/tests/test_reissue_clearance.py",
 }
 
 # The only files that may CALL <something>.to_order_request(...):
@@ -66,6 +78,21 @@ CANCEL_ORDER_ALLOWED = {
 TO_ORDER_REQUEST_ALLOWED = {
     "execution/live_submission.py",
     "execution/tests/test_execution_models.py",
+}
+
+
+# The only PRODUCTION file that may CONSTRUCT LiveOrderSubmissionService /
+# ReissueService (Issue #116 / PR #122 review r3): the composition root,
+# which builds both from ONE ``ReissuePolicy`` object. Constructing either
+# service directly elsewhere re-opens the hazard the root exists to close
+# -- a submission freshness window WIDER than the registration one, which
+# authorizes clearance evidence the registration policy already treats as
+# stale. Tests construct the services directly on purpose (to exercise the
+# constructors' own validation), so the whole test tree is allowed.
+REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED = {
+    "execution/reissue_composition.py",
+    "execution/tests",
+    "broker/tests",
 }
 
 
@@ -110,6 +137,143 @@ def test_cancel_order_is_called_only_by_broker_and_reconciliation_fixture_tests(
 
 def test_to_order_request_is_called_only_by_the_safety_gate_and_model_tests():
     assert _offenders("to_order_request", TO_ORDER_REQUEST_ALLOWED) == []
+
+
+def _local_names_for(tree: ast.AST, class_name: str) -> set[str]:
+    """Every LOCAL name bound to ``class_name`` in this module: the plain
+    name plus any ``from ... import Foo as Alias`` binding (PR #122 Codex
+    review r4)."""
+    names = {class_name}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == class_name and alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def _construction_sites_in_source(source: str, class_name: str) -> list[int]:
+    """Lines constructing ``class_name`` in ``source``, in every static form
+    (PR #122 Codex review r4 -- the pin the sharing guarantee relies on must
+    not be bypassable by how the class is imported):
+
+    - bare name: ``ReissueService(...)``
+    - aliased import: ``from ... import ReissueService as R`` then ``R(...)``
+    - module-qualified: ``reissue_service.ReissueService(...)`` and
+      ``import ... as rs`` -> ``rs.ReissueService(...)`` (any attribute
+      access whose final attribute IS the class name)
+
+    Residual (same limit the ``submit_order`` pin has always had, and the
+    same one ``docs/architecture/safety_gate.md`` lists as non-scope):
+    fully dynamic construction -- ``getattr(module, "ReissueService")()``
+    or a stashed constructor -- is not statically visible to any AST scan.
+    """
+    tree = ast.parse(source)
+    local_names = _local_names_for(tree, class_name)
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in local_names:
+            sites.append(node.lineno)
+        elif isinstance(func, ast.Attribute) and func.attr == class_name:
+            sites.append(node.lineno)
+    return sorted(sites)
+
+
+def _construction_sites(path: pathlib.Path, class_name: str) -> list[int]:
+    return _construction_sites_in_source(path.read_text(encoding="utf-8"), class_name)
+
+
+def _construction_offenders(class_name: str, allowed: set[str]) -> list[str]:
+    offenders = []
+    for relative, path in _python_files():
+        if relative in allowed or any(relative.startswith(prefix + "/") for prefix in allowed):
+            continue
+        for lineno in _construction_sites(path, class_name):
+            offenders.append(f"{relative}:{lineno}")
+    return offenders
+
+
+@pytest.mark.parametrize(
+    "class_name", ["LiveOrderSubmissionService", "ReissueService"]
+)
+def test_reissue_boundary_services_are_built_only_by_the_composition_root(class_name):
+    """Issue #116 / PR #122 review r3: one ``ReissuePolicy`` must govern the
+    registration AND submission freshness windows. Making the argument
+    mandatory removed the "forgot it" failure but still allowed two
+    independently configured policies, so production code obtains BOTH
+    services from ``execution/reissue_composition.py`` alone."""
+    assert (
+        _construction_offenders(class_name, REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED) == []
+    )
+
+
+@pytest.mark.parametrize(
+    "label, source",
+    [
+        (
+            "bare name",
+            "from execution.reissue_service import ReissueService\n"
+            "ReissueService(execution_db_path='x')\n",
+        ),
+        (
+            "aliased import",
+            "from execution.reissue_service import ReissueService as _R\n"
+            "_R(execution_db_path='x')\n",
+        ),
+        (
+            "module-qualified",
+            "from execution import reissue_service\n"
+            "reissue_service.ReissueService(execution_db_path='x')\n",
+        ),
+        (
+            "aliased module",
+            "import execution.reissue_service as _rs\n"
+            "_rs.ReissueService(execution_db_path='x')\n",
+        ),
+    ],
+)
+def test_the_boundary_pin_detects_every_static_construction_form(label, source):
+    """PR #122 Codex review r4: the sharing guarantee RELIES on this pin, so
+    the pin itself is tested. A scan that only matched ``ast.Name`` let a
+    module-qualified or aliased construction through -- i.e. the two
+    services could still be built with independent policies while the pin
+    stayed green."""
+    assert _construction_sites_in_source(source, "ReissueService") == [2], label
+
+
+def test_the_boundary_pin_does_not_flag_unrelated_constructions():
+    """The pin must not fire on other classes (including the policy object
+    itself, which every composer legitimately constructs)."""
+    source = (
+        "from execution.reissue_service import ReissuePolicy\n"
+        "from execution.reissue_composition import ReissueBoundary\n"
+        "ReissuePolicy()\n"
+        "ReissueBoundary(submission=None, registration=None, policy=None)\n"
+    )
+    assert _construction_sites_in_source(source, "ReissueService") == []
+    assert _construction_sites_in_source(source, "LiveOrderSubmissionService") == []
+
+
+def test_the_composition_root_hands_back_one_shared_policy_instance():
+    """The invariant the pin protects, checked on the object graph itself."""
+    import execution.reissue_composition as composition
+
+    source = (REPO_ROOT / "execution" / "reissue_composition.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    # both services are constructed exactly once, in the one factory
+    for class_name in ("LiveOrderSubmissionService", "ReissueService"):
+        sites = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == class_name
+        ]
+        assert len(sites) == 1, f"{class_name} must be constructed once, found {sites}"
+    assert hasattr(composition, "build_reissue_boundary")
 
 
 def test_submission_service_holds_exactly_one_submit_order_call():
