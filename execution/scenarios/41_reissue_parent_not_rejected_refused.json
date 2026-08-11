@@ -1,0 +1,85 @@
+{
+  "scenario_id": "reissue_parent_not_rejected_refused",
+  "description": "非REJECTED親の再発行拒否 (Issue #116): Broker受理済み(ACCEPTED)の親は、有効なclearanceがあっても手動再発行の対象にならない(Broker受理の可能性が残る状態からの再発行経路は存在しない)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-1"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "grant_clearance",
+      "signal_id": "signal-1",
+      "expect": {
+        "outcome": "granted"
+      }
+    },
+    {
+      "action": "manual_reissue",
+      "request": {
+        "execution_request_id": "exec-2",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-2",
+      "parent_execution_request_id": "exec-1",
+      "operator_id": "op-1",
+      "reason": "must be refused: the parent is accepted, not rejected",
+      "expect": {
+        "outcome": "refused",
+        "error_type": "ReissueEligibilityError"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "accepted",
+    "broker_submit_calls": 1,
+    "order_rows": 1,
+    "chain": [
+      {
+        "execution_request_id": "exec-1",
+        "signal_attempt": 1,
+        "submission_phase": "submitted",
+        "order_state": "accepted"
+      }
+    ],
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

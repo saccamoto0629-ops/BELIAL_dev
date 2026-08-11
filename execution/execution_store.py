@@ -4318,6 +4318,72 @@ def get_repair_fence(execution_request_id: str, *, db_path: Path | None = None) 
         return None if row is None else dict(row)
 
 
+def list_intent_supersessions(
+    *, parent_execution_request_id: str | None = None, db_path: Path | None = None
+) -> list[dict]:
+    """The durable supersession markers (Issue #95 / #116): every parent
+    intent that was retired by a reissue child, oldest supersession first,
+    optionally filtered to one parent.
+
+    This is the recovery surface for the Issue #116 journal terminalization
+    sweep: a marker proves the parent can never gain submission authority
+    (``mark_submitting`` refuses on it), so a ``not_started`` journal entry
+    of a marked parent is safe to terminalize -- including entries recorded
+    by a submit that lost the race AFTER the supersession committed. Each
+    marker's parent<->child cross-consistency is validated (missing rows or
+    a mismatched child are out-of-band damage). Read-only: missing DB ->
+    empty list, the file is never created.
+    """
+    if parent_execution_request_id is not None:
+        _require_non_empty_str(parent_execution_request_id, "parent_execution_request_id")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    with _verified_read(db_path) as connection:
+        if parent_execution_request_id is None:
+            rows = connection.execute(
+                f"SELECT * FROM {SUPERSESSIONS_TABLE} "
+                "ORDER BY superseded_at_utc ASC, parent_execution_request_id ASC"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                f"SELECT * FROM {SUPERSESSIONS_TABLE} WHERE parent_execution_request_id = ?",
+                (parent_execution_request_id,),
+            ).fetchall()
+        markers = []
+        for row in rows:
+            marker = dict(row)
+            for field in ("parent_execution_request_id", "child_execution_request_id"):
+                if not isinstance(marker[field], str) or not marker[field].strip():
+                    raise ExecutionIntegrityError(
+                        f"supersession marker failed restore-time validation: {field} "
+                        f"is empty or not a string ({marker[field]!r})"
+                    )
+            try:
+                _parse_utc(marker["superseded_at_utc"])
+            except (ValueError, TypeError) as exc:
+                raise ExecutionIntegrityError(
+                    f"supersession marker for parent "
+                    f"{marker['parent_execution_request_id']!r} carries an unparseable "
+                    f"superseded_at_utc: {exc}"
+                ) from exc
+            parent_row = connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+                "WHERE execution_request_id = ?",
+                (marker["parent_execution_request_id"],),
+            ).fetchone()
+            if parent_row is None:
+                raise _integrity(
+                    marker["parent_execution_request_id"],
+                    "a supersession marker names a parent order row that does not exist",
+                )
+            _validate_outgoing_supersession(
+                connection, {"execution_request_id": marker["parent_execution_request_id"]}
+            )
+            markers.append(marker)
+    return markers
+
+
 # --- read helpers -----------------------------------------------------------
 # A missing DB file returns the empty/None default WITHOUT creating the file
 # (dry-run safe). An error on an EXISTING file propagates -- never masked as

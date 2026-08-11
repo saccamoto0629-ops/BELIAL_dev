@@ -103,7 +103,7 @@ DEFAULT_DB_PATH = BASE_DIR / "data" / "submission_journal.sqlite3"
 BUSY_TIMEOUT_SECONDS = 30
 
 JOURNAL_TABLE = "submission_journal"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # broker_call_state values (see the module docstring for the semantics).
 BROKER_CALL_NOT_STARTED = "not_started"
@@ -121,12 +121,24 @@ DB_SAVE_FAILED = "failed"
 DB_SAVE_STATES: frozenset[str] = frozenset({DB_SAVE_NOT_ATTEMPTED, DB_SAVE_SAVED, DB_SAVE_FAILED})
 
 # outcome values (the machine-readable journal/Execution-DB divergence flag).
+# ``superseded`` (Issue #95 / #116, schema v2) is the TERMINAL state of an
+# intent whose non-submission became definitive: its parent order was
+# retired by a reissue child (gate correction), so this journaled attempt
+# will never be sent. It is reachable ONLY from ``not_started`` -- the one
+# state that PROVES the broker was never called -- so terminalization can
+# never touch an intent the broker might hold, and it never increases
+# submission possibility (a superseded entry can neither be reclaimed nor
+# progress to a broker call).
 OUTCOME_OPEN = "open"
 OUTCOME_COMPLETED = "completed"
 OUTCOME_RECONCILIATION_REQUIRED = "reconciliation_required"
+OUTCOME_SUPERSEDED = "superseded"
 OUTCOMES: frozenset[str] = frozenset(
-    {OUTCOME_OPEN, OUTCOME_COMPLETED, OUTCOME_RECONCILIATION_REQUIRED}
+    {OUTCOME_OPEN, OUTCOME_COMPLETED, OUTCOME_RECONCILIATION_REQUIRED, OUTCOME_SUPERSEDED}
 )
+# The outcomes that end an entry's lifecycle: nothing about them remains
+# unresolved, so ``list_unresolved`` excludes them.
+TERMINAL_OUTCOMES: frozenset[str] = frozenset({OUTCOME_COMPLETED, OUTCOME_SUPERSEDED})
 
 _ENTRY_COLUMNS: tuple[str, ...] = (
     "execution_request_id",
@@ -146,6 +158,7 @@ _ENTRY_COLUMNS: tuple[str, ...] = (
     "outcome",
     "last_error",
     "updated_at_utc",
+    "superseded_by_execution_request_id",
 )
 
 
@@ -187,19 +200,33 @@ def _enum_values_sql(values) -> str:
     return "', '".join(sorted(v.value for v in values))
 
 
-def _create_journal_table_sql() -> str:
-    """Full current schema. The CHECKs mirror the
+def _create_journal_table_sql(*, version: int = SCHEMA_VERSION) -> str:
+    """Full schema for ``version`` (1 or 2). The CHECKs mirror the
     :class:`SubmissionJournalEntry` invariants as a second guard, foremost
     the lifecycle consistency: ``completed`` requires a saved Execution DB
     result, ``unknown`` / ``failed`` require ``reconciliation_required`` and
     a recorded failure reason, and nothing before ``responded`` may carry a
-    broker response."""
+    broker response. Schema v2 (Issue #116) adds the terminal ``superseded``
+    outcome: reachable only from ``not_started`` (the broker was provably
+    never called), and it must name the superseding execution request."""
     sides = _enum_values_sql(OrderSide)
     types = _enum_values_sql(OrderType)
     states = _enum_values_sql(OrderState)
     call_states = "', '".join(sorted(BROKER_CALL_STATES))
     save_states = "', '".join(sorted(DB_SAVE_STATES))
-    outcomes = "', '".join(sorted(OUTCOMES))
+    if version < 2:
+        outcomes = "', '".join(sorted(OUTCOMES - {OUTCOME_SUPERSEDED}))
+        superseded_column = ""
+        lifecycle_checks = f"""CHECK (broker_call_state NOT IN ('{BROKER_CALL_NOT_STARTED}', '{BROKER_CALL_STARTED}') OR outcome = '{OUTCOME_OPEN}'),"""
+    else:
+        outcomes = "', '".join(sorted(OUTCOMES))
+        superseded_column = """superseded_by_execution_request_id TEXT CHECK (superseded_by_execution_request_id IS NULL OR trim(superseded_by_execution_request_id) <> ''),
+            """
+        lifecycle_checks = f"""CHECK (broker_call_state <> '{BROKER_CALL_STARTED}' OR outcome = '{OUTCOME_OPEN}'),
+            CHECK (broker_call_state <> '{BROKER_CALL_NOT_STARTED}' OR outcome IN ('{OUTCOME_OPEN}', '{OUTCOME_SUPERSEDED}')),
+            CHECK (outcome <> '{OUTCOME_SUPERSEDED}' OR broker_call_state = '{BROKER_CALL_NOT_STARTED}'),
+            CHECK ((outcome = '{OUTCOME_SUPERSEDED}') = (superseded_by_execution_request_id IS NOT NULL)),
+            CHECK (superseded_by_execution_request_id IS NULL OR superseded_by_execution_request_id <> execution_request_id),"""
     return f"""
         CREATE TABLE {JOURNAL_TABLE} (
             execution_request_id TEXT PRIMARY KEY NOT NULL CHECK (trim(execution_request_id) <> ''),
@@ -219,12 +246,12 @@ def _create_journal_table_sql() -> str:
             outcome TEXT NOT NULL CHECK (outcome IN ('{outcomes}')),
             last_error TEXT CHECK (last_error IS NULL OR trim(last_error) <> ''),
             updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00'),
-            CHECK ((order_type = '{OrderType.LIMIT.value}') = (requested_price IS NOT NULL)),
+            {superseded_column}CHECK ((order_type = '{OrderType.LIMIT.value}') = (requested_price IS NOT NULL)),
             CHECK ((broker_call_state = '{BROKER_CALL_RESPONDED}') = (broker_response_state IS NOT NULL)),
             CHECK (broker_order_id IS NULL OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
             CHECK (execution_db_save_state = '{DB_SAVE_NOT_ATTEMPTED}' OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
             CHECK ((outcome = '{OUTCOME_COMPLETED}') = (execution_db_save_state = '{DB_SAVE_SAVED}')),
-            CHECK (broker_call_state NOT IN ('{BROKER_CALL_NOT_STARTED}', '{BROKER_CALL_STARTED}') OR outcome = '{OUTCOME_OPEN}'),
+            {lifecycle_checks}
             CHECK (broker_call_state <> '{BROKER_CALL_UNKNOWN}' OR (outcome = '{OUTCOME_RECONCILIATION_REQUIRED}' AND last_error IS NOT NULL)),
             CHECK (execution_db_save_state <> '{DB_SAVE_FAILED}' OR (outcome = '{OUTCOME_RECONCILIATION_REQUIRED}' AND last_error IS NOT NULL))
         ) WITHOUT ROWID
@@ -241,10 +268,10 @@ def _create_index_sql() -> str:
     )
 
 
-def _create_schema(connection: sqlite3.Connection) -> None:
-    connection.execute(_create_journal_table_sql())
+def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
+    connection.execute(_create_journal_table_sql(version=version))
     connection.execute(_create_index_sql())
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    connection.execute(f"PRAGMA user_version = {version}")
 
 
 def _structure_signature(connection: sqlite3.Connection) -> dict:
@@ -266,37 +293,38 @@ def _structure_signature(connection: sqlite3.Connection) -> dict:
     return signature
 
 
-_REFERENCE_SCHEMA_CACHE: tuple[dict, dict] | None = None
+_REFERENCE_SCHEMA_CACHE: dict[int, tuple[dict, dict]] = {}
 
 
-def _reference_schema() -> tuple[dict, dict]:
-    """Pristine reference schema built once in memory: the complete
-    ``sqlite_master`` object map (``sqlite_autoindex_*`` from the UNIQUE
-    constraint included) plus the PRAGMA structural signature."""
-    global _REFERENCE_SCHEMA_CACHE
-    if _REFERENCE_SCHEMA_CACHE is None:
+def _reference_schema(version: int = SCHEMA_VERSION) -> tuple[dict, dict]:
+    """Pristine reference schema for ``version`` built once in memory: the
+    complete ``sqlite_master`` object map (``sqlite_autoindex_*`` from the
+    UNIQUE constraint included) plus the PRAGMA structural signature."""
+    if version not in _REFERENCE_SCHEMA_CACHE:
         with closing(sqlite3.connect(":memory:")) as connection:
-            _create_schema(connection)
+            _create_schema(connection, version=version)
             objects = {
                 (row[0], row[1]): (row[2], None if row[3] is None else _ddl_tokens(row[3]))
                 for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
             }
-            _REFERENCE_SCHEMA_CACHE = (objects, _structure_signature(connection))
-    return _REFERENCE_SCHEMA_CACHE
+            _REFERENCE_SCHEMA_CACHE[version] = (objects, _structure_signature(connection))
+    return _REFERENCE_SCHEMA_CACHE[version]
 
 
-def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
+def _verify_schema(
+    connection: sqlite3.Connection, db_path: Path, *, version: int = SCHEMA_VERSION
+) -> None:
     """Closed-world verification (same stance as ``execution_store``): the
     COMPLETE ``sqlite_master`` object set -- triggers and views included --
     must exactly equal the pristine reference set, the token-normalized DDL
     of every SQL-bearing object must match, the PRAGMA structural signature
     must match, and the schema version must match. Read-only."""
     problems: list[str] = []
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version != SCHEMA_VERSION:
-        problems.append(f"user_version is {version}, expected {SCHEMA_VERSION}")
+    stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if stored_version != version:
+        problems.append(f"user_version is {stored_version}, expected {version}")
 
-    expected_objects, expected_signature = _reference_schema()
+    expected_objects, expected_signature = _reference_schema(version)
     actual_objects = {
         (row[0], row[1]): (row[2], row[3])
         for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
@@ -387,6 +415,7 @@ class SubmissionJournalEntry:
     broker_response_state: OrderState | None = None
     broker_order_id: str | None = None
     last_error: str | None = None
+    superseded_by_execution_request_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.execution_request_id, "execution_request_id")
@@ -459,13 +488,41 @@ class SubmissionJournalEntry:
                 f"{DB_SAVE_SAVED!r} must coincide (got outcome {self.outcome!r}, save "
                 f"state {self.execution_db_save_state!r})"
             )
-        if (
-            self.broker_call_state in (BROKER_CALL_NOT_STARTED, BROKER_CALL_STARTED)
-            and self.outcome != OUTCOME_OPEN
+        if self.broker_call_state == BROKER_CALL_STARTED and self.outcome != OUTCOME_OPEN:
+            raise ValueError(
+                f"broker_call_state {BROKER_CALL_STARTED!r} requires outcome "
+                f"{OUTCOME_OPEN!r}, got {self.outcome!r}"
+            )
+        if self.broker_call_state == BROKER_CALL_NOT_STARTED and self.outcome not in (
+            OUTCOME_OPEN,
+            OUTCOME_SUPERSEDED,
         ):
             raise ValueError(
-                f"broker_call_state {self.broker_call_state!r} requires outcome "
-                f"{OUTCOME_OPEN!r}, got {self.outcome!r}"
+                f"broker_call_state {BROKER_CALL_NOT_STARTED!r} requires outcome "
+                f"{OUTCOME_OPEN!r} or {OUTCOME_SUPERSEDED!r}, got {self.outcome!r}"
+            )
+        # Terminal supersession (Issue #116): only a provably-never-sent
+        # intent may be superseded, and the superseding request is named for
+        # audit -- exactly when the outcome is ``superseded``.
+        if self.superseded_by_execution_request_id is not None:
+            _require_non_empty_str(
+                self.superseded_by_execution_request_id, "superseded_by_execution_request_id"
+            )
+            if self.superseded_by_execution_request_id == self.execution_request_id:
+                raise ValueError("an intent cannot be superseded by itself")
+        if (self.outcome == OUTCOME_SUPERSEDED) != (
+            self.superseded_by_execution_request_id is not None
+        ):
+            raise ValueError(
+                f"outcome {OUTCOME_SUPERSEDED!r} and superseded_by_execution_request_id "
+                f"must coincide (got outcome {self.outcome!r}, superseded_by "
+                f"{self.superseded_by_execution_request_id!r})"
+            )
+        if self.outcome == OUTCOME_SUPERSEDED and self.broker_call_state != BROKER_CALL_NOT_STARTED:
+            raise ValueError(
+                f"outcome {OUTCOME_SUPERSEDED!r} requires broker_call_state "
+                f"{BROKER_CALL_NOT_STARTED!r} (a possibly-sent intent is never "
+                f"terminalized), got {self.broker_call_state!r}"
             )
         if self.broker_call_state == BROKER_CALL_UNKNOWN and (
             self.outcome != OUTCOME_RECONCILIATION_REQUIRED or self.last_error is None
@@ -527,6 +584,7 @@ def _entry_from_row(row, db_path: Path) -> SubmissionJournalEntry:
             outcome=row["outcome"],
             last_error=row["last_error"],
             updated_at_utc=_parse_utc(row["updated_at_utc"]),
+            superseded_by_execution_request_id=row["superseded_by_execution_request_id"],
         )
     except (ValueError, TypeError, InvalidOperation) as exc:
         raise SubmissionJournalIntegrityError(
@@ -569,12 +627,55 @@ class SubmissionJournal:
                         )
                     _create_schema(connection)
                     _verify_schema(connection, self._path)
+                elif version == 1:
+                    self._migrate_v1_to_v2(connection)
                 else:
                     _verify_schema(connection, self._path)
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        """v1 -> v2 migration (Issue #116), inside the caller's ``BEGIN
+        IMMEDIATE`` transaction. The v2 lifecycle CHECKs replace a v1 inline
+        table CHECK, which SQLite's ``ALTER TABLE`` cannot rewrite, so the
+        journal table is REBUILT: verify the DB matches the released v1
+        schema COMPLETELY, create the v2 table, copy every row unchanged
+        (``superseded_by_execution_request_id`` NULL -- v2 is a strict
+        relaxation, so every valid v1 row satisfies the v2 constraints),
+        verify the copy row-for-row, drop the v1 table, recreate the index,
+        bump the version and fully re-verify as v2. Any failure rolls the
+        whole transaction back and leaves the v1 file untouched."""
+        _verify_schema(connection, self._path, version=1)
+        v1_columns = tuple(
+            column for column in _ENTRY_COLUMNS
+            if column != "superseded_by_execution_request_id"
+        )
+        migration_table = f"{JOURNAL_TABLE}_v1_migration"
+        connection.execute(f"DROP INDEX {_JOURNAL_OUTCOME_INDEX}")
+        connection.execute(f"ALTER TABLE {JOURNAL_TABLE} RENAME TO {migration_table}")
+        connection.execute(_create_journal_table_sql())
+        connection.execute(
+            f"INSERT INTO {JOURNAL_TABLE} ({', '.join(v1_columns)}) "
+            f"SELECT {', '.join(v1_columns)} FROM {migration_table}"
+        )
+        before = connection.execute(f"SELECT COUNT(*) FROM {migration_table}").fetchone()[0]
+        after = connection.execute(f"SELECT COUNT(*) FROM {JOURNAL_TABLE}").fetchone()[0]
+        if before != after:
+            raise SubmissionJournalIntegrityError(
+                f"v1 -> v2 migration of {self._path} copied {after} of {before} rows; "
+                "rolling back"
+            )
+        connection.execute(f"DROP TABLE {migration_table}")
+        connection.execute(_create_index_sql())
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _verify_schema(connection, self._path)
+        # every migrated row must restore as a valid v2 entry
+        for row in connection.execute(
+            f"SELECT {', '.join(_ENTRY_COLUMNS)} FROM {JOURNAL_TABLE}"
+        ):
+            _entry_from_row(row, self._path)
 
     # --- writes (all fail closed) --------------------------------------------
 
@@ -687,10 +788,21 @@ class SubmissionJournal:
                         candidate.outcome,
                         None,
                         candidate.updated_at_utc.isoformat(),
+                        None,
                     ),
                 )
             else:
                 existing = _entry_from_row(existing_row, self._path)
+                if existing.outcome == OUTCOME_SUPERSEDED:
+                    # Terminal (Issue #116): the intent's non-submission is
+                    # definitive; reclaiming it would increase submission
+                    # possibility, which terminalization must never do.
+                    self._conflict(
+                        execution_request_id,
+                        f"the journaled intent was terminally superseded by "
+                        f"{existing.superseded_by_execution_request_id!r}; a superseded "
+                        "intent is never reclaimed or re-submitted",
+                    )
                 if existing.broker_call_state != BROKER_CALL_NOT_STARTED:
                     self._conflict(
                         execution_request_id,
@@ -856,6 +968,80 @@ class SubmissionJournal:
             },
         )
 
+    def mark_superseded(
+        self,
+        execution_request_id: str,
+        *,
+        superseded_by_execution_request_id: str,
+        at_utc: datetime,
+    ) -> bool:
+        """Terminalize a provably-never-sent intent whose parent order was
+        retired by a reissue child (Issue #95 / #116): ``not_started`` +
+        ``open`` becomes the terminal ``superseded`` outcome, naming the
+        superseding request for audit.
+
+        Fail-closed toward broker reachability: ONLY a ``not_started`` entry
+        may be terminalized -- ``started`` / ``responded`` / ``unknown``
+        entries (the broker may hold the order) raise
+        :class:`SubmissionJournalError` and stay untouched, exactly like any
+        other refused transition. An entry already superseded BY THE SAME
+        request is an idempotent no-op returning ``False`` (recovery sweeps
+        re-run safely); superseded by a DIFFERENT request is a conflict.
+        Returns ``True`` when this call performed the terminalization."""
+        _require_non_empty_str(execution_request_id, "execution_request_id")
+        _require_non_empty_str(
+            superseded_by_execution_request_id, "superseded_by_execution_request_id"
+        )
+        if superseded_by_execution_request_id == execution_request_id:
+            raise SubmissionJournalError("an intent cannot be superseded by itself")
+        _require_utc(at_utc, "at_utc")
+        self._require_db_file()
+        with _verified_txn(self._path) as connection:
+            row = self._fetch_row(connection, execution_request_id)
+            if row is None:
+                raise SubmissionJournalError(
+                    f"no journal entry exists for execution_request_id "
+                    f"{execution_request_id!r}; nothing to supersede"
+                )
+            entry = _entry_from_row(row, self._path)
+            if entry.outcome == OUTCOME_SUPERSEDED:
+                if (
+                    entry.superseded_by_execution_request_id
+                    == superseded_by_execution_request_id
+                ):
+                    return False  # already terminal, same provenance: no-op
+                self._conflict(
+                    execution_request_id,
+                    f"the entry is already superseded by "
+                    f"{entry.superseded_by_execution_request_id!r}, not by "
+                    f"{superseded_by_execution_request_id!r}",
+                )
+            if entry.broker_call_state != BROKER_CALL_NOT_STARTED:
+                raise SubmissionJournalError(
+                    f"journal entry for {execution_request_id!r} is in "
+                    f"broker_call_state {entry.broker_call_state!r}; only a "
+                    f"{BROKER_CALL_NOT_STARTED!r} entry (the broker was provably never "
+                    "called) may be terminalized as superseded"
+                )
+            if at_utc < entry.updated_at_utc:
+                raise SubmissionJournalError(
+                    f"at_utc {at_utc.isoformat()} precedes the stored updated_at_utc "
+                    f"{entry.updated_at_utc.isoformat()} for {execution_request_id!r}"
+                )
+            connection.execute(
+                f"UPDATE {JOURNAL_TABLE} SET outcome = ?, "
+                "superseded_by_execution_request_id = ?, updated_at_utc = ? "
+                "WHERE execution_request_id = ?",
+                (
+                    OUTCOME_SUPERSEDED,
+                    superseded_by_execution_request_id,
+                    at_utc.isoformat(),
+                    execution_request_id,
+                ),
+            )
+            self._read_back(connection, execution_request_id)
+        return True
+
     # --- reads (never create the DB file) ------------------------------------
 
     def get_entry(self, execution_request_id: str) -> SubmissionJournalEntry | None:
@@ -867,14 +1053,18 @@ class SubmissionJournal:
         return None if row is None else _entry_from_row(row, self._path)
 
     def list_unresolved(self) -> tuple[SubmissionJournalEntry, ...]:
-        """Every entry whose outcome is not ``completed`` -- oldest update
-        first: attempts that never reached the broker call, possibly-sent
-        attempts, unknown outcomes, and ``reconciliation_required`` rows.
-        This is the hand-off surface for reconciliation and works with the
-        Execution Order DB completely unavailable. Missing DB -> empty
-        tuple (the write side fails closed, so nothing was ever submitted
-        without a journal row)."""
-        return self._list_where(f"outcome <> '{OUTCOME_COMPLETED}'")
+        """Every entry whose outcome is not terminal (``completed`` /
+        ``superseded``) -- oldest update first: attempts that never reached
+        the broker call, possibly-sent attempts, unknown outcomes, and
+        ``reconciliation_required`` rows. Terminally superseded intents
+        (Issue #116) are resolved facts and deliberately NOT listed -- an
+        intent whose non-submission is definitive must not be reported as
+        unresolved forever. This is the hand-off surface for reconciliation
+        and works with the Execution Order DB completely unavailable.
+        Missing DB -> empty tuple (the write side fails closed, so nothing
+        was ever submitted without a journal row)."""
+        terminal = "', '".join(sorted(TERMINAL_OUTCOMES))
+        return self._list_where(f"outcome NOT IN ('{terminal}')")
 
     def list_reconciliation_required(self) -> tuple[SubmissionJournalEntry, ...]:
         """Entries explicitly flagged ``reconciliation_required`` (broker
@@ -940,6 +1130,14 @@ class SubmissionJournal:
                     "before any lifecycle update"
                 )
             entry = _entry_from_row(row, self._path)
+            if entry.outcome == OUTCOME_SUPERSEDED:
+                # Terminal (Issue #116): a superseded entry never progresses
+                # -- foremost not toward a broker call.
+                raise SubmissionJournalError(
+                    f"journal entry for {execution_request_id!r} was terminally "
+                    f"superseded by {entry.superseded_by_execution_request_id!r}; no "
+                    "further lifecycle update is accepted"
+                )
             if entry.broker_call_state not in allowed_states:
                 raise SubmissionJournalError(
                     f"journal entry for {execution_request_id!r} is in "

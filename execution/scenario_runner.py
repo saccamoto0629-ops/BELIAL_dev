@@ -83,6 +83,11 @@ from execution.safety_gate import (
     StaticSafetyState,
 )
 from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore
+from execution.reissue_clearance import ReissueClearanceService, ReissueClearanceError
+from execution.reissue_service import (
+    ReissueEligibilityError,
+    ReissueService,
+)
 from execution.shadow_composition import run_production_shadow_cycle
 from execution.shadow_config import parse_shadow_execution_config
 from execution.shadow_execution import ShadowCycleStatus, ShadowExecutionService
@@ -234,7 +239,14 @@ def _build_submit_script(spec: dict):
             reissued_broker_order_id=spec.get("reissued_broker_order_id"),
         )
     if behaviour == "reject":
-        return RejectOrder(**({"reason": spec["reason"]} if "reason" in spec else {}))
+        kwargs = {}
+        if "reason" in spec:
+            kwargs["reason"] = spec["reason"]
+        if "category" in spec:
+            from broker.broker_models import RejectionCategory
+
+            kwargs["category"] = RejectionCategory(spec["category"])
+        return RejectOrder(**kwargs)
     if behaviour == "timeout":
         return TimeoutOrder()
     if behaviour == "fail_communication":
@@ -256,7 +268,7 @@ def _build_broker(definition: ScenarioDefinition) -> FakeBroker:
 def _scenario_symbols(definition: ScenarioDefinition) -> set[str]:
     symbols = set()
     for step in definition.steps:
-        if step.action == "register":
+        if step.action in ("register", "manual_reissue", "gate_correction"):
             symbols.add(step.params["request"]["symbol"])
         elif step.action == "register_concurrent":
             symbols.update(entry["request"]["symbol"] for entry in step.params["registrations"])
@@ -395,6 +407,7 @@ class _ScenarioContext:
         self.decisions_db = work_dir / "safety.sqlite3"
         self.shadow_db = work_dir / "shadow.sqlite3"
         self.journal_db = work_dir / "journal.sqlite3"
+        self.reconciliation_db = work_dir / "reconciliation.sqlite3"
         # No store is initialized eagerly (Issue #78): dry-run shadow
         # scenarios observe that NO store file is ever created, so store
         # initialization happens lazily (and idempotently) in the service
@@ -452,6 +465,32 @@ class _ScenarioContext:
             decision_db_path=self.decisions_db,
             order_db_path=self.orders_db,
             journal_db_path=self.journal_db,
+            clock=lambda: NOW,
+        )
+
+    def make_reissue_service(self) -> ReissueService:
+        """One PRODUCTION reissue registration service per call (Issue #116);
+        the current policy is the scenario's gate policy, so the
+        policy-identity precondition compares against the same content the
+        submitted decisions were produced under."""
+        SQLiteSafetyDecisionStore(self.decisions_db).initialize()
+        SubmissionJournal(self.journal_db).initialize()
+        return ReissueService(
+            execution_db_path=self.orders_db,
+            journal_db_path=self.journal_db,
+            decision_db_path=self.decisions_db,
+            current_policy=self.policy,
+            clock=lambda: NOW,
+        )
+
+    def make_clearance_service(self) -> ReissueClearanceService:
+        """One PRODUCTION clearance observation service per call (Issue
+        #116), running against the scenario's FakeBroker and temporary DBs."""
+        return ReissueClearanceService(
+            broker=self.broker,
+            execution_db_path=self.orders_db,
+            reconciliation_db_path=self.reconciliation_db,
+            observer_id=f"scenario-{self.definition.scenario_id}",
             clock=lambda: NOW,
         )
 
@@ -776,6 +815,48 @@ def _execute_register_concurrent(context: _ScenarioContext, step: ScenarioStep) 
     }
 
 
+def _execute_grant_clearance(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    """Drive the PRODUCTION clearance observation (claim -> reconcile both
+    domains -> judge -> conclude) for the scenario's signal."""
+    try:
+        observation = context.make_clearance_service().observe_signal(
+            step.params["signal_id"]
+        )
+    except ReissueClearanceError as exc:
+        return {"outcome": "error", **_classify_error(exc)}
+    except Exception as exc:
+        return {"outcome": "error", **_classify_error(exc)}
+    if observation.granted:
+        return {"outcome": "granted"}
+    return {"outcome": "not_granted"}
+
+
+def _execute_reissue(context: _ScenarioContext, step: ScenarioStep, register) -> dict:
+    request = _build_request(step.params["request"])
+    try:
+        register(
+            request,
+            client_order_id=step.params["client_order_id"],
+            parent_execution_request_id=step.params["parent_execution_request_id"],
+            operator_id=step.params["operator_id"],
+            reason=step.params["reason"],
+        )
+    except (ReissueEligibilityError, execution_store.ExecutionStoreError, ValueError) as exc:
+        return {"outcome": "refused", "error_type": type(exc).__name__}
+    except Exception as exc:
+        return {"outcome": "error", **_classify_error(exc)}
+    context.client_order_ids[request.execution_request_id] = step.params["client_order_id"]
+    return {"outcome": "registered"}
+
+
+def _execute_manual_reissue(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    return _execute_reissue(context, step, context.make_reissue_service().register_manual_reissue)
+
+
+def _execute_gate_correction(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    return _execute_reissue(context, step, context.make_reissue_service().register_gate_correction)
+
+
 # Cancel is deliberately NOT a step action (PR #96 review r1): no production
 # cancel Execution use case exists yet, and the runner must not synthesize
 # one. FakeBroker cancel behaviour and the store's cancel transitions are
@@ -791,6 +872,9 @@ _STEP_EXECUTORS = {
     "shadow": _execute_shadow,
     "shadow_concurrent": _execute_shadow_concurrent,
     "shadow_production": _execute_shadow_production,
+    "grant_clearance": _execute_grant_clearance,
+    "manual_reissue": _execute_manual_reissue,
+    "gate_correction": _execute_gate_correction,
 }
 
 
@@ -908,6 +992,30 @@ def _collect_actual(context: _ScenarioContext) -> dict:
         "listed_unknown": primary_id in unknown_ids,
         "listed_unresolved": primary_id in unresolved_ids,
     }
+
+    # --- intent-reissue observations (Issue #116) ------------------------
+    chain_actual = None
+    if row is not None:
+        chain_actual = [
+            {
+                "execution_request_id": entry["execution_request_id"],
+                "signal_attempt": entry["signal_attempt"],
+                "submission_phase": entry["submission_phase"],
+                "order_state": entry["order_state"],
+            }
+            for entry in execution_store.list_execution_order_chain(
+                row["signal_id"], db_path=orders_db
+            )
+        ]
+    journal_expected = definition.expected.get("journal_outcomes")
+    journal_actual = None
+    if journal_expected is not None:
+        journal = SubmissionJournal(context.journal_db)
+        journal_actual = {}
+        for request_id in journal_expected:
+            entry = journal.get_entry(request_id)
+            journal_actual[request_id] = None if entry is None else entry.outcome
+    actual.update({"chain": chain_actual, "journal_outcomes": journal_actual})
 
     # --- shadow-store observations (Issue #78) ---------------------------
     shadow_result = None

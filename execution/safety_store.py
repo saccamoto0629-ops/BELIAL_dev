@@ -52,7 +52,7 @@ DEFAULT_DB_PATH = BASE_DIR / "data" / "safety_gate_decisions.sqlite3"
 BUSY_TIMEOUT_SECONDS = 30
 
 DECISIONS_TABLE = "safety_gate_decisions"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _DECISION_COLUMNS: tuple[str, ...] = (
     "execution_request_id",
@@ -64,6 +64,7 @@ _DECISION_COLUMNS: tuple[str, ...] = (
     "rejections_json",
     "account_id",
     "position_count",
+    "policy_snapshot_json",
 )
 
 # Strict rejection JSON shape: each entry must hold exactly these keys.
@@ -95,10 +96,27 @@ def _parse_utc(text: str) -> datetime:
     return value
 
 
-def _create_decisions_table_sql() -> str:
-    """Full current schema. The CHECKs mirror the ``SafetyDecision`` model
-    invariants as a second guard -- foremost allow/reject consistency:
-    an allowed row must carry an empty rejections list and vice versa."""
+# The schema-v2 column (Issue #116): the FULL policy content snapshot
+# (canonical JSON of ``SafetyPolicy.to_snapshot()``) recorded next to the
+# ``policy_id`` of every decision, so "the policy that produced this
+# decision" is bound by CONTENT, not by an id the content can drift behind.
+# Exactly one shared DDL string feeds both the reference CREATE TABLE and
+# the v1 -> v2 ``ALTER TABLE ADD COLUMN`` so the migrated DDL token-matches
+# the reference schema (same pattern as execution_store's reissue columns).
+_POLICY_SNAPSHOT_COLUMN_DDL = (
+    "policy_snapshot_json TEXT CHECK (policy_snapshot_json IS NULL OR "
+    "trim(policy_snapshot_json) <> '')"
+)
+
+
+def _create_decisions_table_sql(*, version: int = SCHEMA_VERSION) -> str:
+    """Full schema for ``version`` (1 or 2). The CHECKs mirror the
+    ``SafetyDecision`` model invariants as a second guard -- foremost
+    allow/reject consistency: an allowed row must carry an empty rejections
+    list and vice versa. The v2 column sits last in the column list and
+    before the table constraint, exactly where ``ALTER TABLE ADD COLUMN``
+    inserts it."""
+    snapshot_column = "" if version < 2 else f"{_POLICY_SNAPSHOT_COLUMN_DDL},\n            "
     return f"""
         CREATE TABLE {DECISIONS_TABLE} (
             decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +129,7 @@ def _create_decisions_table_sql() -> str:
             rejections_json TEXT NOT NULL CHECK (trim(rejections_json) <> ''),
             account_id TEXT CHECK (account_id IS NULL OR trim(account_id) <> ''),
             position_count INTEGER CHECK (position_count IS NULL OR position_count >= 0),
-            CHECK ((allowed = 1) = (rejections_json = '[]'))
+            {snapshot_column}CHECK ((allowed = 1) = (rejections_json = '[]'))
         )
     """
 
@@ -126,10 +144,10 @@ def _create_index_sql() -> str:
     )
 
 
-def _create_schema(connection: sqlite3.Connection) -> None:
-    connection.execute(_create_decisions_table_sql())
+def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
+    connection.execute(_create_decisions_table_sql(version=version))
     connection.execute(_create_index_sql())
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    connection.execute(f"PRAGMA user_version = {version}")
 
 
 def _structure_signature(connection: sqlite3.Connection) -> dict:
@@ -151,37 +169,38 @@ def _structure_signature(connection: sqlite3.Connection) -> dict:
     return signature
 
 
-_REFERENCE_SCHEMA_CACHE: tuple[dict, dict] | None = None
+_REFERENCE_SCHEMA_CACHE: dict[int, tuple[dict, dict]] = {}
 
 
-def _reference_schema() -> tuple[dict, dict]:
-    """Pristine reference schema built once in memory: the complete
-    ``sqlite_master`` object map (``sqlite_sequence`` from AUTOINCREMENT
-    included) plus the PRAGMA structural signature."""
-    global _REFERENCE_SCHEMA_CACHE
-    if _REFERENCE_SCHEMA_CACHE is None:
+def _reference_schema(version: int = SCHEMA_VERSION) -> tuple[dict, dict]:
+    """Pristine reference schema for ``version`` built once in memory: the
+    complete ``sqlite_master`` object map (``sqlite_sequence`` from
+    AUTOINCREMENT included) plus the PRAGMA structural signature."""
+    if version not in _REFERENCE_SCHEMA_CACHE:
         with closing(sqlite3.connect(":memory:")) as connection:
-            _create_schema(connection)
+            _create_schema(connection, version=version)
             objects = {
                 (row[0], row[1]): (row[2], None if row[3] is None else _ddl_tokens(row[3]))
                 for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
             }
-            _REFERENCE_SCHEMA_CACHE = (objects, _structure_signature(connection))
-    return _REFERENCE_SCHEMA_CACHE
+            _REFERENCE_SCHEMA_CACHE[version] = (objects, _structure_signature(connection))
+    return _REFERENCE_SCHEMA_CACHE[version]
 
 
-def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
+def _verify_schema(
+    connection: sqlite3.Connection, db_path: Path, *, version: int = SCHEMA_VERSION
+) -> None:
     """Closed-world verification (same stance as ``execution_store``):
     the COMPLETE ``sqlite_master`` object set -- triggers and views included --
     must exactly equal the pristine reference set, the token-normalized DDL of
     every SQL-bearing object must match, the PRAGMA structural signature must
     match, and the schema version must match. Read-only."""
     problems: list[str] = []
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version != SCHEMA_VERSION:
-        problems.append(f"user_version is {version}, expected {SCHEMA_VERSION}")
+    stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if stored_version != version:
+        problems.append(f"user_version is {stored_version}, expected {version}")
 
-    expected_objects, expected_signature = _reference_schema()
+    expected_objects, expected_signature = _reference_schema(version)
     actual_objects = {
         (row[0], row[1]): (row[2], row[3])
         for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
@@ -313,6 +332,8 @@ class SQLiteSafetyDecisionStore:
                         )
                     _create_schema(connection)
                     _verify_schema(connection, self._path)
+                elif version == 1:
+                    self._migrate_v1_to_v2(connection)
                 else:
                     _verify_schema(connection, self._path)
                 connection.execute("COMMIT")
@@ -320,10 +341,35 @@ class SQLiteSafetyDecisionStore:
                 connection.execute("ROLLBACK")
                 raise
 
-    def record(self, decision: SafetyDecision) -> int:
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        """Additive v1 -> v2 migration (Issue #116), inside the caller's
+        ``BEGIN IMMEDIATE`` transaction: verify the DB matches the released
+        v1 schema COMPLETELY, ``ALTER TABLE ADD COLUMN policy_snapshot_json``
+        (existing rows read back as NULL = "no snapshot was recorded", which
+        the Issue #116 policy-identity check treats fail-closed), bump the
+        version, then fully re-verify as v2. Any failure rolls the whole
+        transaction back and leaves the v1 file untouched."""
+        _verify_schema(connection, self._path, version=1)
+        connection.execute(
+            f"ALTER TABLE {DECISIONS_TABLE} ADD COLUMN {_POLICY_SNAPSHOT_COLUMN_DDL}"
+        )
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _verify_schema(connection, self._path)
+
+    def record(
+        self, decision: SafetyDecision, *, policy_snapshot: dict | None = None
+    ) -> int:
         """Persist one decision; raises on ANY failure (fail closed).
         Returns the assigned ``decision_id`` (Issue #78: shadow results
         reference the decision row they were built from).
+
+        ``policy_snapshot`` (Issue #116) is the FULL content snapshot of the
+        policy that produced the decision (``SafetyPolicy.to_snapshot()``),
+        stored as canonical JSON next to the ``policy_id`` so a later
+        eligibility check can identify the policy by CONTENT -- an id alone
+        does not bind the content behind it. ``None`` records no snapshot
+        (and the Issue #116 policy-identity check then fails closed for this
+        decision).
 
         A missing DB file is a failure, not a trigger for implicit creation:
         the audit store must be initialized deliberately, and a submission
@@ -331,6 +377,12 @@ class SQLiteSafetyDecisionStore:
         """
         if not isinstance(decision, SafetyDecision):
             raise SafetyStoreError(f"decision must be a SafetyDecision, got {decision!r}")
+        if policy_snapshot is not None and (
+            not isinstance(policy_snapshot, dict) or not policy_snapshot
+        ):
+            raise SafetyStoreError(
+                f"policy_snapshot must be a non-empty dict or None, got {policy_snapshot!r}"
+            )
         if not self._path.exists():
             raise SafetyStoreError(
                 f"safety decision DB at {self._path} does not exist; call initialize() first"
@@ -345,6 +397,11 @@ class SQLiteSafetyDecisionStore:
             _rejections_to_json(decision.rejections),
             decision.account_id,
             decision.position_count,
+            (
+                None
+                if policy_snapshot is None
+                else json.dumps(policy_snapshot, sort_keys=True, separators=(",", ":"))
+            ),
         )
         with _verified_txn(self._path) as connection:
             cursor = connection.execute(
@@ -371,6 +428,24 @@ class SQLiteSafetyDecisionStore:
         their decision row, and the report CLI needs the ids to find ORPHAN
         decisions -- audit rows left by a shadow completion that later failed
         and was retried). Purely additive read API."""
+        return tuple(
+            (decision_id, decision)
+            for decision_id, decision, _snapshot in self.list_for_request_records(
+                execution_request_id
+            )
+        )
+
+    def list_for_request_records(
+        self, execution_request_id: str
+    ) -> tuple[tuple[int, SafetyDecision, dict | None], ...]:
+        """All decisions for one request as ``(decision_id, decision,
+        policy_snapshot)`` triples, in recording order (Issue #116).
+
+        ``policy_snapshot`` is the parsed content snapshot of the policy that
+        produced the decision, or ``None`` for rows recorded without one
+        (pre-v2 rows and callers that passed no snapshot). Strictly
+        validated like every other read: a snapshot column that is not a
+        non-empty JSON object raises :class:`SafetyIntegrityError`."""
         if not isinstance(execution_request_id, str) or not execution_request_id.strip():
             raise SafetyStoreError(
                 f"execution_request_id must be a non-empty string, got {execution_request_id!r}"
@@ -392,6 +467,13 @@ class SQLiteSafetyDecisionStore:
                     not isinstance(row["position_count"], int) or row["position_count"] < 0
                 ):
                     raise ValueError(f"position_count is invalid: {row['position_count']!r}")
+                snapshot = None
+                if row["policy_snapshot_json"] is not None:
+                    snapshot = json.loads(row["policy_snapshot_json"])
+                    if not isinstance(snapshot, dict) or not snapshot:
+                        raise ValueError(
+                            "policy_snapshot_json must encode a non-empty JSON object"
+                        )
                 decisions.append(
                     (
                         int(row["decision_id"]),
@@ -406,6 +488,7 @@ class SQLiteSafetyDecisionStore:
                             account_id=row["account_id"],
                             position_count=row["position_count"],
                         ),
+                        snapshot,
                     )
                 )
             except (ValueError, TypeError) as exc:

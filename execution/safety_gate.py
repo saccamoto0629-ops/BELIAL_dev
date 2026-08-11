@@ -171,6 +171,11 @@ class SafetyRejectionCode(enum.Enum):
     INTENT_NOT_REGISTERED = "intent_not_registered"
     DUPLICATE_SUBMISSION = "duplicate_submission"
     SUBMISSION_JOURNAL_FAILED = "submission_journal_failed"
+    # Issue #95 / #116 (intent reissue): a parent superseded by a reissue
+    # child may never be submitted, and a reissue child may only be
+    # submitted under a verified, fresh, correctly-scoped clearance.
+    INTENT_SUPERSEDED = "intent_superseded"
+    REISSUE_CLEARANCE_INVALID = "reissue_clearance_invalid"
 
 
 def _require_utc(value, field_name: str) -> None:

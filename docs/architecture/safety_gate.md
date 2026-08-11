@@ -139,17 +139,20 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 | 準備段階の想定外例外(引数型不正・clock 破損を含む) | `gate_internal_error`(サービスが変換・記録) |
 | 参照価格の欠損・stale・未来時刻 | `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` |
 | 接続先が mode の許可集合にない・identity 不整合 | `execution_mode_mismatch` |
+| 再発行子行または耐久 supersession marker を持つ意図の送信(Issue #95 / #116) | `intent_superseded` |
+| 再発行子の clearance 検証失敗: 不在・`observing`・`revoked`・口座スコープ不一致・スコープ導出不能・鮮度切れ(Issue #116) | `reissue_clearance_invalid` |
 
 例外の型・失敗原因を問わず、**Broker 呼び出し前の失敗から送信へ進む経路は存在しない**。違反が 1 件でもあれば `Broker.submit_order()` は呼ばれない(全違反を収集してから単一の `SafetyDecision` で返す)。
 
 ## 拒否コード一覧(機械可読が正)
 
-`symbol_not_allowed` / `side_not_allowed` / `quantity_limit_exceeded` / `symbol_position_limit_exceeded` / `account_position_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` / `market_snapshot_mismatch` / `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` / `spread_missing` / `spread_limit_exceeded` / `market_closed` / `symbol_not_tradable` / `kill_switch_enabled` / `broker_query_failed` / `state_query_failed` / `decision_persist_failed` / `execution_mode_mismatch` / `gate_internal_error` / `intent_not_registered` / `duplicate_submission` / `submission_journal_failed`
+`symbol_not_allowed` / `side_not_allowed` / `quantity_limit_exceeded` / `symbol_position_limit_exceeded` / `account_position_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` / `market_snapshot_mismatch` / `reference_price_missing` / `reference_price_stale` / `reference_timestamp_future` / `spread_missing` / `spread_limit_exceeded` / `market_closed` / `symbol_not_tradable` / `kill_switch_enabled` / `broker_query_failed` / `state_query_failed` / `decision_persist_failed` / `execution_mode_mismatch` / `gate_internal_error` / `intent_not_registered` / `duplicate_submission` / `submission_journal_failed` / `intent_superseded` / `reissue_clearance_invalid`
 
-- **拒否の解決経路(訂正差し替えは設計のみ・未実装)**: 永続化された `ExecutionRequest` は不変であり(request 内容を更新する store API は存在しない)、`submit()` は毎回同じ内容を読み直して全条件を再評価する。したがって拒否コードによって解決経路が異なる。
+- **拒否の解決経路**: 永続化された `ExecutionRequest` は不変であり(request 内容を更新する store API は存在しない)、`submit()` は毎回同じ内容を読み直して全条件を再評価する。したがって拒否コードによって解決経路が異なる。
   - 市場・口座・運用状態・呼び出し側の入力に起因する拒否 — 条件解消後に**同一 Request を再 submit**する(現行仕様で可能)。
   - `symbol_not_allowed` / `side_not_allowed` — 注文内容は source signal に忠実であり、禁止しているのは policy 側である。解決は**明示的な policy 変更(監査対象の安全判断)後の再 submit**、またはその signal を執行しないことであり、注文内容の書き換えでは解決しない。
-  - `quantity_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` — 注文内容の不備であり、**内容を訂正した新しい意図へ差し替える**モデルが Issue #95 で設計済み([Execution Intent Reissue](execution_reissue.md)。`gate_correction` + 新拒否コード `intent_superseded`)。**実装は後続 Issue のため、現時点では訂正経路が存在しない**(policy 側の緩和でも解消しうるが、それは安全ポリシーの変更である)。
+  - `quantity_limit_exceeded` / `stop_loss_required` / `stop_loss_invalid` / `take_profit_invalid` — 注文内容の不備であり、**内容を訂正した新しい意図へ差し替える**(`gate_correction`。Issue #95 で設計・Issue #116 で実装済み — [Execution Intent Reissue](execution_reissue.md)。`ReissueService.register_gate_correction()` が唯一の公認登録経路であり、差し替え済みの親を送信しようとすると `intent_superseded` で拒否される。policy 側の緩和でも解消しうるが、それは安全ポリシーの変更である)。
+  - `intent_superseded` / `reissue_clearance_invalid` — 再発行チェーン固有の fail-closed 拒否(Issue #116)。前者に解決経路はない(親は恒久に退役)。後者は clearance の再観測(`ReissueClearanceService.observe_signal()`)による有効な付与でのみ解消する。
 - 拒否理由の正は `SafetyRejectionCode`(enum 値)であり、文字列ログは補助である。ログには拒否コード・`execution_request_id`・`policy_id` を出す。**重複抑止(`duplicate_submission`)時はこれに加えて source `signal_id`・現在の `submission_phase` / `order_state`・抑止理由を WARN で必ず出力する**(Issue #76。store 側の作成時 conflict も同じ項目をログする)。secret・token・口座残高等は出さない。
 - 1 判定内の拒否コードは**順序保持 dedup**される(最初の出現が勝つ)。`SafetyDecision` はコードの一意性を構築時不変条件として強制する。
 
@@ -158,7 +161,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 `SafetyDecision` は構築時検証つき(allow ⇔ 拒否 0 件、コード一意、UTC、非空 ID)で、以下を保持する:
 
 - `execution_request_id` / `allowed` / `checked_at_utc`(判定時刻 = Gate clock)
-- `policy_id`(適用ポリシーの識別)
+- `policy_id`(適用ポリシーの識別)— さらに **schema v2(Issue #116)から、判定行の傍らに `policy_snapshot_json`(`SafetyPolicy.to_snapshot()` の canonical JSON)を保存**する。`LiveOrderSubmissionService` は全判定でこれを渡し、`gate_correction` の eligibility が「その判定を生んだ policy が現在適用中の policy と**内容同一**か」を id ではなく内容で識別できる(snapshot の無い行 = v1 由来・省略記録は fail-closed)。読み取りは `list_for_request_records()`(id + 判定 + snapshot の 3 つ組)
 - `rejections`(コード + 詳細メッセージのタプル。コードは一意)
 - `execution_mode` / `connection_target`(型付き接続 identity の値)
 - `account_id` / `position_count`(Broker 照会結果。照会失敗なら None)
@@ -166,6 +169,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 `SQLiteSafetyDecisionStore`(`execution/data/safety_gate_decisions.sqlite3` 既定、`SAFETY_GATE_DECISION_DB_PATH` で上書き)が監査保存を担う。**`execution_orders.sqlite3` とは別ファイル**である(execution store の closed-world schema 検証は他テーブルの同居を拒否するため)。方針は execution store と同一:
 
 - `initialize()` は **pristine な DB のみ**へ schema を新規作成(オブジェクト 0 件 + `user_version` 0)。それ以外は完全検証し、不一致なら **DB 無変更で** `SafetySchemaError`。
+- **schema version は v2**(v1 = Issue #75 初版、v2 = Issue #116 の `policy_snapshot_json` 列)。**v1 → v2 migration**: `initialize()` が「完全検証で v1 と一致した DB のみ」を additive に migration する(`ALTER TABLE ADD COLUMN policy_snapshot_json` → version bump → v2 完全再検証を単一トランザクションで実施。既存行は snapshot NULL として読み戻され、途中失敗は全 rollback で v1 無変更。読み取り経路は migration しない)。
 - 全 read / write が「open → **closed-world schema 検証**(sqlite_master 全 object 集合 + token 正規化 DDL + PRAGMA 構造 signature + version)→ トランザクション」で動作。trigger / view / 制約欠損 lookalike / 他コンポーネント DB は黙って受け入れない。
 - `record()` は**あらゆる失敗で例外**を送出する(DB ファイル欠損 = 未初期化も失敗であり、暗黙にファイルを作らない)。
 - **監査 store は送信サービス内部に封印される**: `LiveOrderSubmissionService` のコンストラクタは **filesystem パス(`decision_db_path`)しか受け取らず**、具体実装 `SQLiteSafetyDecisionStore` をサービス内部で生成する。recorder オブジェクトの注入点自体が存在しないため、`record()` / read-back を override して永続化を偽装できる注入経路はない(InMemory / NoOp recorder は構造的に排除)。さらに record 後に **read-back で保存内容を検証**し、保存が黙って失われた場合も送信は行われない(`decision_persist_failed`)。read-back は**自分の判定が再読で見つかること(membership)**を検証する(PR #101): 同一 intent の並行敗者はそれぞれ自分の拒否判定を記録するため、record と read-back の間に他の呼び出しの判定が割り込み得る。「最新行であること」は契約に含まれない(旧実装はこれを要求しており、並行時に誤って `decision_persist_failed` が付く flake の原因だった)。
@@ -180,6 +184,8 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 
 - `test_safety_gate.py` — 正常許可(FakeBroker へ 1 件送信・監査記録・execution store の phase/state 記録)、固定 client_order_id の使用、LIMIT の SL / TP が現在価格でなく `requested_price` 基準であること、**二重送信防止**(2 回目は `duplicate_submission`・Broker 送信 1 件のまま)、**UNKNOWN 再送禁止**(timeout / 通信失敗後の再 submit 拒否・UNKNOWN 記録)、**created→submitting 勝者のみ送信**(先行遷移・遷移インフラ失敗の fail-closed)、Broker 拒否は結果として記録、**受領済み結果の保存失敗 → UNKNOWN フォールバック + `list_unresolved_submissions()` での可視性**(二重失敗時の submitting/pending 取得・送信前クラッシュ相当の stuck pending 取得を含む)、未登録意図の拒否、破損 order store の fail-closed、**封印された監査 store**(オブジェクト注入の構築時拒否・record 消失の read-back 検知・未初期化 store の送信阻止・元コード保持)、各条件の独立拒否(銘柄 / 方向 / 数量 / SL 無し / SL・TP 不正(BUY / SELL)/ snapshot 銘柄不一致 / 参照価格欠損・stale・未来 / spread 欠損・超過 / market closed / not tradable / 接続先不一致・未知・大文字小文字)、**Broker 実体から導出する型付き接続 identity**(caller 申告の構造的不能(`TypeError`)・FakeBroker は live / demo を名乗れない・非 FakeBroker は fake を名乗れない・未知 mode・identity 欠損 / 型不正の構築時拒否・**組み立て後の identity ドリフトを evaluate の再導出が拒否**)、kill switch(全条件正常でも拒否・照会例外・bool 以外)、ポジション上限(long + short 合算・口座全体・上限未満の許可・stale / 未来 snapshot の fail-closed)、Broker 照会失敗(positions / account / 型不正)、**AccountState の stale / 未来 / 型不正の fail-closed**、想定外例外・clock 破損の `gate_internal_error`、複数違反の同時収集と**順序保持 dedup**(dedup 関数・`SafetyDecision` の一意性不変条件・evaluate 経由の重複排除)、**全拒否経路で `submitted_requests` が 0 件(または増加 0)**、ログへの機械可読コード出力、`SafetyPolicy` / `MarketSafetySnapshot` / `SafetyDecision` の構築時検証と **policy の deep immutability**(呼び出し元 dict の事後変更が判定に影響しない・read-only view への書き込み拒否)、**Issue #76 idempotency**(同一 signal の 2 重 register 拒否・ACCEPTED / SUBMITTING / UNKNOWN の再処理非送信・**サービス再作成(プロセス再起動相当)後の重複抑止**・**独立 store 接続を持つ 2 サービスの同時 submit で Broker 送信 1 件**・重複抑止ログの execution_request_id / signal_id / 状態 / 理由)。
 - `test_safety_store.py` — 再オープン(プロセス再起動相当)後の round-trip、記録順の復元、missing DB への書き込み拒否(ファイル非作成)・読み取り空(ファイル非作成)、pristine 判定、foreign schema / 制約欠損 lookalike / trigger / version 不一致の拒否(DB 無変更)、帯域外改竄(未知コード・未知キー・壊れた時刻)の復元時拒否、DB CHECK 制約の発火、公認送信サービスとの結合(拒否・許可の監査が再起動後も取得可能、未初期化 store の fail-closed)。
+- `test_safety_store.py`(Issue #116 追加分)— policy snapshot の round-trip(`list_for_request_records`)、snapshot なし記録の None 読み戻し、非 dict snapshot の拒否、改竄 snapshot の復元時拒否、**v1 → v2 migration**(既存行保持・冪等性・検証失敗時の完全 rollback と retry 成功)。
+- `test_reissue_service.py` / `test_reissue_clearance.py` / `test_reissue_submission.py`(Issue #116)— 再発行 eligibility・clearance 判定・`intent_superseded` / `reissue_clearance_invalid` の送信経路検証([Execution Intent Reissue](execution_reissue.md))。
 - `test_submission_boundary.py` — `submit_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信呼び出しが 1 箇所であること)。
 - `test_fixed_scenarios.py` ほか(Issue #77)— 固定シナリオ試験。Safety Gate 拒否系(stale price / kill switch / execution mode 不整合 / 複数違反同時収集)を含む分岐を固定データから本番経路(本サービス)経由で再現し、全拒否シナリオで Broker 呼び出しが 0 件であること・機械可読な拒否コード・監査保存件数を expected/actual 比較で固定する。実行方法は `execution/README.md` の「固定シナリオ試験」節を参照。
 

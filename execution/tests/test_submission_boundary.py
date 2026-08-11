@@ -44,6 +44,13 @@ SUBMIT_ORDER_ALLOWED = {
     # sanctioned one in live_submission.py; this is fixture delegation,
     # not a second submission path.
     "execution/tests/test_submission_journal.py",
+    # Issue #116: seeds the FakeBroker with the broker-side orders a
+    # clearance observation must judge (broker-only order, a ghost order
+    # under an unsubmitted parent's key), plus the QueryOnlyBroker facade
+    # whose delegation exists so a wrapper WITHOUT the listing
+    # capabilities still satisfies the Broker protocol. Fixture
+    # provisioning only -- the clearance service itself never submits.
+    "execution/tests/test_reissue_clearance.py",
 }
 
 # Broker CANCELLATION has no production caller at all: the cancel Execution
@@ -57,6 +64,9 @@ CANCEL_ORDER_ALLOWED = {
     "execution/tests/test_broker_reconciliation_repair.py",
     # Issue #105: pins that ReconcileOnlyBroker.cancel_order RAISES.
     "execution/tests/test_reconciliation_runner_cli.py",
+    # Issue #116: the QueryOnlyBroker facade's pure delegation (see
+    # SUBMIT_ORDER_ALLOWED above); no test there cancels anything.
+    "execution/tests/test_reissue_clearance.py",
 }
 
 # The only files that may CALL <something>.to_order_request(...):

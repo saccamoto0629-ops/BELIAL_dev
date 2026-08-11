@@ -1,0 +1,102 @@
+{
+  "scenario_id": "gate_correction_quantity_reduced_filled",
+  "description": "訂正差し替えの成立 (Issue #116): quantity_limit_exceededでGate拒否された未送信の親を、Broker照会のpositive absence evidence + 最新判定 + policy内容同一性のもとで数量減の子に差し替え、子が約定する",
+  "broker": {
+    "scripts": {
+      "client-2": {
+        "behavior": "fill_immediately",
+        "broker_order_id": "BRK-2"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "20",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "rejected",
+        "rejection_codes": ["quantity_limit_exceeded"]
+      }
+    },
+    {
+      "action": "grant_clearance",
+      "signal_id": "signal-1",
+      "expect": {
+        "outcome": "granted"
+      }
+    },
+    {
+      "action": "gate_correction",
+      "request": {
+        "execution_request_id": "exec-2",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "5",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-2",
+      "parent_execution_request_id": "exec-1",
+      "operator_id": "op-1",
+      "reason": "reduce quantity 20 -> 5 to satisfy max_order_quantity",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-2",
+      "expect": {
+        "outcome": "submitted",
+        "state": "filled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "created",
+    "final_state": null,
+    "broker_submit_calls": 1,
+    "order_rows": 2,
+    "chain": [
+      {
+        "execution_request_id": "exec-1",
+        "signal_attempt": 1,
+        "submission_phase": "created",
+        "order_state": null
+      },
+      {
+        "execution_request_id": "exec-2",
+        "signal_attempt": 2,
+        "submission_phase": "submitted",
+        "order_state": "filled"
+      }
+    ],
+    "journal_outcomes": {
+      "exec-1": null,
+      "exec-2": "completed"
+    },
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}
