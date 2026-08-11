@@ -312,9 +312,29 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
+def _lock_snapshot(connection: sqlite3.Connection) -> None:
+    """Turn a just-opened DEFERRED transaction into a REAL read transaction
+    (PR #126 Codex review P1, r3).
+
+    ``BEGIN`` alone acquires nothing, and ``PRAGMA journal_mode`` does not
+    take or keep a read lock either -- so a journal-mode answer obtained
+    before any table read describes a file that another process may still
+    convert. (Measured: with only ``BEGIN`` + the pragma held, a concurrent
+    ``PRAGMA journal_mode=WAL`` succeeds AND the reader goes on to see rows
+    committed after it.) One real page read takes the SHARED lock the rest
+    of the transaction rides on; while it is held, a concurrent conversion
+    fails with ``database is locked``.
+
+    Reading ``sqlite_master`` is deliberate: it is a real database page, it
+    is what the schema verification reads anyway, and it is permitted by the
+    read-only authorizer.
+    """
+    connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+
+
 def _refuse_wal(connection: sqlite3.Connection, db_path: Path) -> None:
     """Refuse a kill switch DB that is in WAL journal mode (PR #126 Codex
-    review P1, r2).
+    review P1, r2/r3).
 
     Every execution-owned store uses the default rollback journal; a WAL
     file can only come from out-of-band maintenance (``PRAGMA
@@ -322,17 +342,23 @@ def _refuse_wal(connection: sqlite3.Connection, db_path: Path) -> None:
     read path must never be able to answer from a snapshot that predates a
     committed ``enable``.
 
-    The check runs INSIDE the caller's already-open transaction, on the very
-    connection whose data will be trusted -- not as a separate file-header
-    probe. A header probe is two observations of a file that another process
-    can convert between them (the r1 fix's residual TOCTOU): the switch to
-    WAL could land after the probe and before the open, and
-    ``connect_read_only`` would then add ``immutable=1`` and silently ignore
-    the ``-wal`` rows. Asking the open transaction itself closes that gap:
-    the answer describes the same snapshot the rows come from. It is also
-    why the read path opens with ``allow_immutable_wal=False`` -- an
-    ``immutable=1`` connection reports ``journal_mode = 'delete'`` for a WAL
-    file, so it could neither be trusted nor even detected here.
+    Two properties make the answer trustworthy, and BOTH are required:
+
+    1. The check runs INSIDE the caller's transaction, on the very
+       connection whose rows will be trusted -- not as a separate
+       file-header probe. A header probe is two observations of a file that
+       another process can convert between them (the r1 residual TOCTOU):
+       the switch to WAL could land after the probe and before the open, and
+       ``connect_read_only`` would then add ``immutable=1`` and silently
+       ignore the ``-wal`` rows. It is also why the read path opens with
+       ``allow_immutable_wal=False`` -- an ``immutable=1`` connection
+       reports ``journal_mode = 'delete'`` for a WAL file, so it could
+       neither be trusted nor even detected here.
+    2. The transaction already HOLDS its read (or write) lock when the
+       question is asked -- :func:`_lock_snapshot` for readers, ``BEGIN
+       IMMEDIATE`` for writers (the r3 residual TOCTOU: inside a bare
+       ``BEGIN`` the pragma locks nothing, so the mode could still flip
+       before the first trusted read).
     """
     mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
     if str(mode).lower() == "wal":
@@ -372,8 +398,8 @@ def _verified_txn(db_path: Path):
 def _verified_read(db_path: Path):
     """Read flow: open a TRUE read-only connection (``mode=ro`` + query_only
     + write-denying authorizer -- a read can never create the file) -> BEGIN
-    -> refuse WAL and verify the schema INSIDE that transaction -> read.
-    Always rolled back.
+    -> take the read lock -> refuse WAL and verify the schema INSIDE that
+    locked transaction -> read. Always rolled back.
 
     ``allow_immutable_wal=False`` (PR #126 Codex review P1, r2): this store
     must never answer from a point-in-time view that ignores committed
@@ -387,8 +413,11 @@ def _verified_read(db_path: Path):
     with closing(connect_read_only(db_path, allow_immutable_wal=False)) as connection:
         connection.execute("BEGIN")
         try:
-            # First statement in the transaction: it both establishes the
-            # read snapshot and answers the WAL question about it.
+            # Order matters (review r3): take the SHARED lock FIRST, then
+            # ask about the journal mode. A pragma asked inside a bare
+            # BEGIN locks nothing, so its answer would not bind the reads
+            # that follow it.
+            _lock_snapshot(connection)
             _refuse_wal(connection, db_path)
             _verify_schema(connection, db_path)
             yield connection

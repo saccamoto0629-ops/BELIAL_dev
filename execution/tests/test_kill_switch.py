@@ -488,6 +488,135 @@ def test_a_wal_conversion_racing_the_open_can_never_be_read_as_disabled(tmp_path
         racing_writer.close()
 
 
+def test_the_read_lock_is_held_before_the_journal_mode_is_trusted(tmp_path, monkeypatch):
+    """PR #126 Codex review P1 (r3): asking ``PRAGMA journal_mode`` inside a
+    bare ``BEGIN`` locks nothing, so the answer did not bind the reads that
+    followed it -- another process could convert to WAL in that window and
+    the read would go on to trust a mode that was no longer true.
+
+    The read transaction now takes its SHARED lock with a real page read
+    BEFORE the question is asked. This probes that directly: at the exact
+    moment the mode is being trusted, a concurrent conversion must FAIL."""
+    import execution.kill_switch_store as module
+
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    store.record_transition(
+        enabled=True, operator="ops", reason="halt", changed_at_utc=at(1)
+    )
+    real_refuse = module._refuse_wal
+    conversions = []
+
+    def refuse_while_probing(connection, db_path):
+        other = sqlite3.connect(path, timeout=0.5)
+        try:
+            other.execute("PRAGMA journal_mode=WAL")
+            conversions.append("converted")
+        except sqlite3.OperationalError as exc:
+            conversions.append(f"blocked: {exc}")
+        finally:
+            other.close()
+        return real_refuse(connection, db_path)
+
+    monkeypatch.setattr(module, "_refuse_wal", refuse_while_probing)
+    state = store.current_state()
+
+    assert conversions and all(entry.startswith("blocked") for entry in conversions), conversions
+    assert state.enabled is True  # the trusted read still reflects the real state
+
+
+def test_no_conversion_can_land_between_the_mode_check_and_the_trusted_reads(
+    tmp_path, monkeypatch
+):
+    """The exact scenario from the review: the mode is accepted as
+    rollback-journal, and the conversion lands AFTER that check but BEFORE
+    the reads that trust it (``_verify_schema`` and the row query). The lock
+    taken for the snapshot is held for the whole transaction, so that window
+    is closed too -- probed at the moment schema verification begins."""
+    import execution.kill_switch_store as module
+
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    store.record_transition(
+        enabled=True, operator="ops", reason="halt", changed_at_utc=at(1)
+    )
+    real_verify = module._verify_schema
+    conversions = []
+
+    def verify_after_probing(connection, db_path, *args, **kwargs):
+        other = sqlite3.connect(path, timeout=0.5)
+        try:
+            other.execute("PRAGMA journal_mode=WAL")
+            conversions.append("converted")
+        except sqlite3.OperationalError as exc:
+            conversions.append(f"blocked: {exc}")
+        finally:
+            other.close()
+        return real_verify(connection, db_path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_verify_schema", verify_after_probing)
+    state = store.current_state()
+
+    assert conversions and all(entry.startswith("blocked") for entry in conversions), conversions
+    assert state.enabled is True
+
+
+def test_a_wal_conversion_before_the_lock_is_still_refused(tmp_path, monkeypatch):
+    """The other side of the same window: if the conversion lands BEFORE the
+    read lock is taken, nothing is blocked -- so the mode check must catch
+    it. Injected at the moment the snapshot is being locked."""
+    import execution.kill_switch_store as module
+
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    real_lock = module._lock_snapshot
+
+    def convert_then_lock(connection):
+        converter = sqlite3.connect(path)
+        try:
+            converter.execute("PRAGMA journal_mode=WAL")
+        finally:
+            converter.close()
+        return real_lock(connection)
+
+    monkeypatch.setattr(module, "_lock_snapshot", convert_then_lock)
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.current_state()
+
+
+def test_the_write_path_holds_its_lock_before_the_journal_mode_is_trusted(tmp_path, monkeypatch):
+    """The write paths use ``BEGIN IMMEDIATE``, which already holds the
+    write lock when the mode is checked -- pinned the same way as the read
+    path so a future refactor cannot quietly reopen the window."""
+    import execution.kill_switch_store as module
+
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    real_refuse = module._refuse_wal
+    conversions = []
+
+    def refuse_while_probing(connection, db_path):
+        other = sqlite3.connect(path, timeout=0.5)
+        try:
+            other.execute("PRAGMA journal_mode=WAL")
+            conversions.append("converted")
+        except sqlite3.OperationalError as exc:
+            conversions.append(f"blocked: {exc}")
+        finally:
+            other.close()
+        return real_refuse(connection, db_path)
+
+    monkeypatch.setattr(module, "_refuse_wal", refuse_while_probing)
+    store.record_transition(
+        enabled=True, operator="ops", reason="halt", changed_at_utc=at(1)
+    )
+    assert conversions and all(entry.startswith("blocked") for entry in conversions), conversions
+
+
 def test_the_read_path_never_opens_a_wal_file_immutably(tmp_path, monkeypatch):
     """The refusal works because the read path opted OUT of the
     ``immutable=1`` fallback: an immutable connection reports
