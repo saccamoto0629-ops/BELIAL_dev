@@ -544,7 +544,13 @@ def init_db(db_path: Path | None = None) -> None:
       failure, and fail loudly on legacy data that cannot be safely converted.
     - Table already current -> no-op (indexes ensured).
 
-    Idempotent and safe to call repeatedly.
+    Idempotent and safe to call repeatedly -- including CONCURRENTLY (Issue #85
+    review): the "table absent" decision is re-checked INSIDE the
+    ``BEGIN IMMEDIATE`` transaction, because two workers starting against a
+    missing DB can both observe "absent" before either creates it; the loser
+    would then wait on the write lock and fail its CREATE TABLE with "table
+    already exists". Re-checking under the write lock makes the loser fall
+    through to the normal already-current path instead of erroring.
     """
     db_path = Path(db_path) if db_path is not None else position_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -557,15 +563,19 @@ def init_db(db_path: Path | None = None) -> None:
         if not _table_exists(connection, POSITIONS_TABLE):
             connection.execute("BEGIN IMMEDIATE")
             try:
-                connection.execute(_create_table_sql(POSITIONS_TABLE))
-                _migrate_notifications_table(connection)
-                _create_indexes(connection)
-                connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-                connection.execute("COMMIT")
+                if not _table_exists(connection, POSITIONS_TABLE):  # re-check under the write lock
+                    connection.execute(_create_table_sql(POSITIONS_TABLE))
+                    _migrate_notifications_table(connection)
+                    _create_indexes(connection)
+                    connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+                    connection.execute("COMMIT")
+                    return
+                # a concurrent worker created the schema while we waited: nothing
+                # to create -- fall through to the normal current/migration paths.
+                connection.execute("ROLLBACK")
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-            return
         if _schema_is_current(connection):
             _create_indexes(connection)
             return

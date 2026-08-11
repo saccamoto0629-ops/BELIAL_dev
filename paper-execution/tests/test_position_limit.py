@@ -230,8 +230,9 @@ def test_refused_signal_stays_cancelled_after_capacity_frees(tmp_path):
 # --- store: concurrent runners cannot overshoot the cap (TOCTOU) --------------
 
 def test_concurrent_intake_respects_cap_exactly(tmp_path):
+    # deliberately NO init_db up front: first-time schema creation must also be
+    # safe under concurrent workers (Codex review on PR #125).
     db = tmp_path / "p.sqlite3"
-    store.init_db(db)
     results, errors = [], []
     barrier = threading.Barrier(6)
 
@@ -254,6 +255,29 @@ def test_concurrent_intake_respects_cap_exactly(tmp_path):
     assert sum(1 for r in rows if r["state"] == "pending") == 1
     assert sum(1 for r in rows if r["terminal_reason"] == "position_limit") == 5
     assert len(_outbox(db)) == 5   # one cancelled notification per refusal, no duplicates
+
+
+def test_concurrent_first_time_init_db_is_safe(tmp_path):
+    # Two workers racing to CREATE the schema on a missing DB: the loser must
+    # fall through to the already-current path, never "table already exists".
+    db = tmp_path / "p.sqlite3"
+    errors = []
+    barrier = threading.Barrier(4)
+
+    def init():
+        try:
+            barrier.wait(timeout=30)
+            store.init_db(db)
+        except Exception as exc:  # pragma: no cover - failure detail for the assert below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=init) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert store.get_schema_status(db) == store.SCHEMA_STATUS_CURRENT
 
 
 # --- models / DB CHECK ---------------------------------------------------------
@@ -442,8 +466,7 @@ def test_terminal_positions_do_not_block_new_cycle_signals(tmp_path):
 
 
 def test_concurrent_runners_no_duplicates_no_overshoot(tmp_path):
-    db = tmp_path / "p.sqlite3"
-    store.init_db(db)
+    db = tmp_path / "p.sqlite3"   # missing DB: concurrent first-time migration must be safe too
     signals = [_signal("sig-0"), _signal("sig-1")]
     errors = []
     barrier = threading.Barrier(2)
