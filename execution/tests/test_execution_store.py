@@ -250,6 +250,13 @@ def test_db_check_constraints_actually_fire(db_path):
             "last_order_result_json": None,
             "created_at_utc": T0.isoformat(),
             "updated_at_utc": T0.isoformat(),
+            "reissued_from_execution_request_id": None,
+            "signal_attempt": 1,
+            "reissue_kind": None,
+            "reissue_initiated_by": None,
+            "reissue_reason": None,
+            "gate_correction_ref_json": None,
+            "reissue_clearance_json": None,
         }
         record.update(overrides)
         return tuple(record[c] for c in store._ORDER_COLUMNS)
@@ -263,6 +270,9 @@ def test_db_check_constraints_actually_fire(db_path):
         row(submission_phase="created", order_state="pending"),          # phase x state
         row(submission_phase="submitted", order_state="accepted",
             last_state_reason="r"),                           # accepted without broker id
+        row(signal_attempt=0),                                # attempt below 1 (v5)
+        row(reissue_kind="retry"),                            # unknown kind (v5)
+        row(reissue_initiated_by="robot"),                    # unknown initiator (v5)
     ]
     with closing(sqlite3.connect(db_path)) as connection:
         for bad in bad_rows:
@@ -932,6 +942,13 @@ def test_null_execution_request_id_is_rejected_by_the_schema(db_path):
         "last_order_result_json": None,
         "created_at_utc": T0.isoformat(),
         "updated_at_utc": T0.isoformat(),
+        "reissued_from_execution_request_id": None,
+        "signal_attempt": 1,
+        "reissue_kind": None,
+        "reissue_initiated_by": None,
+        "reissue_reason": None,
+        "gate_correction_ref_json": None,
+        "reissue_clearance_json": None,
     }
     with closing(sqlite3.connect(db_path)) as connection:
         with pytest.raises(sqlite3.IntegrityError):
@@ -1434,6 +1451,9 @@ def _write_schema(db_path, orders_sql, history_sql=None, index_sqls=None):
         connection.execute(orders_sql)
         connection.execute(history_sql if history_sql is not None else store._create_history_table_sql())
         connection.execute(store._create_fences_table_sql())
+        connection.execute(store._create_clearances_table_sql())
+        connection.execute(store._create_clearance_heads_table_sql())
+        connection.execute(store._create_supersessions_table_sql())
         for sql in index_sqls if index_sqls is not None else store._create_index_sql().values():
             connection.execute(sql)
         connection.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
@@ -1463,8 +1483,10 @@ def test_equivalent_ddl_with_quoted_identifiers_and_cosmetic_differences_is_acce
         f'create index "{store._ORDERS_STATE_INDEX}" on "{store.ORDERS_TABLE}" '
         "(order_state, updated_at_utc)",
         store._create_index_sql()[store._HISTORY_REQUEST_INDEX],
-        f'create UNIQUE index "{store._SIGNAL_UNIQUE_INDEX}" on {store.ORDERS_TABLE} (signal_id)',
+        f'create UNIQUE index "{store._SIGNAL_ATTEMPT_UNIQUE_INDEX}" on '
+        f"{store.ORDERS_TABLE} (signal_id, signal_attempt)",
         store._create_index_sql()[store._HISTORY_REPAIR_INDEX],
+        store._create_index_sql()[store._REISSUED_FROM_UNIQUE_INDEX],
     ]
     _write_schema(db_path, orders_sql, history_sql, index_sqls)
     store.init_db(db_path)  # verification accepts the equivalent schema
@@ -1534,6 +1556,24 @@ def test_dropped_index_is_rejected(db_path):
 # --- Issue #76: source-signal uniqueness / duplicate suppression / migration --
 
 
+# The pre-v5 orders column list (v2-v4 table DDL): _raw_created_row seeds
+# LEGACY-version DBs, whose tables do not hold the v5 reissue columns.
+_LEGACY_ORDER_COLUMNS = tuple(
+    column
+    for column in store._ORDER_COLUMNS
+    if column
+    not in {
+        "reissued_from_execution_request_id",
+        "signal_attempt",
+        "reissue_kind",
+        "reissue_initiated_by",
+        "reissue_reason",
+        "gate_correction_ref_json",
+        "reissue_clearance_json",
+    }
+)
+
+
 def _raw_created_row(connection, request_id, signal_id):
     """Insert a well-formed `created` row out-of-band (bypassing the store's
     constraints only where the schema itself allows it -- used to seed a v2
@@ -1560,16 +1600,47 @@ def _raw_created_row(connection, request_id, signal_id):
         "updated_at_utc": T0.isoformat(),
     }
     connection.execute(
-        f"INSERT INTO {store.ORDERS_TABLE} ({', '.join(store._ORDER_COLUMNS)}) "
-        f"VALUES ({', '.join('?' for _ in store._ORDER_COLUMNS)})",
-        tuple(values[c] for c in store._ORDER_COLUMNS),
+        f"INSERT INTO {store.ORDERS_TABLE} ({', '.join(_LEGACY_ORDER_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in _LEGACY_ORDER_COLUMNS)})",
+        tuple(values[c] for c in _LEGACY_ORDER_COLUMNS),
     )
 
 
+def _downgrade_to_v4(db_path):
+    """Turn a freshly created v5 DB into a genuine released v4 DB: drop the
+    Issue #115 reissue objects (indexes, orders/history columns, clearance
+    table), restore the v4 whole-table signal UNIQUE index and stamp the v4
+    version. Rows persist. Asserted faithful against the pristine v4
+    reference."""
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(f"DROP INDEX {store._SIGNAL_ATTEMPT_UNIQUE_INDEX}")
+        connection.execute(f"DROP INDEX {store._REISSUED_FROM_UNIQUE_INDEX}")
+        for column in (
+            "reissue_clearance_json",
+            "gate_correction_ref_json",
+            "reissue_reason",
+            "reissue_initiated_by",
+            "reissue_kind",
+            "signal_attempt",
+            "reissued_from_execution_request_id",
+        ):
+            connection.execute(f"ALTER TABLE {store.ORDERS_TABLE} DROP COLUMN {column}")
+        connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} DROP COLUMN clearance_json")
+        connection.execute(f"DROP TABLE {store.CLEARANCES_TABLE}")
+        connection.execute(f"DROP TABLE {store.CLEARANCE_HEADS_TABLE}")
+        connection.execute(f"DROP TABLE {store.SUPERSESSIONS_TABLE}")
+        connection.execute(store._SIGNAL_UNIQUE_INDEX_SQL)
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert store._schema_problems(connection, version=4) == []
+
+
 def _downgrade_to_v3(db_path):
-    """Turn a freshly created v4 DB into a genuine released v3 DB: drop the
-    Issue #104 repair provenance index + column and stamp the v3 version.
+    """Turn a freshly created v5 DB into a genuine released v3 DB: drop the
+    Issue #115 then the Issue #104 objects and stamp the v3 version.
     Rows persist. Asserted faithful against the pristine v3 reference."""
+    _downgrade_to_v4(db_path)
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(f"DROP INDEX {store._HISTORY_REPAIR_INDEX}")
         connection.execute(f"ALTER TABLE {store.HISTORY_TABLE} DROP COLUMN repair_generation")
@@ -1582,9 +1653,9 @@ def _downgrade_to_v3(db_path):
 
 
 def _downgrade_to_v2(db_path):
-    """Turn a freshly created v4 DB into a genuine released v2 DB: drop the
-    Issue #104 provenance objects and the Issue #76 unique signal index,
-    then stamp the v2 version. Rows persist."""
+    """Turn a freshly created v5 DB into a genuine released v2 DB: drop the
+    Issue #115 / #104 objects and the Issue #76 unique signal index, then
+    stamp the v2 version. Rows persist."""
     _downgrade_to_v3(db_path)
     with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(f"DROP INDEX {store._SIGNAL_UNIQUE_INDEX}")
@@ -1635,7 +1706,7 @@ def test_create_reports_all_identity_keys_when_they_collide_with_different_rows(
 
     message = str(caught.value)
     assert "execution_request_id is already persisted" in message
-    assert "source signal already produced an execution request" in message
+    assert "source signal already produced attempt 1" in message
     assert "client_order_id is already bound to an execution request" in message
 
 
@@ -1651,7 +1722,7 @@ def test_duplicate_signal_suppression_is_logged_with_ids_state_and_reason(db_pat
     assert "existing_execution_request_id=exec-1" in message
     assert "existing_submission_phase=submitting" in message
     assert "existing_order_state=pending" in message
-    assert "reason=source signal already produced an execution request" in message
+    assert "reason=source signal already produced attempt 1" in message
 
 
 def test_duplicate_request_id_suppression_is_logged(db_path, caplog):
@@ -1782,9 +1853,15 @@ def test_the_broker_order_id_lookup_refuses_a_broken_schema(db_path):
         store.get_execution_order_by_broker_order_id("B-1", db_path=db_path)
 
 
+# SELECT * appends the v5 reissue columns at the end of each pre-migration
+# orders row: parent NULL, attempt backfilled to 1, audit columns NULL.
+_V5_MIGRATED_ROW_TAIL = (None, 1, None, None, None, None, None)
+
+
 def test_init_db_migrates_a_v2_db_in_place_and_keeps_rows_readable(db_path):
     # a released v2 DB (rows included, one already accepted) migrates
-    # additively: unique signal index + version bump, rows byte-identical.
+    # additively: existing column values byte-identical, reissue columns
+    # appended at their defaults (attempt 1, no provenance).
     submit_and_accept(db_path)
     create_order(db_path, request_id="exec-2")
     _downgrade_to_v2(db_path)
@@ -1794,8 +1871,13 @@ def test_init_db_migrates_a_v2_db_in_place_and_keeps_rows_readable(db_path):
 
     after = full_db_state(db_path)
     assert after["user_version"] == store.SCHEMA_VERSION
-    assert any(name == store._SIGNAL_UNIQUE_INDEX for _, name, _, _ in after["schema"])
-    assert after[store.ORDERS_TABLE] == rows_before  # nothing deleted or rewritten
+    schema_names = {name for _, name, _, _ in after["schema"]}
+    assert store._SIGNAL_ATTEMPT_UNIQUE_INDEX in schema_names
+    assert store._REISSUED_FROM_UNIQUE_INDEX in schema_names
+    assert store._SIGNAL_UNIQUE_INDEX not in schema_names  # replaced, not kept
+    assert after[store.ORDERS_TABLE] == sorted(
+        row + _V5_MIGRATED_ROW_TAIL for row in rows_before
+    )  # nothing deleted or rewritten; new columns hold their defaults
     # existing records restore through the normal validated read path
     assert store.get_execution_order("exec-1", db_path=db_path)["order_state"] == "accepted"
     assert store.load_execution_request("exec-2", db_path=db_path) == make_request("exec-2")
@@ -1866,7 +1948,10 @@ def test_two_connections_can_migrate_the_same_wal_v2_db_concurrently(db_path):
     assert outcomes == [None, None]
     after = full_db_state(db_path)
     assert after["user_version"] == store.SCHEMA_VERSION
-    assert sum(name == store._SIGNAL_UNIQUE_INDEX for _, name, _, _ in after["schema"]) == 1
+    assert (
+        sum(name == store._SIGNAL_ATTEMPT_UNIQUE_INDEX for _, name, _, _ in after["schema"])
+        == 1
+    )
 
 
 def test_reads_never_migrate_a_v2_db(db_path):
@@ -2373,10 +2458,13 @@ def test_init_db_migrates_a_v3_db_in_place_and_keeps_rows_readable(db_path):
     after = full_db_state(db_path)
     assert after["user_version"] == store.SCHEMA_VERSION
     assert any(name == store._HISTORY_REPAIR_INDEX for _, name, _, _ in after["schema"])
-    assert after[store.ORDERS_TABLE] == rows_before  # nothing deleted or rewritten
+    assert after[store.ORDERS_TABLE] == sorted(
+        row + _V5_MIGRATED_ROW_TAIL for row in rows_before
+    )  # nothing deleted or rewritten; new columns hold their defaults
     # pre-migration history rows read back with repair_attempt_id = NULL
     history = store.get_state_history("exec-1", db_path=db_path)
     assert {h["repair_attempt_id"] for h in history} == {None}
+    assert {h["clearance_json"] for h in history} == {None}
     store.init_db(db_path)  # idempotent
 
 
