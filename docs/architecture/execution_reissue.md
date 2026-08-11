@@ -258,7 +258,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 3. **親がチェーン末尾の確定拒否(`order_state = rejected`)かつ `rejection_category = transient`** であること。`unclassified` を含む他の全カテゴリ・snapshot からカテゴリを読めない親は拒否(自動の唯一の根拠は正規化分類)。UNKNOWN の親は `rejected` でないため構造的に到達しない(UNKNOWN 非再送契約は不変)。
 4. **注文パラメータが親と完全同一**(数量・価格・SL / TP・order type)。減量を含む一切の変更を拒否する(内容の変更は人間の判断 = 手動経路)。同じ規則は store の登録トランザクション内でも #115 の共通検証(`_reissue_link_problems` の auto 規則)として再強制される。
 5. **有効な clearance**: 手動経路と同一の要件(current・`valid`・鮮度窓内)。チェーンに関わる hazardous divergence は clearance を失効させ、未観測は付与しないため、**未解決の reconciliation discrepancy がある signal はここで拒否される**。
-6. **cooldown**: 親行の永続化された `updated_at_utc`(= 拒否を記録した時刻。以後の監査された同状態再観測はこれを更新し、cooldown を保守側へ再開する)から `ReissuePolicy.auto_reissue_cooldown`(既定 5 分)が経過していること。永続化行由来なので再起動で短縮されない。
+6. **cooldown**: 親行の永続化された `updated_at_utc`(= 拒否を記録した時刻。以後の監査された同状態再観測はこれを更新し、cooldown を保守側へ再開する)から `ReissuePolicy.auto_reissue_cooldown`(既定 5 分)が経過していること。永続化行由来なので再起動で短縮されない。判定はサービス層の事前チェックに加えて、**登録トランザクション内でも現在の親行に対して再検証する**(`create_reissue_execution_order()` の `parent_updated_at_not_after_utc` cutoff。事前チェックとトランザクションの間に正当な再観測が cooldown を再開した場合、stale な読み値では commit できない — clearance 鮮度 cutoff と同じ構造。PR #123 Codex レビュー P2)。
 7. **上限**: auto 上限は永続化されたチェーン行(`reissue_kind = broker_rejected` かつ `reissue_initiated_by = auto`)の集計で判定し、**manual / gate_correction の上限とは独立に数える**(auto が上限到達しても運用者の枠は消費されない。逆も同様)。`max_total_attempts_per_signal` は全種別を跨いで適用される。
 
 登録される子は `initiated_by = auto`・`reissue_reason = "auto policy <policy_id>: parent rejection_category transient"`(**policy 識別子と根拠カテゴリの監査記録**)を持つ通常の phase `created` の Request であり、送信は既存の `submit()` 経路のみ(Gate 全条件の再評価を含む。自動専用の送信経路・緩和は存在しない)。

@@ -372,6 +372,80 @@ def test_the_cooldown_blocks_until_elapsed_and_then_releases(
     assert chain_length(db_path) == 2
 
 
+def test_the_registration_transaction_re_verifies_the_cooldown_cutoff(db_path):
+    """PR #123 Codex review P2 (store side): the cooldown cutoff handed to
+    ``create_reissue_execution_order`` is verified against the CURRENT
+    parent row INSIDE the transaction -- a parent refreshed past the cutoff
+    refuses with the DB untouched, like the clearance freshness cutoff."""
+    reject_parent(db_path)  # parent updated_at_utc = at(2)
+    clearance = record_clearance(db_path, "sig-exec-1")
+    with pytest.raises(store.ExecutionOrderStateConflictError, match="cutoff"):
+        store.create_reissue_execution_order(
+            child_request("exec-1", "exec-2"),
+            client_order_id="client-exec-2",
+            created_at_utc=at(11),
+            parent_execution_request_id="exec-1",
+            reissue_kind=store.REISSUE_KIND_BROKER_REJECTED,
+            reissue_initiated_by=store.REISSUE_INITIATED_AUTO,
+            reissue_reason="auto policy auto-policy-1: parent rejection_category transient",
+            clearance_generation=clearance["clearance_generation"],
+            clearance_evidence_id=clearance["evidence_id"],
+            parent_updated_at_not_after_utc=at(1),
+            db_path=db_path,
+        )
+    assert chain_length(db_path) == 1
+    child = store.create_reissue_execution_order(
+        child_request("exec-1", "exec-2"),
+        client_order_id="client-exec-2",
+        created_at_utc=at(11),
+        parent_execution_request_id="exec-1",
+        reissue_kind=store.REISSUE_KIND_BROKER_REJECTED,
+        reissue_initiated_by=store.REISSUE_INITIATED_AUTO,
+        reissue_reason="auto policy auto-policy-1: parent rejection_category transient",
+        clearance_generation=clearance["clearance_generation"],
+        clearance_evidence_id=clearance["evidence_id"],
+        parent_updated_at_not_after_utc=at(2),
+        db_path=db_path,
+    )
+    assert child["signal_attempt"] == 2
+
+
+def test_a_re_observation_in_the_registration_window_restarts_the_cooldown(
+    db_path, journal_path, safety_path, monkeypatch
+):
+    """PR #123 Codex review P2 (service side): an audited same-state
+    re-observation landing BETWEEN the service's cooldown pre-check and the
+    registration transaction refreshes the parent's ``updated_at_utc`` --
+    the transaction detects it via the cutoff and refuses, so the freshly
+    restarted cooldown is never slipped past."""
+    eligible_parent(db_path)
+    service = make_service(db_path, journal_path, safety_path)  # clock at(30)
+    real = store.create_reissue_execution_order
+
+    def racing(request, **kwargs):
+        # The concurrent writer lands after the pre-check read: a legal
+        # terminal re-observation (identical content, newer timestamp).
+        store.record_order_result(
+            "exec-1",
+            make_result(
+                OrderState.REJECTED,
+                broker_order_id=None,
+                reject_reason="rejected by broker",
+                rejection_category=RejectionCategory.TRANSIENT,
+                updated_at=at(29),
+            ),
+            reason="audited re-observation",
+            db_path=db_path,
+        )
+        return real(request, **kwargs)
+
+    monkeypatch.setattr(store, "create_reissue_execution_order", racing)
+    # cooldown 10s, cutoff = at(20): the refreshed at(29) is inside it.
+    with pytest.raises(store.ExecutionOrderStateConflictError, match="cutoff"):
+        register_auto(service)
+    assert chain_length(db_path) == 1
+
+
 # --- 7 / 8. cap and restart persistence ---------------------------------------
 
 

@@ -2986,6 +2986,7 @@ def create_reissue_execution_order(
     clearance_generation: int,
     clearance_evidence_id: str,
     clearance_observed_after_utc: datetime | None = None,
+    parent_updated_at_not_after_utc: datetime | None = None,
     gate_correction_reference: GateDecisionReference | None = None,
     gate_decision_db_path: Path | None = None,
     db_path: Path | None = None,
@@ -3078,6 +3079,8 @@ def create_reissue_execution_order(
     _require_non_empty_str(clearance_evidence_id, "clearance_evidence_id")
     if clearance_observed_after_utc is not None:
         _require_utc(clearance_observed_after_utc, "clearance_observed_after_utc")
+    if parent_updated_at_not_after_utc is not None:
+        _require_utc(parent_updated_at_not_after_utc, "parent_updated_at_not_after_utc")
     if gate_correction_reference is not None and not isinstance(
         gate_correction_reference, GateDecisionReference
     ):
@@ -3101,6 +3104,27 @@ def create_reissue_execution_order(
         parent, _parent_history = _require_bundle_for_update(
             connection, parent_execution_request_id
         )
+
+        # The caller may condition the registration on the parent row's
+        # persisted ``updated_at_utc`` (Issue #117 / PR #123 Codex review
+        # P2): the auto-reissue cooldown runs from that timestamp, and a
+        # LEGAL same-state re-observation between the service's pre-check
+        # and this transaction refreshes it -- which must RESTART the
+        # cooldown, not slip past it on the stale read. Verified INSIDE the
+        # transaction, exactly like the clearance freshness cutoff below;
+        # WHAT window applies stays the service layer's judgement.
+        if parent_updated_at_not_after_utc is not None:
+            parent_updated_at = _parse_utc(parent["updated_at_utc"])
+            if parent_updated_at > parent_updated_at_not_after_utc:
+                raise ExecutionOrderStateConflictError(
+                    f"the parent {parent_execution_request_id!r} was updated at "
+                    f"{parent['updated_at_utc']}, after the caller's cutoff "
+                    f"{_iso(parent_updated_at_not_after_utc)}; the parent row "
+                    "changed between the caller's precondition read and this "
+                    "registration (e.g. an audited re-observation restarted the "
+                    "auto-reissue cooldown), so the registration is refused and "
+                    "nothing was changed"
+                )
 
         # A supersession marker without its child row (out-of-band damage)
         # was already rejected by the parent bundle load above --

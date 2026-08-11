@@ -464,7 +464,10 @@ class ReissueService:
         - the cooldown must have elapsed since the parent row's persisted
           ``updated_at_utc`` (the recording of the rejection; a later
           audited re-observation refreshes it and conservatively restarts
-          the cooldown);
+          the cooldown) -- pre-checked here AND re-verified against the
+          CURRENT parent row inside the registration transaction, so a
+          re-observation landing between the two cannot slip past a
+          freshly restarted cooldown (PR #123 Codex review P2);
         - the auto cap is derived from PERSISTED chain rows only, counted
           independently of the manual and correction caps.
 
@@ -495,7 +498,7 @@ class ReissueService:
         )
         category = self._require_transient_rejected_parent(parent)
         self._require_identical_order_parameters(request, parent)
-        self._require_cooldown_elapsed(parent)
+        cooldown_cutoff = self._require_cooldown_elapsed(parent)
         child = execution_store.create_reissue_execution_order(
             request,
             client_order_id=client_order_id,
@@ -512,6 +515,9 @@ class ReissueService:
             clearance_generation=clearance["clearance_generation"],
             clearance_evidence_id=clearance["evidence_id"],
             clearance_observed_after_utc=self._clearance_cutoff(),
+            # The cooldown is re-verified against the CURRENT parent row
+            # inside the registration transaction (PR #123 Codex review P2).
+            parent_updated_at_not_after_utc=cooldown_cutoff,
             db_path=self._execution_db_path,
         )
         _LOGGER.info(
@@ -763,22 +769,29 @@ class ReissueService:
                 "instead)"
             )
 
-    def _require_cooldown_elapsed(self, parent: dict) -> None:
+    def _require_cooldown_elapsed(self, parent: dict) -> datetime:
         """Issue #117 rapid-fire prevention: the cooldown runs from the
         parent row's persisted ``updated_at_utc`` -- the recording of the
         rejection (a later audited same-state re-observation refreshes it,
         which conservatively RESTARTS the cooldown). Persisted-row derived,
-        so restarts cannot shorten it."""
+        so restarts cannot shorten it.
+
+        Returns the cutoff (now - cooldown) the registration transaction
+        re-verifies against the CURRENT parent row (PR #123 Codex review
+        P2): this pre-check reads the parent outside the transaction, so a
+        legal re-observation landing in the window would otherwise slip an
+        auto reissue past a freshly restarted cooldown."""
+        cutoff = self._now() - self._reissue_policy.auto_reissue_cooldown
         rejected_recorded_at = datetime.fromisoformat(parent["updated_at_utc"])
-        ready_at = rejected_recorded_at + self._reissue_policy.auto_reissue_cooldown
-        now = self._now()
-        if now < ready_at:
+        if rejected_recorded_at > cutoff:
+            ready_at = rejected_recorded_at + self._reissue_policy.auto_reissue_cooldown
             raise ReissueEligibilityError(
                 f"the auto-reissue cooldown has not elapsed: the parent's rejection "
                 f"was recorded at {parent['updated_at_utc']} and the cooldown "
                 f"{self._reissue_policy.auto_reissue_cooldown} runs until "
-                f"{ready_at.isoformat()} (now {now.isoformat()})"
+                f"{ready_at.isoformat()}"
             )
+        return cutoff
 
     def _clearance_cutoff(self) -> datetime:
         """The freshness cutoff the REGISTRATION transaction enforces (the
