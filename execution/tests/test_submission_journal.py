@@ -20,6 +20,7 @@ from broker.fake_broker import FakeBroker, TimeoutOrder
 from execution import execution_store, sqlite_ro
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
@@ -161,6 +162,7 @@ def make_service(
         order_db_path=order_db if order_db is not None else tmp_path / "orders.sqlite3",
         journal_db_path=journal_db,
         clock=lambda: NOW,
+        reissue_policy=ReissuePolicy(),
     )
     return service, broker, SubmissionJournal(journal_db)
 

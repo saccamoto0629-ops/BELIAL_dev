@@ -15,6 +15,7 @@ from broker.broker_models import AccountState, OrderSide, OrderType
 from broker.fake_broker import FakeBroker
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
@@ -331,6 +332,7 @@ def _submit_with_path(tmp_path, *, initialized=True, kill_switch=False):
         order_db_path=tmp_path / "orders.sqlite3",
         journal_db_path=journal_db_path,
         clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
     )
     service.register(request, client_order_id="client-flow-1")
     decision, result = service.submit(request.execution_request_id, market=market)

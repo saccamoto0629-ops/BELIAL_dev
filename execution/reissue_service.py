@@ -42,6 +42,16 @@ contracts, all fail-closed):
   bound stays the Safety Gate's ``max_order_quantity`` on the child's own
   submit.
 
+``ReissuePolicy`` is a MANDATORY constructor argument here and on
+``LiveOrderSubmissionService`` (PR #122 Codex review r2). The clearance
+freshness window is enforced at two boundaries -- registration (here, and
+again inside the registration transaction) and submission -- and a
+submission window WIDER than the registration one silently authorizes
+evidence the registration policy already considers stale. Neither
+constructor therefore invents a default: the composer must name one
+object and hand it to both (``LiveOrderSubmissionService.reissue_policy``
+exposes it for exactly that).
+
 Superseded-intent terminalization (Issue #116): once a gate correction
 retires a parent, the parent's Submission Journal intent -- provably never
 sent (``not_started``) -- must converge to the TERMINAL ``superseded``
@@ -181,14 +191,20 @@ class ReissueService:
         journal_db_path: Path | str,
         decision_db_path: Path | str,
         current_policy: SafetyPolicy,
-        reissue_policy: ReissuePolicy | None = None,
+        reissue_policy: ReissuePolicy,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(current_policy, SafetyPolicy):
             raise ValueError(f"current_policy must be a SafetyPolicy, got {current_policy!r}")
-        if reissue_policy is not None and not isinstance(reissue_policy, ReissuePolicy):
+        # Mandatory, exactly like on the submission boundary (PR #122 Codex
+        # review r2): the registration and submission freshness windows are
+        # ONE policy object, and no constructor may quietly invent its own.
+        if not isinstance(reissue_policy, ReissuePolicy):
             raise ValueError(
-                f"reissue_policy must be a ReissuePolicy or None, got {reissue_policy!r}"
+                f"reissue_policy must be a ReissuePolicy (the SAME instance the "
+                f"submission boundary enforces; there is deliberately no default, so "
+                f"the two freshness windows cannot silently diverge), got "
+                f"{reissue_policy!r}"
             )
         if clock is not None and not callable(clock):
             raise ValueError(f"clock must be a callable returning a datetime, got {clock!r}")
@@ -196,7 +212,7 @@ class ReissueService:
         self._journal = SubmissionJournal(Path(journal_db_path))
         self._decision_db_path = Path(decision_db_path)
         self._current_policy = current_policy
-        self._reissue_policy = reissue_policy or ReissuePolicy()
+        self._reissue_policy = reissue_policy
         self._clock = clock
 
     @property

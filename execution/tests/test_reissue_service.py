@@ -82,7 +82,7 @@ def make_service(db_path, journal_path, safety_path, *, policy=None, reissue_pol
         journal_db_path=journal_path,
         decision_db_path=safety_path,
         current_policy=policy or make_policy(),
-        reissue_policy=reissue_policy,
+        reissue_policy=reissue_policy or ReissuePolicy(),
         clock=clock or (lambda: at(30)),
     )
 

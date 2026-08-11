@@ -65,6 +65,14 @@ Submission contract (docs/architecture/safety_gate.md):
    are resolved by reconciliation (crash-boundary table:
    docs/architecture/submission_journal.md).
 
+Reissue policy (Issue #116 / PR #122 review r2): ``reissue_policy`` is a
+MANDATORY constructor argument -- the SAME ``ReissuePolicy`` instance the
+registration service (``execution/reissue_service.py``) uses. The clearance
+freshness window is enforced at both boundaries, and a submission window
+wider than the registration one would silently authorize evidence the
+registration policy already treats as stale; refusing to default it here
+makes that mismatch unconstructable rather than merely discouraged.
+
 Fail-closed conversions (before any broker call): store lookup failures ->
 ``STATE_QUERY_FAILED``; unregistered intents -> ``INTENT_NOT_REGISTERED``;
 decision persistence or read-back failures -> ``DECISION_PERSIST_FAILED``;
@@ -123,7 +131,7 @@ class LiveOrderSubmissionService:
         order_db_path: str | Path,
         journal_db_path: str | Path,
         clock: Callable[[], datetime],
-        reissue_policy: ReissuePolicy | None = None,
+        reissue_policy: ReissuePolicy,
     ) -> None:
         if not isinstance(connection, BrokerConnection):
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
@@ -153,9 +161,21 @@ class LiveOrderSubmissionService:
             )
         if not callable(clock):
             raise ValueError(f"clock must be a callable returning a UTC datetime, got {clock!r}")
-        if reissue_policy is not None and not isinstance(reissue_policy, ReissuePolicy):
+        # ONE reissue policy governs both boundaries, and naming it is
+        # MANDATORY (PR #122 Codex review r2): a silent default here would
+        # let a composer configure a narrow registration window
+        # (ReissueService) while submissions kept authorizing evidence
+        # under the wider default window -- the mismatch is invisible
+        # precisely because nobody wrote it down. Requiring the argument
+        # makes "both boundaries share one policy object" a property the
+        # code enforces instead of a convention the docs merely ask for.
+        # ``reissue_policy`` is exposed as a read-only property so the
+        # registration service can be built from the very same instance.
+        if not isinstance(reissue_policy, ReissuePolicy):
             raise ValueError(
-                f"reissue_policy must be a ReissuePolicy or None, got {reissue_policy!r}"
+                f"reissue_policy must be a ReissuePolicy (the SAME instance the "
+                f"registration side uses; there is deliberately no default, so the "
+                f"two freshness windows cannot silently diverge), got {reissue_policy!r}"
             )
         self._connection = connection
         self._gate = gate
@@ -163,12 +183,14 @@ class LiveOrderSubmissionService:
         self._order_db_path = Path(order_db_path)
         self._journal = SubmissionJournal(Path(journal_db_path))
         self._clock = clock
-        # ONE reissue policy governs both boundaries (PR #122 Codex review
-        # P2): the registration freshness window (ReissueService) and the
-        # submission freshness cutoff enforced here are the SAME value, so a
-        # composer cannot configure a narrow registration window while
-        # submissions silently authorize evidence under a wider default.
-        self._reissue_policy = reissue_policy or ReissuePolicy()
+        self._reissue_policy = reissue_policy
+
+    @property
+    def reissue_policy(self) -> ReissuePolicy:
+        """The reissue policy this submission boundary enforces. Compose the
+        registration service from THIS object so both boundaries provably
+        share one policy."""
+        return self._reissue_policy
 
     # --- intent registration -------------------------------------------------
 

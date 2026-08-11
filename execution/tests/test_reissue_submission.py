@@ -105,9 +105,6 @@ def make_submission_service(
     SQLiteSafetyDecisionStore(decision_db).initialize()
     SubmissionJournal(journal_db).initialize()
     clock = clock or (lambda: at(100))
-    kwargs = {}
-    if reissue_policy is not None:
-        kwargs["reissue_policy"] = reissue_policy
     service = LiveOrderSubmissionService(
         connection=BrokerConnection(broker=broker),
         gate=SafetyGate(policy=make_policy(), state_provider=StaticSafetyState(), clock=clock),
@@ -115,7 +112,7 @@ def make_submission_service(
         order_db_path=db_path,
         journal_db_path=journal_db,
         clock=clock,
-        **kwargs,
+        reissue_policy=reissue_policy or ReissuePolicy(),
     )
     return service, broker, journal_db
 
@@ -334,6 +331,7 @@ def test_journal_terminalization_failure_keeps_the_refusal_and_the_sweep_recover
         journal_db_path=journal_db,
         decision_db_path=tmp_path / "safety_gate_decisions.sqlite3",
         current_policy=make_policy(),
+        reissue_policy=ReissuePolicy(),
         clock=lambda: at(200),
     )
     actions = sweep.terminalize_superseded_intents()
@@ -379,8 +377,63 @@ def test_a_narrow_reissue_policy_governs_the_submission_cutoff(tmp_path, db_path
     assert decision.allowed and result is not None
 
 
-def test_the_submission_service_rejects_a_non_policy_object(tmp_path, db_path):
-    with pytest.raises(ValueError, match="reissue_policy"):
-        make_submission_service(
-            tmp_path, db_path, reissue_policy=timedelta(seconds=30)
-        )
+
+
+def test_both_boundaries_require_an_explicitly_named_reissue_policy(tmp_path, db_path):
+    """PR #122 review r2: neither constructor may invent a policy. Omitting
+    the argument is a TypeError and passing None a ValueError, so the
+    dangerous configuration (a narrow registration window paired with a
+    wider DEFAULT submission window) cannot be built at all."""
+    from execution.reissue_service import ReissueService
+
+    decision_db = tmp_path / "safety_gate_decisions.sqlite3"
+    journal_db = tmp_path / "submission_journal.sqlite3"
+    SQLiteSafetyDecisionStore(decision_db).initialize()
+    SubmissionJournal(journal_db).initialize()
+    submission_kwargs = dict(
+        connection=BrokerConnection(broker=make_broker()),
+        gate=SafetyGate(
+            policy=make_policy(), state_provider=StaticSafetyState(), clock=lambda: at(100)
+        ),
+        decision_db_path=decision_db,
+        order_db_path=db_path,
+        journal_db_path=journal_db,
+        clock=lambda: at(100),
+    )
+    with pytest.raises(TypeError, match="reissue_policy"):
+        LiveOrderSubmissionService(**submission_kwargs)
+    with pytest.raises(ValueError, match="reissue_policy must be a ReissuePolicy"):
+        LiveOrderSubmissionService(**submission_kwargs, reissue_policy=None)
+
+    registration_kwargs = dict(
+        execution_db_path=db_path,
+        journal_db_path=journal_db,
+        decision_db_path=decision_db,
+        current_policy=make_policy(),
+    )
+    with pytest.raises(TypeError, match="reissue_policy"):
+        ReissueService(**registration_kwargs)
+    with pytest.raises(ValueError, match="reissue_policy must be a ReissuePolicy"):
+        ReissueService(**registration_kwargs, reissue_policy=None)
+
+
+def test_the_submission_policy_is_exposed_so_both_boundaries_share_one_object(
+    tmp_path, db_path
+):
+    """The composer names ONE policy and can build the registration service
+    from the very instance the submission boundary enforces."""
+    from execution.reissue_service import ReissueService
+
+    policy = ReissuePolicy(clearance_max_age=timedelta(seconds=30))
+    service, _, journal_db = make_submission_service(
+        tmp_path, db_path, reissue_policy=policy
+    )
+    assert service.reissue_policy is policy
+    registration = ReissueService(
+        execution_db_path=db_path,
+        journal_db_path=journal_db,
+        decision_db_path=tmp_path / "safety_gate_decisions.sqlite3",
+        current_policy=make_policy(),
+        reissue_policy=service.reissue_policy,
+    )
+    assert registration.reissue_policy is policy

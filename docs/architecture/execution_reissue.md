@@ -252,7 +252,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 **全経路に共通する前提**: 有効な **reissue clearance**(order / position 双方の照合が成功した無差分の積極的証拠・鮮度窓内)が必要であり、登録時だけでなく**送信の瞬間まで有効**でなければならない(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
 
 - 回数の判定は**常に永続化された行から導出**する(該当 signal の MAX(`signal_attempt`) と `reissue_kind` / `initiated_by` の集計)。in-memory カウンタ・プロセス状態には依存しないため、**プロセス再起動・多重起動後も上限と一意性が維持される**。
-- 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する(`max_total_attempts_per_signal`、**既定 4**)。clearance の**鮮度窓は `ReissuePolicy.clearance_max_age`(既定 5 分)**であり、登録時(`ReissueService`。事前確認 + 登録トランザクション内の cutoff 照合)と送信時(`LiveOrderSubmissionService` が `mark_submitting()` へ渡す cutoff)の両方で判定される。**両境界は同一の `ReissuePolicy` オブジェクトを共有する**(PR #122 Codex レビュー P2): 送信サービスは `reissue_policy` を受け取り、独自の既定値を持たない — composer が狭い登録窓を設定しながら送信側が広い既定窓で認可してしまう構成を作れないようにするためである。
+- 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する(`max_total_attempts_per_signal`、**既定 4**)。clearance の**鮮度窓は `ReissuePolicy.clearance_max_age`(既定 5 分)**であり、登録時(`ReissueService`。事前確認 + 登録トランザクション内の cutoff 照合)と送信時(`LiveOrderSubmissionService` が `mark_submitting()` へ渡す cutoff)の両方で判定される。**両境界は同一の `ReissuePolicy` オブジェクトを共有し、その明示は必須である**(PR #122 Codex レビュー P2 / r2): `LiveOrderSubmissionService` と `ReissueService` はいずれも `reissue_policy` を**必須引数**として受け取り、**既定値を持たない**(省略は `TypeError`、`None` は `ValueError`)。silent default を残すと「登録側だけ 30 秒に絞り、送信側は既定 5 分のまま」という**危険な向きの不一致**(送信窓 > 登録窓 = 登録が stale と見なす evidence を送信が認可する)を composer が無自覚に作れてしまうためである。`LiveOrderSubmissionService.reissue_policy` プロパティが同一インスタンスを公開するので、登録サービスはそこから合成できる。
 
 ## 監査・再起動耐性・並行実行
 

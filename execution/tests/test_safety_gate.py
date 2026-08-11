@@ -32,6 +32,7 @@ from broker.fake_broker import FailCommunication, FakeBroker, RejectOrder, Timeo
 from execution import execution_store
 from execution.execution_models import ExecutionRequest
 from execution.live_submission import LiveOrderSubmissionService
+from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
@@ -148,6 +149,7 @@ def make_service(
         order_db_path=tmp_path / "orders.sqlite3",
         journal_db_path=journal_db_path,
         clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
     )
     # Reader handle for assertions only (the service's own store is sealed).
     return service, conn.broker, SQLiteSafetyDecisionStore(decision_db_path)
@@ -474,6 +476,7 @@ def test_decision_store_cannot_be_injected_as_an_object(tmp_path):
                 order_db_path=tmp_path / "orders.sqlite3",
                 journal_db_path=tmp_path / "journal.sqlite3",
                 clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
             )
 
 
@@ -1337,6 +1340,7 @@ def test_two_concurrent_services_reach_the_broker_exactly_once(tmp_path, monkeyp
                 order_db_path=order_db,
                 journal_db_path=journal_db,
                 clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
             )
         )
     services[0].register(req, client_order_id="client-1")
