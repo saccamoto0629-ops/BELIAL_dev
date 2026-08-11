@@ -38,6 +38,12 @@ from execution.live_submission import (
     CancelRefusalCode,
     CancelStatus,
 )
+from execution.submission_journal import (
+    CANCEL_OUTCOME_BROKER_REFUSED,
+    OUTCOME_COMPLETED,
+    OUTCOME_RECONCILIATION_REQUIRED,
+    SubmissionJournal,
+)
 
 # Shared helpers of the submission suite (tests run per-directory, so sibling
 # helpers import flat -- same style as test_scenario_runner.py).
@@ -395,6 +401,130 @@ def test_cancel_double_failure_keeps_the_order_visible_in_flight(tmp_path, monke
     assert stored_state(tmp_path) == ("submitted", "accepted")
     in_flight = execution_store.list_in_flight_orders(db_path=tmp_path / "orders.sqlite3")
     assert [row["execution_request_id"] for row in in_flight] == ["exec-1"]
+    # The P1 crash window (PR #124 review): the order row still reads
+    # cancellable, but the DURABLE journal claim blocks any re-send -- from
+    # this service and from a fresh one (process-restart equivalence).
+    retry = service.cancel("exec-1")
+    assert retry.status is CancelStatus.REFUSED
+    assert retry.refusal_code is CancelRefusalCode.ATTEMPT_UNRESOLVED
+    fresh_service, _, _ = make_service(
+        tmp_path, conn=connection(broker), initialize_decisions=False, initialize_journal=False
+    )
+    restarted = fresh_service.cancel("exec-1")
+    assert restarted.refusal_code is CancelRefusalCode.ATTEMPT_UNRESOLVED
+    assert broker.cancel_requests == ["client-1"]  # exactly one broker cancel ever
+    # ... and the claim is visible on the reconciliation hand-off surface.
+    journal = SubmissionJournal(tmp_path / "journal.sqlite3")
+    unresolved = journal.list_unresolved_cancellations()
+    assert [entry.execution_request_id for entry in unresolved] == ["exec-1"]
+
+
+# --- durable cancel claim (PR #124 Codex review P1) ---------------------------
+
+
+def test_cancel_success_completes_the_durable_claim(tmp_path):
+    service, broker = accepted_order(tmp_path)
+    assert service.cancel("exec-1").status is CancelStatus.CANCELLED
+    entry = SubmissionJournal(tmp_path / "journal.sqlite3").get_cancellation_entry("exec-1")
+    assert entry is not None and entry.outcome == OUTCOME_COMPLETED
+    assert entry.broker_response_state is OrderState.CANCELLED
+
+
+def test_cancel_timeout_flags_the_claim_reconciliation_required(tmp_path):
+    broker = make_broker()
+    broker.script_order("client-1", StayPending(broker_order_id="BRK-1"))
+    broker.script_cancel("client-1", TimeoutCancellation())
+    service, broker = accepted_order(tmp_path, broker=broker)
+    with pytest.raises(BrokerTimeoutError):
+        service.cancel("exec-1")
+    journal = SubmissionJournal(tmp_path / "journal.sqlite3")
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.outcome == OUTCOME_RECONCILIATION_REQUIRED
+    assert [e.execution_request_id for e in journal.list_unresolved_cancellations()] == ["exec-1"]
+
+
+def test_broker_refused_cancel_terminalizes_the_claim_and_allows_a_new_attempt(tmp_path):
+    broker = make_broker()
+    broker.script_order("client-1", StayPending(broker_order_id="BRK-1"))
+    broker.script_cancel("client-1", FailCancellation(reason="hold"))
+    service, broker = accepted_order(tmp_path, broker=broker)
+    assert service.cancel("exec-1").status is CancelStatus.BROKER_REFUSED
+    journal = SubmissionJournal(tmp_path / "journal.sqlite3")
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.outcome == CANCEL_OUTCOME_BROKER_REFUSED and entry.attempt_count == 1
+    assert journal.list_unresolved_cancellations() == ()  # terminal, not unresolved
+    assert service.cancel("exec-1").status is CancelStatus.BROKER_REFUSED
+    assert journal.get_cancellation_entry("exec-1").attempt_count == 2
+    assert broker.cancel_requests == ["client-1", "client-1"]
+
+
+def test_cancel_without_the_journal_fails_closed_before_the_broker(tmp_path):
+    service, broker = accepted_order(tmp_path)
+    (tmp_path / "journal.sqlite3").unlink()
+    outcome = service.cancel("exec-1")
+    assert outcome.status is CancelStatus.REFUSED
+    assert outcome.refusal_code is CancelRefusalCode.JOURNAL_FAILED
+    assert broker.cancel_requests == []  # the broker was never reached
+
+
+def test_cancel_started_mark_failure_fails_closed(tmp_path, monkeypatch):
+    """A claim whose ``started`` mark cannot be written refuses BEFORE the
+    broker; the ``not_started`` claim stays reclaimable, so a later cancel
+    succeeds normally."""
+    service, broker = accepted_order(tmp_path)
+    from execution.submission_journal import SubmissionJournal as SJ
+
+    real = SJ.mark_cancel_broker_call_started
+    monkeypatch.setattr(
+        SJ,
+        "mark_cancel_broker_call_started",
+        lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("journal down")),
+    )
+    outcome = service.cancel("exec-1")
+    assert outcome.refusal_code is CancelRefusalCode.JOURNAL_FAILED
+    assert broker.cancel_requests == []
+    monkeypatch.setattr(SJ, "mark_cancel_broker_call_started", real)
+    assert service.cancel("exec-1").status is CancelStatus.CANCELLED
+    assert broker.cancel_requests == ["client-1"]
+
+
+def test_concurrent_cancels_send_exactly_one_broker_cancel(tmp_path):
+    """Two callers race past the state precheck together; the durable claim
+    plus its one-shot started transition let exactly ONE reach the broker."""
+    import threading
+
+    service, broker = accepted_order(tmp_path)
+    barrier = threading.Barrier(2)
+    results: list = [None, None]
+
+    def work(index: int) -> None:
+        worker, _, _ = make_service(
+            tmp_path, conn=connection(broker), initialize_decisions=False, initialize_journal=False
+        )
+        barrier.wait(timeout=30)
+        try:
+            results[index] = worker.cancel("exec-1")
+        except Exception as exc:  # pragma: no cover - would fail the assertions
+            results[index] = exc
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert broker.cancel_requests == ["client-1"]  # exactly one broker cancel
+    outcomes = [r for r in results if isinstance(r, CancelOutcome)]
+    assert len(outcomes) == 2
+    cancelled = [o for o in outcomes if o.status is CancelStatus.CANCELLED]
+    refused = [o for o in outcomes if o.status is CancelStatus.REFUSED]
+    assert len(cancelled) == 1 and len(refused) == 1
+    # The loser lost either the claim insert or the one-shot started
+    # transition -- both are fail-closed refusals that never reach the broker.
+    assert refused[0].refusal_code in (
+        CancelRefusalCode.ATTEMPT_UNRESOLVED,
+        CancelRefusalCode.JOURNAL_FAILED,
+    )
+    assert stored_state(tmp_path) == ("submitted", "cancelled")
 
 
 # --- CancelOutcome invariants -------------------------------------------------

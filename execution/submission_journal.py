@@ -54,6 +54,20 @@ intent whose order CONTENT changed (e.g. MARKET turned LIMIT, or a moved
 limit price) can never silently reuse the journaled attempt (PR #113
 review P1).
 
+Cancellation journal (Issue #99 / PR #124 review P1, schema v3): the same
+DB file additionally holds the ``cancellation_journal`` table -- one durable
+CANCEL-attempt claim per order for the sanctioned cancel path
+(``LiveOrderSubmissionService.cancel``). The order row's state alone cannot
+close the crash window between ``Broker.cancel_order`` and the outcome
+writes (the row still reads cancellable), nor the window where two
+concurrent callers both pass the state precheck; the claim's atomic
+acquisition and its one-shot ``not_started -> started`` transition close
+both. Lifecycle mirrors the submission side; the cancel-specific terminal
+outcome ``broker_refused`` (definitive ``BrokerCancellationError``) is
+reclaimable as a NEW attempt because a definitively refused cancel leaves
+nothing pending at the broker. ``list_unresolved_cancellations()`` is the
+reconciliation hand-off surface.
+
 Fail-closed contract (Issue #93): every write raises on ANY failure --
 missing/uninitialized DB, schema mismatch, precondition violation, insert
 failure. The sanctioned submission path treats any journal failure BEFORE
@@ -103,7 +117,8 @@ DEFAULT_DB_PATH = BASE_DIR / "data" / "submission_journal.sqlite3"
 BUSY_TIMEOUT_SECONDS = 30
 
 JOURNAL_TABLE = "submission_journal"
-SCHEMA_VERSION = 2
+CANCELLATION_TABLE = "cancellation_journal"
+SCHEMA_VERSION = 3
 
 # broker_call_state values (see the module docstring for the semantics).
 BROKER_CALL_NOT_STARTED = "not_started"
@@ -140,6 +155,20 @@ OUTCOMES: frozenset[str] = frozenset(
 # unresolved, so ``list_unresolved`` excludes them.
 TERMINAL_OUTCOMES: frozenset[str] = frozenset({OUTCOME_COMPLETED, OUTCOME_SUPERSEDED})
 
+# Cancellation journal outcomes (Issue #99, schema v3). ``broker_refused`` is
+# the cancel-specific TERMINAL outcome: the broker DEFINITIVELY refused the
+# cancellation (``BrokerCancellationError``), so no cancel is pending at the
+# broker -- which is exactly why a later cancel may reclaim such a row as a
+# NEW attempt (``attempt_count`` + 1). ``superseded`` does not exist for
+# cancels (there is no reissue-supersession of a cancel attempt).
+CANCEL_OUTCOME_BROKER_REFUSED = "broker_refused"
+CANCEL_OUTCOMES: frozenset[str] = frozenset(
+    {OUTCOME_OPEN, OUTCOME_COMPLETED, OUTCOME_RECONCILIATION_REQUIRED, CANCEL_OUTCOME_BROKER_REFUSED}
+)
+TERMINAL_CANCEL_OUTCOMES: frozenset[str] = frozenset(
+    {OUTCOME_COMPLETED, CANCEL_OUTCOME_BROKER_REFUSED}
+)
+
 _ENTRY_COLUMNS: tuple[str, ...] = (
     "execution_request_id",
     "client_order_id",
@@ -159,6 +188,20 @@ _ENTRY_COLUMNS: tuple[str, ...] = (
     "last_error",
     "updated_at_utc",
     "superseded_by_execution_request_id",
+)
+
+_CANCEL_COLUMNS: tuple[str, ...] = (
+    "execution_request_id",
+    "client_order_id",
+    "attempt_count",
+    "cancellation_started_at_utc",
+    "broker_call_state",
+    "broker_response_state",
+    "broker_order_id",
+    "execution_db_save_state",
+    "outcome",
+    "last_error",
+    "updated_at_utc",
 )
 
 
@@ -258,7 +301,47 @@ def _create_journal_table_sql(*, version: int = SCHEMA_VERSION) -> str:
     """
 
 
+def _create_cancellation_table_sql() -> str:
+    """Cancellation journal (Issue #99, schema v3): one row per order naming
+    the durable CANCEL-attempt claim. The lifecycle mirrors the submission
+    journal -- ``not_started`` -> ``started`` -> ``responded`` | ``unknown``
+    -- with one cancel-specific terminal outcome: ``broker_refused`` (the
+    broker definitively refused; ``broker_response_state`` stays NULL because
+    a refusal carries no OrderResult, and the row is reclaimable as a NEW
+    attempt). The CHECKs mirror :class:`CancellationJournalEntry`."""
+    states = _enum_values_sql(OrderState)
+    call_states = "', '".join(sorted(BROKER_CALL_STATES))
+    save_states = "', '".join(sorted(DB_SAVE_STATES))
+    outcomes = "', '".join(sorted(CANCEL_OUTCOMES))
+    return f"""
+        CREATE TABLE {CANCELLATION_TABLE} (
+            execution_request_id TEXT PRIMARY KEY NOT NULL CHECK (trim(execution_request_id) <> ''),
+            client_order_id TEXT NOT NULL UNIQUE CHECK (trim(client_order_id) <> ''),
+            attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+            cancellation_started_at_utc TEXT NOT NULL CHECK (cancellation_started_at_utc LIKE '%+00:00'),
+            broker_call_state TEXT NOT NULL CHECK (broker_call_state IN ('{call_states}')),
+            broker_response_state TEXT CHECK (broker_response_state IS NULL OR broker_response_state IN ('{states}')),
+            broker_order_id TEXT CHECK (broker_order_id IS NULL OR trim(broker_order_id) <> ''),
+            execution_db_save_state TEXT NOT NULL CHECK (execution_db_save_state IN ('{save_states}')),
+            outcome TEXT NOT NULL CHECK (outcome IN ('{outcomes}')),
+            last_error TEXT CHECK (last_error IS NULL OR trim(last_error) <> ''),
+            updated_at_utc TEXT NOT NULL CHECK (updated_at_utc LIKE '%+00:00'),
+            CHECK (broker_response_state IS NULL OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
+            CHECK (broker_call_state <> '{BROKER_CALL_RESPONDED}' OR broker_response_state IS NOT NULL OR outcome = '{CANCEL_OUTCOME_BROKER_REFUSED}'),
+            CHECK (outcome <> '{CANCEL_OUTCOME_BROKER_REFUSED}' OR (broker_call_state = '{BROKER_CALL_RESPONDED}' AND broker_response_state IS NULL AND execution_db_save_state = '{DB_SAVE_NOT_ATTEMPTED}' AND last_error IS NOT NULL)),
+            CHECK (broker_order_id IS NULL OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
+            CHECK (execution_db_save_state = '{DB_SAVE_NOT_ATTEMPTED}' OR broker_call_state = '{BROKER_CALL_RESPONDED}'),
+            CHECK ((outcome = '{OUTCOME_COMPLETED}') = (execution_db_save_state = '{DB_SAVE_SAVED}')),
+            CHECK (broker_call_state <> '{BROKER_CALL_STARTED}' OR outcome = '{OUTCOME_OPEN}'),
+            CHECK (broker_call_state <> '{BROKER_CALL_NOT_STARTED}' OR outcome = '{OUTCOME_OPEN}'),
+            CHECK (broker_call_state <> '{BROKER_CALL_UNKNOWN}' OR (outcome = '{OUTCOME_RECONCILIATION_REQUIRED}' AND last_error IS NOT NULL)),
+            CHECK (execution_db_save_state <> '{DB_SAVE_FAILED}' OR (outcome = '{OUTCOME_RECONCILIATION_REQUIRED}' AND last_error IS NOT NULL))
+        ) WITHOUT ROWID
+    """
+
+
 _JOURNAL_OUTCOME_INDEX = f"idx_{JOURNAL_TABLE}_outcome"
+_CANCELLATION_OUTCOME_INDEX = f"idx_{CANCELLATION_TABLE}_outcome"
 
 
 def _create_index_sql() -> str:
@@ -268,28 +351,39 @@ def _create_index_sql() -> str:
     )
 
 
+def _create_cancellation_index_sql() -> str:
+    return (
+        f"CREATE INDEX {_CANCELLATION_OUTCOME_INDEX} ON {CANCELLATION_TABLE} "
+        "(outcome, updated_at_utc)"
+    )
+
+
 def _create_schema(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> None:
     connection.execute(_create_journal_table_sql(version=version))
     connection.execute(_create_index_sql())
+    if version >= 3:
+        connection.execute(_create_cancellation_table_sql())
+        connection.execute(_create_cancellation_index_sql())
     connection.execute(f"PRAGMA user_version = {version}")
 
 
-def _structure_signature(connection: sqlite3.Connection) -> dict:
-    signature: dict = {
-        f"table_info:{JOURNAL_TABLE}": [
-            tuple(row) for row in connection.execute(f"PRAGMA table_info({JOURNAL_TABLE})")
-        ],
-        f"foreign_keys:{JOURNAL_TABLE}": [
-            tuple(row) for row in connection.execute(f"PRAGMA foreign_key_list({JOURNAL_TABLE})")
-        ],
-    }
-    index_entries = []
-    for index_row in connection.execute(f"PRAGMA index_list({JOURNAL_TABLE})"):
-        columns = [
-            tuple(info) for info in connection.execute(f"PRAGMA index_info({index_row[1]})")
+def _structure_signature(connection: sqlite3.Connection, *, version: int = SCHEMA_VERSION) -> dict:
+    tables = (JOURNAL_TABLE,) if version < 3 else (JOURNAL_TABLE, CANCELLATION_TABLE)
+    signature: dict = {}
+    for table in tables:
+        signature[f"table_info:{table}"] = [
+            tuple(row) for row in connection.execute(f"PRAGMA table_info({table})")
         ]
-        index_entries.append((index_row[1], index_row[2], index_row[3], index_row[4], columns))
-    signature[f"indexes:{JOURNAL_TABLE}"] = sorted(index_entries)
+        signature[f"foreign_keys:{table}"] = [
+            tuple(row) for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        ]
+        index_entries = []
+        for index_row in connection.execute(f"PRAGMA index_list({table})"):
+            columns = [
+                tuple(info) for info in connection.execute(f"PRAGMA index_info({index_row[1]})")
+            ]
+            index_entries.append((index_row[1], index_row[2], index_row[3], index_row[4], columns))
+        signature[f"indexes:{table}"] = sorted(index_entries)
     return signature
 
 
@@ -307,7 +401,10 @@ def _reference_schema(version: int = SCHEMA_VERSION) -> tuple[dict, dict]:
                 (row[0], row[1]): (row[2], None if row[3] is None else _ddl_tokens(row[3]))
                 for row in connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
             }
-            _REFERENCE_SCHEMA_CACHE[version] = (objects, _structure_signature(connection))
+            _REFERENCE_SCHEMA_CACHE[version] = (
+                objects,
+                _structure_signature(connection, version=version),
+            )
     return _REFERENCE_SCHEMA_CACHE[version]
 
 
@@ -343,7 +440,7 @@ def _verify_schema(
                 "(constraints missing or altered)"
             )
 
-    if not problems and _structure_signature(connection) != expected_signature:
+    if not problems and _structure_signature(connection, version=version) != expected_signature:
         problems.append(
             "live PRAGMA structure (table_info/index_list/index_info/foreign_key_list) "
             "differs from the reference schema"
@@ -592,6 +689,138 @@ def _entry_from_row(row, db_path: Path) -> SubmissionJournalEntry:
         ) from exc
 
 
+@dataclass(frozen=True)
+class CancellationJournalEntry:
+    """One journaled CANCEL attempt (Issue #99), with the full lifecycle
+    invariants enforced at construction (restore-time validation reuses
+    this). ``attempt_count`` counts the attempts this row represented: a
+    definitively broker-refused row may be reclaimed as a NEW attempt."""
+
+    execution_request_id: str
+    client_order_id: str
+    attempt_count: int
+    cancellation_started_at_utc: datetime
+    broker_call_state: str
+    execution_db_save_state: str
+    outcome: str
+    updated_at_utc: datetime
+    broker_response_state: OrderState | None = None
+    broker_order_id: str | None = None
+    last_error: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.execution_request_id, "execution_request_id")
+        _require_non_empty_str(self.client_order_id, "client_order_id")
+        if isinstance(self.attempt_count, bool) or not isinstance(self.attempt_count, int) or self.attempt_count < 1:
+            raise ValueError(f"attempt_count must be an int >= 1, got {self.attempt_count!r}")
+        _require_utc(self.cancellation_started_at_utc, "cancellation_started_at_utc")
+        _require_utc(self.updated_at_utc, "updated_at_utc")
+        if self.broker_call_state not in BROKER_CALL_STATES:
+            raise ValueError(f"unknown broker_call_state {self.broker_call_state!r}")
+        if self.execution_db_save_state not in DB_SAVE_STATES:
+            raise ValueError(f"unknown execution_db_save_state {self.execution_db_save_state!r}")
+        if self.outcome not in CANCEL_OUTCOMES:
+            raise ValueError(f"unknown cancellation outcome {self.outcome!r}")
+        if self.broker_response_state is not None and not isinstance(
+            self.broker_response_state, OrderState
+        ):
+            raise ValueError(
+                f"broker_response_state must be an OrderState or None, got "
+                f"{self.broker_response_state!r}"
+            )
+        if self.broker_order_id is not None:
+            _require_non_empty_str(self.broker_order_id, "broker_order_id")
+        if self.last_error is not None:
+            _require_non_empty_str(self.last_error, "last_error")
+        # Lifecycle cross-field invariants (mirrored by the DB CHECKs).
+        responded = self.broker_call_state == BROKER_CALL_RESPONDED
+        refused = self.outcome == CANCEL_OUTCOME_BROKER_REFUSED
+        if refused:
+            # The one cancel-specific shape: the broker ANSWERED (responded)
+            # with a definitive refusal that carries no OrderResult.
+            if (
+                not responded
+                or self.broker_response_state is not None
+                or self.execution_db_save_state != DB_SAVE_NOT_ATTEMPTED
+                or self.last_error is None
+            ):
+                raise ValueError(
+                    f"outcome {CANCEL_OUTCOME_BROKER_REFUSED!r} requires a responded "
+                    "broker call with no response snapshot, no Execution DB save and "
+                    "a recorded refusal reason"
+                )
+        else:
+            if responded != (self.broker_response_state is not None):
+                raise ValueError(
+                    "broker_response_state must be present exactly when "
+                    f"broker_call_state is {BROKER_CALL_RESPONDED!r} (got state "
+                    f"{self.broker_call_state!r}, response {self.broker_response_state!r})"
+                )
+        if self.broker_order_id is not None and not responded:
+            raise ValueError(
+                f"broker_order_id requires broker_call_state {BROKER_CALL_RESPONDED!r}, "
+                f"got {self.broker_call_state!r}"
+            )
+        if self.execution_db_save_state != DB_SAVE_NOT_ATTEMPTED and not responded:
+            raise ValueError(
+                "an Execution DB save can only be recorded for a responded broker call "
+                f"(got call state {self.broker_call_state!r}, save state "
+                f"{self.execution_db_save_state!r})"
+            )
+        if (self.outcome == OUTCOME_COMPLETED) != (self.execution_db_save_state == DB_SAVE_SAVED):
+            raise ValueError(
+                f"outcome {OUTCOME_COMPLETED!r} and execution_db_save_state "
+                f"{DB_SAVE_SAVED!r} must coincide (got outcome {self.outcome!r}, save "
+                f"state {self.execution_db_save_state!r})"
+            )
+        if self.broker_call_state in (BROKER_CALL_NOT_STARTED, BROKER_CALL_STARTED) and (
+            self.outcome != OUTCOME_OPEN
+        ):
+            raise ValueError(
+                f"broker_call_state {self.broker_call_state!r} requires outcome "
+                f"{OUTCOME_OPEN!r}, got {self.outcome!r}"
+            )
+        if self.broker_call_state == BROKER_CALL_UNKNOWN and (
+            self.outcome != OUTCOME_RECONCILIATION_REQUIRED or self.last_error is None
+        ):
+            raise ValueError(
+                f"broker_call_state {BROKER_CALL_UNKNOWN!r} requires outcome "
+                f"{OUTCOME_RECONCILIATION_REQUIRED!r} and a recorded last_error"
+            )
+        if self.execution_db_save_state == DB_SAVE_FAILED and (
+            self.outcome != OUTCOME_RECONCILIATION_REQUIRED or self.last_error is None
+        ):
+            raise ValueError(
+                f"execution_db_save_state {DB_SAVE_FAILED!r} requires outcome "
+                f"{OUTCOME_RECONCILIATION_REQUIRED!r} and a recorded last_error"
+            )
+
+
+def _cancel_entry_from_row(row, db_path: Path) -> CancellationJournalEntry:
+    try:
+        return CancellationJournalEntry(
+            execution_request_id=row["execution_request_id"],
+            client_order_id=row["client_order_id"],
+            attempt_count=row["attempt_count"],
+            cancellation_started_at_utc=_parse_utc(row["cancellation_started_at_utc"]),
+            broker_call_state=row["broker_call_state"],
+            broker_response_state=(
+                None
+                if row["broker_response_state"] is None
+                else OrderState(row["broker_response_state"])
+            ),
+            broker_order_id=row["broker_order_id"],
+            execution_db_save_state=row["execution_db_save_state"],
+            outcome=row["outcome"],
+            last_error=row["last_error"],
+            updated_at_utc=_parse_utc(row["updated_at_utc"]),
+        )
+    except (ValueError, TypeError, InvalidOperation) as exc:
+        raise SubmissionJournalIntegrityError(
+            f"cancellation journal row in {db_path} failed restore-time validation: {exc}"
+        ) from exc
+
+
 class SubmissionJournal:
     """The durable Submission Journal store (see the module docstring).
 
@@ -629,6 +858,9 @@ class SubmissionJournal:
                     _verify_schema(connection, self._path)
                 elif version == 1:
                     self._migrate_v1_to_v2(connection)
+                    self._migrate_v2_to_v3(connection)
+                elif version == 2:
+                    self._migrate_v2_to_v3(connection)
                 else:
                     _verify_schema(connection, self._path)
                 connection.execute("COMMIT")
@@ -669,13 +901,27 @@ class SubmissionJournal:
             )
         connection.execute(f"DROP TABLE {migration_table}")
         connection.execute(_create_index_sql())
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        _verify_schema(connection, self._path)
+        connection.execute("PRAGMA user_version = 2")
+        _verify_schema(connection, self._path, version=2)
         # every migrated row must restore as a valid v2 entry
         for row in connection.execute(
             f"SELECT {', '.join(_ENTRY_COLUMNS)} FROM {JOURNAL_TABLE}"
         ):
             _entry_from_row(row, self._path)
+
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        """v2 -> v3 migration (Issue #99), inside the caller's ``BEGIN
+        IMMEDIATE`` transaction. Purely ADDITIVE: verify the DB matches the
+        released v2 schema COMPLETELY, create the (empty) cancellation
+        journal table plus its index, bump the version, and fully re-verify
+        as v3. Existing submission rows are untouched byte-for-byte; any
+        failure rolls the whole transaction back and leaves the v2 file
+        unmodified."""
+        _verify_schema(connection, self._path, version=2)
+        connection.execute(_create_cancellation_table_sql())
+        connection.execute(_create_cancellation_index_sql())
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _verify_schema(connection, self._path)
 
     # --- writes (all fail closed) --------------------------------------------
 
@@ -1042,6 +1288,276 @@ class SubmissionJournal:
             self._read_back(connection, execution_request_id)
         return True
 
+    # --- cancellation journal (Issue #99) ------------------------------------
+
+    def record_cancellation_intent(
+        self,
+        *,
+        execution_request_id: str,
+        client_order_id: str,
+        started_at_utc: datetime,
+    ) -> None:
+        """Durably CLAIM a cancel attempt BEFORE any broker cancel call.
+
+        This is the atomic claim the sanctioned cancel path requires (PR
+        #124 Codex review P1): concurrent callers serialize on the ``BEGIN
+        IMMEDIATE`` transaction, and a restarted caller finds the durable
+        row -- so a possibly-sent cancel can never be sent again. Rules:
+
+        - no row -> INSERT (``not_started``, ``open``, attempt 1);
+        - ``not_started`` row -> RECLAIM (the broker cancel was provably
+          never sent; refreshes the timestamps, refuses moving them
+          backwards, keeps the attempt count);
+        - ``broker_refused`` row (terminal, definitively NOT cancelled and
+          nothing pending at the broker) -> RECLAIM as a NEW attempt
+          (``attempt_count`` + 1, lifecycle reset to ``not_started``);
+        - anything else -- ``started`` / ``unknown`` / ``responded`` /
+          ``reconciliation_required`` / ``completed`` -- CONFLICTS
+          (:class:`SubmissionJournalConflictError`): a broker cancel may
+          have happened (or definitively did); re-sending is banned and
+          unresolved rows are reconciliation's to resolve;
+        - a stored ``client_order_id`` differing from this order's binding,
+          or one journaled for a different request, CONFLICTS.
+        """
+        _require_non_empty_str(execution_request_id, "execution_request_id")
+        _require_non_empty_str(client_order_id, "client_order_id")
+        _require_utc(started_at_utc, "started_at_utc")
+        self._require_db_file()
+        with _verified_txn(self._path) as connection:
+            existing_row = self._fetch_cancel_row(connection, execution_request_id)
+            if existing_row is None:
+                owner = connection.execute(
+                    f"SELECT execution_request_id FROM {CANCELLATION_TABLE} "
+                    "WHERE client_order_id = ?",
+                    (client_order_id,),
+                ).fetchone()
+                if owner is not None:
+                    self._conflict(
+                        execution_request_id,
+                        f"client_order_id {client_order_id!r} already has a journaled "
+                        f"cancel attempt for execution_request_id "
+                        f"{owner['execution_request_id']!r}",
+                    )
+                connection.execute(
+                    f"INSERT INTO {CANCELLATION_TABLE} ({', '.join(_CANCEL_COLUMNS)}) "
+                    f"VALUES ({', '.join('?' for _ in _CANCEL_COLUMNS)})",
+                    (
+                        execution_request_id,
+                        client_order_id,
+                        1,
+                        started_at_utc.isoformat(),
+                        BROKER_CALL_NOT_STARTED,
+                        None,
+                        None,
+                        DB_SAVE_NOT_ATTEMPTED,
+                        OUTCOME_OPEN,
+                        None,
+                        started_at_utc.isoformat(),
+                    ),
+                )
+            else:
+                existing = _cancel_entry_from_row(existing_row, self._path)
+                if existing.client_order_id != client_order_id:
+                    self._conflict(
+                        execution_request_id,
+                        f"the journaled cancel attempt is bound to client_order_id "
+                        f"{existing.client_order_id!r}, not {client_order_id!r}",
+                    )
+                if started_at_utc < existing.updated_at_utc:
+                    raise SubmissionJournalError(
+                        f"started_at_utc {started_at_utc.isoformat()} precedes the "
+                        f"stored updated_at_utc {existing.updated_at_utc.isoformat()} "
+                        f"for {execution_request_id!r}; refusing to reclaim backwards"
+                    )
+                if existing.outcome == CANCEL_OUTCOME_BROKER_REFUSED:
+                    # Definitive refusal: nothing is pending at the broker,
+                    # so a later cancel is a NEW attempt, not a duplicate.
+                    connection.execute(
+                        f"UPDATE {CANCELLATION_TABLE} SET attempt_count = ?, "
+                        "cancellation_started_at_utc = ?, broker_call_state = ?, "
+                        "broker_response_state = NULL, broker_order_id = NULL, "
+                        "execution_db_save_state = ?, outcome = ?, last_error = NULL, "
+                        "updated_at_utc = ? WHERE execution_request_id = ?",
+                        (
+                            existing.attempt_count + 1,
+                            started_at_utc.isoformat(),
+                            BROKER_CALL_NOT_STARTED,
+                            DB_SAVE_NOT_ATTEMPTED,
+                            OUTCOME_OPEN,
+                            started_at_utc.isoformat(),
+                            execution_request_id,
+                        ),
+                    )
+                elif existing.broker_call_state == BROKER_CALL_NOT_STARTED:
+                    # Provably never sent: reclaim the same attempt.
+                    connection.execute(
+                        f"UPDATE {CANCELLATION_TABLE} SET cancellation_started_at_utc = ?, "
+                        "updated_at_utc = ? WHERE execution_request_id = ?",
+                        (
+                            started_at_utc.isoformat(),
+                            started_at_utc.isoformat(),
+                            execution_request_id,
+                        ),
+                    )
+                else:
+                    self._conflict(
+                        execution_request_id,
+                        f"a journaled cancel attempt already progressed to "
+                        f"broker_call_state {existing.broker_call_state!r} (outcome "
+                        f"{existing.outcome!r}); the broker cancel may have happened -- "
+                        "re-sending is banned and the entry is resolved by "
+                        "reconciliation, never by another cancel",
+                    )
+            self._read_back_cancel(connection, execution_request_id)
+
+    def mark_cancel_broker_call_started(
+        self, execution_request_id: str, *, at_utc: datetime
+    ) -> None:
+        """Record -- IMMEDIATELY before ``Broker.cancel_order`` -- that the
+        cancel call is about to happen. Entered exactly once per claim: the
+        ``not_started -> started`` transition is serialized by the write
+        transaction, so of two racing callers holding the same claim only
+        one can proceed to the broker."""
+        self._cancel_transition(
+            execution_request_id,
+            at_utc=at_utc,
+            allowed_states=(BROKER_CALL_NOT_STARTED,),
+            updates={"broker_call_state": BROKER_CALL_STARTED},
+        )
+
+    def record_cancel_broker_response(
+        self,
+        execution_request_id: str,
+        *,
+        response_state: OrderState,
+        broker_order_id: str | None,
+        at_utc: datetime,
+    ) -> None:
+        """Record the received post-cancel snapshot (before the Execution DB
+        save). Requires the entry to be ``started``."""
+        if not isinstance(response_state, OrderState):
+            raise SubmissionJournalError(
+                f"response_state must be an OrderState, got {response_state!r}"
+            )
+        if broker_order_id is not None:
+            _require_non_empty_str(broker_order_id, "broker_order_id")
+        self._cancel_transition(
+            execution_request_id,
+            at_utc=at_utc,
+            allowed_states=(BROKER_CALL_STARTED,),
+            updates={
+                "broker_call_state": BROKER_CALL_RESPONDED,
+                "broker_response_state": response_state.value,
+                "broker_order_id": broker_order_id,
+            },
+        )
+
+    def record_cancel_broker_outcome_unknown(
+        self, execution_request_id: str, *, error: str, at_utc: datetime
+    ) -> None:
+        """The broker cancel raised (timeout / communication failure /
+        anything but a definitive refusal): the outcome is UNKNOWN. Marks
+        the entry ``reconciliation_required``; resolved by later queries,
+        never by re-sending."""
+        _require_non_empty_str(error, "error")
+        self._cancel_transition(
+            execution_request_id,
+            at_utc=at_utc,
+            allowed_states=(BROKER_CALL_STARTED,),
+            updates={
+                "broker_call_state": BROKER_CALL_UNKNOWN,
+                "outcome": OUTCOME_RECONCILIATION_REQUIRED,
+                "last_error": error,
+            },
+        )
+
+    def mark_cancel_broker_refused(
+        self, execution_request_id: str, *, error: str, at_utc: datetime
+    ) -> None:
+        """The broker DEFINITIVELY refused the cancellation
+        (``BrokerCancellationError``): terminalize the attempt as
+        ``broker_refused``. Nothing is pending at the broker, so
+        :meth:`record_cancellation_intent` may later reclaim the row as a
+        NEW attempt."""
+        _require_non_empty_str(error, "error")
+        self._cancel_transition(
+            execution_request_id,
+            at_utc=at_utc,
+            allowed_states=(BROKER_CALL_STARTED,),
+            updates={
+                "broker_call_state": BROKER_CALL_RESPONDED,
+                "outcome": CANCEL_OUTCOME_BROKER_REFUSED,
+                "last_error": error,
+            },
+        )
+
+    def record_cancel_execution_db_save_failed(
+        self,
+        execution_request_id: str,
+        *,
+        response_state: OrderState,
+        broker_order_id: str | None,
+        error: str,
+        at_utc: datetime,
+    ) -> None:
+        """The broker ANSWERED the cancel but persisting the result into the
+        Execution Order DB failed: journal the response plus the failure and
+        mark the entry ``reconciliation_required``. Accepted from
+        ``started`` (a lost response write is healed here) or
+        ``responded``."""
+        if not isinstance(response_state, OrderState):
+            raise SubmissionJournalError(
+                f"response_state must be an OrderState, got {response_state!r}"
+            )
+        if broker_order_id is not None:
+            _require_non_empty_str(broker_order_id, "broker_order_id")
+        _require_non_empty_str(error, "error")
+        self._cancel_transition(
+            execution_request_id,
+            at_utc=at_utc,
+            allowed_states=(BROKER_CALL_STARTED, BROKER_CALL_RESPONDED),
+            updates={
+                "broker_call_state": BROKER_CALL_RESPONDED,
+                "broker_response_state": response_state.value,
+                "broker_order_id": broker_order_id,
+                "execution_db_save_state": DB_SAVE_FAILED,
+                "outcome": OUTCOME_RECONCILIATION_REQUIRED,
+                "last_error": error,
+            },
+        )
+
+    def mark_cancel_completed(
+        self,
+        execution_request_id: str,
+        *,
+        response_state: OrderState,
+        broker_order_id: str | None,
+        at_utc: datetime,
+    ) -> None:
+        """The post-cancel snapshot was durably saved into the Execution
+        Order DB: close the cancel entry (``completed``). Accepted from
+        ``started`` (a lost response write is healed here) or
+        ``responded``."""
+        if not isinstance(response_state, OrderState):
+            raise SubmissionJournalError(
+                f"response_state must be an OrderState, got {response_state!r}"
+            )
+        if broker_order_id is not None:
+            _require_non_empty_str(broker_order_id, "broker_order_id")
+        self._cancel_transition(
+            execution_request_id,
+            at_utc=at_utc,
+            allowed_states=(BROKER_CALL_STARTED, BROKER_CALL_RESPONDED),
+            updates={
+                "broker_call_state": BROKER_CALL_RESPONDED,
+                "broker_response_state": response_state.value,
+                "broker_order_id": broker_order_id,
+                "execution_db_save_state": DB_SAVE_SAVED,
+                "outcome": OUTCOME_COMPLETED,
+                "last_error": None,
+            },
+        )
+
     # --- reads (never create the DB file) ------------------------------------
 
     def get_entry(self, execution_request_id: str) -> SubmissionJournalEntry | None:
@@ -1072,6 +1588,26 @@ class SubmissionJournal:
         failed), oldest update first."""
         return self._list_where(f"outcome = '{OUTCOME_RECONCILIATION_REQUIRED}'")
 
+    def get_cancellation_entry(
+        self, execution_request_id: str
+    ) -> CancellationJournalEntry | None:
+        _require_non_empty_str(execution_request_id, "execution_request_id")
+        if not self._path.exists():
+            return None
+        with _verified_read(self._path) as connection:
+            row = self._fetch_cancel_row(connection, execution_request_id)
+        return None if row is None else _cancel_entry_from_row(row, self._path)
+
+    def list_unresolved_cancellations(self) -> tuple[CancellationJournalEntry, ...]:
+        """Every cancel attempt whose outcome is not terminal (``completed``
+        / ``broker_refused``), oldest update first: claims that never
+        reached the broker call, possibly-sent cancels, unknown outcomes and
+        ``reconciliation_required`` rows. The hand-off surface for
+        reconciliation, usable with the Execution Order DB completely
+        unavailable. Missing DB -> empty tuple."""
+        terminal = "', '".join(sorted(TERMINAL_CANCEL_OUTCOMES))
+        return self._list_cancels_where(f"outcome NOT IN ('{terminal}')")
+
     # --- internals -----------------------------------------------------------
 
     def _list_where(self, predicate: str) -> tuple[SubmissionJournalEntry, ...]:
@@ -1084,6 +1620,16 @@ class SubmissionJournal:
             ).fetchall()
         return tuple(_entry_from_row(row, self._path) for row in rows)
 
+    def _list_cancels_where(self, predicate: str) -> tuple[CancellationJournalEntry, ...]:
+        if not self._path.exists():
+            return ()
+        with _verified_read(self._path) as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(_CANCEL_COLUMNS)} FROM {CANCELLATION_TABLE} "
+                f"WHERE {predicate} ORDER BY updated_at_utc ASC, execution_request_id ASC"
+            ).fetchall()
+        return tuple(_cancel_entry_from_row(row, self._path) for row in rows)
+
     def _require_db_file(self) -> None:
         if not self._path.exists():
             raise SubmissionJournalError(
@@ -1095,6 +1641,13 @@ class SubmissionJournal:
     def _fetch_row(self, connection: sqlite3.Connection, execution_request_id: str):
         return connection.execute(
             f"SELECT {', '.join(_ENTRY_COLUMNS)} FROM {JOURNAL_TABLE} "
+            "WHERE execution_request_id = ?",
+            (execution_request_id,),
+        ).fetchone()
+
+    def _fetch_cancel_row(self, connection: sqlite3.Connection, execution_request_id: str):
+        return connection.execute(
+            f"SELECT {', '.join(_CANCEL_COLUMNS)} FROM {CANCELLATION_TABLE} "
             "WHERE execution_request_id = ?",
             (execution_request_id,),
         ).fetchone()
@@ -1160,6 +1713,58 @@ class SubmissionJournal:
             )
             self._read_back(connection, execution_request_id)
 
+    def _cancel_transition(
+        self,
+        execution_request_id: str,
+        *,
+        at_utc: datetime,
+        allowed_states: tuple[str, ...],
+        updates: dict,
+    ) -> None:
+        """Cancellation-journal counterpart of :meth:`_transition` -- same
+        verified BEGIN IMMEDIATE flow, precondition check, timestamp
+        monotonicity and pre-commit read-back, against the cancel table."""
+        _require_non_empty_str(execution_request_id, "execution_request_id")
+        _require_utc(at_utc, "at_utc")
+        self._require_db_file()
+        with _verified_txn(self._path) as connection:
+            row = self._fetch_cancel_row(connection, execution_request_id)
+            if row is None:
+                raise SubmissionJournalError(
+                    f"no cancellation journal entry exists for execution_request_id "
+                    f"{execution_request_id!r}; record_cancellation_intent() must run "
+                    "before any lifecycle update"
+                )
+            entry = _cancel_entry_from_row(row, self._path)
+            if entry.outcome in TERMINAL_CANCEL_OUTCOMES:
+                raise SubmissionJournalError(
+                    f"cancellation journal entry for {execution_request_id!r} is "
+                    f"terminal (outcome {entry.outcome!r}); no further lifecycle "
+                    "update is accepted (a new attempt reclaims via "
+                    "record_cancellation_intent)"
+                )
+            if entry.broker_call_state not in allowed_states:
+                raise SubmissionJournalError(
+                    f"cancellation journal entry for {execution_request_id!r} is in "
+                    f"broker_call_state {entry.broker_call_state!r} (outcome "
+                    f"{entry.outcome!r}); this update requires one of "
+                    f"{sorted(allowed_states)}"
+                )
+            if at_utc < entry.updated_at_utc:
+                raise SubmissionJournalError(
+                    f"at_utc {at_utc.isoformat()} precedes the stored updated_at_utc "
+                    f"{entry.updated_at_utc.isoformat()} for {execution_request_id!r}"
+                )
+            assignments = dict(updates)
+            assignments["updated_at_utc"] = at_utc.isoformat()
+            connection.execute(
+                f"UPDATE {CANCELLATION_TABLE} SET "
+                + ", ".join(f"{column} = ?" for column in assignments)
+                + " WHERE execution_request_id = ?",
+                (*assignments.values(), execution_request_id),
+            )
+            self._read_back_cancel(connection, execution_request_id)
+
     def _read_back(self, connection: sqlite3.Connection, execution_request_id: str) -> None:
         """Pre-commit write-back validation: the mutated row must re-read as
         a fully valid entry INSIDE the same transaction, or the whole write
@@ -1170,3 +1775,13 @@ class SubmissionJournal:
                 f"journal write for {execution_request_id!r} did not read back"
             )
         _entry_from_row(row, self._path)
+
+    def _read_back_cancel(
+        self, connection: sqlite3.Connection, execution_request_id: str
+    ) -> None:
+        row = self._fetch_cancel_row(connection, execution_request_id)
+        if row is None:
+            raise SubmissionJournalIntegrityError(
+                f"cancellation journal write for {execution_request_id!r} did not read back"
+            )
+        _cancel_entry_from_row(row, self._path)

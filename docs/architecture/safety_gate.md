@@ -65,18 +65,29 @@ service.cancel(execution_request_id) -> CancelOutcome
        phase=submitting/pending → cancel_submission_unresolved(submit 未確認中の盲目キャンセル禁止)
        state=cancelled     → cancel_already_cancelled(重複キャンセルの冪等拒否)
        state=filled/rejected → cancel_terminal_state(terminal は不変)
-    3. ACCEPTED / PARTIALLY_FILLED(phase=submitted)のみ Broker.cancel_order(保存済み client_order_id)
-    4. 結果の記録
-       post-cancel OrderResult → record_order_result(既存の状態機械 / validate_order_result_update 契約で
-         CANCELLED を永続化)→ status=cancelled
-       BrokerCancellationError(確定拒否)→ 状態不変・履歴追記なし・WARN 記録 → status=broker_refused
-       その他の例外(timeout / 通信失敗 / not found / 想定外)→ state-only UNKNOWN を best-effort 記録して re-raise
-       受領済み結果の保存失敗 → state-only UNKNOWN へフォールバック記録して元例外を re-raise
+    3. 耐久 cancel claim の獲得(PR #124 CodeX レビュー P1。cancellation journal =
+       Submission Journal と同一 SQLite ファイル内の専用テーブル、schema v3)
+       既存 claim との衝突(started / unknown / reconciliation_required / completed)
+         → cancel_attempt_unresolved(Broker は呼ばれない。クラッシュ後・並行呼び出しの二重 cancel を構造的に阻止)
+       claim 保存失敗 → cancel_journal_failed(fail-closed。Broker は呼ばれない)
+    4. Journal を started へ更新(Broker 呼び出し直前の最後の書き込み。not_started → started は
+       一度きり = 同一 claim を握った並行呼び出しのうち Broker へ到達するのは 1 つだけ。
+       失敗 → cancel_journal_failed で fail-closed、not_started claim は未送信の証明として残り reclaim 可能)
+    5. ACCEPTED / PARTIALLY_FILLED(phase=submitted)のみ Broker.cancel_order(保存済み client_order_id)
+    6. 結果の記録(Broker 呼び出し後の journal 書き込みは best-effort・critical ログ)
+       post-cancel OrderResult → Journal 応答記録 + record_order_result(既存の状態機械 /
+         validate_order_result_update 契約で CANCELLED を永続化)+ Journal 完了更新 → status=cancelled
+       BrokerCancellationError(確定拒否)→ 状態不変・履歴追記なし・WARN 記録・Journal を terminal
+         broker_refused へ(以後の cancel は新規試行として claim を reclaim 可能)→ status=broker_refused
+       その他の例外(timeout / 通信失敗 / not found / 想定外)→ Journal へ reconciliation_required を記録 +
+         state-only UNKNOWN を best-effort 記録して re-raise
+       受領済み結果の保存失敗 → Journal へ応答内容込みの reconciliation_required を耐久記録 +
+         state-only UNKNOWN へフォールバック記録して元例外を re-raise
 ```
 
-- **idempotency(重複キャンセル防止)**: 判定の正は**耐久保存された注文状態**であり、プロセス再起動・サービス再作成をまたいで有効。CANCELLED 確定後の再実行は `cancel_already_cancelled`、outcome 消失後(UNKNOWN)の再実行は `cancel_outcome_unresolved` で拒否され、いずれも Broker への 2 回目の cancel は発生しない。確定拒否(`broker_refused`)後の再実行だけは**新規試行**として許される(Broker に係属中の cancel は存在しないため重複ではない)。
+- **idempotency(重複キャンセル防止)**: 二層の耐久ガードで保証され、プロセス再起動・サービス再作成・並行呼び出しをまたいで有効。第一に**耐久保存された注文状態**: CANCELLED 確定後の再実行は `cancel_already_cancelled`、outcome 消失後(UNKNOWN)の再実行は `cancel_outcome_unresolved` で拒否。第二に**耐久 cancel claim**(PR #124 レビュー P1): Broker 呼び出し後・outcome 記録前にプロセスが停止した場合(注文 row は cancellable のまま = 状態だけでは防げないクラッシュ窓)や、2 呼び出しが状態事前検査を同時に通過した場合も、journal claim の一意獲得と `not_started → started` の一度きり遷移が 2 回目の Broker cancel を構造的に阻止する(`cancel_attempt_unresolved` / `cancel_journal_failed`)。確定拒否(`broker_refused`)後の再実行だけは**新規試行**として claim を reclaim できる(Broker に係属中の cancel は存在しないため重複ではない。`attempt_count` で監査)。
 - **UNKNOWN の再送禁止(submit 契約との対称)**: cancel の timeout・通信失敗等は「未キャンセル」へ降格されず UNKNOWN として記録され、以後の cancel は拒否される。解決は照会 / reconciliation のみ(`list_unknown_orders()` / `list_unresolved_submissions()` の照会対象)。
-- **DB 保存失敗の可視化**: Broker が応答した後の失敗は決して拒否へ変換されない(re-raise)。受領済み CANCELLED 結果の保存が失敗しても state-only UNKNOWN で照会対象に残り、後続照会が Broker 側の真実(CANCELLED)を再観測して解決する。UNKNOWN フォールバックまで失敗した場合(order DB 全損)も、cancel は**常に登録・送信済みの耐久 row を対象とする**ため注文は ACCEPTED のまま `list_in_flight_orders()` / `list_reconciliation_orders()` から見え続ける — submit と異なり「Execution DB に痕跡が残らない試行」が構造的に存在しないため、**Submission Journal はキャンセルへ拡張しない**(設計判断)。
+- **DB 保存失敗の可視化**: Broker が応答した後の失敗は決して拒否へ変換されない(re-raise)。受領済み CANCELLED 結果の保存が失敗しても、cancellation journal に応答内容込みの `reconciliation_required` が耐久記録され、state-only UNKNOWN で照会対象にも残る(後続照会が Broker 側の真実 = CANCELLED を再観測して解決)。UNKNOWN フォールバックまで失敗した場合(order DB 全損)も、journal claim が durable に残る(`SubmissionJournal.list_unresolved_cancellations()` で列挙可能)うえ、cancel は常に登録・送信済みの耐久 row を対象とするため注文は ACCEPTED のまま `list_in_flight_orders()` / `list_reconciliation_orders()` から見え続ける。
 - **確定拒否時の状態不変**: `BrokerCancellationError`(例: Broker 側で約定済み)では状態機械に合成遷移を書かない。store/broker の乖離は in-flight のまま reconciliation が観測・解決する対象であり、失敗情報は `CancelOutcome.detail` と WARN ログ(execution_request_id / signal_id / client_order_id / phase / state / 理由)に記録される。
 
 ## execution mode と Shadow 評価(Issue #78)
@@ -214,7 +225,8 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - `test_safety_store.py`(Issue #116 追加分)— policy snapshot の round-trip(`list_for_request_records`)、snapshot なし記録の None 読み戻し、非 dict snapshot の拒否、改竄 snapshot の復元時拒否、**v1 → v2 migration**(既存行保持・冪等性・検証失敗時の完全 rollback と retry 成功)。
 - `test_reissue_service.py` / `test_reissue_clearance.py` / `test_reissue_submission.py`(Issue #116)— 再発行 eligibility・clearance 判定・`intent_superseded` / `reissue_clearance_invalid` の送信経路検証([Execution Intent Reissue](execution_reissue.md))。
 - `test_submission_boundary.py` — `submit_order` / `cancel_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信・キャンセル呼び出しが各 1 箇所であること)。
-- `test_cancel_submission.py`(Issue #99)— 公認キャンセル経路の全分岐: 成功(既存状態機械契約での CANCELLED 永続化・部分約定の fill 保持)、重複キャンセルの冪等拒否(サービス再作成後含む・Broker cancel 1 回のまま)、Broker 確定拒否の状態不変 + 失敗記録 + 再試行の新規試行扱い、store=ACCEPTED / broker=FILLED 乖離時の確定拒否、ローカル型付き拒否の全コード(未登録 / 未送信 / submitting・pending / submit 後 UNKNOWN / terminal / store 読み取り不能)と全拒否経路で Broker cancel 0 件、timeout・通信失敗・not found・想定外例外の保守的 UNKNOWN 記録 + re-raise + 再送禁止、受領済み結果の保存失敗 → UNKNOWN フォールバック + 元例外 re-raise + 照会可視性、二重失敗時の critical ログと `list_in_flight_orders()` での可視性維持、`CancelOutcome` のクロスフィールド不変条件。
+- `test_cancel_submission.py`(Issue #99)— 公認キャンセル経路の全分岐: 成功(既存状態機械契約での CANCELLED 永続化・部分約定の fill 保持・journal claim の completed 終端)、重複キャンセルの冪等拒否(サービス再作成後含む・Broker cancel 1 回のまま)、Broker 確定拒否の状態不変 + 失敗記録 + journal terminal `broker_refused` + 再試行の新規試行扱い(attempt_count 増分)、store=ACCEPTED / broker=FILLED 乖離時の確定拒否、ローカル型付き拒否の全コード(未登録 / 未送信 / submitting・pending / submit 後 UNKNOWN / terminal / store 読み取り不能)と全拒否経路で Broker cancel 0 件、timeout・通信失敗・not found・想定外例外の保守的 UNKNOWN 記録 + journal `reconciliation_required` + re-raise + 再送禁止、受領済み結果の保存失敗 → journal 耐久記録 + UNKNOWN フォールバック + 元例外 re-raise + 照会可視性、**二重失敗クラッシュ窓**(注文 row が cancellable のままでも journal claim が再送を阻止: 同一サービス・再作成サービスとも `cancel_attempt_unresolved`・`list_unresolved_cancellations()` で可視)、**並行 cancel**(barrier 同期の 2 呼び出しで Broker cancel ちょうど 1 回・敗者は fail-closed 拒否)、**journal fail-closed**(journal 欠損 / started 書き込み失敗で Broker 未到達・`not_started` claim の reclaim 後に正常続行)、`CancelOutcome` のクロスフィールド不変条件。
+- `test_submission_journal.py`(Issue #99 追加分)— cancellation journal の claim ライフサイクル(round-trip・reopen 復元・`started` 後の再取得拒否 = クラッシュ窓・unknown / save-failed 後の conflict・`not_started` reclaim と時刻後退拒否・`broker_refused` 終端化と新規試行 reclaim・started 一度きり遷移・client_order_id 束縛・`list_unresolved_cancellations()` の terminal 除外)、`CancellationJournalEntry` 不変条件、**v2 → v3 migration**(additive・既存行無変更・冪等・検証失敗時の完全 rollback と retry 成功)。
 - `test_fixed_scenarios.py` ほか(Issue #77)— 固定シナリオ試験。Safety Gate 拒否系(stale price / kill switch / execution mode 不整合 / 複数違反同時収集)を含む分岐を固定データから本番経路(本サービス)経由で再現し、全拒否シナリオで Broker 呼び出しが 0 件であること・機械可読な拒否コード・監査保存件数を expected/actual 比較で固定する。キャンセル系 6 件(Issue #99: 成功 / Broker 確定拒否 / terminal 拒否 / 重複抑止 / timeout UNKNOWN / DB 保存失敗)は `cancel` ステップが本サービスの公開 cancel API のみを駆動する。実行方法は `execution/README.md` の「固定シナリオ試験」節を参照。
 
 ## 非スコープ(Issue #75 時点で未実装)

@@ -77,12 +77,18 @@ definitive broker refusal (``BrokerCancellationError``) leaves the stored
 state untouched and is returned as ``BROKER_REFUSED``; ANY other broker
 exception and ANY failure to persist a received post-cancel result record
 state-only UNKNOWN (best-effort) and re-raise -- the mirror of the submit
-contract above. The submission journal is deliberately NOT extended for
-cancels: a cancel always targets an already-registered, already-submitted
-DURABLE order row, so every failure mode leaves the order visible to
-reconciliation (``list_in_flight_orders`` / ``list_unknown_orders`` /
-``list_unresolved_submissions``) -- there is no counterpart of the
-"submit attempt with no Execution-DB trace" case the journal exists for.
+contract above. Every cancel attempt is additionally claimed in the durable
+CANCELLATION JOURNAL (PR #124 Codex review P1; same sealed SQLite file as
+the submission journal, own table): the claim is journaled BEFORE any
+broker call and the ``started`` mark is the last write before
+``cancel_order``, so a caller that crashed after the broker call -- or a
+concurrent second caller -- can never send a second broker cancel even
+while the order row still reads cancellable (journal conflicts ->
+``ATTEMPT_UNRESOLVED``; journal failures -> ``JOURNAL_FAILED``, fail
+closed). After the broker call, journal writes are best-effort and never
+block recording the outcome; unresolved claims are listed by
+``SubmissionJournal.list_unresolved_cancellations()`` and are resolved by
+reconciliation, never by re-sending.
 
 Reissue policy (Issue #116 / PR #122 review r2): ``reissue_policy`` is a
 MANDATORY constructor argument -- the SAME ``ReissuePolicy`` instance the
@@ -200,6 +206,19 @@ class CancelRefusalCode(enum.Enum):
     #: second broker call. This is also the duplicate-cancel guard after a
     #: cancel whose outcome was lost.
     OUTCOME_UNRESOLVED = "cancel_outcome_unresolved"
+    #: The durable cancellation journal already holds an attempt for this
+    #: order that may have reached (or provably reached) the broker -- the
+    #: crash-window / concurrent-caller guard (PR #124 Codex review P1):
+    #: even when the ORDER row still reads cancellable (the process died
+    #: after the broker cancel but before any outcome write, or another
+    #: caller is mid-flight), the claim cannot be re-acquired and no second
+    #: broker cancel is sent. Resolved by reconciliation
+    #: (``SubmissionJournal.list_unresolved_cancellations()``).
+    ATTEMPT_UNRESOLVED = "cancel_attempt_unresolved"
+    #: The durable cancellation journal could not record the claim (or the
+    #: started mark): the broker is NOT called (fail closed) -- without the
+    #: durable claim a crash could make the attempt re-sendable.
+    JOURNAL_FAILED = "cancel_journal_failed"
     #: State ``cancelled``: the cancel already succeeded. Refusing (instead
     #: of re-sending) makes re-running the same cancel idempotent.
     ALREADY_CANCELLED = "cancel_already_cancelled"
@@ -508,13 +527,23 @@ class LiveOrderSubmissionService:
           (``list_unknown_orders`` / ``list_unresolved_submissions``) and
           any later ``cancel()`` refuses with ``OUTCOME_UNRESOLVED``.
         - A received post-cancel ``OrderResult`` whose persistence fails is
-          NEVER lost silently: state-only UNKNOWN is recorded (the order
-          becomes a reconciliation query target whose broker-side truth --
-          CANCELLED -- a later query re-observes) and the original
-          persistence failure re-raises. The intent row itself is durable
-          (it existed before the cancel), so unlike a submit there is no
-          case where the attempt leaves no trace -- the submission journal
-          is deliberately NOT extended for cancels.
+          NEVER lost silently: the response is journaled as
+          ``reconciliation_required`` (durable even with the order DB down),
+          state-only UNKNOWN is recorded (the order becomes a query target
+          whose broker-side truth -- CANCELLED -- a later query re-observes)
+          and the original persistence failure re-raises.
+        - Every attempt is CLAIMED in the durable cancellation journal
+          BEFORE the broker call (PR #124 Codex review P1): concurrent
+          callers serialize on the claim and its one-shot ``not_started ->
+          started`` transition, and a caller restarted after a possibly-sent
+          cancel finds the durable claim and is refused
+          (``ATTEMPT_UNRESOLVED``) even while the order row still reads
+          cancellable. A claim that provably never reached the broker
+          (``not_started``) is reclaimable; a definitively refused attempt
+          (``broker_refused``) is reclaimable as a NEW attempt. Journal
+          failures before the broker call refuse fail-closed
+          (``JOURNAL_FAILED``); after it they are logged critically and
+          never block.
         """
         _require_non_empty_str(execution_request_id, "execution_request_id")
         try:
@@ -611,9 +640,66 @@ class LiveOrderSubmissionService:
                 signal_id=signal_id,
             )
 
+        # Durable cancel claim, FIRST barrier (PR #124 Codex review P1): the
+        # attempt is journaled -- independent of the order row's state --
+        # before any broker call. Concurrent callers serialize on the
+        # journal's write transaction, and a restarted caller finds the
+        # durable claim: a possibly-sent cancel can never be sent again,
+        # even while the order row still reads ACCEPTED (the crash window
+        # between the broker call and the outcome writes).
+        try:
+            self._journal.record_cancellation_intent(
+                execution_request_id=execution_request_id,
+                client_order_id=row["client_order_id"],
+                started_at_utc=self._now(),
+            )
+        except SubmissionJournalConflictError as exc:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.ATTEMPT_UNRESOLVED,
+                f"the cancellation journal already holds an attempt for this order: "
+                f"{exc}; re-sending is banned -- unresolved cancel attempts are "
+                "handed to reconciliation, never re-sent",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        except Exception as exc:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.JOURNAL_FAILED,
+                f"cancellation journal persistence failed: {exc}; the broker was NOT "
+                "called (fail closed)",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+        # SECOND barrier: the ``started`` mark is the LAST write before the
+        # broker call, entered exactly once per claim (``not_started ->
+        # started`` serializes in the journal's transaction) -- of two
+        # racing callers holding the same claim, only one reaches the
+        # broker; a ``not_started`` row remains durable proof the broker
+        # cancel was never sent and is reclaimable by a later attempt.
+        try:
+            self._journal.mark_cancel_broker_call_started(
+                execution_request_id, at_utc=self._now()
+            )
+        except Exception as exc:
+            return self._refused_cancel(
+                execution_request_id,
+                CancelRefusalCode.JOURNAL_FAILED,
+                f"journal cancel-call-start persistence failed: {exc}; the broker was "
+                "NOT called (fail closed) -- a 'not_started' claim remains as durable "
+                "proof and a later cancel may reclaim it",
+                phase=phase,
+                state=state,
+                signal_id=signal_id,
+            )
+
         # ---- past this point the broker is called: failures are recorded
         # conservatively as UNKNOWN and re-raised, never converted into
-        # refusals (mirror of the submit contract) --------------------------
+        # refusals (mirror of the submit contract); journal writes are
+        # best-effort (critical log) and never block -----------------------
         try:
             result = self._connection.broker.cancel_order(row["client_order_id"])
         except BrokerCancellationError as exc:
@@ -632,6 +718,13 @@ class LiveOrderSubmissionService:
                 state.value,
                 exc,
             )
+            self._journal_write(
+                "cancel broker refusal",
+                lambda at: self._journal.mark_cancel_broker_refused(
+                    execution_request_id, error=f"broker refused cancellation: {exc}", at_utc=at
+                ),
+                execution_request_id,
+            )
             return CancelOutcome(
                 execution_request_id=execution_request_id,
                 status=CancelStatus.BROKER_REFUSED,
@@ -643,10 +736,27 @@ class LiveOrderSubmissionService:
             # unexpected: the cancel outcome is LOST, so the order outcome is
             # lost with it (conservative: a "not found" or "communication
             # failure" claim never downgrades what the broker may hold).
+            self._journal_write(
+                "cancel outcome unknown",
+                lambda at: self._journal.record_cancel_broker_outcome_unknown(
+                    execution_request_id, error=f"cancel outcome lost: {exc}", at_utc=at
+                ),
+                execution_request_id,
+            )
             self._record_unknown_outcome(
                 execution_request_id, exc, context=_CANCEL_UNKNOWN_CONTEXT_LOST
             )
             raise
+        self._journal_write(
+            "cancel broker response",
+            lambda at: self._journal.record_cancel_broker_response(
+                execution_request_id,
+                response_state=result.state,
+                broker_order_id=result.broker_order_id,
+                at_utc=at,
+            ),
+            execution_request_id,
+        )
         try:
             execution_store.record_order_result(
                 execution_request_id,
@@ -659,11 +769,34 @@ class LiveOrderSubmissionService:
             # result could not be persisted: the order must remain a QUERY
             # TARGET whose broker-side truth a later query re-observes --
             # never lost behind a persistence error (Issue #75 review r3
-            # contract, applied to cancel).
+            # contract, applied to cancel). The JOURNAL keeps the durable
+            # record -- response content included -- even when the order DB
+            # itself is down.
+            self._journal_write(
+                "cancel execution DB save failure",
+                lambda at: self._journal.record_cancel_execution_db_save_failed(
+                    execution_request_id,
+                    response_state=result.state,
+                    broker_order_id=result.broker_order_id,
+                    error=f"cancel result persistence failed: {exc}",
+                    at_utc=at,
+                ),
+                execution_request_id,
+            )
             self._record_unknown_outcome(
                 execution_request_id, exc, context=_CANCEL_UNKNOWN_CONTEXT_PERSIST
             )
             raise
+        self._journal_write(
+            "cancel completion",
+            lambda at: self._journal.mark_cancel_completed(
+                execution_request_id,
+                response_state=result.state,
+                broker_order_id=result.broker_order_id,
+                at_utc=at,
+            ),
+            execution_request_id,
+        )
         if result.state is not OrderState.CANCELLED:
             # Defensive: the Broker contract returns the post-cancel snapshot
             # of a SUCCESSFUL cancel. A conforming observation was recorded

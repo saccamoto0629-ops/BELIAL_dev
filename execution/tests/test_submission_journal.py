@@ -35,6 +35,8 @@ from execution.submission_journal import (
     BROKER_CALL_RESPONDED,
     BROKER_CALL_STARTED,
     BROKER_CALL_UNKNOWN,
+    CANCEL_OUTCOME_BROKER_REFUSED,
+    CancellationJournalEntry,
     DB_SAVE_FAILED,
     DB_SAVE_NOT_ATTEMPTED,
     DB_SAVE_SAVED,
@@ -1066,7 +1068,8 @@ def test_v1_to_v2_migration_rebuilds_and_keeps_every_row(tmp_path):
     journal.initialize()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        # v1 chains through v2 up to the current version (v3, Issue #99)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         rows = connection.execute(
             "SELECT execution_request_id, outcome, superseded_by_execution_request_id "
             "FROM submission_journal ORDER BY execution_request_id"
@@ -1117,4 +1120,256 @@ def test_v1_to_v2_migration_rolls_back_completely_on_failure(tmp_path, monkeypat
     # and a clean retry succeeds
     SubmissionJournal(path).initialize()
     with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+# --- cancellation journal (Issue #99 / PR #124 review P1) ---------------------
+
+
+def make_cancel_journal(tmp_path) -> SubmissionJournal:
+    journal = SubmissionJournal(tmp_path / "journal.sqlite3")
+    journal.initialize()
+    return journal
+
+
+def claim(journal, *, at=NOW, execution_request_id="exec-1", client_order_id="client-1"):
+    journal.record_cancellation_intent(
+        execution_request_id=execution_request_id,
+        client_order_id=client_order_id,
+        started_at_utc=at,
+    )
+
+
+def test_cancel_claim_round_trip_to_completed(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.broker_call_state == BROKER_CALL_NOT_STARTED
+    assert entry.outcome == OUTCOME_OPEN and entry.attempt_count == 1
+    journal.mark_cancel_broker_call_started("exec-1", at_utc=LATER)
+    journal.record_cancel_broker_response(
+        "exec-1", response_state=OrderState.CANCELLED, broker_order_id="B-1", at_utc=LATER
+    )
+    journal.mark_cancel_completed(
+        "exec-1", response_state=OrderState.CANCELLED, broker_order_id="B-1", at_utc=LATER
+    )
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.outcome == OUTCOME_COMPLETED
+    assert entry.execution_db_save_state == DB_SAVE_SAVED
+    assert entry.broker_response_state is OrderState.CANCELLED
+    assert journal.list_unresolved_cancellations() == ()
+    # survives reopen (process-restart equivalence)
+    assert SubmissionJournal(journal.path).get_cancellation_entry("exec-1").outcome == (
+        OUTCOME_COMPLETED
+    )
+
+
+def test_cancel_claim_is_not_reacquirable_once_started(tmp_path):
+    """The P1 crash window: a caller that died after the broker cancel left a
+    ``started`` claim; no restarted caller may re-acquire it."""
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    journal.mark_cancel_broker_call_started("exec-1", at_utc=LATER)
+    with pytest.raises(SubmissionJournalConflictError, match="progressed"):
+        claim(journal, at=LATER + timedelta(seconds=1))
+    # started claims stay visible for reconciliation
+    unresolved = journal.list_unresolved_cancellations()
+    assert [entry.execution_request_id for entry in unresolved] == ["exec-1"]
+
+
+def test_cancel_claim_conflicts_after_unknown_and_save_failed(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    journal.mark_cancel_broker_call_started("exec-1", at_utc=LATER)
+    journal.record_cancel_broker_outcome_unknown("exec-1", error="timeout", at_utc=LATER)
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.outcome == OUTCOME_RECONCILIATION_REQUIRED
+    assert entry.broker_call_state == BROKER_CALL_UNKNOWN
+    with pytest.raises(SubmissionJournalConflictError):
+        claim(journal, at=LATER)
+
+    claim(journal, execution_request_id="exec-2", client_order_id="client-2")
+    journal.mark_cancel_broker_call_started("exec-2", at_utc=LATER)
+    journal.record_cancel_execution_db_save_failed(
+        "exec-2",
+        response_state=OrderState.CANCELLED,
+        broker_order_id="B-2",
+        error="disk full",
+        at_utc=LATER,
+    )
+    entry = journal.get_cancellation_entry("exec-2")
+    assert entry.outcome == OUTCOME_RECONCILIATION_REQUIRED
+    assert entry.execution_db_save_state == DB_SAVE_FAILED
+    assert entry.broker_response_state is OrderState.CANCELLED
+    with pytest.raises(SubmissionJournalConflictError):
+        claim(journal, execution_request_id="exec-2", client_order_id="client-2", at=LATER)
+    assert [e.execution_request_id for e in journal.list_unresolved_cancellations()] == [
+        "exec-1",
+        "exec-2",
+    ]
+
+
+def test_cancel_not_started_claim_is_reclaimable_but_never_backwards(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    claim(journal, at=LATER)  # provably never sent: reclaim refreshes timestamps
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.attempt_count == 1 and entry.updated_at_utc == LATER
+    with pytest.raises(SubmissionJournalError, match="backwards"):
+        claim(journal, at=NOW)
+    with pytest.raises(SubmissionJournalConflictError, match="client_order_id"):
+        claim(journal, at=LATER, client_order_id="client-other")
+
+
+def test_cancel_broker_refused_terminalizes_and_reclaims_as_new_attempt(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    journal.mark_cancel_broker_call_started("exec-1", at_utc=LATER)
+    journal.mark_cancel_broker_refused("exec-1", error="already filled", at_utc=LATER)
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.outcome == CANCEL_OUTCOME_BROKER_REFUSED
+    assert entry.broker_call_state == BROKER_CALL_RESPONDED
+    assert entry.broker_response_state is None
+    assert entry.last_error == "already filled"
+    # terminal: excluded from the unresolved hand-off surface
+    assert journal.list_unresolved_cancellations() == ()
+    # a definitively refused cancel left nothing pending: NEW attempt
+    claim(journal, at=LATER + timedelta(seconds=1))
+    entry = journal.get_cancellation_entry("exec-1")
+    assert entry.attempt_count == 2
+    assert entry.broker_call_state == BROKER_CALL_NOT_STARTED
+    assert entry.outcome == OUTCOME_OPEN and entry.last_error is None
+
+
+def test_cancel_started_transition_is_one_shot(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    journal.mark_cancel_broker_call_started("exec-1", at_utc=LATER)
+    with pytest.raises(SubmissionJournalError, match="requires one of"):
+        journal.mark_cancel_broker_call_started("exec-1", at_utc=LATER)
+
+
+def test_cancel_claim_refuses_foreign_client_order_id(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    claim(journal)
+    with pytest.raises(SubmissionJournalConflictError, match="already has a journaled"):
+        claim(journal, execution_request_id="exec-2", client_order_id="client-1")
+
+
+def test_cancel_lifecycle_updates_require_an_existing_claim(tmp_path):
+    journal = make_cancel_journal(tmp_path)
+    with pytest.raises(SubmissionJournalError, match="record_cancellation_intent"):
+        journal.mark_cancel_broker_call_started("exec-1", at_utc=NOW)
+
+
+def test_cancel_claim_requires_the_db_file(tmp_path):
+    journal = SubmissionJournal(tmp_path / "missing.sqlite3")
+    with pytest.raises(SubmissionJournalError, match="initialize"):
+        claim(journal)
+    assert not (tmp_path / "missing.sqlite3").exists()
+
+
+def test_cancellation_entry_invariants():
+    def entry(**overrides):
+        values = dict(
+            execution_request_id="exec-1",
+            client_order_id="client-1",
+            attempt_count=1,
+            cancellation_started_at_utc=NOW,
+            broker_call_state=BROKER_CALL_NOT_STARTED,
+            execution_db_save_state=DB_SAVE_NOT_ATTEMPTED,
+            outcome=OUTCOME_OPEN,
+            updated_at_utc=NOW,
+        )
+        values.update(overrides)
+        return CancellationJournalEntry(**values)
+
+    entry()  # the baseline claim is valid
+    with pytest.raises(ValueError):
+        entry(attempt_count=0)
+    with pytest.raises(ValueError):
+        entry(outcome=OUTCOME_SUPERSEDED)  # not a cancel outcome
+    with pytest.raises(ValueError):
+        entry(outcome=OUTCOME_COMPLETED)  # completed requires saved
+    with pytest.raises(ValueError):
+        entry(broker_call_state=BROKER_CALL_STARTED, outcome=OUTCOME_RECONCILIATION_REQUIRED)
+    with pytest.raises(ValueError):
+        # broker_refused must be responded + no snapshot + reason
+        entry(outcome=CANCEL_OUTCOME_BROKER_REFUSED)
+    with pytest.raises(ValueError):
+        # a responded (non-refused) entry must carry the response snapshot
+        entry(broker_call_state=BROKER_CALL_RESPONDED)
+    with pytest.raises(ValueError):
+        entry(broker_call_state=BROKER_CALL_UNKNOWN, outcome=OUTCOME_OPEN)
+
+
+def _build_v2_journal(path):
+    """A released-v2 journal DB with one completed submission row, written
+    through the v2 schema directly."""
+    from execution import submission_journal as sj
+
+    connection = sqlite3.connect(path)
+    try:
+        sj._create_schema(connection, version=2)
+        connection.execute(
+            "INSERT INTO submission_journal VALUES ("
+            "'exec-2', 'client-2', 'USD_JPY', 'buy', 'market', '1', NULL, "
+            "'fake', 'fake', "
+            "'2026-07-22T01:00:00+00:00', 'responded', 'filled', 'B-1', "
+            "'saved', 'completed', NULL, '2026-07-22T01:00:01+00:00', NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v2_to_v3_migration_adds_the_cancellation_table_additively(tmp_path):
+    path = tmp_path / "journal.sqlite3"
+    _build_v2_journal(path)
+    with sqlite3.connect(path) as connection:
+        row_before = connection.execute("SELECT * FROM submission_journal").fetchone()
+    journal = SubmissionJournal(path)
+    journal.initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        # existing submission rows untouched
+        assert connection.execute("SELECT * FROM submission_journal").fetchone() == row_before
+        # the cancellation table starts empty
+        assert connection.execute("SELECT COUNT(*) FROM cancellation_journal").fetchone()[0] == 0
+    journal.initialize()  # idempotent
+    # and the cancel lifecycle works on the migrated DB
+    claim(journal)
+    assert journal.get_cancellation_entry("exec-1").outcome == OUTCOME_OPEN
+
+
+def test_v2_to_v3_migration_rolls_back_completely_on_failure(tmp_path, monkeypatch):
+    from execution import submission_journal as sj
+
+    path = tmp_path / "journal.sqlite3"
+    _build_v2_journal(path)
+    with sqlite3.connect(path) as connection:
+        before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+
+    real_verify = sj._verify_schema
+
+    def fail_v3_verification(connection, db_path, *, version=sj.SCHEMA_VERSION):
+        if version == sj.SCHEMA_VERSION:
+            raise sj.SubmissionJournalSchemaError("injected post-migration failure")
+        return real_verify(connection, db_path, version=version)
+
+    monkeypatch.setattr(sj, "_verify_schema", fail_v3_verification)
+    with pytest.raises(SubmissionJournalSchemaError, match="injected"):
+        SubmissionJournal(path).initialize()
+    monkeypatch.undo()
+
+    with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall() == before
+    # and a clean retry succeeds
+    SubmissionJournal(path).initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
