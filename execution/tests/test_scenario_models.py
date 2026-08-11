@@ -144,16 +144,54 @@ def test_primary_id_can_be_declared_explicitly():
         (lambda s: s.update(faults=[{"boundary": "everywhere"}]), "boundary"),
         (lambda s: s.update(faults=[{"boundary": "initial_save", "after_calls": -1}]), "after_calls"),
         (lambda s: s.update(broker={"scripts": {"client-1": {"behavior": "explode"}}}), "behavior"),
-        # cancel scripting left the schema with the cancel step (PR #96 r1)
+        # Issue #99: cancel is back in the schema, closed-world validated.
         (
-            lambda s: s.update(broker={"cancel_scripts": {"client-1": {"behavior": "fail_cancellation"}}}),
+            lambda s: s.update(broker={"cancel_scripts": {"client-1": {"behavior": "explode"}}}),
+            "behavior",
+        ),
+        (
+            lambda s: s.update(
+                broker={"cancel_scripts": {"client-1": {"behavior": "fail_cancellation", "price": "1"}}}
+            ),
             "unknown keys",
         ),
         (
             lambda s: s["steps"].append(
-                {"action": "cancel", "execution_request_id": "exec-1", "expect": {"outcome": "cancelled"}}
+                {"action": "cancel", "execution_request_id": "exec-1", "expect": {"outcome": "maybe"}}
             ),
-            "action",
+            "outcome",
+        ),
+        (
+            lambda s: s["steps"].append(
+                {
+                    "action": "cancel",
+                    "execution_request_id": "exec-1",
+                    "expect": {"outcome": "refused", "refusal_code": "not_a_code"},
+                }
+            ),
+            "refusal_code",
+        ),
+        (
+            lambda s: s["steps"].append(
+                {
+                    "action": "submit",
+                    "execution_request_id": "exec-1",
+                    # refusal_code is a CANCEL-step key only
+                    "expect": {"outcome": "rejected", "refusal_code": "cancel_terminal_state"},
+                }
+            ),
+            "unknown keys",
+        ),
+        (
+            lambda s: s["steps"].append(
+                {
+                    "action": "cancel",
+                    "execution_request_id": "exec-1",
+                    "at_offset_seconds": "60",
+                    "expect": {"outcome": "cancelled"},
+                }
+            ),
+            "at_offset_seconds",
         ),
         (
             lambda s: s.update(broker={"scripts": {"client-1": {"behavior": "reject", "price": "1"}}}),

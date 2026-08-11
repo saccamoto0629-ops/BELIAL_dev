@@ -224,6 +224,28 @@ def test_scripted_cancel_failure_raises_and_leaves_state_unchanged():
     assert broker.get_order("c-1").state is m.OrderState.ACCEPTED
 
 
+def test_scripted_cancel_timeout_raises_and_leaves_state_unchanged():
+    """Issue #99: a cancel whose outcome is lost (``TimeoutCancellation``)
+    raises ``BrokerTimeoutError``; deterministically the broker-side order
+    stays unchanged, and the attempt is still recorded."""
+    broker = fb.FakeBroker()
+    broker.script_order("c-1", fb.StayPending())
+    broker.script_cancel("c-1", fb.TimeoutCancellation())
+    broker.submit_order(make_request())
+    with pytest.raises(m.BrokerTimeoutError) as exc_info:
+        broker.cancel_order("c-1")
+    assert exc_info.value.code is m.BrokerErrorCode.TIMEOUT
+    assert broker.get_order("c-1").state is m.OrderState.ACCEPTED
+    assert broker.cancel_requests == ["c-1"]
+
+
+def test_timeout_cancellation_requires_a_non_empty_reason():
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.TimeoutCancellation(reason="")
+    with pytest.raises(m.BrokerInvalidRequestError):
+        fb.TimeoutCancellation(reason="   ")
+
+
 def test_cancelling_a_filled_order_fails_with_cancellation_error():
     broker = fb.FakeBroker()
     broker.submit_order(make_request())  # default: immediate full fill

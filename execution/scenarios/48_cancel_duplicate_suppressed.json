@@ -1,0 +1,89 @@
+{
+  "scenario_id": "cancel_duplicate_suppressed",
+  "description": "同一キャンセルの再実行: CANCELLED確定後の2回目のcancelはBrokerを呼ばずに冪等拒否され、Brokerへのcancel呼び出しは1回のまま(Issue #99)",
+  "broker": {
+    "scripts": {
+      "client-1": {
+        "behavior": "stay_pending",
+        "broker_order_id": "BRK-1"
+      }
+    }
+  },
+  "steps": [
+    {
+      "action": "register",
+      "request": {
+        "execution_request_id": "exec-1",
+        "signal_id": "signal-1",
+        "strategy_id": "strategy-1",
+        "symbol": "USD_JPY",
+        "side": "buy",
+        "order_type": "market",
+        "quantity": "1",
+        "stop_loss_price": "149.50",
+        "take_profit_price": "151.50"
+      },
+      "client_order_id": "client-1",
+      "expect": {
+        "outcome": "registered"
+      }
+    },
+    {
+      "action": "submit",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "submitted",
+        "state": "accepted"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "cancelled",
+        "state": "cancelled"
+      }
+    },
+    {
+      "action": "cancel",
+      "execution_request_id": "exec-1",
+      "expect": {
+        "outcome": "refused",
+        "refusal_code": "cancel_already_cancelled"
+      }
+    }
+  ],
+  "expected": {
+    "final_phase": "submitted",
+    "final_state": "cancelled",
+    "state_history": [
+      {
+        "previous_state": null,
+        "new_state": "pending",
+        "reason": "live submission via safety gate",
+        "broker_order_id": null
+      },
+      {
+        "previous_state": "pending",
+        "new_state": "accepted",
+        "reason": "live submission via safety gate",
+        "broker_order_id": "BRK-1"
+      },
+      {
+        "previous_state": "accepted",
+        "new_state": "cancelled",
+        "reason": "live cancellation via sanctioned cancel path",
+        "broker_order_id": "BRK-1"
+      }
+    ],
+    "broker_submit_calls": 1,
+    "broker_cancel_calls": 1,
+    "order_rows": 1,
+    "history_rows": 3,
+    "safety_decisions": 1,
+    "last_decision_allowed": true,
+    "broker_order_id": "BRK-1",
+    "listed_unknown": false,
+    "listed_unresolved": false
+  }
+}

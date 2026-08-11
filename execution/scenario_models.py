@@ -31,6 +31,7 @@ from pathlib import Path
 
 from broker.broker_models import OrderSide, OrderState, OrderType
 from execution.execution_store import KNOWN_PHASES
+from execution.live_submission import CancelRefusalCode
 from execution.safety_gate import SafetyRejectionCode
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,16 +41,17 @@ _SCENARIO_ID_PATTERN = re.compile(r"^[a-z0-9_]+$")
 
 _ORDER_STATE_VALUES = frozenset(state.value for state in OrderState)
 _REJECTION_CODE_VALUES = frozenset(code.value for code in SafetyRejectionCode)
+_CANCEL_REFUSAL_CODE_VALUES = frozenset(code.value for code in CancelRefusalCode)
 _SIDE_VALUES = frozenset(side.value for side in OrderSide)
 _ORDER_TYPE_VALUES = frozenset(order_type.value for order_type in OrderType)
 
 # Submit-script behaviours the runner can configure on FakeBroker, with the
 # extra keys each behaviour accepts. Kept in lockstep with
 # ``broker.fake_broker``; an unknown behaviour is a schema error, never a
-# silent default. Cancel behaviours are deliberately NOT part of the scenario
-# schema (PR #96 review r1): no production cancel Execution use case exists
-# yet, so fixed scenarios cannot exercise one -- FakeBroker cancel behaviour
-# and the store's cancel transitions are covered by ordinary pytest instead.
+# silent default. Cancel behaviours re-entered the schema with Issue #99:
+# the production cancel Execution use case now exists
+# (``LiveOrderSubmissionService.cancel``), so fixed scenarios drive it via
+# the public API -- exactly the restoration PR #96 review r1 deferred.
 _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
     "fill_immediately": frozenset({"price", "broker_order_id"}),
     "stay_pending": frozenset({"broker_order_id"}),
@@ -64,6 +66,15 @@ _SUBMIT_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
     "reject": frozenset({"reason", "category"}),
     "timeout": frozenset(),
     "fail_communication": frozenset(),
+}
+
+# Cancel scripts (Issue #99): what FakeBroker does when the SANCTIONED cancel
+# path (LiveOrderSubmissionService.cancel) reaches it. Unscripted orders
+# cancel successfully; ``fail_cancellation`` is the broker's definitive
+# refusal; ``timeout`` loses the cancel outcome (BrokerTimeoutError).
+_CANCEL_BEHAVIOUR_KEYS: dict[str, frozenset[str]] = {
+    "fail_cancellation": frozenset({"reason"}),
+    "timeout": frozenset({"reason"}),
 }
 
 _REJECTION_CATEGORY_VALUES = frozenset(
@@ -90,6 +101,10 @@ _STEP_ACTIONS = frozenset(
     {
         "register",
         "submit",
+        # Issue #99: the sanctioned cancel use case
+        # (LiveOrderSubmissionService.cancel) -- the runner calls the public
+        # API only, never a synthesized cancel path.
+        "cancel",
         "record_unknown",
         "mark_submitting",
         "submit_concurrent",
@@ -109,6 +124,9 @@ _STEP_ACTIONS = frozenset(
 _STEP_OUTCOMES: dict[str, frozenset[str]] = {
     "register": frozenset({"registered", "conflict", "error"}),
     "submit": frozenset({"submitted", "rejected", "error"}),
+    # ``cancelled`` / ``refused`` / ``broker_refused`` mirror CancelStatus;
+    # ``error`` is a re-raised broker/store exception (UNKNOWN territory).
+    "cancel": frozenset({"cancelled", "refused", "broker_refused", "error"}),
     "record_unknown": frozenset({"recorded", "error"}),
     "mark_submitting": frozenset({"ok", "error"}),
     "shadow": frozenset({"recorded", "duplicate", "dry_run", "conflict", "error"}),
@@ -143,7 +161,9 @@ _GATE_KEYS = frozenset(
     }
 )
 
-_BROKER_KEYS = frozenset({"default_fill_price", "connection_target", "scripts"})
+_BROKER_KEYS = frozenset(
+    {"default_fill_price", "connection_target", "scripts", "cancel_scripts"}
+)
 
 # ``after_calls`` lets the first N calls succeed then fails the rest;
 # ``fail_calls`` (Issue #78 stale-claim recovery) fails the FIRST N calls
@@ -177,6 +197,11 @@ _STEP_COMMON_KEYS = frozenset({"action", "expect"})
 _STEP_EXTRA_KEYS: dict[str, frozenset[str]] = {
     "register": frozenset({"request", "client_order_id"}),
     "submit": frozenset({"execution_request_id"}),
+    # ``at_offset_seconds`` moves the service clock for THIS step past the
+    # broker's deterministic event ticks (same vocabulary as the shadow
+    # steps), so a state-only UNKNOWN fallback can satisfy the store's
+    # timestamp monotonicity against an already-recorded broker observation.
+    "cancel": frozenset({"execution_request_id", "at_offset_seconds"}),
     "record_unknown": frozenset({"execution_request_id", "reason"}),
     "mark_submitting": frozenset({"execution_request_id", "reason"}),
     "submit_concurrent": frozenset({"execution_request_id", "workers"}),
@@ -218,6 +243,9 @@ EXPECTED_KEYS = frozenset(
         "final_state",
         "state_history",
         "broker_submit_calls",
+        # Issue #99: every cancel ATTEMPT that reached FakeBroker (successful,
+        # refused and timed-out alike -- FakeBroker.cancel_requests).
+        "broker_cancel_calls",
         "submitted_request",
         "order_rows",
         "history_rows",
@@ -265,6 +293,8 @@ _SUBMITTED_REQUEST_KEYS = frozenset(
 )
 
 _STEP_EXPECT_KEYS = frozenset({"outcome", "state", "rejection_codes", "error_type", "error_code"})
+# Cancel steps additionally declare the typed local-refusal code (Issue #99).
+_CANCEL_STEP_EXPECT_KEYS = _STEP_EXPECT_KEYS | frozenset({"refusal_code"})
 _SHADOW_STEP_EXPECT_KEYS = frozenset(
     {"outcome", "allowed", "rejection_codes", "error_type", "conflict_fields"}
 )
@@ -423,6 +453,17 @@ def _validate_broker(spec, scenario: str) -> dict:
         _require_non_empty_str(client_order_id, "broker.scripts key", scenario)
         _validate_script(
             script, f"broker.scripts[{client_order_id}]", scenario, table=_SUBMIT_BEHAVIOUR_KEYS
+        )
+    cancel_scripts = _require_mapping(
+        broker.get("cancel_scripts", {}), "broker.cancel_scripts", scenario
+    )
+    for client_order_id, script in cancel_scripts.items():
+        _require_non_empty_str(client_order_id, "broker.cancel_scripts key", scenario)
+        _validate_script(
+            script,
+            f"broker.cancel_scripts[{client_order_id}]",
+            scenario,
+            table=_CANCEL_BEHAVIOUR_KEYS,
         )
     return broker
 
@@ -595,7 +636,12 @@ def _validate_step_expect(action: str, expect, name: str, scenario: str) -> dict
             if key in expect:
                 _require_int(expect[key], f"{name}.{key}", scenario)
         return expect
-    _require_known_keys(expect, _STEP_EXPECT_KEYS, name, scenario)
+    _require_known_keys(
+        expect,
+        _CANCEL_STEP_EXPECT_KEYS if action == "cancel" else _STEP_EXPECT_KEYS,
+        name,
+        scenario,
+    )
     outcome = expect.get("outcome")
     if outcome not in _STEP_OUTCOMES[action]:
         raise _fail(
@@ -604,6 +650,12 @@ def _validate_step_expect(action: str, expect, name: str, scenario: str) -> dict
         )
     if "state" in expect and expect["state"] not in _ORDER_STATE_VALUES:
         raise _fail(scenario, f"{name}.state must be one of {sorted(_ORDER_STATE_VALUES)}")
+    if "refusal_code" in expect and expect["refusal_code"] not in _CANCEL_REFUSAL_CODE_VALUES:
+        raise _fail(
+            scenario,
+            f"{name}.refusal_code must be one of {sorted(_CANCEL_REFUSAL_CODE_VALUES)}, "
+            f"got {expect['refusal_code']!r}",
+        )
     if "rejection_codes" in expect:
         _validate_rejection_codes(expect["rejection_codes"], f"{name}.rejection_codes", scenario)
     if "error_type" in expect:
@@ -660,10 +712,12 @@ def _validate_step(spec, index: int, scenario: str) -> ScenarioStep:
         params["request"] = _validate_request(step.get("request"), f"{name}.request", scenario)
         for key in ("client_order_id", "parent_execution_request_id", "operator_id", "reason"):
             _require_non_empty_str(step.get(key), f"{name}.{key}", scenario)
-    elif action in ("submit", "record_unknown", "mark_submitting", "submit_concurrent"):
+    elif action in ("submit", "cancel", "record_unknown", "mark_submitting", "submit_concurrent"):
         _require_non_empty_str(step.get("execution_request_id"), f"{name}.execution_request_id", scenario)
         if action == "submit_concurrent":
             _require_int(step.get("workers"), f"{name}.workers", scenario, minimum=2)
+        if action == "cancel" and "at_offset_seconds" in step:
+            _require_int(step["at_offset_seconds"], f"{name}.at_offset_seconds", scenario)
         if action in ("record_unknown", "mark_submitting") and "reason" in step:
             _require_non_empty_str(step["reason"], f"{name}.reason", scenario)
     elif action == "register_concurrent":
@@ -725,8 +779,8 @@ def _validate_expected(spec, scenario: str) -> dict:
             if "broker_order_id" in entry and entry["broker_order_id"] is not None:
                 _require_non_empty_str(entry["broker_order_id"], f"{name}.broker_order_id", scenario)
     for key in (
-        "broker_submit_calls", "order_rows", "history_rows", "safety_decisions",
-        "shadow_rows", "shadow_claim_rows",
+        "broker_submit_calls", "broker_cancel_calls", "order_rows", "history_rows",
+        "safety_decisions", "shadow_rows", "shadow_claim_rows",
     ):
         if key in expected:
             _require_int(expected[key], f"expected.{key}", scenario)

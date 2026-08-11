@@ -52,6 +52,33 @@ service.submit(execution_request_id, market=...)
 - **未解決 submission の照会**: `execution_store.list_unresolved_submissions()` は、`state = 'unknown'`(従来の照会対象)に加え、**`phase = 'submitting'` かつ `state = 'pending'`**(遷移獲得後に Broker 観測が一度も記録されないまま停止したケース — 送信前クラッシュ、または結果保存とUNKNOWNフォールバックの二重失敗)を返す read-only API。実注文が存在しうる submission は必ず reconciliation から見える。`created`(送信試行なし)と確定観測済み(phase `submitted`)は含まない。
 - **Execution DB と独立の耐久 Submission Journal(Issue #93)**: Gate を通過した送信試行は、Broker 呼び出しの**前に**専用 SQLite ファイルの Submission Journal へ耐久記録される。Journal への保存失敗は `submission_journal_failed` で fail-closed(Broker は呼ばれない)。Broker 応答後に Execution DB 保存が失敗した場合は Journal 上に `reconciliation_required` が応答内容込みで残り、**Execution DB が schema 異常・read-only・破損・消失で全損していても** `SubmissionJournal.list_unresolved()` から未解決送信を列挙・プロセス再起動後も復元できる。Journal は execution store と独立の二重送信ガードでもある(Execution DB を再作成しても同一 intent の再送信を阻止)。詳細・クラッシュ境界表は [Submission Journal](submission_journal.md) を参照。
 
+## 公認キャンセル経路(Issue #99)
+
+キャンセルも送信と同じ単一サービス境界に閉じる: **`LiveOrderSubmissionService.cancel(execution_request_id)` が `Broker.cancel_order` へ至る唯一の公認経路**であり、リポジトリ全体の AST 走査テスト(`test_submission_boundary.py`)が `cancel_order` の呼び出し箇所を `live_submission.py` 内の 1 箇所(+ broker 自身のテスト等の fixture)に固定する。Safety Gate はキャンセルを評価しない(Gate は発注リスクを増やす操作の事前検証層であり、キャンセルの実行判断・自動キャンセルは非スコープ)。
+
+```text
+service.cancel(execution_request_id) -> CancelOutcome
+    1. execution store から row を復元(いかなる lookup 失敗も cancel_state_query_failed で fail-closed)
+       未登録 → cancel_intent_not_registered / phase=created → cancel_not_submitted
+    2. 現在状態による型付き事前拒否(Broker は呼ばれない: broker_called=False)
+       state=unknown       → cancel_outcome_unresolved(未解決 outcome への再送禁止)
+       phase=submitting/pending → cancel_submission_unresolved(submit 未確認中の盲目キャンセル禁止)
+       state=cancelled     → cancel_already_cancelled(重複キャンセルの冪等拒否)
+       state=filled/rejected → cancel_terminal_state(terminal は不変)
+    3. ACCEPTED / PARTIALLY_FILLED(phase=submitted)のみ Broker.cancel_order(保存済み client_order_id)
+    4. 結果の記録
+       post-cancel OrderResult → record_order_result(既存の状態機械 / validate_order_result_update 契約で
+         CANCELLED を永続化)→ status=cancelled
+       BrokerCancellationError(確定拒否)→ 状態不変・履歴追記なし・WARN 記録 → status=broker_refused
+       その他の例外(timeout / 通信失敗 / not found / 想定外)→ state-only UNKNOWN を best-effort 記録して re-raise
+       受領済み結果の保存失敗 → state-only UNKNOWN へフォールバック記録して元例外を re-raise
+```
+
+- **idempotency(重複キャンセル防止)**: 判定の正は**耐久保存された注文状態**であり、プロセス再起動・サービス再作成をまたいで有効。CANCELLED 確定後の再実行は `cancel_already_cancelled`、outcome 消失後(UNKNOWN)の再実行は `cancel_outcome_unresolved` で拒否され、いずれも Broker への 2 回目の cancel は発生しない。確定拒否(`broker_refused`)後の再実行だけは**新規試行**として許される(Broker に係属中の cancel は存在しないため重複ではない)。
+- **UNKNOWN の再送禁止(submit 契約との対称)**: cancel の timeout・通信失敗等は「未キャンセル」へ降格されず UNKNOWN として記録され、以後の cancel は拒否される。解決は照会 / reconciliation のみ(`list_unknown_orders()` / `list_unresolved_submissions()` の照会対象)。
+- **DB 保存失敗の可視化**: Broker が応答した後の失敗は決して拒否へ変換されない(re-raise)。受領済み CANCELLED 結果の保存が失敗しても state-only UNKNOWN で照会対象に残り、後続照会が Broker 側の真実(CANCELLED)を再観測して解決する。UNKNOWN フォールバックまで失敗した場合(order DB 全損)も、cancel は**常に登録・送信済みの耐久 row を対象とする**ため注文は ACCEPTED のまま `list_in_flight_orders()` / `list_reconciliation_orders()` から見え続ける — submit と異なり「Execution DB に痕跡が残らない試行」が構造的に存在しないため、**Submission Journal はキャンセルへ拡張しない**(設計判断)。
+- **確定拒否時の状態不変**: `BrokerCancellationError`(例: Broker 側で約定済み)では状態機械に合成遷移を書かない。store/broker の乖離は in-flight のまま reconciliation が観測・解決する対象であり、失敗情報は `CancelOutcome.detail` と WARN ログ(execution_request_id / signal_id / client_order_id / phase / state / 理由)に記録される。
+
 ## execution mode と Shadow 評価(Issue #78)
 
 execution mode の統一語彙は `ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)であり、設定文字列は `resolve_execution_mode()` がロード時に解決する(未知 mode は明示拒否)。`demo` / `live` は引き続き**定義と validation のみ**で、Adapter 型が登録されるまで接続を構築できない。
@@ -186,14 +213,16 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - `test_safety_store.py` — 再オープン(プロセス再起動相当)後の round-trip、記録順の復元、missing DB への書き込み拒否(ファイル非作成)・読み取り空(ファイル非作成)、pristine 判定、foreign schema / 制約欠損 lookalike / trigger / version 不一致の拒否(DB 無変更)、帯域外改竄(未知コード・未知キー・壊れた時刻)の復元時拒否、DB CHECK 制約の発火、公認送信サービスとの結合(拒否・許可の監査が再起動後も取得可能、未初期化 store の fail-closed)。
 - `test_safety_store.py`(Issue #116 追加分)— policy snapshot の round-trip(`list_for_request_records`)、snapshot なし記録の None 読み戻し、非 dict snapshot の拒否、改竄 snapshot の復元時拒否、**v1 → v2 migration**(既存行保持・冪等性・検証失敗時の完全 rollback と retry 成功)。
 - `test_reissue_service.py` / `test_reissue_clearance.py` / `test_reissue_submission.py`(Issue #116)— 再発行 eligibility・clearance 判定・`intent_superseded` / `reissue_clearance_invalid` の送信経路検証([Execution Intent Reissue](execution_reissue.md))。
-- `test_submission_boundary.py` — `submit_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信呼び出しが 1 箇所であること)。
-- `test_fixed_scenarios.py` ほか(Issue #77)— 固定シナリオ試験。Safety Gate 拒否系(stale price / kill switch / execution mode 不整合 / 複数違反同時収集)を含む分岐を固定データから本番経路(本サービス)経由で再現し、全拒否シナリオで Broker 呼び出しが 0 件であること・機械可読な拒否コード・監査保存件数を expected/actual 比較で固定する。実行方法は `execution/README.md` の「固定シナリオ試験」節を参照。
+- `test_submission_boundary.py` — `submit_order` / `cancel_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信・キャンセル呼び出しが各 1 箇所であること)。
+- `test_cancel_submission.py`(Issue #99)— 公認キャンセル経路の全分岐: 成功(既存状態機械契約での CANCELLED 永続化・部分約定の fill 保持)、重複キャンセルの冪等拒否(サービス再作成後含む・Broker cancel 1 回のまま)、Broker 確定拒否の状態不変 + 失敗記録 + 再試行の新規試行扱い、store=ACCEPTED / broker=FILLED 乖離時の確定拒否、ローカル型付き拒否の全コード(未登録 / 未送信 / submitting・pending / submit 後 UNKNOWN / terminal / store 読み取り不能)と全拒否経路で Broker cancel 0 件、timeout・通信失敗・not found・想定外例外の保守的 UNKNOWN 記録 + re-raise + 再送禁止、受領済み結果の保存失敗 → UNKNOWN フォールバック + 元例外 re-raise + 照会可視性、二重失敗時の critical ログと `list_in_flight_orders()` での可視性維持、`CancelOutcome` のクロスフィールド不変条件。
+- `test_fixed_scenarios.py` ほか(Issue #77)— 固定シナリオ試験。Safety Gate 拒否系(stale price / kill switch / execution mode 不整合 / 複数違反同時収集)を含む分岐を固定データから本番経路(本サービス)経由で再現し、全拒否シナリオで Broker 呼び出しが 0 件であること・機械可読な拒否コード・監査保存件数を expected/actual 比較で固定する。キャンセル系 6 件(Issue #99: 成功 / Broker 確定拒否 / terminal 拒否 / 重複抑止 / timeout UNKNOWN / DB 保存失敗)は `cancel` ステップが本サービスの公開 cancel API のみを駆動する。実行方法は `execution/README.md` の「固定シナリオ試験」節を参照。
 
 ## 非スコープ(Issue #75 時点で未実装)
 
 - OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(`demo` / `live` の `BrokerConnection` は Adapter 型が登録されるまで構築不能)
 - Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ)
 - 動的ロット計算・証拠金最適化・リスク量からの数量計算
+- 自動キャンセル判断(いつキャンセルするかの Strategy / 運用判断。公認キャンセル**経路**は Issue #99 で実装済みだが、それを呼ぶ判断側は非スコープ)
 - Strategy / Paper Signal の売買ロジック変更、Paper Execution への Broker 接続
 - reconciliation の定期実行(UNKNOWN / 未解決 submission の解決は後続照会記録のみ。照会**対象の取得**は `list_unresolved_submissions()` で可能)
 - 数量ベース・証拠金ベースのポジション上限、部分約定中注文のカウント

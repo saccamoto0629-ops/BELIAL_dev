@@ -60,6 +60,7 @@ from tempfile import TemporaryDirectory
 
 from broker.broker_models import AccountState, BrokerError, OrderSide, OrderState, OrderType
 from broker.fake_broker import (
+    FailCancellation,
     FailCommunication,
     FakeBroker,
     FillImmediately,
@@ -67,6 +68,7 @@ from broker.fake_broker import (
     PartiallyFillThenReissue,
     RejectOrder,
     StayPending,
+    TimeoutCancellation,
     TimeoutOrder,
 )
 from execution import execution_store, shadow_store
@@ -252,6 +254,18 @@ def _build_submit_script(spec: dict):
     raise ScenarioDefinitionError(f"unknown submit behaviour {behaviour!r}")  # guarded by validation
 
 
+def _build_cancel_script(spec: dict):
+    behaviour = spec["behavior"]
+    kwargs = {}
+    if "reason" in spec:
+        kwargs["reason"] = spec["reason"]
+    if behaviour == "fail_cancellation":
+        return FailCancellation(**kwargs)
+    if behaviour == "timeout":
+        return TimeoutCancellation(**kwargs)
+    raise ScenarioDefinitionError(f"unknown cancel behaviour {behaviour!r}")  # guarded by validation
+
+
 def _build_broker(definition: ScenarioDefinition) -> FakeBroker:
     spec = definition.broker
     broker = FakeBroker(
@@ -260,6 +274,8 @@ def _build_broker(definition: ScenarioDefinition) -> FakeBroker:
     )
     for client_order_id, script in spec.get("scripts", {}).items():
         broker.script_order(client_order_id, _build_submit_script(script))
+    for client_order_id, script in spec.get("cancel_scripts", {}).items():
+        broker.script_cancel(client_order_id, _build_cancel_script(script))
     return broker
 
 
@@ -456,11 +472,13 @@ class _ScenarioContext:
         self.client_order_ids: dict[str, str] = {}
         self.step_results: list[dict] = []
 
-    def _boundary(self):
+    def _boundary(self, clock=None):
         """Both production services from the PRODUCTION composition root
         (Issue #116 / PR #122 review r3): one ReissuePolicy governs the
         registration and submission freshness windows, and the scenarios
-        exercise the only sanctioned way to wire them."""
+        exercise the only sanctioned way to wire them. ``clock`` overrides
+        the SERVICE clock only (cancel steps move it past the broker's
+        deterministic event ticks via ``at_offset_seconds``)."""
         SQLiteSafetyDecisionStore(self.decisions_db).initialize()
         SubmissionJournal(self.journal_db).initialize()
         return build_reissue_boundary(
@@ -471,14 +489,14 @@ class _ScenarioContext:
             decision_db_path=self.decisions_db,
             order_db_path=self.orders_db,
             journal_db_path=self.journal_db,
-            clock=lambda: NOW,
+            clock=clock if clock is not None else (lambda: NOW),
         )
 
-    def make_service(self) -> LiveOrderSubmissionService:
+    def make_service(self, clock=None) -> LiveOrderSubmissionService:
         """One service per call: concurrency steps give each worker its own
         instance (multi-process equivalence); sequential steps just use a
         fresh one, which is stateless beyond its injected paths."""
-        return self._boundary().submission
+        return self._boundary(clock).submission
 
     def make_reissue_service(self):
         """One PRODUCTION reissue registration service per call (Issue #116),
@@ -595,6 +613,25 @@ def _execute_submit(context: _ScenarioContext, step: ScenarioStep) -> dict:
     if result is not None:
         return {"outcome": "submitted", "state": result.state.value}
     return {"outcome": "rejected", "rejection_codes": sorted(decision.rejection_codes)}
+
+
+def _execute_cancel(context: _ScenarioContext, step: ScenarioStep) -> dict:
+    """Issue #99: the runner calls the PRODUCTION public cancel API only.
+    Outcome classification (cancelled / refused / broker_refused) is the
+    service's own ``CancelOutcome``; a re-raised exception (timeout,
+    persistence failure -- UNKNOWN territory) is reported as ``error``."""
+    try:
+        outcome = context.make_service(clock=context.step_clock(step)).cancel(
+            step.params["execution_request_id"]
+        )
+    except Exception as exc:
+        return {"outcome": "error", **_classify_error(exc)}
+    payload = {"outcome": outcome.status.value}
+    if outcome.refusal_code is not None:
+        payload["refusal_code"] = outcome.refusal_code.value
+    if outcome.result is not None:
+        payload["state"] = outcome.result.state.value
+    return payload
 
 
 def _execute_record_unknown(context: _ScenarioContext, step: ScenarioStep) -> dict:
@@ -862,14 +899,15 @@ def _execute_gate_correction(context: _ScenarioContext, step: ScenarioStep) -> d
     return _execute_reissue(context, step, context.make_reissue_service().register_gate_correction)
 
 
-# Cancel is deliberately NOT a step action (PR #96 review r1): no production
-# cancel Execution use case exists yet, and the runner must not synthesize
-# one. FakeBroker cancel behaviour and the store's cancel transitions are
-# covered by ordinary pytest (broker/tests/test_fake_broker.py,
-# execution/tests/test_execution_store.py).
+# The ``cancel`` step (Issue #99) drives the PRODUCTION cancel use case --
+# ``LiveOrderSubmissionService.cancel()`` -- and nothing else: the runner
+# holds no cancel orchestration of its own (the PR #96 review r1 ban on a
+# synthesized cancel path stands; what changed is that the production path
+# now exists, so the fixed cancel scenarios return via the public API).
 _STEP_EXECUTORS = {
     "register": _execute_register,
     "submit": _execute_submit,
+    "cancel": _execute_cancel,
     "record_unknown": _execute_record_unknown,
     "mark_submitting": _execute_mark_submitting,
     "submit_concurrent": _execute_submit_concurrent,
@@ -969,6 +1007,10 @@ def _collect_actual(context: _ScenarioContext) -> dict:
             for entry in history
         ],
         "broker_submit_calls": len(submitted),
+        # Issue #99: every cancel ATTEMPT recorded by FakeBroker (successful,
+        # refused and timed-out alike), so scenarios can pin that refusals
+        # and duplicate cancels never reach the broker.
+        "broker_cancel_calls": len(context.broker.cancel_requests),
         "submitted_request": None
         if first_submitted is None
         else {

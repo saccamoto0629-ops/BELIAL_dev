@@ -318,9 +318,23 @@ class FailCancellation:
         _require_non_empty_reason(self.reason, "FailCancellation.reason")
 
 
-CancelScript = FailCancellation
+@dataclass(frozen=True)
+class TimeoutCancellation:
+    """The cancel attempt times out (``BrokerTimeoutError``): the cancel
+    OUTCOME is lost -- the broker may or may not have cancelled the order
+    (Issue #99, mirroring ``TimeoutOrder`` for submits). Deterministically,
+    the broker-side order state is left unchanged, but callers must treat
+    the order as ``UNKNOWN`` until a later query resolves it."""
 
-_CANCEL_SCRIPT_TYPES = (FailCancellation,)
+    reason: str = "cancel timed out"
+
+    def __post_init__(self) -> None:
+        _require_non_empty_reason(self.reason, "TimeoutCancellation.reason")
+
+
+CancelScript = Union[FailCancellation, TimeoutCancellation]
+
+_CANCEL_SCRIPT_TYPES = (FailCancellation, TimeoutCancellation)
 
 _CLOCK_BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -685,6 +699,12 @@ class FakeBroker:
         script = self._cancel_scripts.get(client_order_id)
         if isinstance(script, FailCancellation):
             raise BrokerCancellationError(script.reason, client_order_id=client_order_id)
+        if isinstance(script, TimeoutCancellation):
+            # Outcome lost, reproduced immediately (never by waiting): the
+            # broker-side order deterministically stays unchanged, but the
+            # caller cannot know that -- the order is UNKNOWN territory until
+            # a later query resolves it (Issue #99).
+            raise BrokerTimeoutError(script.reason, client_order_id=client_order_id)
         if current.state in TERMINAL_ORDER_STATES:
             raise BrokerCancellationError(
                 f"cannot cancel order in terminal state {current.state.value!r}",
