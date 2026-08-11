@@ -868,10 +868,10 @@ def test_behavioral_probe_leaves_no_rows_behind(tmp_path):
 # --- 14/15/16: migration paths + rollback ------------------------------------
 
 
-def test_fresh_db_is_v3_current(tmp_path):
+def test_fresh_db_is_current_version(tmp_path):
     db = tmp_path / "p.sqlite3"
     store.init_db(db)
-    assert _user_version(db) == store.CURRENT_SCHEMA_VERSION == 3
+    assert _user_version(db) == store.CURRENT_SCHEMA_VERSION == 4   # v4: Issue #85 position_limit CHECK
     assert store.get_schema_status(db) == store.SCHEMA_STATUS_CURRENT
 
 
@@ -922,7 +922,7 @@ def test_v2_prototype_migrates_to_v3_preserving_history(tmp_path):
     ])
     assert store.get_schema_status(db) == store.SCHEMA_STATUS_LEGACY   # prototype = legacy now
     store.init_db(db)
-    assert _user_version(db) == 3
+    assert _user_version(db) == store.CURRENT_SCHEMA_VERSION
     assert store.get_schema_status(db) == store.SCHEMA_STATUS_CURRENT
     done = store.get_notification("a:open", db_path=db)
     assert done["delivery_status"] == "success" and done["attempt_count"] == 1

@@ -180,7 +180,10 @@ def test_signal_read_failure_counts_as_failure(tmp_path, monkeypatch):
 
 def test_write_failure_counts_as_failure(tmp_path, monkeypatch):
     db = tmp_path / "p.sqlite3"
-    monkeypatch.setattr(store, "create_position", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("x")))
+    monkeypatch.setattr(
+        store, "create_position_capacity_guarded",
+        lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("x")),
+    )
     res = _run(db, [_signal()], _candles([(50, 51, 49, 50), (100, 100, 100, 100)]), NOW)
     assert res.failures >= 1
 

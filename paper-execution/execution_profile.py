@@ -18,6 +18,14 @@ Every parameter a position is judged by is snapshotted onto the position row at
 change to CLI flags or config can never alter an existing position's outcome --
 the position is always re-evaluated from its own stored snapshot, not from the
 live profile.
+
+``max_active_positions_per_side`` (Issue #85) is the one deliberate exception
+to the snapshot rule: it is an INTAKE-time gate ("may this signal become a new
+position, given the other positions currently active in its
+symbol/timeframe/side scope?"), not a rule any individual position is judged
+by. It is therefore evaluated against the live profile at signal intake and
+never snapshotted onto position rows -- an existing position's evaluation is
+unaffected by it.
 """
 
 from __future__ import annotations
@@ -46,6 +54,14 @@ class ExecutionProfile:
     squeeze-breakout strategy, and ``same_candle_priority`` defaults to the
     conservative ``stop_loss``. ``max_entry_delay_bars`` defaults to 3 bars
     (Issue #49: "timeframe × 3本分").
+
+    ``max_active_positions_per_side`` (Issue #85): concurrent-position cap per
+    ``(symbol, timeframe, side)`` scope, counting non-terminal (pending / open)
+    positions. Defaults to 1 -- one active position per direction per scope; a
+    signal refused by the cap is recorded as ``cancelled`` /
+    ``position_limit``. ``None`` disables the cap (the pre-#85 unlimited,
+    per-signal-independent behaviour). Intake-time gate only -- never
+    snapshotted onto position rows (see the module docstring).
     """
 
     name: str = DEFAULT_PROFILE_NAME
@@ -58,6 +74,7 @@ class ExecutionProfile:
     spread: float = 0.0
     slippage: float = 0.0
     commission: float = 0.0
+    max_active_positions_per_side: int | None = 1
 
     def __post_init__(self) -> None:
         if self.same_candle_priority not in KNOWN_SAME_CANDLE_PRIORITIES:
@@ -76,6 +93,11 @@ class ExecutionProfile:
         for field_name in ("spread", "slippage", "commission"):
             if getattr(self, field_name) < 0:
                 raise ValueError(f"{field_name} must be >= 0, got {getattr(self, field_name)!r}")
+        if self.max_active_positions_per_side is not None and self.max_active_positions_per_side < 1:
+            raise ValueError(
+                "max_active_positions_per_side must be >= 1 or None (unlimited), "
+                f"got {self.max_active_positions_per_side!r}"
+            )
 
 
 DEFAULT_PROFILE = ExecutionProfile()

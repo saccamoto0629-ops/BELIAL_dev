@@ -26,7 +26,7 @@ def test_state_sets():
 def test_state_terminal_reason_closed_set():
     assert models.STATE_TERMINAL_REASONS["closed"] == {"take_profit", "stop_loss", "max_holding_time"}
     assert models.STATE_TERMINAL_REASONS["expired"] == {"entry_timeout"}
-    assert models.STATE_TERMINAL_REASONS["cancelled"] == {"invalid_input", "manual"}
+    assert models.STATE_TERMINAL_REASONS["cancelled"] == {"invalid_input", "manual", "position_limit"}
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,10 @@ Orchestration only. Each cycle:
 
   1. read Paper Signals (READ-ONLY, never writes/migrates the Signal DB) and,
      for each not-yet-tracked signal, store a ``pending`` position -- or a
-     terminal ``cancelled`` position for an invalid signal (never a silent skip).
+     terminal ``cancelled`` position for an invalid signal (``invalid_input``)
+     or for a signal over the Issue #85 concurrent-position cap
+     (``position_limit``; capacity check + INSERT are one atomic store
+     transaction). Never a silent skip.
   2. evaluate ``pending`` positions against confirmed candles: open (next
      confirmed candle's open), expire (entry timeout / weekend carry-over), or
      keep waiting.
@@ -226,7 +229,8 @@ def _candles_for_close(candles: pd.DataFrame, entry_time_utc: str, watermark: st
 
 
 def _process_signal(
-    signal: dict, *, dry_run: bool, db_path: Path, read_db_path: Path, profile_for
+    signal: dict, *, dry_run: bool, db_path: Path, read_db_path: Path, profile_for,
+    dry_run_intake: dict[tuple[str, str, str], int] | None = None,
 ) -> tuple[str | None, dict | None]:
     """Store one signal as pending (or cancelled).
 
@@ -234,6 +238,15 @@ def _process_signal(
     the resulting position record (for Issue #83 notification events; on a dry
     run this is the projected record, built but never written). Reads go to
     ``read_db_path`` (the dry-run snapshot on a dry run); writes to ``db_path``.
+
+    Concurrent-position cap (Issue #85): a valid signal whose
+    ``(symbol, timeframe, side)`` scope already holds
+    ``profile.max_active_positions_per_side`` pending/open positions is
+    recorded as a terminal ``cancelled`` position (``position_limit``) instead
+    of a new pending -- atomically, via the store's capacity-guarded insert
+    (check + INSERT in ONE transaction, so concurrent runners cannot overshoot
+    the cap). On a dry run the same decision is projected from the snapshot
+    plus ``dry_run_intake`` (would-be pendings of THIS cycle), without writing.
     """
     logger = _get_logger()
     signal_id = signal.get("signal_id") or ""
@@ -261,22 +274,57 @@ def _process_signal(
 
     symbol = signal["symbol"]
     timeframe = signal["timeframe"]
+    side = signal["side"]
     profile = profile_for(symbol, timeframe)
+    limit = profile.max_active_positions_per_side
     entry_deadline = engine.compute_entry_deadline(
         signal["target_candle_utc"], timeframe, profile.max_entry_delay_bars
     )
     if dry_run:
+        # Project the Issue #85 capacity decision: snapshot state + the would-be
+        # pendings already accepted earlier in THIS dry-run cycle. Read-only.
+        scope = (symbol, timeframe, side)
+        intake = dry_run_intake if dry_run_intake is not None else {}
+        active = store.count_active_positions(symbol, timeframe, side, db_path=read_db_path)
+        active += intake.get(scope, 0)
+        if limit is not None and active >= limit:
+            logger.info(
+                "[DRY_RUN] would CANCEL signal %s (position_limit: %d active %s %s %s >= %d)",
+                signal_id, active, symbol, timeframe, side, limit,
+            )
+            record = models.create_cancelled_position(
+                signal_id=signal_id, symbol=symbol, timeframe=timeframe, side=side,
+                strategy_profile=signal.get("strategy_profile") or "", profile=profile,
+                signal_candle_utc=signal["target_candle_utc"], entry_deadline_utc=entry_deadline,
+                terminal_reason=models.REASON_POSITION_LIMIT,
+            )
+            return "cancelled", record
+        intake[scope] = intake.get(scope, 0) + 1
         logger.info(
             "[DRY_RUN] would create PENDING for signal %s (%s %s %s) deadline=%s",
-            signal_id, symbol, timeframe, signal["side"], entry_deadline,
+            signal_id, symbol, timeframe, side, entry_deadline,
         )
         return "pending", None
     record = models.create_pending_position(
-        signal_id=signal_id, symbol=symbol, timeframe=timeframe, side=signal["side"],
+        signal_id=signal_id, symbol=symbol, timeframe=timeframe, side=side,
         strategy_profile=signal.get("strategy_profile") or "", profile=profile,
         signal_candle_utc=signal["target_candle_utc"], entry_deadline_utc=entry_deadline,
     )
-    return ("pending", record) if store.create_position(record, db_path=db_path) else (None, None)
+    # Atomic capacity check + insert (Issue #85): pending under the cap, or a
+    # terminal cancelled/position_limit row + its outbox row (Issue #83) when
+    # the scope is full. One transaction -- concurrent runners cannot overshoot.
+    outcome, stored = store.create_position_capacity_guarded(
+        record, max_active_per_side=limit, db_path=db_path
+    )
+    if outcome == store.CAPACITY_RESULT_PENDING:
+        return "pending", stored
+    if outcome == store.CAPACITY_RESULT_CANCELLED:
+        logger.info(
+            "Signal %s refused by position limit (%s %s %s, max %s): recorded cancelled/position_limit.",
+            signal_id, symbol, timeframe, side, limit,
+        )
+        return "cancelled", stored
+    return None, None  # duplicate signal_id: already tracked, nothing written
 
 
 def _process_pending(
@@ -540,10 +588,14 @@ def run_once(
             logger.error("Paper Execution: reading Paper Signals failed: %s", exc)
             result.failures += 1
             signal_rows = []
+        # Issue #85 dry-run capacity projection: would-be pendings accepted earlier
+        # in this cycle count toward the cap of later same-scope signals.
+        dry_run_intake: dict[tuple[str, str, str], int] = {}
         for signal in signal_rows:
             try:
                 action, record = _process_signal(
-                    signal, dry_run=dry_run, db_path=db_path, read_db_path=read_db_path, profile_for=profile_for
+                    signal, dry_run=dry_run, db_path=db_path, read_db_path=read_db_path,
+                    profile_for=profile_for, dry_run_intake=dry_run_intake,
                 )
             except Exception as exc:
                 logger.error("Paper Execution: signal %s failed: %s", signal.get("signal_id"), exc)
@@ -726,10 +778,24 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--spread", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--commission", type=float, default=0.0)
+    parser.add_argument(
+        "--max-active-positions-per-side",
+        type=int,
+        default=profiles.DEFAULT_PROFILE.max_active_positions_per_side,
+        help=(
+            "Issue #85: max pending+open positions per (symbol, timeframe, side). "
+            "A signal over the cap is recorded as cancelled/position_limit. "
+            "0 = unlimited (pre-#85 per-signal-independent behaviour). Default: %(default)s."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def _profile_from_args(args: argparse.Namespace) -> "profiles.ExecutionProfile":
+    # CLI mapping: 0 = unlimited (the profile models "no cap" as None).
+    max_active = args.max_active_positions_per_side
+    if max_active is not None and max_active == 0:
+        max_active = None
     return profiles.ExecutionProfile(
         max_entry_delay_bars=args.max_entry_delay_bars,
         max_hold_bars=args.max_hold_bars,
@@ -739,6 +805,7 @@ def _profile_from_args(args: argparse.Namespace) -> "profiles.ExecutionProfile":
         spread=args.spread,
         slippage=args.slippage,
         commission=args.commission,
+        max_active_positions_per_side=max_active,
     )
 
 
