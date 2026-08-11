@@ -318,7 +318,8 @@ python -m execution.kill_switch_cli disable \
 - 停止中であることの確認手段: (1) `status` の出力、(2) 送信試行側の WARN ログ `Safety Gate rejected ... codes=('kill_switch_enabled',)`(journalctl)、(3) Safety Gate 判定監査 DB(`safety_gate_decisions.sqlite3`)の拒否記録。Discord 通知は未実装(Issue #81 は「ログまたは Discord」を要求しており、ログ + status で満たす)。
 - 履歴は上書きされない: UPDATE / DELETE は DB trigger が拒否する。同じ状態への enable の重ね掛けも履歴行として残る(監査目的)。
 - enable / disable は store 未作成時、schema 作成と遷移追記を**単一トランザクション**で行う。コマンドが途中で失敗しても「初期化だけ済んだ空 store(disabled と読める)」は残らず、fail-closed のままになる。
-- **この DB を WAL mode(`PRAGMA journal_mode=WAL`)へ変換しないこと**: WAL ヘッダの DB は store が全経路で拒否し(stale な「disabled」を返す可能性を排除するため)、Gate は fail-closed で全新規送信を止め、CLI は exit 1(UNAVAILABLE)になる。誤って変換した場合は `sqlite3 <db> 'PRAGMA journal_mode=DELETE;'` で戻す(記録済みの状態・履歴は失われない)。
+- **この DB を WAL mode(`PRAGMA journal_mode=WAL`)へ変換しないこと**: WAL の DB は store が全経路で拒否し(stale な「disabled」を返す可能性を排除するため)、Gate は fail-closed で全新規送信を止め、CLI は exit 1(UNAVAILABLE)になる。誤って変換した場合は `sqlite3 <db> 'PRAGMA journal_mode=DELETE;'` で戻す(記録済みの状態・履歴は失われない)。
+- 状態読み取りは**履歴全行の完全性を検証**してから状態を返す。帯域外編集で 1 行でも壊れていれば、その後に正常な `disable` を追記しても Gate・CLI とも fail-closed のまま(緊急停止のための `enable` は破損 DB でも記録できるが、状態が検証可能になるまで送信は止まったまま)。破損が疑われる場合は `status` の出力と `sqlite3 <db> 'SELECT * FROM kill_switch_transitions;'` で該当行を特定する。
 - 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(照合)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
 - 現時点で本番の常駐 Live Execution runner は存在しない(Live 接続未実装)。Kill Switch は将来の Live 送信 composition が `PersistentKillSwitchStateProvider` を配線することで効く契約であり、手順・状態 store・CLI はその運用準備として先行整備している(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
 

@@ -14,6 +14,7 @@ real DB.
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -418,6 +419,165 @@ def test_cli_status_on_wal_db_reports_unavailable_exit_1(tmp_path, capsys):
     to_wal_mode(path)
     assert kill_switch_cli_main(["--db", str(path), "status"]) == 1
     assert "UNAVAILABLE" in capsys.readouterr().err
+
+
+def test_a_wal_conversion_racing_the_open_can_never_be_read_as_disabled(tmp_path, monkeypatch):
+    """PR #126 Codex review P1 (r2): the WAL refusal must not be a SEPARATE
+    file-header probe. The race is injected deterministically -- another
+    process converts to WAL and commits an ``enable`` exactly between the
+    old probe point and the connection open -- by hooking the open itself.
+    The racing connection stays OPEN so the enable really does live in the
+    ``-wal`` side file (closing it would checkpoint the row into the main
+    database and destroy the very condition under test).
+
+    Under the old two-probe design the header still said rollback-journal at
+    probe time, so the refusal passed, ``connect_read_only`` then added
+    ``immutable=1``, and the enable sitting in ``-wal`` was invisible: the
+    store answered DISABLED. Now the journal mode is observed on the open
+    connection inside the read transaction, so the same race fails closed.
+    """
+    import execution.kill_switch_store as module
+    from execution.sqlite_ro import connect_read_only as ro_connect
+
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    store.record_transition(
+        enabled=False, operator="ops", reason="baseline disable", changed_at_utc=at(0)
+    )
+    real_connect = module.connect_read_only
+    racing_writer = sqlite3.connect(path)
+
+    def connect_after_the_race(db_path, **kwargs):
+        # Lands AFTER any pre-open header probe would have run.
+        if racing_writer.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            racing_writer.execute("PRAGMA journal_mode=WAL")
+            racing_writer.execute(
+                "INSERT INTO kill_switch_transitions "
+                "(enabled, changed_at_utc, operator, reason) "
+                "VALUES (1, ?, 'ops', 'emergency stop during WAL maintenance')",
+                (at(1).isoformat(),),
+            )
+            racing_writer.commit()
+        return real_connect(db_path, **kwargs)
+
+    try:
+        monkeypatch.setattr(module, "connect_read_only", connect_after_the_race)
+        with pytest.raises(KillSwitchSchemaError, match="WAL"):
+            store.current_state()
+        with pytest.raises(KillSwitchStoreError):
+            PersistentKillSwitchStateProvider(path).is_kill_switch_enabled()
+        monkeypatch.undo()
+
+        # The defect being pinned is real, not hypothetical: an immutable=1
+        # view of this very file still reports the pre-race state -- exactly
+        # the stale OFF the old read path would have returned.
+        with closing(ro_connect(path)) as immutable_view:  # default fallback
+            stale = immutable_view.execute(
+                "SELECT enabled FROM kill_switch_transitions "
+                "ORDER BY transition_id DESC LIMIT 1"
+            ).fetchone()[0]
+        assert stale == 0  # committed enable invisible -> would have read as OFF
+        with closing(ro_connect(path, allow_immutable_wal=False)) as wal_aware_view:
+            fresh = wal_aware_view.execute(
+                "SELECT enabled FROM kill_switch_transitions "
+                "ORDER BY transition_id DESC LIMIT 1"
+            ).fetchone()[0]
+        assert fresh == 1  # the path the store uses does see it (then refuses)
+    finally:
+        racing_writer.close()
+
+
+def test_the_read_path_never_opens_a_wal_file_immutably(tmp_path, monkeypatch):
+    """The refusal works because the read path opted OUT of the
+    ``immutable=1`` fallback: an immutable connection reports
+    ``journal_mode='delete'`` for a WAL file, so it could neither be
+    trusted nor detected. Pin that the kill switch asks for that opt-out."""
+    import execution.kill_switch_store as module
+
+    path = ks_db(tmp_path)
+    SQLiteKillSwitchStore(path).initialize()
+    seen = {}
+    real_connect = module.connect_read_only
+
+    def recording_connect(db_path, **kwargs):
+        seen.update(kwargs)
+        return real_connect(db_path, **kwargs)
+
+    monkeypatch.setattr(module, "connect_read_only", recording_connect)
+    SQLiteKillSwitchStore(path).current_state()
+    assert seen == {"allow_immutable_wal": False}
+
+
+def test_default_read_only_connections_keep_the_immutable_wal_fallback(tmp_path):
+    """The opt-out is kill-switch-local: every other execution store keeps
+    the documented ``immutable=1`` behaviour for foreign WAL files."""
+    from execution.sqlite_ro import connect_read_only as ro_connect
+
+    path = tmp_path / "foreign.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE t (a INTEGER)")
+        connection.execute("PRAGMA journal_mode=WAL")
+    with closing(ro_connect(path)) as connection:  # default: immutable fallback
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    with closing(ro_connect(path, allow_immutable_wal=False)) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+# --- full-history validation before returning OFF (PR #126 review P1 r2) -----
+
+
+def insert_malformed_row(path, *, enabled=1):
+    """An out-of-band row that satisfies the DB CHECKs but is not a valid
+    UTC timestamp -- the corruption strict restore validation must catch."""
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO kill_switch_transitions (enabled, changed_at_utc, operator, reason) "
+            f"VALUES ({enabled}, 'garbage+00:00', 'x', 'y')"
+        )
+
+
+def test_a_valid_disable_on_top_of_a_malformed_row_still_fails_closed(tmp_path):
+    """PR #126 Codex review P1 (r2): a ``LIMIT 1`` state read validated only
+    the newest row, so appending a valid disable over a malformed older row
+    made the gate read OFF while the CLI rejected the same DB as corrupt.
+    Every state read now validates the whole history."""
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    insert_malformed_row(path)
+    # Writes verify the schema, not past rows -- so this disable commits.
+    store.initialize_and_record(
+        enabled=False, operator="ops", reason="resume", changed_at_utc=at(2)
+    )
+    with pytest.raises(KillSwitchIntegrityError):
+        store.current_state()
+    with pytest.raises(KillSwitchIntegrityError):
+        store.snapshot()
+    provider = PersistentKillSwitchStateProvider(path)
+    with pytest.raises(KillSwitchIntegrityError):
+        provider.is_kill_switch_enabled()
+
+
+def test_the_gate_and_the_cli_agree_on_a_partially_corrupt_store(tmp_path, capsys):
+    """The two answers to "is this store trustworthy?" must not diverge: the
+    CLI reporting fail-closed while the gate allowed submissions was the
+    defect. Both now refuse, and the broker receives nothing."""
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    insert_malformed_row(path)
+    store.record_transition(
+        enabled=False, operator="ops", reason="resume", changed_at_utc=at(2)
+    )
+    assert kill_switch_cli_main(["--db", str(path), "status"]) == 1
+    assert "UNAVAILABLE" in capsys.readouterr().err
+
+    decision, result, broker = submit_once(tmp_path)
+    assert decision.allowed is False
+    assert SafetyRejectionCode.STATE_QUERY_FAILED in codes(decision)
+    assert result is None
+    assert broker.submitted_requests == []
 
 
 # --- store: fail-closed on every unverifiable state --------------------------

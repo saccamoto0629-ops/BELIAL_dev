@@ -55,12 +55,20 @@ strictly -- an out-of-band edited DB raises
 :class:`KillSwitchIntegrityError` instead of being trusted. Connections are
 always explicitly closed (Windows file-handle hygiene).
 
-A DB whose header declares WAL journaling is refused on EVERY path (PR #126
-Codex review P1): an ``immutable=1`` read of a WAL file can miss a committed
-``enable`` still sitting in the ``-wal`` side file and report a stale
-DISABLED -- exactly the "unreadable reads as OFF" failure Issue #81 forbids.
-The store never creates WAL databases itself; an out-of-band conversion is
-fail-closed until reverted (``PRAGMA journal_mode=DELETE``).
+A DB in WAL journal mode is refused on EVERY path (PR #126 Codex review
+P1): a point-in-time read of a WAL file can miss a committed ``enable``
+still sitting in the ``-wal`` side file and report a stale DISABLED --
+exactly the "unreadable reads as OFF" failure Issue #81 forbids. The check
+runs inside the caller's own transaction, on the connection whose rows are
+about to be trusted, so no window exists in which the file could be
+converted between checking and reading (review r2). The store never creates
+WAL databases itself; an out-of-band conversion is fail-closed until
+reverted (``PRAGMA journal_mode=DELETE``), and nothing recorded is lost.
+
+Every state read validates the COMPLETE history, not merely the newest row
+(review r2): otherwise a malformed older row could hide behind a valid
+newer ``disable`` and let the gate read OFF from a database the operator
+CLI simultaneously reports as corrupt.
 """
 
 from __future__ import annotations
@@ -73,7 +81,7 @@ from datetime import datetime
 from pathlib import Path
 
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
-from execution.sqlite_ro import _is_wal_header, connect_read_only
+from execution.sqlite_ro import connect_read_only
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "kill_switch.sqlite3"
@@ -304,23 +312,35 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
-def _refuse_wal(db_path: Path) -> None:
-    """Refuse a kill switch DB whose header declares WAL journaling (PR #126
-    Codex review P1). Every execution-owned store uses the default rollback
-    journal; a WAL header can only come from out-of-band maintenance
-    (``PRAGMA journal_mode=WAL``). ``connect_read_only`` would open such a
-    file with ``immutable=1``, which ignores the ``-wal`` side file -- a
-    committed ``enable`` sitting in the WAL would be invisible and the read
-    would return a stale DISABLED. A state that can read stale OFF is
-    unverifiable, so it is rejected on EVERY path (reads, writes,
-    initialization) instead: fail-closed until the file is converted back
-    (``PRAGMA journal_mode=DELETE``)."""
-    if _is_wal_header(db_path):
+def _refuse_wal(connection: sqlite3.Connection, db_path: Path) -> None:
+    """Refuse a kill switch DB that is in WAL journal mode (PR #126 Codex
+    review P1, r2).
+
+    Every execution-owned store uses the default rollback journal; a WAL
+    file can only come from out-of-band maintenance (``PRAGMA
+    journal_mode=WAL``). WAL is refused rather than supported because the
+    read path must never be able to answer from a snapshot that predates a
+    committed ``enable``.
+
+    The check runs INSIDE the caller's already-open transaction, on the very
+    connection whose data will be trusted -- not as a separate file-header
+    probe. A header probe is two observations of a file that another process
+    can convert between them (the r1 fix's residual TOCTOU): the switch to
+    WAL could land after the probe and before the open, and
+    ``connect_read_only`` would then add ``immutable=1`` and silently ignore
+    the ``-wal`` rows. Asking the open transaction itself closes that gap:
+    the answer describes the same snapshot the rows come from. It is also
+    why the read path opens with ``allow_immutable_wal=False`` -- an
+    ``immutable=1`` connection reports ``journal_mode = 'delete'`` for a WAL
+    file, so it could neither be trusted nor even detected here.
+    """
+    mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(mode).lower() == "wal":
         raise KillSwitchSchemaError(
             f"kill switch DB at {db_path} is in WAL journal mode, which the store "
-            "refuses: an immutable read could miss a committed enable and report a "
-            "stale DISABLED. Convert it back with 'PRAGMA journal_mode=DELETE' "
-            "(fail-closed until then)"
+            "refuses: a read could then answer from a snapshot that predates a "
+            "committed enable. Convert it back with 'PRAGMA journal_mode=DELETE' "
+            "(fail-closed until then; no recorded state or history is lost)"
         )
 
 
@@ -333,12 +353,13 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def _verified_txn(db_path: Path):
-    """Write flow: open -> BEGIN IMMEDIATE -> verify schema -> row work ->
-    COMMIT (ROLLBACK on any error). Connection always explicitly closed."""
-    _refuse_wal(db_path)
+    """Write flow: open -> BEGIN IMMEDIATE -> refuse WAL -> verify schema ->
+    row work -> COMMIT (ROLLBACK on any error). Connection always explicitly
+    closed."""
     with closing(_connect(db_path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            _refuse_wal(connection, db_path)
             _verify_schema(connection, db_path)
             yield connection
             connection.execute("COMMIT")
@@ -350,13 +371,25 @@ def _verified_txn(db_path: Path):
 @contextmanager
 def _verified_read(db_path: Path):
     """Read flow: open a TRUE read-only connection (``mode=ro`` + query_only
-    + write-denying authorizer -- a read can never create the file or side
-    files) -> BEGIN (consistent view) -> verify schema -> read. Always
-    rolled back."""
-    _refuse_wal(db_path)
-    with closing(connect_read_only(db_path)) as connection:
+    + write-denying authorizer -- a read can never create the file) -> BEGIN
+    -> refuse WAL and verify the schema INSIDE that transaction -> read.
+    Always rolled back.
+
+    ``allow_immutable_wal=False`` (PR #126 Codex review P1, r2): this store
+    must never answer from a point-in-time view that ignores committed
+    ``-wal`` rows, so the ``immutable=1`` fallback is disabled here. A WAL
+    file is then opened as an ordinary read-only connection, which both
+    SEES the WAL content and REPORTS ``journal_mode = 'wal'`` -- so
+    :func:`_refuse_wal`, running on this same connection and snapshot, fails
+    closed with no window in which the file could change identity between
+    the check and the read.
+    """
+    with closing(connect_read_only(db_path, allow_immutable_wal=False)) as connection:
         connection.execute("BEGIN")
         try:
+            # First statement in the transaction: it both establishes the
+            # read snapshot and answers the WAL question about it.
+            _refuse_wal(connection, db_path)
             _verify_schema(connection, db_path)
             yield connection
         finally:
@@ -456,11 +489,11 @@ class SQLiteKillSwitchStore:
         back -- a fresh file is left schema-less (unverifiable, fail-closed),
         never committed empty."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        _refuse_wal(self._path)
         try:
             with closing(_connect(self._path)) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
+                    _refuse_wal(connection, self._path)
                     objects = connection.execute("SELECT name FROM sqlite_master").fetchall()
                     version = connection.execute("PRAGMA user_version").fetchone()[0]
                     if not objects:
@@ -541,15 +574,20 @@ class SQLiteKillSwitchStore:
         """The current state = the highest-id transition (ids are the
         ordering authority; timestamps are auxiliary). An initialized store
         with zero rows is DISABLED. Raises on a missing, foreign, corrupt or
-        out-of-band-edited DB -- never "disabled by default"."""
-        rows = self._read_rows(
-            f"SELECT transition_id, {', '.join(_TRANSITION_COLUMNS)} FROM {TRANSITIONS_TABLE} "
-            "ORDER BY transition_id DESC LIMIT 1"
-        )
-        if not rows:
-            return KillSwitchState(enabled=False, transition=None)
-        transition = self._validated(rows[0])
-        return KillSwitchState(enabled=transition.enabled, transition=transition)
+        out-of-band-edited DB -- never "disabled by default".
+
+        The WHOLE history is validated before a state is returned (PR #126
+        Codex review P1, r2), not just the latest row. A ``LIMIT 1`` read
+        would let a malformed OLDER row stay invisible: appending a valid
+        ``disable`` on top of it (writes verify the schema, not past rows)
+        would make the gate read OFF and allow submissions, while
+        ``snapshot()`` / the CLI rejected the very same DB as corrupt --
+        two answers to one question, with the permissive one enforcing.
+        ``docs/architecture/safety_gate.md`` requires corruption and
+        out-of-band edits to stay errors, so every state read carries the
+        same integrity commitment.
+        """
+        return self.snapshot()[0]
 
     def list_transitions(self) -> tuple[KillSwitchTransition, ...]:
         """The full change history in recording order (Issue #81: enable /
@@ -563,7 +601,12 @@ class SQLiteKillSwitchStore:
         the SAME result set the history comes from, so a concurrent writer
         can never make a status report say "disabled" while its own history
         listing already shows a newer enable. Strict validation and
-        fail-closed behaviour are identical to the other reads."""
+        fail-closed behaviour are identical to the other reads.
+
+        This is also the single implementation behind ``current_state()``
+        and ``list_transitions()`` (review r2): one read shape means one
+        integrity commitment, so the gate and the operator CLI can never
+        disagree about whether the store is trustworthy."""
         rows = self._read_rows(
             f"SELECT transition_id, {', '.join(_TRANSITION_COLUMNS)} FROM {TRANSITIONS_TABLE} "
             "ORDER BY transition_id ASC"

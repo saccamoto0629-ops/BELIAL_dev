@@ -136,8 +136,21 @@ def _is_wal_header(path: Path) -> bool:
     return len(header) >= 20 and header[:16] == b"SQLite format 3\x00" and header[18] == 2
 
 
-def connect_read_only(db_path: Path | str) -> sqlite3.Connection:
+def connect_read_only(
+    db_path: Path | str, *, allow_immutable_wal: bool = True
+) -> sqlite3.Connection:
     """Open ``db_path`` strictly read-only (see the module docstring).
+
+    ``allow_immutable_wal`` (default True, the long-standing behaviour) opts
+    a WAL-declaring file into the ``immutable=1`` path: no side files, no
+    mtime change, at the cost of a point-in-time view that IGNORES anything
+    still in ``-wal``. A caller whose correctness depends on never reading a
+    stale committed value must pass False (PR #126 Codex review P1: the kill
+    switch would otherwise be able to answer "disabled" from a snapshot that
+    predates a committed enable). With False the file is opened as a plain
+    ``mode=ro`` connection, which reads the WAL content -- and the caller can
+    then observe the real journal mode INSIDE its own read transaction
+    (``PRAGMA journal_mode``), with no separate header probe to race.
 
     The caller owns closing the connection (use ``contextlib.closing``).
     """
@@ -150,7 +163,7 @@ def connect_read_only(db_path: Path | str) -> sqlite3.Connection:
     # URI-special character (spaces, '?', '#', unicode) -- including Windows
     # drive letters -- so arbitrary filenames cannot smuggle URI parameters.
     uri = path.resolve().as_uri() + "?mode=ro"
-    if _is_wal_header(path):
+    if allow_immutable_wal and _is_wal_header(path):
         uri += "&immutable=1"
     connection = sqlite3.connect(
         uri, uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None
