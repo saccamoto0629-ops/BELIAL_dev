@@ -488,6 +488,66 @@ def test_a_wal_conversion_racing_the_open_can_never_be_read_as_disabled(tmp_path
         racing_writer.close()
 
 
+def kill_switch_files(path):
+    """Only the kill switch DB and its would-be sidecars -- other stores in
+    the same tmp_path are irrelevant here."""
+    return sorted(
+        entry.name for entry in path.parent.iterdir() if entry.name.startswith(path.name)
+    )
+
+
+def test_refusing_a_wal_db_creates_no_sidecars_on_any_path(tmp_path):
+    """PR #126 Codex review P2 (r4): refusing a WAL file must not TOUCH the
+    filesystem. Opening an already-WAL database with the immutable fallback
+    disabled makes SQLite recreate ``-wal`` / ``-shm``, so the refusal has
+    to happen before the open -- otherwise the operator ``status`` and every
+    gate evaluation would mutate the directory on their failure path."""
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    to_wal_mode(path)  # the writer closes, so the sidecars are gone again
+    before = kill_switch_files(path)
+    assert before == ["kill_switch.sqlite3"], before
+
+    for call in (
+        store.current_state,
+        store.snapshot,
+        store.list_transitions,
+        store.initialize,
+        lambda: PersistentKillSwitchStateProvider(path).is_kill_switch_enabled(),
+        lambda: store.record_transition(
+            enabled=True, operator="ops", reason="halt", changed_at_utc=at(1)
+        ),
+        lambda: store.initialize_and_record(
+            enabled=True, operator="ops", reason="halt", changed_at_utc=at(2)
+        ),
+    ):
+        with pytest.raises(KillSwitchStoreError, match="WAL"):
+            call()
+        assert kill_switch_files(path) == before
+
+
+def test_cli_status_on_a_wal_db_creates_no_sidecars(tmp_path, capsys):
+    path = ks_db(tmp_path)
+    SQLiteKillSwitchStore(path).initialize()
+    to_wal_mode(path)
+    before = kill_switch_files(path)
+    assert kill_switch_cli_main(["--db", str(path), "status"]) == 1
+    assert "UNAVAILABLE" in capsys.readouterr().err
+    assert kill_switch_files(path) == before
+
+
+def test_gate_evaluation_against_a_wal_db_creates_no_sidecars(tmp_path):
+    path = ks_db(tmp_path)
+    SQLiteKillSwitchStore(path).initialize()
+    to_wal_mode(path)
+    before = kill_switch_files(path)
+    decision, result, broker = submit_once(tmp_path)
+    assert SafetyRejectionCode.STATE_QUERY_FAILED in codes(decision)
+    assert result is None and broker.submitted_requests == []
+    assert kill_switch_files(path) == before
+
+
 def test_the_read_lock_is_held_before_the_journal_mode_is_trusted(tmp_path, monkeypatch):
     """PR #126 Codex review P1 (r3): asking ``PRAGMA journal_mode`` inside a
     bare ``BEGIN`` locks nothing, so the answer did not bind the reads that

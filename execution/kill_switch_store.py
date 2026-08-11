@@ -58,12 +58,22 @@ always explicitly closed (Windows file-handle hygiene).
 A DB in WAL journal mode is refused on EVERY path (PR #126 Codex review
 P1): a point-in-time read of a WAL file can miss a committed ``enable``
 still sitting in the ``-wal`` side file and report a stale DISABLED --
-exactly the "unreadable reads as OFF" failure Issue #81 forbids. The check
-runs inside the caller's own transaction, on the connection whose rows are
-about to be trusted, so no window exists in which the file could be
-converted between checking and reading (review r2). The store never creates
-WAL databases itself; an out-of-band conversion is fail-closed until
-reverted (``PRAGMA journal_mode=DELETE``), and nothing recorded is lost.
+exactly the "unreadable reads as OFF" failure Issue #81 forbids. Two checks
+work together:
+
+- :func:`_refuse_wal_header` runs BEFORE the file is opened and rejects a
+  file that already declares WAL. It is not authoritative (a header probe
+  cannot see a conversion racing the open) -- its job is to keep a read
+  from RECREATING the ``-wal`` / ``-shm`` sidecars just to refuse the file
+  (review r4).
+- :func:`_refuse_wal` is authoritative: it asks the connection whose rows
+  are about to be trusted, inside its transaction and while its lock is
+  already held, so no window exists in which the file could be converted
+  between checking and reading (reviews r2 / r3).
+
+The store never creates WAL databases itself; an out-of-band conversion is
+fail-closed until reverted (``PRAGMA journal_mode=DELETE``), and nothing
+recorded is lost.
 
 Every state read validates the COMPLETE history, not merely the newest row
 (review r2): otherwise a malformed older row could hide behind a valid
@@ -81,7 +91,7 @@ from datetime import datetime
 from pathlib import Path
 
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
-from execution.sqlite_ro import connect_read_only
+from execution.sqlite_ro import _is_wal_header, connect_read_only
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "kill_switch.sqlite3"
@@ -312,6 +322,34 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
+def _refuse_wal_header(db_path: Path) -> None:
+    """EARLY, NON-AUTHORITATIVE WAL refusal, before the file is opened
+    (PR #126 Codex review P2, r4).
+
+    :func:`_refuse_wal` is the authoritative check, but it can only speak
+    after a connection exists -- and opening an ALREADY-WAL database with
+    ``allow_immutable_wal=False`` makes SQLite recreate the ``-wal`` /
+    ``-shm`` sidecars (measured: the directory held only the DB before
+    ``current_state()`` and both sidecars after). Read paths -- the operator
+    ``status`` and every gate evaluation -- must not mutate the filesystem,
+    least of all on a failure path, so a file whose header ALREADY declares
+    WAL is refused here, before any open.
+
+    This is deliberately not a replacement for the in-transaction check: a
+    header probe is a separate observation and cannot see a conversion that
+    races the open (review r1/r3). It only removes the side effect for the
+    case that is decidable without opening anything; correctness still
+    rests on :func:`_refuse_wal` under a held lock.
+    """
+    if _is_wal_header(db_path):
+        raise KillSwitchSchemaError(
+            f"kill switch DB at {db_path} is in WAL journal mode, which the store "
+            "refuses: a read could then answer from a snapshot that predates a "
+            "committed enable. Convert it back with 'PRAGMA journal_mode=DELETE' "
+            "(fail-closed until then; no recorded state or history is lost)"
+        )
+
+
 def _lock_snapshot(connection: sqlite3.Connection) -> None:
     """Turn a just-opened DEFERRED transaction into a REAL read transaction
     (PR #126 Codex review P1, r3).
@@ -379,9 +417,11 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def _verified_txn(db_path: Path):
-    """Write flow: open -> BEGIN IMMEDIATE -> refuse WAL -> verify schema ->
-    row work -> COMMIT (ROLLBACK on any error). Connection always explicitly
+    """Write flow: refuse an already-WAL file -> open -> BEGIN IMMEDIATE ->
+    refuse WAL (authoritative, under the write lock) -> verify schema -> row
+    work -> COMMIT (ROLLBACK on any error). Connection always explicitly
     closed."""
+    _refuse_wal_header(db_path)
     with closing(_connect(db_path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -410,6 +450,10 @@ def _verified_read(db_path: Path):
     closed with no window in which the file could change identity between
     the check and the read.
     """
+    # Refuse an already-WAL file BEFORE opening it (review r4): opening one
+    # would recreate its -wal / -shm sidecars, and a read must not touch the
+    # filesystem. Not authoritative on its own -- see _refuse_wal_header.
+    _refuse_wal_header(db_path)
     with closing(connect_read_only(db_path, allow_immutable_wal=False)) as connection:
         connection.execute("BEGIN")
         try:
@@ -518,6 +562,7 @@ class SQLiteKillSwitchStore:
         back -- a fresh file is left schema-less (unverifiable, fail-closed),
         never committed empty."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        _refuse_wal_header(self._path)
         try:
             with closing(_connect(self._path)) as connection:
                 connection.execute("BEGIN IMMEDIATE")

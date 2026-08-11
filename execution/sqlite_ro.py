@@ -152,6 +152,12 @@ def connect_read_only(
     then observe the real journal mode INSIDE its own read transaction
     (``PRAGMA journal_mode``), with no separate header probe to race.
 
+    NOTE (review r4): with ``allow_immutable_wal=False``, opening a WAL file
+    makes SQLite recreate its ``-wal`` / ``-shm`` sidecars -- the module's
+    no-side-file guarantee holds for the DEFAULT path only. A caller that
+    opts out and still must not touch the filesystem has to reject WAL files
+    BEFORE calling this (``kill_switch_store._refuse_wal_header``).
+
     The caller owns closing the connection (use ``contextlib.closing``).
     """
     path = Path(db_path)
