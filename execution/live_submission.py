@@ -724,6 +724,7 @@ class LiveOrderSubmissionService:
                     execution_request_id, error=f"broker refused cancellation: {exc}", at_utc=at
                 ),
                 execution_request_id,
+                recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
             )
             return CancelOutcome(
                 execution_request_id=execution_request_id,
@@ -742,6 +743,7 @@ class LiveOrderSubmissionService:
                     execution_request_id, error=f"cancel outcome lost: {exc}", at_utc=at
                 ),
                 execution_request_id,
+                recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
             )
             self._record_unknown_outcome(
                 execution_request_id, exc, context=_CANCEL_UNKNOWN_CONTEXT_LOST
@@ -756,6 +758,7 @@ class LiveOrderSubmissionService:
                 at_utc=at,
             ),
             execution_request_id,
+            recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
         )
         try:
             execution_store.record_order_result(
@@ -782,6 +785,7 @@ class LiveOrderSubmissionService:
                     at_utc=at,
                 ),
                 execution_request_id,
+                recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
             )
             self._record_unknown_outcome(
                 execution_request_id, exc, context=_CANCEL_UNKNOWN_CONTEXT_PERSIST
@@ -796,6 +800,7 @@ class LiveOrderSubmissionService:
                 at_utc=at,
             ),
             execution_request_id,
+            recovery_surface="SubmissionJournal.list_unresolved_cancellations()",
         )
         if result.state is not OrderState.CANCELLED:
             # Defensive: the Broker contract returns the post-cancel snapshot
@@ -1274,15 +1279,26 @@ class LiveOrderSubmissionService:
             )
         return decision
 
-    def _journal_write(self, context: str, write, execution_request_id: str) -> None:
+    def _journal_write(
+        self,
+        context: str,
+        write,
+        execution_request_id: str,
+        *,
+        recovery_surface: str = "SubmissionJournal.list_unresolved()",
+    ) -> None:
         """Best-effort journal write AFTER the broker call: a journal failure
         here must never block recording the broker outcome elsewhere and is
         never converted into a rejection (the order may exist). The entry
-        then stays in its previous state -- still not ``completed``, so it
-        remains visible via ``SubmissionJournal.list_unresolved()``. Uses
-        the wall clock as a last resort: the injected clock may be exactly
-        what is broken, and losing this record over a clock fault would
-        defeat the journal's purpose."""
+        then stays in its previous state -- still not terminal, so it
+        remains visible via ``recovery_surface`` (the SUBMISSION queue
+        ``SubmissionJournal.list_unresolved()`` by default; cancel-side call
+        sites name ``list_unresolved_cancellations()`` instead, PR #124
+        Codex review r2 P2 -- the recovery message must point at the queue
+        that actually lists the entry). Uses the wall clock as a last
+        resort: the injected clock may be exactly what is broken, and
+        losing this record over a clock fault would defeat the journal's
+        purpose."""
         try:
             try:
                 at = self._now()
@@ -1292,10 +1308,10 @@ class LiveOrderSubmissionService:
         except Exception:
             _LOGGER.critical(
                 "failed to journal %s for execution_request_id=%s; the journal entry "
-                "stays unresolved and remains listed by SubmissionJournal."
-                "list_unresolved(); resolve via reconciliation",
+                "stays unresolved and remains listed by %s; resolve via reconciliation",
                 context,
                 execution_request_id,
+                recovery_surface,
             )
 
     def _record_unknown_outcome(

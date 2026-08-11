@@ -527,6 +527,40 @@ def test_concurrent_cancels_send_exactly_one_broker_cancel(tmp_path):
     assert stored_state(tmp_path) == ("submitted", "cancelled")
 
 
+def test_cancel_journal_failure_after_broker_names_the_cancellation_queue(
+    tmp_path, monkeypatch, caplog
+):
+    """PR #124 Codex review r2 P2: when a cancel-side best-effort journal
+    write fails AFTER the broker call, the critical recovery message must
+    point at the queue that actually lists the stuck claim --
+    ``list_unresolved_cancellations()``, not the submission-side
+    ``list_unresolved()`` -- and the failure must not block the outcome."""
+    service, broker = accepted_order(tmp_path)
+    from execution.submission_journal import SubmissionJournal as SJ
+
+    monkeypatch.setattr(
+        SJ,
+        "mark_cancel_completed",
+        lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("journal down")),
+    )
+    with caplog.at_level(logging.CRITICAL):
+        outcome = service.cancel("exec-1")
+    assert outcome.status is CancelStatus.CANCELLED  # never blocked
+    assert stored_state(tmp_path) == ("submitted", "cancelled")
+    record = next(
+        r for r in caplog.records if "failed to journal cancel completion" in r.getMessage()
+    )
+    assert "SubmissionJournal.list_unresolved_cancellations()" in record.getMessage()
+    assert "list_unresolved()" not in record.getMessage().replace(
+        "list_unresolved_cancellations()", ""
+    )
+    monkeypatch.undo()
+    # ... and the claim is indeed on that queue (still ``responded``/open).
+    journal = SubmissionJournal(tmp_path / "journal.sqlite3")
+    unresolved = journal.list_unresolved_cancellations()
+    assert [entry.execution_request_id for entry in unresolved] == ["exec-1"]
+
+
 # --- CancelOutcome invariants -------------------------------------------------
 
 
