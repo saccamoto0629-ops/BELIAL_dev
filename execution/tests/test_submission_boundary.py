@@ -10,6 +10,8 @@ repository-wide, that no other module grows a direct ``submit_order`` /
 import ast
 import pathlib
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # The only files that may CALL <something>.submit_order(...):
@@ -79,6 +81,21 @@ TO_ORDER_REQUEST_ALLOWED = {
 }
 
 
+# The only PRODUCTION file that may CONSTRUCT LiveOrderSubmissionService /
+# ReissueService (Issue #116 / PR #122 review r3): the composition root,
+# which builds both from ONE ``ReissuePolicy`` object. Constructing either
+# service directly elsewhere re-opens the hazard the root exists to close
+# -- a submission freshness window WIDER than the registration one, which
+# authorizes clearance evidence the registration policy already treats as
+# stale. Tests construct the services directly on purpose (to exercise the
+# constructors' own validation), so the whole test tree is allowed.
+REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED = {
+    "execution/reissue_composition.py",
+    "execution/tests",
+    "broker/tests",
+}
+
+
 def _python_files():
     for path in sorted(REPO_ROOT.rglob("*.py")):
         relative = path.relative_to(REPO_ROOT)
@@ -120,6 +137,62 @@ def test_cancel_order_is_called_only_by_broker_and_reconciliation_fixture_tests(
 
 def test_to_order_request_is_called_only_by_the_safety_gate_and_model_tests():
     assert _offenders("to_order_request", TO_ORDER_REQUEST_ALLOWED) == []
+
+
+def _construction_sites(path: pathlib.Path, class_name: str) -> list[int]:
+    """Lines constructing ``class_name`` by bare name (``Foo(...)``) -- the
+    form every call site in this repository uses."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == class_name
+    ]
+
+
+def _construction_offenders(class_name: str, allowed: set[str]) -> list[str]:
+    offenders = []
+    for relative, path in _python_files():
+        if relative in allowed or any(relative.startswith(prefix + "/") for prefix in allowed):
+            continue
+        for lineno in _construction_sites(path, class_name):
+            offenders.append(f"{relative}:{lineno}")
+    return offenders
+
+
+@pytest.mark.parametrize(
+    "class_name", ["LiveOrderSubmissionService", "ReissueService"]
+)
+def test_reissue_boundary_services_are_built_only_by_the_composition_root(class_name):
+    """Issue #116 / PR #122 review r3: one ``ReissuePolicy`` must govern the
+    registration AND submission freshness windows. Making the argument
+    mandatory removed the "forgot it" failure but still allowed two
+    independently configured policies, so production code obtains BOTH
+    services from ``execution/reissue_composition.py`` alone."""
+    assert (
+        _construction_offenders(class_name, REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED) == []
+    )
+
+
+def test_the_composition_root_hands_back_one_shared_policy_instance():
+    """The invariant the pin protects, checked on the object graph itself."""
+    import execution.reissue_composition as composition
+
+    source = (REPO_ROOT / "execution" / "reissue_composition.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    # both services are constructed exactly once, in the one factory
+    for class_name in ("LiveOrderSubmissionService", "ReissueService"):
+        sites = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == class_name
+        ]
+        assert len(sites) == 1, f"{class_name} must be constructed once, found {sites}"
+    assert hasattr(composition, "build_reissue_boundary")
 
 
 def test_submission_service_holds_exactly_one_submit_order_call():

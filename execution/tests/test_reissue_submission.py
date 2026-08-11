@@ -437,3 +437,61 @@ def test_the_submission_policy_is_exposed_so_both_boundaries_share_one_object(
         reissue_policy=service.reissue_policy,
     )
     assert registration.reissue_policy is policy
+
+
+def test_the_composition_root_builds_both_boundaries_from_one_policy(tmp_path, db_path):
+    """PR #122 review r3: mandatory arguments still allowed TWO separately
+    configured policies. The composition root is the sanctioned wiring --
+    one object, both boundaries -- and a repository-wide AST pin
+    (test_submission_boundary.py) keeps production code from bypassing it."""
+    from execution.reissue_composition import ReissueBoundary, build_reissue_boundary
+
+    decision_db = tmp_path / "safety_gate_decisions.sqlite3"
+    journal_db = tmp_path / "submission_journal.sqlite3"
+    SQLiteSafetyDecisionStore(decision_db).initialize()
+    SubmissionJournal(journal_db).initialize()
+    policy = ReissuePolicy(clearance_max_age=timedelta(seconds=30))
+    gate_policy = make_policy()
+    boundary = build_reissue_boundary(
+        connection=BrokerConnection(broker=make_broker()),
+        gate=SafetyGate(
+            policy=gate_policy, state_provider=StaticSafetyState(), clock=lambda: at(100)
+        ),
+        current_policy=gate_policy,
+        reissue_policy=policy,
+        decision_db_path=decision_db,
+        order_db_path=db_path,
+        journal_db_path=journal_db,
+        clock=lambda: at(100),
+    )
+    assert isinstance(boundary, ReissueBoundary)
+    # ONE object governs both freshness windows -- by construction
+    assert boundary.policy is policy
+    assert boundary.submission.reissue_policy is policy
+    assert boundary.registration.reissue_policy is policy
+
+
+def test_the_composition_root_refuses_a_gate_policy_mismatch(tmp_path, db_path):
+    """The correction eligibility rule compares a basis decision's policy
+    snapshot against "the currently applied policy"; if that were a
+    different object than the gate evaluates with, the comparison would
+    judge a policy nothing enforces."""
+    from execution.reissue_composition import build_reissue_boundary
+
+    decision_db = tmp_path / "safety_gate_decisions.sqlite3"
+    journal_db = tmp_path / "submission_journal.sqlite3"
+    SQLiteSafetyDecisionStore(decision_db).initialize()
+    SubmissionJournal(journal_db).initialize()
+    with pytest.raises(ValueError, match="SAME SafetyPolicy instance"):
+        build_reissue_boundary(
+            connection=BrokerConnection(broker=make_broker()),
+            gate=SafetyGate(
+                policy=make_policy(), state_provider=StaticSafetyState(), clock=lambda: at(100)
+            ),
+            current_policy=make_policy(),  # equal content, different object
+            reissue_policy=ReissuePolicy(),
+            decision_db_path=decision_db,
+            order_db_path=db_path,
+            journal_db_path=journal_db,
+            clock=lambda: at(100),
+        )

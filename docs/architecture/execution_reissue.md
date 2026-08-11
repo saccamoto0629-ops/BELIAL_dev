@@ -252,7 +252,13 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 **全経路に共通する前提**: 有効な **reissue clearance**(order / position 双方の照合が成功した無差分の積極的証拠・鮮度窓内)が必要であり、登録時だけでなく**送信の瞬間まで有効**でなければならない(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
 
 - 回数の判定は**常に永続化された行から導出**する(該当 signal の MAX(`signal_attempt`) と `reissue_kind` / `initiated_by` の集計)。in-memory カウンタ・プロセス状態には依存しないため、**プロセス再起動・多重起動後も上限と一意性が維持される**。
-- 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する(`max_total_attempts_per_signal`、**既定 4**)。clearance の**鮮度窓は `ReissuePolicy.clearance_max_age`(既定 5 分)**であり、登録時(`ReissueService`。事前確認 + 登録トランザクション内の cutoff 照合)と送信時(`LiveOrderSubmissionService` が `mark_submitting()` へ渡す cutoff)の両方で判定される。**両境界は同一の `ReissuePolicy` オブジェクトを共有し、その明示は必須である**(PR #122 Codex レビュー P2 / r2): `LiveOrderSubmissionService` と `ReissueService` はいずれも `reissue_policy` を**必須引数**として受け取り、**既定値を持たない**(省略は `TypeError`、`None` は `ValueError`)。silent default を残すと「登録側だけ 30 秒に絞り、送信側は既定 5 分のまま」という**危険な向きの不一致**(送信窓 > 登録窓 = 登録が stale と見なす evidence を送信が認可する)を composer が無自覚に作れてしまうためである。`LiveOrderSubmissionService.reissue_policy` プロパティが同一インスタンスを公開するので、登録サービスはそこから合成できる。
+- 3 つの上限は独立に数える(自動が上限に達しても、運用者の明示判断は別枠。Broker へ到達しなかった訂正は Broker 再試行の予算を消費しない)。**合計 attempt 数にも policy 上限**を置き、無限チェーンを構造的に禁止する(`max_total_attempts_per_signal`、**既定 4**)。clearance の**鮮度窓は `ReissuePolicy.clearance_max_age`(既定 5 分)**であり、登録時(`ReissueService`。事前確認 + 登録トランザクション内の cutoff 照合)と送信時(`LiveOrderSubmissionService` が `mark_submitting()` へ渡す cutoff)の両方で判定される。**両境界の窓は 1 つの `ReissuePolicy` から供給する**(PR #122 Codex レビュー P2 / r2 / r3)。危険なのは**送信窓 > 登録窓**の向き(登録が stale と見なす evidence を送信が認可する)であり、これを段階的に構造で閉じている:
+
+1. `LiveOrderSubmissionService` / `ReissueService` はいずれも `reissue_policy` を**必須引数**とし、**既定値を持たない**(省略は `TypeError`、`None` は `ValueError`)。silent default による無自覚な不一致は構築不能。
+2. **合成は composition root に集約する** — `execution/reissue_composition.py` の `build_reissue_boundary()` が 1 つの policy から両サービスを構築して `ReissueBoundary`(`submission` / `registration` / `policy`)を返す。`current_policy` は Gate が評価する `SafetyPolicy` と**同一インスタンス**であることも要求する(訂正 eligibility が「現在適用中の policy」と比較する対象が、実際に強制されている policy と一致するため)。
+3. **迂回の構造的禁止**: `execution/tests/test_submission_boundary.py` が「production コードで両サービスを構築してよいのは composition root だけ」を**リポジトリ全体の AST 走査**で固定する(`Broker.submit_order` の境界固定と同じ方式)。必須引数だけでは「別々に構成した 2 つの policy を明示的に渡す」ことが依然可能だったため、この pin が実質的な強制になる。
+
+**残余(明示的な境界)**: オブジェクト同一性は**プロセス内**の保証である。登録(運用者操作)と送信(将来の Live Execution runner)が別プロセスになれば、両者は**1 つの設定ソース**から policy を読む必要があり、composition root はそこまでは強制できない(現時点で runner は未実装 = 非スコープであり、プロセスは 1 つしかない)。いずれの場合も store 側の fail-closed 検査が最終防衛線として残る — 登録トランザクションは clearance が current かつ `valid` であることを、`mark_submitting()` は status / 口座スコープ / 鮮度を送信の瞬間に再検証する。
 
 ## 監査・再起動耐性・並行実行
 

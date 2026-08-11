@@ -84,11 +84,8 @@ from execution.safety_gate import (
 )
 from execution.safety_store import SafetyStoreError, SQLiteSafetyDecisionStore
 from execution.reissue_clearance import ReissueClearanceService, ReissueClearanceError
-from execution.reissue_service import (
-    ReissueEligibilityError,
-    ReissuePolicy,
-    ReissueService,
-)
+from execution.reissue_composition import build_reissue_boundary
+from execution.reissue_service import ReissueEligibilityError, ReissuePolicy
 from execution.shadow_composition import run_production_shadow_cycle
 from execution.shadow_config import parse_shadow_execution_config
 from execution.shadow_execution import ShadowCycleStatus, ShadowExecutionService
@@ -459,37 +456,37 @@ class _ScenarioContext:
         self.client_order_ids: dict[str, str] = {}
         self.step_results: list[dict] = []
 
-    def make_service(self) -> LiveOrderSubmissionService:
-        """One service per call: concurrency steps give each worker its own
-        instance (multi-process equivalence); sequential steps just use a
-        fresh one, which is stateless beyond its injected paths."""
+    def _boundary(self):
+        """Both production services from the PRODUCTION composition root
+        (Issue #116 / PR #122 review r3): one ReissuePolicy governs the
+        registration and submission freshness windows, and the scenarios
+        exercise the only sanctioned way to wire them."""
         SQLiteSafetyDecisionStore(self.decisions_db).initialize()
         SubmissionJournal(self.journal_db).initialize()
-        return LiveOrderSubmissionService(
+        return build_reissue_boundary(
             connection=self.connection,
             gate=SafetyGate(policy=self.policy, state_provider=self.state, clock=lambda: NOW),
+            current_policy=self.policy,
+            reissue_policy=self.reissue_policy,
             decision_db_path=self.decisions_db,
             order_db_path=self.orders_db,
             journal_db_path=self.journal_db,
             clock=lambda: NOW,
-            reissue_policy=self.reissue_policy,
         )
 
-    def make_reissue_service(self) -> ReissueService:
-        """One PRODUCTION reissue registration service per call (Issue #116);
-        the current policy is the scenario's gate policy, so the
-        policy-identity precondition compares against the same content the
-        submitted decisions were produced under."""
-        SQLiteSafetyDecisionStore(self.decisions_db).initialize()
-        SubmissionJournal(self.journal_db).initialize()
-        return ReissueService(
-            execution_db_path=self.orders_db,
-            journal_db_path=self.journal_db,
-            decision_db_path=self.decisions_db,
-            current_policy=self.policy,
-            reissue_policy=self.reissue_policy,
-            clock=lambda: NOW,
-        )
+    def make_service(self) -> LiveOrderSubmissionService:
+        """One service per call: concurrency steps give each worker its own
+        instance (multi-process equivalence); sequential steps just use a
+        fresh one, which is stateless beyond its injected paths."""
+        return self._boundary().submission
+
+    def make_reissue_service(self):
+        """One PRODUCTION reissue registration service per call (Issue #116),
+        from the same composition root as the submission service; the
+        current policy is the scenario's gate policy, so the policy-identity
+        precondition compares against the same content the submitted
+        decisions were produced under."""
+        return self._boundary().registration
 
     def make_clearance_service(self) -> ReissueClearanceService:
         """One PRODUCTION clearance observation service per call (Issue
