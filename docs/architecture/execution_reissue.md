@@ -1,6 +1,6 @@
 # Execution Intent Reissue — REJECTED 後の再発行モデル(Issue #95 設計)
 
-`REJECTED` で終端した Execution Request の注文意図を、idempotency と二重発注防止を壊さずに再発行するためのモデル定義。**実装状況**: `RejectionCategory` は Issue #114、**永続化層(schema v5・親子関係と attempt・clearance evidence・登録 API `create_reissue_execution_order()`・`mark_submitting()` の子存在 / clearance 検証・チェーン読み取り API)は Issue #115 で実装済み**([Execution Request](execution_request.md) が実装契約の正)。**サービス層(Issue #116)も実装済み**: eligibility 判定・登録ユースケース(`execution/reissue_service.py` の `ReissueService`)、clearance の要件判定 / 発行 / 失効と並行観測の直列化(`execution/reissue_clearance.py` の `ReissueClearanceService`)、通常 `submit()` 経路への接続(`intent_superseded` / `reissue_clearance_invalid` 拒否コードと clearance 照合入力)、superseded intent の終端化([Submission Journal](submission_journal.md) の `superseded` outcome + recovery sweep)。手動再発行・訂正差し替えは、この公認経路経由でのみ可能である(自動再試行は Issue #117 のまま未実装・既定無効)。
+`REJECTED` で終端した Execution Request の注文意図を、idempotency と二重発注防止を壊さずに再発行するためのモデル定義。**実装状況**: `RejectionCategory` は Issue #114、**永続化層(schema v5・親子関係と attempt・clearance evidence・登録 API `create_reissue_execution_order()`・`mark_submitting()` の子存在 / clearance 検証・チェーン読み取り API)は Issue #115 で実装済み**([Execution Request](execution_request.md) が実装契約の正)。**サービス層(Issue #116)も実装済み**: eligibility 判定・登録ユースケース(`execution/reissue_service.py` の `ReissueService`)、clearance の要件判定 / 発行 / 失効と並行観測の直列化(`execution/reissue_clearance.py` の `ReissueClearanceService`)、通常 `submit()` 経路への接続(`intent_superseded` / `reissue_clearance_invalid` 拒否コードと clearance 照合入力)、superseded intent の終端化([Submission Journal](submission_journal.md) の `superseded` outcome + recovery sweep)。手動再発行・訂正差し替えは、この公認経路経由でのみ可能である。**自動再試行(Issue #117)も登録ユースケースとして実装済み**(`ReissueService.register_auto_reissue()`。**既定無効** = `max_auto_reissues_per_signal` 0 のままでは一切動作しない。呼び出し元となる Live Execution runner / scheduler への組み込みは runner 設計 Issue 側で未着手)。
 
 > **重要な位置づけ**
 >
@@ -15,7 +15,7 @@
 2. **再発行は「暗黙のリトライ」ではなく「明示的な新しい注文意図」**として扱う: 新しい `execution_request_id` + 新しい `client_order_id` を持つ**別の ExecutionRequest レコード**を、元 Request との親子関係(`reissued_from_execution_request_id` + `signal_attempt`)を永続化して作成する。元 Request の **Execution 側の行・状態履歴・snapshot** には一切触れない(Broker へ到達していない意図の Submission Journal 記録だけは、訂正差し替え時に終端化の対象になる。下記「Journal 側の後始末(契約のみ)」)。親子リンクは `reissue_kind` で 2 種類に区別する — **`broker_rejected`**(Broker が確定拒否した意図の再発行)と **`gate_correction`**(Broker へ一度も到達していない意図の訂正差し替え。下記「Safety Gate 拒否の扱い」)。
 3. **子 Request が親から変更してよいフィールドを限定する**: `signal_id` / `strategy_id` / `symbol` / `side` は identity として不変、注文パラメータ(数量・価格・SL / TP・order type)のみ訂正可能。数量は原則として減少方向のみ(**例外: 親が `broker_rejected` かつ `rejection_category = parameter` の場合に限り policy 上限内の増量を許可**)。自動再試行は全パラメータ同一を必須とする(下記「子 Request のフィールド不変条件」が正)。
 4. **再発行可否は Broker 中立の正規化拒否分類(`RejectionCategory`)で決める。** Broker 固有の拒否コードは Adapter 内で分類へ写像され、共通モデルへ直接漏れない。分類できない拒否は fail-closed(自動再発行不可)。
-5. **手動再発行を先行し、自動再試行は定義のみ**: 初期実装は手動再発行(と `gate_correction`)のみ。自動再試行は `transient` カテゴリ限定・policy 上限つきの契約として本書で定義するが、Live Execution runner が存在するまで実装せず、policy 既定でも無効(上限 0)とする。
+5. **手動再発行を先行し、自動再試行は policy 明示設定なしでは無効**: 手動再発行(と `gate_correction`)を #116 で先行実装し、自動再試行は `transient` カテゴリ限定・policy 上限つきの契約として **#117 で登録ユースケースを実装した**(下記「自動再試行の実装契約」)。policy 既定は引き続き無効(上限 0)であり、runner / scheduler への組み込みは runner 設計 Issue 側に残る。
 6. **`signal_id` の一意性契約は「signal_id 全体一意」から「(signal_id, signal_attempt) 一意 + 線形チェーン制約」へ拡張する**(schema v5・#115 で実装済み)。同一 signal からの意図しない重複生成の防止は、従来どおり DB 制約 + `BEGIN IMMEDIATE` を最終防衛線として維持する。
 7. **再発行 Request は通常の `submit()` 経路をそのまま通る**: Safety Gate の再評価・判定の耐久保存・Submission Journal・`created → submitting` 遷移を含め、再発行専用の送信経路や Gate バイパスは作らない。
 
@@ -240,14 +240,28 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 
 | | 手動再発行(`broker_rejected`) | 訂正差し替え(`gate_correction`) | 自動再試行(`broker_rejected`) |
 |---|---|---|---|
-| 初期実装 | **対象**(#116 で実装済み) | **対象**(#116 で実装済み) | **対象外**(定義のみ。Live Execution runner 導入後の別 Issue) |
+| 初期実装 | **対象**(#116 で実装済み) | **対象**(#116 で実装済み) | **対象**(#117 で登録ユースケース実装済み。runner / scheduler からの呼び出しは runner 設計 Issue 側) |
 | 親の終わり方 | Broker が確定拒否(REJECTED) | Broker 未到達(phase `created` + Journal `not_started`) | Broker が確定拒否(REJECTED) |
 | 許可カテゴリ | 全カテゴリ(運用者判断が根拠) | 該当なし(`OrderResult` が存在しない) | `transient` のみ |
 | 注文パラメータの訂正 | 可(不変条件の範囲内。数量は非増加。ただし `parameter` 拒否のみ policy 上限内の増量可) | 可(不変条件の範囲内。数量は非増加) | **不可(親と完全同一)** |
-| 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断 |
+| 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断(runner 未実装のため呼び出し元は未接続) |
 | 記録 | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = auto` + policy 識別子・根拠(必須) |
 | 回数上限 | policy `max_manual_reissues_per_signal`(**既定 2**。#116 `ReissuePolicy`) | policy `max_gate_corrections_per_signal`(**既定 2**) | policy `max_auto_reissues_per_signal`(**既定 0 = 無効**) |
 | 追加条件 | — | Gate 判定 / Journal 事前条件(上記)。crash boundary 3 は対象外 | cooldown(連打防止)・kill switch 有効時は不可 |
+
+### 自動再試行の実装契約(Issue #117・実装済み)
+
+`ReissueService.register_auto_reissue()`(`execution/reissue_service.py`)が唯一の登録経路である。前提条件はすべて fail-closed で、ひとつでも確認できなければ登録拒否・DB 無変更:
+
+1. **policy の明示 opt-in**: `ReissuePolicy.max_auto_reissues_per_signal` > 0(**既定 0 = 無効**。既定設定では他の全条件が揃っていても一切登録されない)**かつ `ReissuePolicy.policy_id` が命名されている**こと(既定 None。監査記録が「どの policy が自動を認可したか」を識別できない匿名 policy は拒否)。
+2. **kill switch が検証可能に無効であること**: `SafetyStateProvider.is_kill_switch_enabled()` を登録時に照会し、有効・照会失敗・非 boolean 応答・provider 未配線のいずれも拒否。provider は composition root(`build_reissue_boundary()`)が **Gate の評価に使う同一インスタンス**(`SafetyGate.state_provider`)を配線する。
+3. **親がチェーン末尾の確定拒否(`order_state = rejected`)かつ `rejection_category = transient`** であること。`unclassified` を含む他の全カテゴリ・snapshot からカテゴリを読めない親は拒否(自動の唯一の根拠は正規化分類)。UNKNOWN の親は `rejected` でないため構造的に到達しない(UNKNOWN 非再送契約は不変)。
+4. **注文パラメータが親と完全同一**(数量・価格・SL / TP・order type)。減量を含む一切の変更を拒否する(内容の変更は人間の判断 = 手動経路)。同じ規則は store の登録トランザクション内でも #115 の共通検証(`_reissue_link_problems` の auto 規則)として再強制される。
+5. **有効な clearance**: 手動経路と同一の要件(current・`valid`・鮮度窓内)。チェーンに関わる hazardous divergence は clearance を失効させ、未観測は付与しないため、**未解決の reconciliation discrepancy がある signal はここで拒否される**。
+6. **cooldown**: 親行の永続化された `updated_at_utc`(= 拒否を記録した時刻。以後の監査された同状態再観測はこれを更新し、cooldown を保守側へ再開する)から `ReissuePolicy.auto_reissue_cooldown`(既定 5 分)が経過していること。永続化行由来なので再起動で短縮されない。判定はサービス層の事前チェックに加えて、**登録トランザクション内でも現在の親行に対して再検証する**(`create_reissue_execution_order()` の `parent_updated_at_not_after_utc` cutoff。事前チェックとトランザクションの間に正当な再観測が cooldown を再開した場合、stale な読み値では commit できない — clearance 鮮度 cutoff と同じ構造。PR #123 Codex レビュー P2)。
+7. **上限**: auto 上限は永続化されたチェーン行(`reissue_kind = broker_rejected` かつ `reissue_initiated_by = auto`)の集計で判定し、**manual / gate_correction の上限とは独立に数える**(auto が上限到達しても運用者の枠は消費されない。逆も同様)。`max_total_attempts_per_signal` は全種別を跨いで適用される。
+
+登録される子は `initiated_by = auto`・`reissue_reason = "auto policy <policy_id>: parent rejection_category transient"`(**policy 識別子と根拠カテゴリの監査記録**)を持つ通常の phase `created` の Request であり、送信は既存の `submit()` 経路のみ(Gate 全条件の再評価を含む。自動専用の送信経路・緩和は存在しない)。
 
 **全経路に共通する前提**: 有効な **reissue clearance**(order / position 双方の照合が成功した無差分の積極的証拠・鮮度窓内)が必要であり、登録時だけでなく**送信の瞬間まで有効**でなければならない(下記「Reconciliation との整合」。自動だけでなく手動・訂正も対象)。
 
@@ -381,7 +395,7 @@ REJECTED の確定は常に完全 `OrderResult` snapshot を伴う(`record_order
 | #114 | [Broker] `RejectionCategory` の定義と `OrderResult.rejection_category`(REJECTED ⇔ 必須の相互制約・旧 snapshot の `unclassified` 読み戻し・FakeBroker / OANDA Demo Adapter の写像)— **実装済み** | なし |
 | #115 | [Execution] schema v5(親子関係・attempt / kind 列・一意性制約の置換・v4 → v5 migration・チェーン整合とフィールド不変条件の検証・`mark_submitting()` の子存在検証と **clearance 照合**・**clearance evidence の保存形式と送信時 evidence の原子的な記録**・読み取り API のチェーン対応)— **実装済み** | #114 は不要(独立) |
 | #116 | [Execution] 手動再発行 + 訂正差し替えユースケース(登録 API・eligibility 検証・**policy 同一性の識別方式**・Gate 判定 / Journal 事前条件・**superseded intent の終端化(競合・再試行を含む)**・`intent_superseded` 拒否コード・**clearance の要件判定 / 発行 / 失効と並行観測の直列化**・**未送信の親に対する Broker 照会**・監査記録・通常 `submit()` 経路への接続・固定シナリオ)— **実装済み** | #114 #115 |
-| #117 | [Execution] `transient` 限定の自動再試行 policy(cooldown・上限・kill switch / discrepancy 前提条件。**既定無効**) | #114 #115 #116 + Live Execution runner(未着手) |
+| #117 | [Execution] `transient` 限定の自動再試行 policy(cooldown・上限・kill switch / discrepancy 前提条件。**既定無効**)— **登録ユースケース実装済み**(`register_auto_reissue()`。上記「自動再試行の実装契約」)。runner / scheduler への組み込みは runner 設計 Issue 側 | #114 #115 #116(Live Execution runner への接続は runner 側 Issue) |
 
 ## 関連ドキュメント
 

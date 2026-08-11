@@ -135,6 +135,10 @@ def build_reissue_boundary(
         current_policy=current_policy,
         reissue_policy=reissue_policy,
         clock=clock,
+        # Issue #117: the auto-reissue kill-switch precondition reads the
+        # SAME provider the gate evaluates with -- one source of truth, by
+        # construction.
+        state_provider=gate.state_provider,
     )
     return ReissueBoundary(
         submission=submission, registration=registration, policy=reissue_policy

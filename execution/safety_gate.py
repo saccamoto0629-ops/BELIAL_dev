@@ -609,6 +609,13 @@ class SafetyGate:
         persists ``policy.to_snapshot()`` next to every shadow result)."""
         return self._policy
 
+    @property
+    def state_provider(self) -> SafetyStateProvider:
+        """The gate's kill-switch source (Issue #117: the reissue
+        composition root hands the SAME provider to the auto-reissue
+        registration precondition, so both read one source of truth)."""
+        return self._state_provider
+
     def evaluate(
         self,
         request: ExecutionRequest,
