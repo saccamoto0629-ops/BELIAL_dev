@@ -54,6 +54,13 @@ never create the file or side files) and re-validate every stored row
 strictly -- an out-of-band edited DB raises
 :class:`KillSwitchIntegrityError` instead of being trusted. Connections are
 always explicitly closed (Windows file-handle hygiene).
+
+A DB whose header declares WAL journaling is refused on EVERY path (PR #126
+Codex review P1): an ``immutable=1`` read of a WAL file can miss a committed
+``enable`` still sitting in the ``-wal`` side file and report a stale
+DISABLED -- exactly the "unreadable reads as OFF" failure Issue #81 forbids.
+The store never creates WAL databases itself; an out-of-band conversion is
+fail-closed until reverted (``PRAGMA journal_mode=DELETE``).
 """
 
 from __future__ import annotations
@@ -66,7 +73,7 @@ from datetime import datetime
 from pathlib import Path
 
 from execution.execution_store import _ddl_tokens  # shared DDL token normalizer (PR #91 r3)
-from execution.sqlite_ro import connect_read_only
+from execution.sqlite_ro import _is_wal_header, connect_read_only
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "data" / "kill_switch.sqlite3"
@@ -297,6 +304,26 @@ def _verify_schema(connection: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
+def _refuse_wal(db_path: Path) -> None:
+    """Refuse a kill switch DB whose header declares WAL journaling (PR #126
+    Codex review P1). Every execution-owned store uses the default rollback
+    journal; a WAL header can only come from out-of-band maintenance
+    (``PRAGMA journal_mode=WAL``). ``connect_read_only`` would open such a
+    file with ``immutable=1``, which ignores the ``-wal`` side file -- a
+    committed ``enable`` sitting in the WAL would be invisible and the read
+    would return a stale DISABLED. A state that can read stale OFF is
+    unverifiable, so it is rejected on EVERY path (reads, writes,
+    initialization) instead: fail-closed until the file is converted back
+    (``PRAGMA journal_mode=DELETE``)."""
+    if _is_wal_header(db_path):
+        raise KillSwitchSchemaError(
+            f"kill switch DB at {db_path} is in WAL journal mode, which the store "
+            "refuses: an immutable read could miss a committed enable and report a "
+            "stale DISABLED. Convert it back with 'PRAGMA journal_mode=DELETE' "
+            "(fail-closed until then)"
+        )
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
     connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
@@ -308,6 +335,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 def _verified_txn(db_path: Path):
     """Write flow: open -> BEGIN IMMEDIATE -> verify schema -> row work ->
     COMMIT (ROLLBACK on any error). Connection always explicitly closed."""
+    _refuse_wal(db_path)
     with closing(_connect(db_path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -325,6 +353,7 @@ def _verified_read(db_path: Path):
     + write-denying authorizer -- a read can never create the file or side
     files) -> BEGIN (consistent view) -> verify schema -> read. Always
     rolled back."""
+    _refuse_wal(db_path)
     with closing(connect_read_only(db_path)) as connection:
         connection.execute("BEGIN")
         try:
@@ -373,7 +402,61 @@ class SQLiteKillSwitchStore:
         other content must pass full verification or fails WITHOUT modifying
         the file.
         """
+        self._initialize_txn(row_work=None)
+
+    def initialize_and_record(
+        self, *, enabled: bool, operator: str, reason: str, changed_at_utc: datetime
+    ) -> KillSwitchTransition:
+        """Create-or-verify the schema AND append the transition in ONE
+        transaction (PR #126 Codex review P1).
+
+        The CLI's emergency path previously ran ``initialize()`` and
+        ``record_transition()`` as two separate transactions; a process kill
+        (or a full disk) between them would leave a COMMITTED empty store --
+        which reads as DISABLED -- turning the prior fail-closed missing-DB
+        state into fail-open without any audit row. Here the schema creation
+        (pristine DB only, same rule as ``initialize``) and the first row
+        share one ``BEGIN IMMEDIATE`` transaction: any failure rolls both
+        back, so the file stays missing / schema-less (= unverifiable =
+        fail-closed), never "initialized but empty". On an EXISTING store
+        this degrades to verify + append, exactly like
+        :meth:`record_transition`.
+        """
+        if not isinstance(enabled, bool):
+            raise KillSwitchStoreError(f"enabled must be a bool, got {enabled!r}")
+        try:
+            _require_non_empty_str(operator, "operator")
+            _require_non_empty_str(reason, "reason")
+            _require_utc(changed_at_utc, "changed_at_utc")
+        except ValueError as exc:
+            raise KillSwitchStoreError(str(exc)) from exc
+        record = (int(enabled), changed_at_utc.isoformat(), operator, reason)
+
+        def append(connection: sqlite3.Connection) -> int:
+            cursor = connection.execute(
+                f"INSERT INTO {TRANSITIONS_TABLE} ({', '.join(_TRANSITION_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _TRANSITION_COLUMNS)})",
+                record,
+            )
+            return int(cursor.lastrowid)
+
+        transition_id = self._initialize_txn(row_work=append)
+        return KillSwitchTransition(
+            transition_id=transition_id,
+            enabled=enabled,
+            changed_at_utc=changed_at_utc,
+            operator=operator,
+            reason=reason,
+        )
+
+    def _initialize_txn(self, *, row_work):
+        """One ``BEGIN IMMEDIATE`` transaction: create the schema into a
+        pristine DB (or fully verify an existing one), then run ``row_work``
+        (if any) inside the SAME transaction. Any failure rolls everything
+        back -- a fresh file is left schema-less (unverifiable, fail-closed),
+        never committed empty."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        _refuse_wal(self._path)
         try:
             with closing(_connect(self._path)) as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -390,7 +473,9 @@ class SQLiteKillSwitchStore:
                         _verify_schema(connection, self._path)
                     else:
                         _verify_schema(connection, self._path)
+                    result = None if row_work is None else row_work(connection)
                     connection.execute("COMMIT")
+                    return result
                 except Exception:
                     connection.execute("ROLLBACK")
                     raise
@@ -470,11 +555,24 @@ class SQLiteKillSwitchStore:
         """The full change history in recording order (Issue #81: enable /
         disable, time, operator and reason are all auditable). Every row is
         strictly re-validated. Raises on any failure, like every read."""
+        return self.snapshot()[1]
+
+    def snapshot(self) -> tuple[KillSwitchState, tuple[KillSwitchTransition, ...]]:
+        """Current state AND full history from ONE verified read transaction
+        (PR #126 Codex review P2): the state is derived from the last row of
+        the SAME result set the history comes from, so a concurrent writer
+        can never make a status report say "disabled" while its own history
+        listing already shows a newer enable. Strict validation and
+        fail-closed behaviour are identical to the other reads."""
         rows = self._read_rows(
             f"SELECT transition_id, {', '.join(_TRANSITION_COLUMNS)} FROM {TRANSITIONS_TABLE} "
             "ORDER BY transition_id ASC"
         )
-        return tuple(self._validated(row) for row in rows)
+        transitions = tuple(self._validated(row) for row in rows)
+        if not transitions:
+            return KillSwitchState(enabled=False, transition=None), ()
+        latest = transitions[-1]
+        return KillSwitchState(enabled=latest.enabled, transition=latest), transitions
 
     def _read_rows(self, query: str) -> list:
         if not self._path.exists():

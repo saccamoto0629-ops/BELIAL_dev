@@ -12,8 +12,11 @@ for the emergency stop:
   (an uninitialized store is reported as UNAVAILABLE = fail-closed, exit 1;
   it is never reported as "disabled").
 - ``enable``  -- engage the switch (halt all new submissions). Requires
-  ``--operator`` and ``--reason``; initializes a missing store first so the
-  emergency action is one command. Idempotent in effect: enabling an
+  ``--operator`` and ``--reason``; on a missing store the schema and the
+  enable transition are created in ONE transaction (PR #126 Codex review
+  P1: a failure mid-command leaves the file unverifiable = fail-closed,
+  never a committed empty store that would read as disabled), so the
+  emergency action stays one command. Idempotent in effect: enabling an
   already-enabled switch appends another audit row and keeps it enabled.
 - ``disable`` -- resume new submissions. DELIBERATELY harder than enable
   (Issue #81: releasing must be an explicit contract): on top of
@@ -160,8 +163,10 @@ def _emit(payload: dict, as_json: bool) -> None:
 
 
 def _state_payload(command: str, store: SQLiteKillSwitchStore) -> dict:
-    state = store.current_state()
-    history = store.list_transitions()
+    # State and history come from ONE verified read transaction (PR #126
+    # Codex review P2): a concurrent enable can never make this report say
+    # "DISABLED" while its own history already lists the newer enable row.
+    state, history = store.snapshot()
     return {
         "command": command,
         "db_path": str(store.path),
@@ -201,8 +206,11 @@ def _run_cli(argv: list[str] | None) -> int:
             payload = _state_payload("status", store)
         else:
             enabled = args.command == "enable"
-            store.initialize()
-            transition = store.record_transition(
+            # Schema creation (missing store) and the transition are ONE
+            # transaction (PR #126 Codex review P1): a failure mid-command
+            # can never leave a committed empty store -- which would read as
+            # DISABLED -- behind; the file stays unverifiable = fail-closed.
+            transition = store.initialize_and_record(
                 enabled=enabled,
                 operator=operator,
                 reason=reason,

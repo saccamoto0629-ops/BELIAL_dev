@@ -255,6 +255,171 @@ def test_db_path_env_override_and_relative_resolution(monkeypatch, tmp_path):
     assert resolved.parts[-3:] == ("execution", "data", "relative.sqlite3")
 
 
+# --- atomic initialize + first transition (PR #126 Codex review P1) ----------
+
+
+def test_initialize_and_record_creates_schema_and_row_in_one_transaction(tmp_path):
+    store = SQLiteKillSwitchStore(ks_db(tmp_path))
+    recorded = store.initialize_and_record(
+        enabled=True, operator="ops", reason="emergency", changed_at_utc=at(1)
+    )
+    assert recorded.transition_id == 1
+    reopened = SQLiteKillSwitchStore(ks_db(tmp_path))
+    assert reopened.current_state().enabled is True
+    assert len(reopened.list_transitions()) == 1
+
+
+def test_initialize_and_record_appends_normally_on_an_existing_store(tmp_path):
+    store = initialized_store(tmp_path)
+    store.record_transition(enabled=True, operator="a", reason="halt", changed_at_utc=at(1))
+    recorded = store.initialize_and_record(
+        enabled=False, operator="b", reason="resume", changed_at_utc=at(2)
+    )
+    assert recorded.transition_id == 2
+    assert store.current_state().enabled is False
+    assert len(store.list_transitions()) == 2
+
+
+def test_failed_initialize_and_record_never_leaves_a_committed_disabled_store(
+    tmp_path, monkeypatch
+):
+    """The Codex P1 crash window: a failure between schema creation and the
+    first transition must not leave an empty-but-valid store behind (which
+    would read as DISABLED and flip the missing-DB fail-closed state to
+    fail-open). The whole call is one transaction: after a mid-transaction
+    failure the path is either still missing or unverifiable -- every read
+    keeps raising (fail-closed), never returns disabled."""
+    import execution.kill_switch_store as module
+
+    real_create_schema = module._create_schema
+
+    def create_schema_then_die(connection):
+        real_create_schema(connection)
+        raise sqlite3.OperationalError("simulated failure before the first transition")
+
+    monkeypatch.setattr(module, "_create_schema", create_schema_then_die)
+    store = SQLiteKillSwitchStore(ks_db(tmp_path))
+    with pytest.raises(KillSwitchStoreError):
+        store.initialize_and_record(
+            enabled=True, operator="ops", reason="emergency", changed_at_utc=at(1)
+        )
+    monkeypatch.undo()
+    with pytest.raises(KillSwitchStoreError):
+        store.current_state()
+    provider = PersistentKillSwitchStateProvider(ks_db(tmp_path))
+    with pytest.raises(KillSwitchStoreError):
+        provider.is_kill_switch_enabled()
+
+
+def test_initialize_and_record_validates_inputs_without_creating_the_file(tmp_path):
+    store = SQLiteKillSwitchStore(ks_db(tmp_path))
+    with pytest.raises(KillSwitchStoreError):
+        store.initialize_and_record(
+            enabled=True, operator=" ", reason="r", changed_at_utc=at(1)
+        )
+    assert not ks_db(tmp_path).exists()
+
+
+def test_initialize_and_record_rejects_foreign_and_versioned_files(tmp_path):
+    path = ks_db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE other_component (id INTEGER)")
+    before = path.read_bytes()
+    with pytest.raises(KillSwitchSchemaError):
+        SQLiteKillSwitchStore(path).initialize_and_record(
+            enabled=True, operator="ops", reason="halt", changed_at_utc=at(1)
+        )
+    assert path.read_bytes() == before
+
+
+# --- single-snapshot reads (PR #126 Codex review P2) --------------------------
+
+
+def test_snapshot_returns_state_and_history_from_one_consistent_read(tmp_path):
+    store = initialized_store(tmp_path)
+    state, history = store.snapshot()
+    assert state == KillSwitchState(enabled=False, transition=None)
+    assert history == ()
+    store.record_transition(enabled=True, operator="a", reason="halt", changed_at_utc=at(1))
+    store.record_transition(enabled=False, operator="b", reason="resume", changed_at_utc=at(2))
+    state, history = store.snapshot()
+    # The state IS the last row of the same result set the history came
+    # from -- they cannot diverge under a concurrent writer.
+    assert state.transition == history[-1]
+    assert state.enabled is history[-1].enabled is False
+    assert [entry.transition_id for entry in history] == [1, 2]
+
+
+# --- WAL-mode refusal (PR #126 Codex review P1) -------------------------------
+
+
+def to_wal_mode(path):
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+
+
+def test_wal_mode_db_is_refused_on_every_path_never_stale_off(tmp_path):
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    store.record_transition(enabled=True, operator="ops", reason="halt", changed_at_utc=at(1))
+    to_wal_mode(path)
+    # A committed enable could now sit in the -wal side file, invisible to an
+    # immutable read. The store refuses the file entirely instead of ever
+    # answering from a potentially stale view.
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.current_state()
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.list_transitions()
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.record_transition(
+            enabled=False, operator="ops", reason="resume", changed_at_utc=at(2)
+        )
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.initialize()
+    with pytest.raises(KillSwitchSchemaError, match="WAL"):
+        store.initialize_and_record(
+            enabled=True, operator="ops", reason="halt again", changed_at_utc=at(3)
+        )
+
+
+def test_wal_mode_db_fails_closed_through_the_gate_with_zero_submits(tmp_path):
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    to_wal_mode(path)
+    decision, result, broker = submit_once(tmp_path)
+    assert decision.allowed is False
+    assert SafetyRejectionCode.STATE_QUERY_FAILED in codes(decision)
+    assert result is None
+    assert broker.submitted_requests == []
+
+
+def test_wal_mode_db_recovers_after_conversion_back_to_rollback_journal(tmp_path):
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    store.record_transition(enabled=True, operator="ops", reason="halt", changed_at_utc=at(1))
+    to_wal_mode(path)
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    finally:
+        connection.close()
+    assert store.current_state().enabled is True  # nothing was lost
+
+
+def test_cli_status_on_wal_db_reports_unavailable_exit_1(tmp_path, capsys):
+    path = ks_db(tmp_path)
+    SQLiteKillSwitchStore(path).initialize()
+    to_wal_mode(path)
+    assert kill_switch_cli_main(["--db", str(path), "status"]) == 1
+    assert "UNAVAILABLE" in capsys.readouterr().err
+
+
 # --- store: fail-closed on every unverifiable state --------------------------
 
 
