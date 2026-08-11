@@ -39,6 +39,7 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `EXECUTION_ORDER_DB_PATH` | `execution/data/execution_orders.sqlite3` | 将来の Live Execution 用 Execution Order DB のパス上書き(`execution/execution_store.py`、Issue #74)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Live Execution runner 未実装。テストは `tmp_path` を使用) |
 | `SAFETY_GATE_DECISION_DB_PATH` | `execution/data/safety_gate_decisions.sqlite3` | 将来の Live Execution 用 Safety Gate 判定監査 DB のパス上書き(`execution/safety_store.py`、Issue #75)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Live Execution runner 未実装。テストは `tmp_path` を使用) |
 | `SUBMISSION_JOURNAL_DB_PATH` | `execution/data/submission_journal.sqlite3` | 将来の Live Execution 用 Submission Journal DB のパス上書き(`execution/submission_journal.py`、Issue #93)。Broker 送信前後の送信試行を Execution Order DB と**独立に**耐久記録する(Journal 保存失敗時は fail-closed で送信されない)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Live Execution runner 未実装。テストは `tmp_path` を使用) |
+| `KILL_SWITCH_DB_PATH` | `execution/data/kill_switch.sqlite3` | Execution 層の**永続 Kill Switch** 状態 DB のパス上書き(`execution/kill_switch_store.py`、Issue #81)。相対パスは `execution/` 基準。本番は永続ボリューム上の絶対パス推奨。状態は append-only の遷移履歴(有効/無効・UTC 時刻・operator・reason)で、Safety Gate は毎評価この DB を再読する。**DB が読めない(未初期化・schema 不一致・破損)あいだは fail-closed で全新規送信が拒否される**(「OFF 扱い」にはならない)。操作は `python -m execution.kill_switch_cli`(下記 CLI 節)。**この DB を評価する Live Execution runner は現時点で存在しない**(Live 接続未実装。テストは `tmp_path` を使用) |
 | `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。schema v3(Issue #105)は position / trade / SL・TP 検出記録テーブル(`manual_review` のみ許可)と run の position summary 列を additive に追加(migration は v1 → v2 → v3 の段階適用、`init_reconciliation_db()` のみ)。**この DB を作成・更新する運用導線は手動 reconciliation CLI(`python -m execution.reconciliation_runner`。Issue #105、下記 CLI 節)だけであり**、scheduler / 常駐 Bot への組み込みは未実装(テストは `tmp_path` を使用) |
 | `OANDA_API_TOKEN` | empty | OANDA Demo Adapter(`broker/oanda_demo_adapter.py`、Issue #79)の API token。**Demo(fxpractice)口座のトークンのみ**。環境変数でのみ渡し、ログ・例外・docs へ実値を書かない。**運用導線からこの Adapter を起動するプロセスは現時点で存在しない**(Execution 統合は未実装。opt-in の実 API テストのみが使用) |
 | `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない |
@@ -280,6 +281,44 @@ python -m execution.reconciliation_runner --broker fake --dry-run
 - **token / account id / endpoint は出力・ログへ一切出ない**(接続表示は定数ラベル `demo / oanda-demo` のみ。設定エラー文言は環境変数名のみを含み値を echo しない)。
 - 検出結果は要確認(`manual_review`)分類の記録であり、**この CLI から自動修復は起動しない**。order スコープの修復(Issue #104)はサービス API の明示呼び出しのみ。
 - 通常 CI・pytest から実 Demo API へは接続しない(CI は `--broker fake` 経路のみ実行)。
+
+### Execution Kill Switch — 緊急発注停止・状態確認・解除(Issue #81)
+
+`python -m execution.kill_switch_cli` は Execution 層の**永続 Kill Switch** を操作する唯一の運用導線。有効化すると Safety Gate(`kill_switch_enabled`)が**すべての新規 Broker 送信**を拒否する。状態は SQLite(`KILL_SWITCH_DB_PATH`、既定 `execution/data/kill_switch.sqlite3`)に append-only の履歴として永続化されるため、**プロセス再起動・多重起動・別プロセスからの送信にも停止が効き続ける**。reconciliation・read-only 照会・cancel は Gate を通らないため停止中も実行できる。この CLI は Broker・ネットワークへ一切触れない。
+
+EC2 上での緊急停止(enable は 1 コマンド。DB 未作成でも初期化して停止する):
+
+```bash
+cd /opt/berial
+source .venv/bin/activate
+
+# 緊急停止: 以後の新規送信をすべて拒否(operator / reason は監査履歴に必須)
+python -m execution.kill_switch_cli enable \
+    --operator "$(whoami)" --reason "incident: manual emergency stop"
+```
+
+状態確認(read-only。DB を作成しない):
+
+```bash
+# 現在状態 + 全変更履歴(有効/無効・UTC 時刻・operator・reason)
+python -m execution.kill_switch_cli status
+
+# 機械可読(pure-ASCII JSON)
+python -m execution.kill_switch_cli --json status
+```
+
+解除(**明示操作**。`--confirm-resume` がなければ usage error で何も変わらない):
+
+```bash
+python -m execution.kill_switch_cli disable \
+    --operator "$(whoami)" --reason "incident resolved" --confirm-resume
+```
+
+- exit code: **0** = 成功(status は状態が読めたこと)/ **1** = 状態 store 障害(DB 欠損・未初期化・schema 不一致・破損。**この間 Gate は `state_query_failed` で全新規送信を拒否する fail-closed 状態**であり、`status` は「disabled」ではなく UNAVAILABLE と報告する)/ **2** = usage error(`--operator` / `--reason` 欠落・空文字、`--confirm-resume` なしの disable)。
+- 停止中であることの確認手段: (1) `status` の出力、(2) 送信試行側の WARN ログ `Safety Gate rejected ... codes=('kill_switch_enabled',)`(journalctl)、(3) Safety Gate 判定監査 DB(`safety_gate_decisions.sqlite3`)の拒否記録。Discord 通知は未実装(Issue #81 は「ログまたは Discord」を要求しており、ログ + status で満たす)。
+- 履歴は上書きされない: UPDATE / DELETE は DB trigger が拒否する。同じ状態への enable の重ね掛けも履歴行として残る(監査目的)。
+- 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(照合)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
+- 現時点で本番の常駐 Live Execution runner は存在しない(Live 接続未実装)。Kill Switch は将来の Live 送信 composition が `PersistentKillSwitchStateProvider` を配線することで効く契約であり、手順・状態 store・CLI はその運用準備として先行整備している(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
 
 ### Paper Signal 日次集計レポート(Issue #47)
 

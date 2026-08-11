@@ -1,6 +1,6 @@
 # Safety Gate / Live Order Submission(Issue #75)
 
-将来の **Live Execution** に向けた、Broker 送信直前の fail-closed 検証層と単一送信サービス境界の仕様。実装は `execution/safety_gate.py`(判定)、`execution/safety_store.py`(判定監査保存)、`execution/live_submission.py`(唯一の公認送信経路)。
+将来の **Live Execution** に向けた、Broker 送信直前の fail-closed 検証層と単一送信サービス境界の仕様。実装は `execution/safety_gate.py`(判定)、`execution/safety_store.py`(判定監査保存)、`execution/live_submission.py`(唯一の公認送信経路)、`execution/kill_switch_store.py` + `execution/kill_switch_cli.py`(永続 Kill Switch。Issue #81)。
 
 > **重要な位置づけ**
 >
@@ -119,7 +119,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 | 静的ポリシー | `SafetyPolicy` | Gate 構築時に注入(`policy_id` で監査から識別可能) |
 | 市場データ | `MarketSafetySnapshot` | 呼び出し側(Gate 自身は市場データ I/O を行わない) |
 | Broker 照会 | `Broker.get_positions()` / `get_account_state()` | evaluate 内で同期照会 |
-| BELIAL 側状態 | `SafetyStateProvider`(kill switch) | Gate 構築時に注入 |
+| BELIAL 側状態 | `SafetyStateProvider`(kill switch) | Gate 構築時に注入。production は耐久実装 `PersistentKillSwitchStateProvider`(下記「永続 Kill Switch」)、`StaticSafetyState` はテスト / 固定シナリオ / shadow 設定用 |
 | 現在時刻 | 注入 clock(UTC 必須) | Gate / サービス各々に注入 |
 | 接続 identity | `BrokerConnection` | サービス構築時に注入(mode / target は Broker 自身の `connection_identity()` から導出。評価時にも再導出) |
 
@@ -162,6 +162,17 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 ### kill switch
 
 `SafetyStateProvider.is_kill_switch_enabled()` が True なら、**他条件に関係なく**すべての新規注文を拒否する(`kill_switch_enabled`)。照会が例外を出した場合、または **bool 以外を返した場合**(falsy なゴミを「無効」と読まない)は `state_query_failed` で拒否する。
+
+## 永続 Kill Switch(Issue #81)
+
+kill switch の**状態の正はプロセスメモリではなく専用 SQLite**(`execution/kill_switch_store.py`、既定 `execution/data/kill_switch.sqlite3`、`KILL_SWITCH_DB_PATH` で上書き)である。新しい Gate・新しい送信経路・新しい拒否コードは**追加しない**: 既存の `SafetyStateProvider` 契約と `kill_switch_enabled` / `state_query_failed` の拒否コード契約をそのまま再利用し、`LiveOrderSubmissionService` の単一境界も不変。
+
+- **状態モデル(append-only)**: 唯一のテーブル `kill_switch_transitions` に、明示操作 1 回 = 1 行(操作後の `enabled`・`changed_at_utc`(UTC)・`operator`・`reason`)を**追記のみ**で記録する。UPDATE / DELETE は schema 内 trigger が ABORT し(帯域外の sqlite3 直叩きにも効く)、trigger は closed-world schema 検証の対象なので trigger を欠いた lookalike DB は信頼されない。現在状態 = 最大 `transition_id` の行(ID が順序の正、時刻は補助)。**初期化済みで遷移 0 行は「作成済み・未発動 = disabled」**という意図的な状態である。
+- **fail-closed(読めない ≠ OFF)**: DB ファイル欠損・未初期化・schema 不一致・foreign DB・破損・帯域外編集はすべて例外(`KillSwitchStoreError` 系)であり、Gate の既存変換で `state_query_failed` になる — **検証不能な kill switch は全新規送信を止める**。読み取りは true read-only 接続(`sqlite_ro.py`)で DB を新規作成しない。schema 方針(pristine init・closed-world 検証・厳格復元・明示 close)は execution store / safety store と同一。migration は v1 のため存在しない(将来変更時は各 store と同じ additive 方式に従う)。
+- **`PersistentKillSwitchStateProvider`**: `SafetyStateProvider` の耐久実装。**毎回 fresh 接続で commit 済み状態を再読**し、プロセス内キャッシュを持たない — 有効化はプロセス再起動・サービス / provider の再構築・同一ホストの別プロセス(緊急 CLI)をまたいで**次の評価から**効く。Live 送信の composition は本 provider を配線しなければならない(`StaticSafetyState` はテスト / 固定シナリオ(Issue #77)/ shadow 設定(Issue #78)の in-memory 用として存続)。Issue #117 の自動再発行前提条件は `gate.state_provider` を共有するため、同じ耐久状態を読む。
+- **停止中も動く経路**: reconciliation(検出 / 修復 / CLI)・execution store の read-only 照会・cancel は Gate を評価しないため kill switch の影響を受けない(Issue #81: 停止中も既存ポジションの照会・保護処理は継続可能)。Paper Execution / Paper Signal / Backtest は Broker 境界に触れないため対象外(kill switch を混ぜない)。
+- **運用 CLI**(`python -m execution.kill_switch_cli`、[operations.md](../operations/operations.md) に EC2 手順): `status`(read-only。読めない store は UNAVAILABLE = fail-closed として exit 1 で報告し「disabled」とは言わない)/ `enable`(`--operator` / `--reason` 必須。missing store は pristine init してから追記 = 緊急停止は 1 コマンド)/ `disable`(**明示 `--confirm-resume` フラグがなければ usage error で無変更** — 解除は誤操作で起きにくい明示契約)。exit code は 0 / 1(store 障害 = fail-closed 側)/ 2(usage)。
+- **可観測性**: 停止中の送信試行は既存の WARN ログ(`codes=('kill_switch_enabled',)`)と判定監査 store(`safety_store.py`)に記録され、CLI `status` で現在状態と全履歴を確認できる。
 
 ## fail-closed 条件(すべて拒否になる)
 
@@ -224,7 +235,8 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - `test_safety_store.py` — 再オープン(プロセス再起動相当)後の round-trip、記録順の復元、missing DB への書き込み拒否(ファイル非作成)・読み取り空(ファイル非作成)、pristine 判定、foreign schema / 制約欠損 lookalike / trigger / version 不一致の拒否(DB 無変更)、帯域外改竄(未知コード・未知キー・壊れた時刻)の復元時拒否、DB CHECK 制約の発火、公認送信サービスとの結合(拒否・許可の監査が再起動後も取得可能、未初期化 store の fail-closed)。
 - `test_safety_store.py`(Issue #116 追加分)— policy snapshot の round-trip(`list_for_request_records`)、snapshot なし記録の None 読み戻し、非 dict snapshot の拒否、改竄 snapshot の復元時拒否、**v1 → v2 migration**(既存行保持・冪等性・検証失敗時の完全 rollback と retry 成功)。
 - `test_reissue_service.py` / `test_reissue_clearance.py` / `test_reissue_submission.py`(Issue #116)— 再発行 eligibility・clearance 判定・`intent_superseded` / `reissue_clearance_invalid` の送信経路検証([Execution Intent Reissue](execution_reissue.md))。
-- `test_submission_boundary.py` — `submit_order` / `cancel_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信・キャンセル呼び出しが各 1 箇所であること)。
+- `test_kill_switch.py`(Issue #81)— 永続 Kill Switch: store の round-trip・再オープン(プロセス再起動相当)後の状態・履歴維持、operator / reason / UTC 時刻の保存、append-only(UPDATE / DELETE の trigger 拒否・repeated enable の履歴追記)、missing DB の read / write 拒否(ファイル非作成)、pristine 判定・foreign schema・trigger 欠損 lookalike・version 不一致・非 SQLite ファイル・帯域外挿入行の fail-closed、公認送信経路経由の統合(OFF で FakeBroker へ 1 件送信 / ON で 0 件 + 既存 `kill_switch_enabled` コード / **service・provider 再構築後も停止継続** / 明示 disable 後の再開 / missing・foreign・corrupt・malformed DB は `state_query_failed` で 0 件)、別 store インスタンスからの enable が再構成なしに次の submit へ効くこと、並行 multi-instance 追記の履歴無矛盾、**停止中の reconciliation CLI / read-only 照会の継続**、拒否の WARN ログと判定監査 store への記録、CLI(status / enable / disable の正常系・usage error・fail-closed exit code・JSON・`--confirm-resume` 契約)。
+- `test_submission_boundary.py` — `submit_order` / `cancel_order` / `to_order_request` 呼び出し箇所のリポジトリ全体 AST 走査(サービス境界迂回の構造的禁止、`live_submission.py` 内の送信・キャンセル呼び出しが各 1 箇所であること)。Kill Switch 実装(store / provider / CLI)が新しい送信呼び出し箇所を持たないことも、この走査が構造的に固定する。
 - `test_cancel_submission.py`(Issue #99)— 公認キャンセル経路の全分岐: 成功(既存状態機械契約での CANCELLED 永続化・部分約定の fill 保持・journal claim の completed 終端)、重複キャンセルの冪等拒否(サービス再作成後含む・Broker cancel 1 回のまま)、Broker 確定拒否の状態不変 + 失敗記録 + journal terminal `broker_refused` + 再試行の新規試行扱い(attempt_count 増分)、store=ACCEPTED / broker=FILLED 乖離時の確定拒否、ローカル型付き拒否の全コード(未登録 / 未送信 / submitting・pending / submit 後 UNKNOWN / terminal / store 読み取り不能)と全拒否経路で Broker cancel 0 件、timeout・通信失敗・not found・想定外例外の保守的 UNKNOWN 記録 + journal `reconciliation_required` + re-raise + 再送禁止、受領済み結果の保存失敗 → journal 耐久記録 + UNKNOWN フォールバック + 元例外 re-raise + 照会可視性、**二重失敗クラッシュ窓**(注文 row が cancellable のままでも journal claim が再送を阻止: 同一サービス・再作成サービスとも `cancel_attempt_unresolved`・`list_unresolved_cancellations()` で可視)、**並行 cancel**(barrier 同期の 2 呼び出しで Broker cancel ちょうど 1 回・敗者は fail-closed 拒否)、**journal fail-closed**(journal 欠損 / started 書き込み失敗で Broker 未到達・`not_started` claim の reclaim 後に正常続行)、`CancelOutcome` のクロスフィールド不変条件。
 - `test_submission_journal.py`(Issue #99 追加分)— cancellation journal の claim ライフサイクル(round-trip・reopen 復元・`started` 後の再取得拒否 = クラッシュ窓・unknown / save-failed 後の conflict・`not_started` reclaim と時刻後退拒否・`broker_refused` 終端化と新規試行 reclaim・started 一度きり遷移・client_order_id 束縛・`list_unresolved_cancellations()` の terminal 除外)、`CancellationJournalEntry` 不変条件、**v2 → v3 migration**(additive・既存行無変更・冪等・検証失敗時の完全 rollback と retry 成功)。
 - `test_fixed_scenarios.py` ほか(Issue #77)— 固定シナリオ試験。Safety Gate 拒否系(stale price / kill switch / execution mode 不整合 / 複数違反同時収集)を含む分岐を固定データから本番経路(本サービス)経由で再現し、全拒否シナリオで Broker 呼び出しが 0 件であること・機械可読な拒否コード・監査保存件数を expected/actual 比較で固定する。キャンセル系 6 件(Issue #99: 成功 / Broker 確定拒否 / terminal 拒否 / 重複抑止 / timeout UNKNOWN / DB 保存失敗)は `cancel` ステップが本サービスの公開 cancel API のみを駆動する。実行方法は `execution/README.md` の「固定シナリオ試験」節を参照。
