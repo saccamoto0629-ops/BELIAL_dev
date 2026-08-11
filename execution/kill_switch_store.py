@@ -49,9 +49,10 @@ modifying the file. Every read and write verifies the schema first -- the
 closed-world comparison of the complete ``sqlite_master`` object set
 (token-normalized DDL; the append-only triggers are part of the verified
 set), the PRAGMA structural signature and the schema version. Reads go
-through TRUE read-only connections (``execution/sqlite_ro.py``: a read can
-never create the file or side files) and re-validate every stored row
-strictly -- an out-of-band edited DB raises
+through TRUE read-only connections (``execution/sqlite_ro.py``: a read
+never creates the database file, and creates no ``-wal`` / ``-shm`` side
+files for a non-WAL database -- see the scope note below) and re-validate
+every stored row strictly -- an out-of-band edited DB raises
 :class:`KillSwitchIntegrityError` instead of being trusted. Connections are
 always explicitly closed (Windows file-handle hygiene).
 
@@ -202,6 +203,63 @@ class KillSwitchState:
             raise ValueError(
                 "state.enabled must equal the latest transition's enabled value"
             )
+
+
+@dataclass(frozen=True)
+class KillSwitchRecordOutcome:
+    """What :meth:`SQLiteKillSwitchStore.initialize_and_record` returns (PR
+    #126 Codex review P2, r6).
+
+    ``transition`` is ALWAYS the durably committed change -- receiving this
+    object at all means the write succeeded. ``state`` / ``history`` are the
+    report read inside that same transaction, and carrying them here is the
+    point: the caller never runs a second read that could fail on its own
+    and leave it unable to describe a change that is already durable.
+
+    ``state`` and ``history`` are ``None`` (with ``integrity_error`` set)
+    for the ONE case that survives: the rows were read, but the store's
+    history does not validate -- an out-of-band corrupted row. The
+    transition still committed (an emergency ``enable`` must never be
+    blocked by pre-existing damage), and the caller must report exactly
+    that: recorded, but the state is unverifiable and therefore still
+    fail-closed.
+    """
+
+    transition: KillSwitchTransition
+    state: KillSwitchState | None
+    history: tuple[KillSwitchTransition, ...] | None
+    integrity_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transition, KillSwitchTransition):
+            raise ValueError(f"transition must be a KillSwitchTransition, got {self.transition!r}")
+        if (self.state is None) != (self.history is None):
+            raise ValueError("state and history must be present or absent together")
+        if (self.state is None) != (self.integrity_error is not None):
+            raise ValueError(
+                "integrity_error must be set exactly when the state could not be built"
+            )
+        if self.state is None:
+            _require_non_empty_str(self.integrity_error, "integrity_error")
+            return
+        if not isinstance(self.state, KillSwitchState):
+            raise ValueError(f"state must be a KillSwitchState, got {self.state!r}")
+        if not isinstance(self.history, tuple):
+            raise ValueError(f"history must be a tuple, got {type(self.history).__name__}")
+        if not self.history:
+            raise ValueError("history must contain at least the recorded transition")
+        if self.state.transition != self.history[-1]:
+            raise ValueError("state must be derived from the last history entry")
+        if self.transition.transition_id != self.history[-1].transition_id:
+            raise ValueError(
+                "the recorded transition must be the newest entry of the returned history"
+            )
+
+    @property
+    def state_is_verifiable(self) -> bool:
+        """False when the transition committed but the store's history does
+        not validate -- the caller must keep reporting fail-closed."""
+        return self.state is not None
 
 
 def _create_transitions_table_sql() -> str:
@@ -543,9 +601,10 @@ class SQLiteKillSwitchStore:
 
     def initialize_and_record(
         self, *, enabled: bool, operator: str, reason: str, changed_at_utc: datetime
-    ) -> KillSwitchTransition:
-        """Create-or-verify the schema AND append the transition in ONE
-        transaction (PR #126 Codex review P1).
+    ) -> KillSwitchRecordOutcome:
+        """Create-or-verify the schema, append the transition AND read back
+        the resulting state + history -- all in ONE transaction (PR #126
+        Codex review P1 / P2 r6).
 
         The CLI's emergency path previously ran ``initialize()`` and
         ``record_transition()`` as two separate transactions; a process kill
@@ -558,6 +617,16 @@ class SQLiteKillSwitchStore:
         fail-closed), never "initialized but empty". On an EXISTING store
         this degrades to verify + append, exactly like
         :meth:`record_transition`.
+
+        The state and history are returned FROM THAT SAME TRANSACTION
+        (review r6) rather than left to a second, independent read. A
+        separate read can fail on its own -- another process holding an
+        exclusive lock, an out-of-band WAL conversion -- and the caller
+        would then have a DURABLY COMMITTED transition it cannot describe.
+        For ``disable`` that mismatch is dangerous in the wrong direction:
+        submissions resume while the operator is told the store is
+        fail-closed. Returning the report with the mutation removes that
+        window instead of asking the CLI to reason about it.
         """
         if not isinstance(enabled, bool):
             raise KillSwitchStoreError(f"enabled must be a bool, got {enabled!r}")
@@ -569,21 +638,44 @@ class SQLiteKillSwitchStore:
             raise KillSwitchStoreError(str(exc)) from exc
         record = (int(enabled), changed_at_utc.isoformat(), operator, reason)
 
-        def append(connection: sqlite3.Connection) -> int:
+        def append_and_read(connection: sqlite3.Connection):
             cursor = connection.execute(
                 f"INSERT INTO {TRANSITIONS_TABLE} ({', '.join(_TRANSITION_COLUMNS)}) "
                 f"VALUES ({', '.join('?' for _ in _TRANSITION_COLUMNS)})",
                 record,
             )
-            return int(cursor.lastrowid)
+            rows = connection.execute(
+                f"SELECT transition_id, {', '.join(_TRANSITION_COLUMNS)} "
+                f"FROM {TRANSITIONS_TABLE} ORDER BY transition_id ASC"
+            ).fetchall()
+            return int(cursor.lastrowid), rows
 
-        transition_id = self._initialize_txn(row_work=append)
-        return KillSwitchTransition(
+        transition_id, rows = self._initialize_txn(row_work=append_and_read)
+        # ---- past this point the transition is COMMITTED and durable ----
+        recorded = KillSwitchTransition(
             transition_id=transition_id,
             enabled=enabled,
             changed_at_utc=changed_at_utc,
             operator=operator,
             reason=reason,
+        )
+        try:
+            history = tuple(self._validated(row) for row in rows)
+        except KillSwitchIntegrityError as exc:
+            # Pre-existing out-of-band damage elsewhere in the history. The
+            # write is deliberately NOT rolled back: an emergency enable must
+            # never be blocked by a corrupted older row (and rolling back
+            # would also discard an operator action that already succeeded).
+            # The state stays unverifiable, so the caller reports fail-closed
+            # while making clear the transition WAS recorded.
+            return KillSwitchRecordOutcome(
+                transition=recorded, state=None, history=None, integrity_error=str(exc)
+            )
+        latest = history[-1]
+        return KillSwitchRecordOutcome(
+            transition=recorded,
+            state=KillSwitchState(enabled=latest.enabled, transition=latest),
+            history=history,
         )
 
     def _initialize_txn(self, *, row_work):

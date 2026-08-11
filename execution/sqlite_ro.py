@@ -19,8 +19,11 @@ reads) must therefore connect through :func:`connect_read_only`, which
   ``journal_mode``, ``writable_schema``, ...) are denied too; read-only
   pragmas (``table_info`` etc.) that the schema verification needs stay
   allowed,
-- never creates the file, its parent directory, or ``-wal`` / ``-shm`` side
-  files, and works inside a read-only directory,
+- never creates the file or its parent directory, creates no ``-wal`` /
+  ``-shm`` side files on the DEFAULT path, and works inside a read-only
+  directory (the side-file part is scoped: see "WAL databases" below --
+  a caller that passes ``allow_immutable_wal=False`` does materialize the
+  sidecars for a WAL file),
 - raises :class:`ReadOnlyDbMissingError` for a missing path instead of
   creating anything (callers decide whether "missing" means ``None`` / empty
   or an explicit failure).
@@ -34,9 +37,19 @@ no side files, no mtime change -- at the documented cost that an immutable
 probe sees a point-in-time view and must not race a concurrent writer (the
 same trade-off Paper Execution's snapshot-copy dry-run reads make).
 
+That immutable fallback is what makes the no-side-file property hold
+unconditionally on the DEFAULT path -- and a caller can OPT OUT of it
+(``allow_immutable_wal=False``, PR #126). Opting out is the right call when
+reading a stale committed value would be a safety failure rather than a
+staleness annoyance, and it comes with the inverse trade: for a WAL file the
+open DOES create ``-wal`` / ``-shm``. The two cannot be had together --
+reading WAL content requires the WAL index. Callers that opt out own that
+consequence and must state their own scoped contract (see
+``kill_switch_store``).
+
 A corrupted or foreign file still OPENS here (SQLite validates lazily); the
-callers' schema verification is what rejects it -- this module only
-guarantees that looking at a file never modifies the filesystem.
+callers' schema verification is what rejects it -- on the default path this
+module guarantees that looking at a file never modifies the filesystem.
 """
 
 from __future__ import annotations

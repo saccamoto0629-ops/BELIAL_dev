@@ -261,10 +261,14 @@ def test_db_path_env_override_and_relative_resolution(monkeypatch, tmp_path):
 
 def test_initialize_and_record_creates_schema_and_row_in_one_transaction(tmp_path):
     store = SQLiteKillSwitchStore(ks_db(tmp_path))
-    recorded = store.initialize_and_record(
+    outcome = store.initialize_and_record(
         enabled=True, operator="ops", reason="emergency", changed_at_utc=at(1)
     )
-    assert recorded.transition_id == 1
+    assert outcome.transition.transition_id == 1
+    # The report comes from the SAME transaction as the write (review r6).
+    assert outcome.state_is_verifiable
+    assert outcome.state.enabled is True
+    assert outcome.history == (outcome.transition,)
     reopened = SQLiteKillSwitchStore(ks_db(tmp_path))
     assert reopened.current_state().enabled is True
     assert len(reopened.list_transitions()) == 1
@@ -273,10 +277,12 @@ def test_initialize_and_record_creates_schema_and_row_in_one_transaction(tmp_pat
 def test_initialize_and_record_appends_normally_on_an_existing_store(tmp_path):
     store = initialized_store(tmp_path)
     store.record_transition(enabled=True, operator="a", reason="halt", changed_at_utc=at(1))
-    recorded = store.initialize_and_record(
+    outcome = store.initialize_and_record(
         enabled=False, operator="b", reason="resume", changed_at_utc=at(2)
     )
-    assert recorded.transition_id == 2
+    assert outcome.transition.transition_id == 2
+    assert outcome.state.enabled is False
+    assert [entry.transition_id for entry in outcome.history] == [1, 2]
     assert store.current_state().enabled is False
     assert len(store.list_transitions()) == 2
 
@@ -793,6 +799,76 @@ def test_a_valid_disable_on_top_of_a_malformed_row_still_fails_closed(tmp_path):
     provider = PersistentKillSwitchStateProvider(path)
     with pytest.raises(KillSwitchIntegrityError):
         provider.is_kill_switch_enabled()
+
+
+def test_an_emergency_enable_is_still_recorded_on_a_corrupt_store(tmp_path):
+    """PR #126 Codex review P2 (r6): pre-existing damage must never block an
+    emergency stop. The transition commits; only the REPORT degrades -- the
+    state stays unverifiable, so the gate keeps rejecting."""
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    insert_malformed_row(path)
+
+    outcome = store.initialize_and_record(
+        enabled=True, operator="ops", reason="emergency", changed_at_utc=at(3)
+    )
+    assert outcome.transition.enabled is True
+    assert outcome.state_is_verifiable is False
+    assert outcome.state is None and outcome.history is None
+    assert "restore-time validation" in outcome.integrity_error
+
+    # The row really is durable: a fresh connection can see it...
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT enabled, operator, reason FROM kill_switch_transitions "
+            "ORDER BY transition_id DESC LIMIT 1"
+        ).fetchall()
+    assert rows == [(1, "ops", "emergency")]
+    # ...while the state stays unverifiable, so submissions remain blocked.
+    with pytest.raises(KillSwitchIntegrityError):
+        PersistentKillSwitchStateProvider(path).is_kill_switch_enabled()
+
+
+def test_cli_reports_a_recorded_transition_even_when_the_state_is_unverifiable(
+    tmp_path, capsys
+):
+    """The dangerous mis-report the review identified: a committed change
+    must not be announced as merely "UNAVAILABLE", or an operator would
+    read a successful disable as having had no effect. Exit 1 still stands
+    (the state cannot be confirmed), but the message says what happened."""
+    path = ks_db(tmp_path)
+    store = SQLiteKillSwitchStore(path)
+    store.initialize()
+    store.record_transition(enabled=True, operator="ops", reason="halt", changed_at_utc=at(1))
+    insert_malformed_row(path)
+
+    assert (
+        kill_switch_cli_main(
+            [
+                "--db",
+                str(path),
+                "disable",
+                "--operator",
+                "ops",
+                "--reason",
+                "resolved",
+                "--confirm-resume",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "WAS RECORDED" in err
+    assert "enabled=False" in err and "operator=ops" in err
+    assert "cannot be confirmed" in err
+    # And the disable really is durable despite the exit code.
+    with sqlite3.connect(path) as connection:
+        latest = connection.execute(
+            "SELECT enabled, reason FROM kill_switch_transitions "
+            "ORDER BY transition_id DESC LIMIT 1"
+        ).fetchone()
+    assert latest == (0, "resolved")
 
 
 def test_the_gate_and_the_cli_agree_on_a_partially_corrupt_store(tmp_path, capsys):

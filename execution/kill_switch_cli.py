@@ -162,14 +162,19 @@ def _emit(payload: dict, as_json: bool) -> None:
         _print_state(payload)
 
 
-def _state_payload(command: str, store: SQLiteKillSwitchStore) -> dict:
-    # State and history come from ONE verified read transaction (PR #126
-    # Codex review P2): a concurrent enable can never make this report say
-    # "DISABLED" while its own history already lists the newer enable row.
-    state, history = store.snapshot()
+def _payload(command: str, db_path, state, history) -> dict:
+    """Build the report from an ALREADY-OBTAINED state + history pair.
+
+    Both always come from ONE verified transaction (PR #126 Codex review
+    P2): a concurrent change can never make this report say "DISABLED"
+    while its own history already lists a newer enable. For enable /
+    disable that transaction is the one that COMMITTED the change (review
+    r6), so a durable transition can never be reported as a fail-closed
+    store.
+    """
     return {
         "command": command,
-        "db_path": str(store.path),
+        "db_path": str(db_path),
         "kill_switch_enabled": state.enabled,
         "last_transition": None
         if state.transition is None
@@ -203,21 +208,41 @@ def _run_cli(argv: list[str] | None) -> int:
             # Read-only on purpose: status must never create or migrate the
             # DB, and a store that cannot be read is the fail-closed state,
             # reported as such -- never as "disabled".
-            payload = _state_payload("status", store)
+            state, history = store.snapshot()
+            payload = _payload("status", store.path, state, history)
         else:
             enabled = args.command == "enable"
-            # Schema creation (missing store) and the transition are ONE
-            # transaction (PR #126 Codex review P1): a failure mid-command
-            # can never leave a committed empty store -- which would read as
-            # DISABLED -- behind; the file stays unverifiable = fail-closed.
-            transition = store.initialize_and_record(
+            # Schema creation (missing store), the transition AND the report
+            # are ONE transaction (PR #126 Codex review P1 / P2 r6): a
+            # failure mid-command can never leave a committed empty store --
+            # which would read as DISABLED -- behind, and a transition that
+            # DID commit is never reported as a fail-closed store, because
+            # describing it needs no second read that could fail on its own.
+            outcome = store.initialize_and_record(
                 enabled=enabled,
                 operator=operator,
                 reason=reason,
                 changed_at_utc=datetime.now(timezone.utc),
             )
-            payload = _state_payload(args.command, store)
-            payload["recorded_transition"] = _transition_payload(transition)
+            if not outcome.state_is_verifiable:
+                # The transition IS durable -- say so plainly. Reporting only
+                # "UNAVAILABLE" here would tell an operator their disable did
+                # not take effect while submissions were already free to
+                # resume. Exit 1 still stands: the state cannot be verified,
+                # so the gate keeps rejecting.
+                recorded = outcome.transition
+                print(
+                    f"kill switch transition #{recorded.transition_id} WAS RECORDED "
+                    f"(enabled={recorded.enabled}, operator={recorded.operator}, "
+                    f"at={recorded.changed_at_utc.isoformat()}), but the store's "
+                    f"history does not validate, so the current state cannot be "
+                    f"confirmed: {outcome.integrity_error}. The Safety Gate rejects "
+                    "every new submission while this persists.",
+                    file=sys.stderr,
+                )
+                return EXIT_STORE_ERROR
+            payload = _payload(args.command, store.path, outcome.state, outcome.history)
+            payload["recorded_transition"] = _transition_payload(outcome.transition)
     except KillSwitchStoreError as exc:
         print(
             "kill switch state UNAVAILABLE (fail-closed: the Safety Gate rejects "
