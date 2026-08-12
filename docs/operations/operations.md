@@ -330,7 +330,7 @@ python -m execution.kill_switch_cli disable \
 - `enable` / `disable` が exit 1 でも、出力に `WAS RECORDED` があれば**その遷移は記録済み**である(履歴に破損行がある等で現在状態を確認できないだけ)。この場合 Gate は fail-closed のまま送信を止め続けるので、破損を解消してから `status` で再確認する。逆に `WAS RECORDED` がない exit 1 は、遷移が記録されていない(store 自体を開けない)ことを意味する。
 - 状態読み取りは**履歴全行の完全性を検証**してから状態を返す。帯域外編集で 1 行でも壊れていれば、その後に正常な `disable` を追記しても Gate・CLI とも fail-closed のまま(緊急停止のための `enable` は破損 DB でも記録できるが、状態が検証可能になるまで送信は止まったまま)。破損が疑われる場合は `status` の出力と `sqlite3 <db> 'SELECT * FROM kill_switch_transitions;'` で該当行を特定する。
 - 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(照合)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
-- 現時点で本番の常駐 Live Execution runner は存在しない(Issue #82 で追加されたのは**Live 接続のロックと起動前 preflight** までで、定期実行する送信プロセスは未実装)。Kill Switch は Live 送信 composition が `PersistentKillSwitchStateProvider` を配線することで効く契約であり、`python -m execution.live_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
+- 現時点で本番の常駐 Live Execution runner は存在しない(Issue #82 で追加されたのは**Live 接続のロックと起動前 preflight** までで、定期実行する送信プロセスは未実装)。Kill Switch は Live 送信境界が `PersistentKillSwitchStateProvider` を読むことで効き、**この配線は契約ではなく強制**である(`LiveOrderSubmissionService` は execution mode が `live` の場合、gate が永続 Kill Switch reader を持たない composition を構築時に拒否する。in-memory provider では「OFF」を構造的に作れてしまい、読み取り不能を暗黙の OFF に変えるため)。加えて、`python -m execution.live_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
 
 ### Live 接続の有効化 / 無効化 / 緊急停止(Issue #82)
 

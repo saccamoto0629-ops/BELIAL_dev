@@ -130,8 +130,10 @@ from execution import execution_store
 from execution.execution_models import ExecutionRequest
 from execution.reissue_clearance import ClearanceScopeError, derive_account_scope
 from execution.reissue_service import ReissuePolicy
+from execution.kill_switch_store import PersistentKillSwitchStateProvider
 from execution.safety_gate import (
     BrokerConnection,
+    ExecutionMode,
     MarketSafetySnapshot,
     SafetyDecision,
     SafetyGate,
@@ -301,6 +303,24 @@ class LiveOrderSubmissionService:
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
         if not isinstance(gate, SafetyGate):
             raise ValueError(f"gate must be a SafetyGate, got {gate!r}")
+        # A LIVE submission boundary must read a DURABLE kill switch (Issue
+        # #82; PR #128 Codex review r5 P1). Composition-time evidence cannot
+        # be made unforgeable inside one process -- anything that can reach a
+        # module-private signer can equally read the credentials out of the
+        # environment -- so the control that has to hold is here, where it is
+        # checkable: an in-memory provider (or any subclass free to override
+        # the query) would make "the kill switch is off" true by construction
+        # and turn an unreadable switch into a silent OFF, which Issue #82
+        # forbids. ``fake`` / shadow compositions keep their static providers.
+        if connection.execution_mode is ExecutionMode.LIVE and (
+            type(gate.state_provider) is not PersistentKillSwitchStateProvider
+        ):
+            raise ValueError(
+                "a live submission boundary requires the gate to read the persistent "
+                "kill switch (exactly a PersistentKillSwitchStateProvider, so the state "
+                "cannot be answered from memory and an unreadable switch cannot read as "
+                f"OFF), got {type(gate.state_provider).__name__}"
+            )
         if not isinstance(decision_db_path, (str, Path)):
             # The audit trail is SEALED inside the service (Issue #75 review
             # r3): only a filesystem path can be injected, never a recorder

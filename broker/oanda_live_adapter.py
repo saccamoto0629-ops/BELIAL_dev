@@ -21,13 +21,29 @@ locks 2-5; locks 1, 6 and 7 belong to the execution layer:
 Locks 2-5 are ISSUANCE preconditions, not merely constructor arguments
 (PR #128 Codex review r3 / r4): :class:`LiveActivation` and
 :class:`OandaLiveConfig` carry an issuance seal that only their
-``from_environment`` / ``from_env`` issuers can compute, and those issuers
-read the REAL process environment. The seal is an HMAC over the object's own
-field values under a per-process key, so it is neither forgeable nor
-transferable between objects (see :func:`_issuance_seal`). Writing
-``LiveActivation("true", True)`` by hand does not produce a grant, so an
-adapter instance means the process environment genuinely carried the flag,
-the credentials and the endpoint.
+``from_environment`` / ``from_env`` issuers compute, and those issuers read
+the REAL process environment. The seal is an HMAC over the object's own field
+values under a per-process key, so evidence cannot be written by hand from
+plain values, lifted from another issued object, edited through
+``dataclasses.replace`` or resurrected through pickle
+(see :func:`_issuance_seal`).
+
+WHAT THE SEAL IS NOT (PR #128 Codex review r5, correcting what earlier
+rounds of this docstring claimed): it is not a security boundary against
+arbitrary code running INSIDE this process. ``_issuance_seal`` and its key
+are module attributes, and Python has no way to hide them -- any caller that
+can import and call the signer can equally read ``os.environ`` and POST to
+OANDA directly, so it already holds the credentials and needs none of this.
+The seal defends against the failure Issue #82 is actually about: a
+mis-wired or mistaken composition producing something that LOOKS like
+checked evidence. The boundaries that are enforceable, and enforced, are
+
+- ``execution/tests/test_submission_boundary.py``, which pins production to
+  exactly ONE construction site (``execution/live_lock.py``), and
+- ``execution/live_submission.py``, which refuses to build a LIVE submission
+  boundary unless the gate reads the DURABLE kill switch -- so a connection,
+  however it was obtained, still cannot submit while the switch is on or
+  unreadable.
 
 What an adapter instance does NOT prove is locks 6 and 7: the Kill Switch
 and the safety policy are checked by the composer

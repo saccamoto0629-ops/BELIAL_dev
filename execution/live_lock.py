@@ -59,6 +59,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -278,6 +279,40 @@ _LIVE_POLICY_KEYS = frozenset(
 # token, a full account id or an endpoint URL into any field must not see it
 # echoed back into a log. The field NAMES are the closed-world schema keys,
 # which are fixed vocabulary, not operator data.
+#
+# SYMBOLS ARE THE ONE EXCEPTION, so they are constrained instead of trusted
+# (PR #128 Codex review r5 P1). ``allowed_symbols`` is the only free-form
+# operator value the startup summary PRINTS, and "non-empty string" was weak
+# enough that a token pasted into it (with the matching
+# ``max_spread_by_symbol`` key) made a perfectly valid policy whose summary
+# then echoed the secret. Symbols must now look like an instrument -- upper
+# case alphanumerics either side of a single underscore, which covers the
+# OANDA vocabulary (``USD_JPY``, ``XAU_USD``, ``SPX500_USD``) while a v20
+# token (lowercase hex + hyphen), an account id (``101-004-...-001``) and a
+# URL (``:`` and ``/``) all fail the shape and are refused, unprinted.
+_SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{2,8}_[A-Z0-9]{2,8}")
+
+# Defence in depth for a policy built somewhere other than the strict loader
+# above: the DISPLAY boundary refuses to print a symbol it cannot recognise.
+_UNPRINTABLE_SYMBOL = "<unprintable>"
+
+
+def _displayable_symbols(symbols) -> tuple[str, ...]:
+    return tuple(
+        symbol if _SYMBOL_PATTERN.fullmatch(symbol) else _UNPRINTABLE_SYMBOL
+        for symbol in symbols
+    )
+
+
+def _require_symbol_shape(symbols, key: str) -> list[str]:
+    for symbol in symbols:
+        if not _SYMBOL_PATTERN.fullmatch(symbol):
+            raise LiveSafetyConfigError(
+                f"{key} must each be an instrument symbol of the form BASE_QUOTE "
+                "(upper-case letters or digits, 2-8 characters each side of one "
+                "underscore); the configured value is not echoed"
+            )
+    return list(symbols)
 
 
 def _require_key(mapping: dict, key: str):
@@ -363,7 +398,11 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
     if not isinstance(spreads_raw, dict) or not spreads_raw:
         raise LiveSafetyConfigError("max_spread_by_symbol must be a non-empty object")
     # The per-symbol key is NOT interpolated into the error text: it is
-    # operator-supplied data like any value (PR #128 Codex review P1).
+    # operator-supplied data like any value (PR #128 Codex review P1), and it
+    # must satisfy the instrument shape for the same reason ``allowed_symbols``
+    # does -- the two key sets have to match, so a credential pasted into one
+    # would otherwise have to be pasted into the other (r5 P1).
+    _require_symbol_shape(spreads_raw.keys(), "max_spread_by_symbol entries")
     spreads = {
         symbol: _positive_decimal(spread, "max_spread_by_symbol entries")
         for symbol, spread in spreads_raw.items()
@@ -381,7 +420,11 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
     try:
         return SafetyPolicy(
             policy_id=policy_id,
-            allowed_symbols=frozenset(_non_empty_str_list(raw, "allowed_symbols")),
+            allowed_symbols=frozenset(
+                _require_symbol_shape(
+                    _non_empty_str_list(raw, "allowed_symbols"), "allowed_symbols entries"
+                )
+            ),
             allowed_sides=frozenset(sides),
             max_order_quantity=_positive_decimal(
                 _require_key(raw, "max_order_quantity"), "max_order_quantity"
@@ -745,7 +788,12 @@ def _summary(
         # Never the id itself: the shared non-reversible digest (Issue #79 /
         # PR #101) is what every display boundary in this repository uses.
         account_reference=safe_account_reference(account_id),
-        allowed_symbols=tuple(sorted(policy.allowed_symbols)) if policy is not None else (),
+        # Never a raw symbol: the strict loader already refuses anything that
+        # is not instrument-shaped, and this second pass keeps a policy built
+        # by some other path from printing an operator's paste (r5 P1).
+        allowed_symbols=(
+            _displayable_symbols(sorted(policy.allowed_symbols)) if policy is not None else ()
+        ),
         max_order_quantity=str(policy.max_order_quantity) if policy is not None else None,
         max_positions_per_symbol=(
             policy.max_positions_per_symbol if policy is not None else None

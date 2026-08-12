@@ -42,7 +42,7 @@ from broker.oanda_live_adapter import (
 from broker.oanda_v20_adapter import TransportConnectionError
 from execution.execution_models import ExecutionRequest
 from execution.kill_switch_store import PersistentKillSwitchStateProvider, SQLiteKillSwitchStore
-from execution.live_lock import _compose_live_connection
+from execution.live_lock import _compose_live_connection, _displayable_symbols
 from execution.live_lock import (
     ENDPOINT_KIND_DEMO,
     ENDPOINT_KIND_LIVE,
@@ -53,12 +53,14 @@ from execution.live_lock import (
     KILL_SWITCH_UNVERIFIABLE,
     LiveLockCode,
     LiveSafetyConfigError,
+    LiveSafetySummary,
     build_live_connection,
     classify_endpoint,
     endpoint_host_family,
     evaluate_live_activation,
     load_live_safety_policy,
 )
+from execution.live_startup_cli import main
 from execution.live_submission import LiveOrderSubmissionService
 from execution.reissue_service import ReissuePolicy
 from execution.safety_gate import (
@@ -631,17 +633,72 @@ def test_unknown_safety_configuration_keys_are_not_echoed(tmp_path):
 def test_a_policy_invariant_violation_never_echoes_the_values(tmp_path):
     """SafetyPolicy's own cross-field messages quote symbols and targets, so
     they are not forwarded: the operator gets the constraint list instead."""
+    # Both symbols are instrument-shaped (so they reach the cross-field
+    # invariant rather than the shape check) but the key sets disagree.
     path = write_safety_config(
         tmp_path,
-        allowed_symbols=["SECRET-VALUE"],
-        max_spread_by_symbol={"OTHER-SECRET": "0.05"},
+        allowed_symbols=["USD_JPY"],
+        max_spread_by_symbol={"EUR_USD": "0.05"},
     )
     with pytest.raises(LiveSafetyConfigError) as exc_info:
         load_live_safety_policy(path)
     message = str(exc_info.value)
-    assert "SECRET-VALUE" not in message
-    assert "OTHER-SECRET" not in message
+    assert "USD_JPY" not in message
+    assert "EUR_USD" not in message
     assert "max_spread_by_symbol keys must exactly cover allowed_symbols" in message
+
+
+def test_a_credential_pasted_as_a_symbol_is_refused_and_never_printed(tmp_path, capsys):
+    """PR #128 Codex review r5 P1: ``allowed_symbols`` is the only free-form
+    operator value the summary PRINTS, and "non-empty string" was weak enough
+    that a token pasted into it (plus the matching ``max_spread_by_symbol``
+    key, which the invariant requires) made a VALID policy -- so render() /
+    to_dict() / the CLI all echoed the secret. Symbols must now look like an
+    instrument, so the document fails closed with the value unprinted."""
+    token = "a1b2c3d4e5f60718293a4b5c6d7e8f90-0123456789abcdef0123456789abcdef"
+    for pasted in (token, ACCOUNT, OANDA_LIVE_API_URL, "SECRET-VALUE", "usd_jpy"):
+        path = write_safety_config(
+            tmp_path,
+            allowed_symbols=[pasted],
+            max_spread_by_symbol={pasted: "0.05"},
+        )
+        with pytest.raises(LiveSafetyConfigError) as exc_info:
+            load_live_safety_policy(path)
+        message = str(exc_info.value)
+        assert pasted not in message, "the refusal echoed the pasted value"
+        assert "BASE_QUOTE" in message
+
+    # and the whole CLI path stays clean, in text and JSON form
+    path = write_safety_config(
+        tmp_path, allowed_symbols=[token], max_spread_by_symbol={token: "0.05"}
+    )
+    for argv in ([], ["--json"]):
+        main(["--execution-mode", "live", "--safety-config", str(path), *argv])
+        captured = capsys.readouterr()
+        assert token not in captured.out
+        assert token not in captured.err
+
+
+def test_the_summary_never_prints_a_symbol_it_cannot_recognise():
+    """Defence in depth for a policy built by some path other than the strict
+    loader: the DISPLAY boundary substitutes a placeholder (r5 P1)."""
+    summary = LiveSafetySummary(
+        execution_mode="live",
+        endpoint_kind="live",
+        account_reference=None,
+        allowed_symbols=_displayable_symbols(["USD_JPY", "live-token-SECRET"]),
+        max_order_quantity=None,
+        max_positions_per_symbol=None,
+        max_positions_account=None,
+        kill_switch="off",
+        live_confirmed=True,
+        locks=(),
+        rejection_codes=(),
+    )
+    assert summary.allowed_symbols == ("USD_JPY", "<unprintable>")
+    assert "live-token-SECRET" not in summary.render()
+    assert "live-token-SECRET" not in json.dumps(summary.to_dict())
+    assert "live-token-SECRET" not in repr(summary)
 
 
 def test_a_safety_configuration_missing_a_field_fails_closed(tmp_path):
@@ -995,9 +1052,21 @@ def test_kill_switch_blocks_a_live_submission_before_any_broker_call(tmp_path, m
     assert decision.allowed is True
     assert connection is not None
 
+    # The PRODUCTION wiring: a live submission boundary may only read the
+    # DURABLE switch (PR #128 Codex review r5 P1), so the operator flips the
+    # real store the composer already opened -- the "switch enabled after
+    # startup" case, which is the only way a live service can still be
+    # holding a connection when the switch goes on.
+    db_path = tmp_path / "kill_switch.sqlite3"
+    SQLiteKillSwitchStore(db_path).record_transition(
+        enabled=True,
+        operator="ops",
+        reason="incident",
+        changed_at_utc=NOW + timedelta(minutes=2),
+    )
     gate = SafetyGate(
         policy=policy(),
-        state_provider=StaticSafetyState(kill_switch_enabled=True),
+        state_provider=PersistentKillSwitchStateProvider(db_path),
         clock=lambda: NOW,
     )
     SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3").initialize()
@@ -1042,10 +1111,6 @@ def test_kill_switch_blocks_a_live_submission_before_any_broker_call(tmp_path, m
 
 
 def test_an_unreadable_kill_switch_blocks_a_live_submission_too(tmp_path, monkeypatch):
-    class BrokenProvider:
-        def is_kill_switch_enabled(self):
-            raise RuntimeError("kill switch DB is corrupt")
-
     calls = []
 
     def recording_transport(method, *args, **kwargs):
@@ -1056,8 +1121,14 @@ def test_an_unreadable_kill_switch_blocks_a_live_submission_too(tmp_path, monkey
 
     _, connection = sealed_build(tmp_path, monkeypatch, transport=recording_transport)
     assert connection is not None
+    # Corrupt the DURABLE store the live boundary is required to read (r5
+    # P1): "could not read it" must never become a silent OFF.
+    db_path = tmp_path / "kill_switch.sqlite3"
+    db_path.write_bytes(b"this is not a SQLite database")
     gate = SafetyGate(
-        policy=policy(), state_provider=BrokenProvider(), clock=lambda: NOW
+        policy=policy(),
+        state_provider=PersistentKillSwitchStateProvider(db_path),
+        clock=lambda: NOW,
     )
     SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3").initialize()
     SubmissionJournal(tmp_path / "journal.sqlite3").initialize()
@@ -1098,3 +1169,51 @@ def test_an_unreadable_kill_switch_blocks_a_live_submission_too(tmp_path, monkey
     assert gate_decision.allowed is False
     assert SafetyRejectionCode.STATE_QUERY_FAILED.value in gate_decision.rejection_codes
     assert set(calls) <= {"GET"}, "a state-changing broker call was attempted"
+
+
+def test_a_live_submission_boundary_refuses_an_in_memory_kill_switch(tmp_path, monkeypatch):
+    """PR #128 Codex review r5 P1. Composition-time evidence cannot be made
+    unforgeable inside one process -- whatever can reach a module-private
+    signer can equally read the credentials straight out of the environment.
+    The control that CAN be enforced is at the submission boundary: a live
+    service must read the DURABLE switch, so no composition (mistaken or
+    otherwise) can answer "the kill switch is off" from memory or turn an
+    unreadable switch into a silent OFF."""
+    _, connection = sealed_build(tmp_path, monkeypatch, transport=poisoned_transport)
+    assert connection is not None
+    SQLiteSafetyDecisionStore(tmp_path / "safety.sqlite3").initialize()
+    SubmissionJournal(tmp_path / "journal.sqlite3").initialize()
+
+    class AlwaysOffProvider:
+        def is_kill_switch_enabled(self):  # pragma: no cover - must never run
+            return False
+
+    class SneakyProvider(PersistentKillSwitchStateProvider):
+        def is_kill_switch_enabled(self):  # pragma: no cover - must never run
+            return False
+
+    def compose(state_provider):
+        return LiveOrderSubmissionService(
+            connection=connection,
+            gate=SafetyGate(
+                policy=policy(), state_provider=state_provider, clock=lambda: NOW
+            ),
+            decision_db_path=tmp_path / "safety.sqlite3",
+            order_db_path=tmp_path / "orders.sqlite3",
+            journal_db_path=tmp_path / "journal.sqlite3",
+            clock=lambda: NOW,
+            reissue_policy=ReissuePolicy(),
+        )
+
+    for provider in (
+        StaticSafetyState(kill_switch_enabled=False),
+        AlwaysOffProvider(),
+        # a SUBCLASS is refused too: it is free to override the query, which
+        # is the whole point of demanding the persistent reader
+        SneakyProvider(released_kill_switch(tmp_path)),
+    ):
+        with pytest.raises(ValueError, match="persistent kill switch"):
+            compose(provider)
+
+    # the sanctioned provider composes
+    assert compose(PersistentKillSwitchStateProvider(released_kill_switch(tmp_path))) is not None
