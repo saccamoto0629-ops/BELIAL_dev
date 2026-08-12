@@ -50,7 +50,7 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない |
 | `OANDA_API_URL` | `https://api-fxpractice.oanda.com` | OANDA Demo Adapter の接続先。**Demo endpoint のみ許可(allowlist)**。Live endpoint(`fxtrade` を含む host)やその他の URL を指定すると構築時に fail-closed で起動拒否。HTTP redirect は追従しない(3xx は共通エラー化)ため、応答によって Demo endpoint 外へ接続が逸れることもない |
 | `OANDA_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Demo Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない** |
-| `BELIAL_RUN_OANDA_DEMO_API_TESTS` | unset | `1` のときだけ OANDA Demo 実 API テスト(`broker/tests/test_oanda_demo_adapter_demo_api.py`)を実行する opt-in フラグ。通常 CI では未設定のため全件 skip され、7 スイートは外部通信しないまま |
+| `BELIAL_RUN_OANDA_DEMO_API_TESTS` | unset | `1` のときだけ OANDA Demo 実 API テスト(`broker/tests/test_oanda_demo_adapter_demo_api.py`)を実行する opt-in フラグ。通常 CI では未設定のため全件 skip され、8 スイートは外部通信しないまま |
 | `PAPER_EXECUTION_DISCORD_WEBHOOK_URL` | empty | Paper Execution 状態遷移通知(仮想約定・仮想損益。Issue #83)の Discord Webhook。`paper-execution/.env` またはプロセス環境変数。Paper Signal の `DISCORD_WEBHOOK_URL` とは別変数(責務分離)。Transactional Outbox 方式: 通知 outbox 行は Position 遷移と同一トランザクションで確定するため、Webhook 未設定でも記録され消えない。未設定時は claim せず attempt を消費せず滞留し、URL 設定後に `DELIVERY_BATCH_LIMIT`=20 件/cycle で順次配送する。配送は at-least-once(HTTP 成功後 success 記録前に停止すると同一 Event ID の重複があり得る)。配送失敗は position 状態・`--once` 終了コードへ影響せず、後続 cycle で自動再送(上限5回、以後 `dead_letter`) |
 
 注意: `news-feed-bot/` のニュース投稿では、現行コードで使用している実変数名は `NEWS_WEBHOOK_URL` である。`DISCORD_WEBHOOK_URL` はニュース投稿用の設定名ではない。一方、`market-watch/` のイベント通知では旧設定との互換性のため、`BOT_ALERTS_WEBHOOK_URL` が未設定の場合に限り `DISCORD_WEBHOOK_URL` をlegacy fallbackとして扱う。

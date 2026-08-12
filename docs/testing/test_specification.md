@@ -22,7 +22,7 @@ BELIAL の観測〜分類〜Alert〜仮説(Paper Signal)〜検証(Backtest)〜�
 - 重要ケースと既存pytestの**対応関係**を追跡可能にする。
 
 ### 範囲
-- `backtest/` / `market-watch/` / `news-feed-bot/` / `paper-signal/` / `paper-execution/` の単体・軽量結合テスト。
+- `backtest/` / `market-watch/` / `news-feed-bot/` / `paper-signal/` / `paper-execution/` / `broker/` / `execution/` / `scripts/` の単体・軽量結合テスト。
 - 副作用抑止(DB作成/更新・Discord送信・S3アップロード・presigned URL・state更新)の検証観点。
 
 ### 非対象(Non-Scope)
@@ -45,9 +45,10 @@ python -m pytest paper-signal/tests -q
 python -m pytest paper-execution/tests -q
 python -m pytest broker/tests -q
 python -m pytest execution/tests -q
+python -m pytest scripts/tests -q
 ```
 
-CI(#32)では最低限この7スイートを継続実行することを想定する(現行の `.github/workflows/ci.yml` は7スイートすべてを実行している)。テストは外部ネットワーク・実DB・実S3・実Discordに到達しない(§4–§5)。唯一の例外は OANDA Demo 実 API テスト(`broker/tests/test_oanda_demo_adapter_demo_api.py`、Issue #79)で、**通常 CI からは分離**されている: `BELIAL_RUN_OANDA_DEMO_API_TESTS=1` と Demo credentials(`OANDA_API_TOKEN` / `OANDA_ACCOUNT_ID`)を明示設定したときのみ実行され、未設定なら全件 skip されるため、7 スイートの通常実行は引き続き外部通信ゼロである。
+CI(#32)では最低限この8スイートを継続実行することを想定する(現行の `.github/workflows/ci.yml` は8スイートすべてを実行している)。テストは外部ネットワーク・実DB・実S3・実Discordに到達しない(§4–§5)。唯一の例外は OANDA Demo 実 API テスト(`broker/tests/test_oanda_demo_adapter_demo_api.py`、Issue #79)で、**通常 CI からは分離**されている: `BELIAL_RUN_OANDA_DEMO_API_TESTS=1` と Demo credentials(`OANDA_API_TOKEN` / `OANDA_ACCOUNT_ID`)を明示設定したときのみ実行され、未設定なら全件 skip されるため、8 スイートの通常実行は引き続き外部通信ゼロである。
 
 加えて、Execution 層には**固定シナリオ試験**(Issue #77。Shadow Mode(Issue #78)・キャンセル(Issue #99)・再発行(Issue #116)系を含め現在 48 シナリオ)がある。`execution/scenarios/*.json` の固定データを共通 runner が本番の Execution 経路(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / FakeBroker)へ流し、expected と actual を比較する。通常の pytest がモジュール単位の観点を固定するのに対し、固定シナリオは「正常約定・拒否・部分約定・timeout(UNKNOWN)・DB保存失敗・多重起動競合」等の**分岐シナリオ全体を1件ずつデータで再現**する。pytest(`execution/tests/test_fixed_scenarios.py` がシナリオ id 単位で parametrize)からも、CLI からも実行できる:
 
@@ -76,7 +77,7 @@ python -m execution.reconciliation_runner --broker oanda-demo [--dry-run] [--ord
 python -m execution.reconciliation_runner --broker fake --dry-run                                                  # 配線確認(ネットワークなし)
 ```
 
-現状のテスト件数(`def test_` 実数、目安):backtest 418 / market-watch 190 / news-feed-bot 145 / paper-signal 258 / paper-execution 181(Issue #83 通知 outbox、Issue #85 同時ポジション制御を含む)/ broker 355(Issue #73 / PR #87、Issue #75 接続identity追加、Issue #77 / PR #96 FakeBroker最小拡張 + broker_order_id一意性・拒否原子性、Issue #79 / PR #101 OANDA Demo Adapter、Issue #102 / #114 Order Reissue + 拒否分類、Issue #103 注文列挙 `OrderListingBroker`、Issue #105 trade / closed-trade listing + SL/TP 観測モデル、Issue #82 OANDA Live Adapter)/ execution 1239(Issue #74 / PR #91、Issue #75 Safety Gate / Live Order Submission、Issue #76 二重発注防止 / idempotency、Issue #77 / PR #96 固定シナリオ試験、Issue #78 / PR #100 Shadow Mode = Production Signal経路・claim-first・provenance・true read-only・strict JSON、Issue #81 永続 Kill Switch、Issue #82 Live 接続二重ロック + 起動前 preflight、Issue #93 Submission Journal、Issue #99 公認キャンセル経路 + cancellation journal、Issue #95 / #114〜#117 再発行チェーン・clearance・自動再試行、Issue #103 Broker reconciliation 差分検出、Issue #104 Broker reconciliation 修復、Issue #105 position / trade / SL・TP reconciliation + 手動 CLI 追加)。
+現状のテスト件数(`def test_` 実数、目安):backtest 418 / market-watch 190 / news-feed-bot 145 / paper-signal 258 / paper-execution 181 / scripts 153(Issue #83 通知 outbox、Issue #85 同時ポジション制御を含む)/ broker 355(Issue #73 / PR #87、Issue #75 接続identity追加、Issue #77 / PR #96 FakeBroker最小拡張 + broker_order_id一意性・拒否原子性、Issue #79 / PR #101 OANDA Demo Adapter、Issue #102 / #114 Order Reissue + 拒否分類、Issue #103 注文列挙 `OrderListingBroker`、Issue #105 trade / closed-trade listing + SL/TP 観測モデル、Issue #82 OANDA Live Adapter)/ execution 1239(Issue #74 / PR #91、Issue #75 Safety Gate / Live Order Submission、Issue #76 二重発注防止 / idempotency、Issue #77 / PR #96 固定シナリオ試験、Issue #78 / PR #100 Shadow Mode = Production Signal経路・claim-first・provenance・true read-only・strict JSON、Issue #81 永続 Kill Switch、Issue #82 Live 接続二重ロック + 起動前 preflight、Issue #93 Submission Journal、Issue #99 公認キャンセル経路 + cancellation journal、Issue #95 / #114〜#117 再発行チェーン・clearance・自動再試行、Issue #103 Broker reconciliation 差分検出、Issue #104 Broker reconciliation 修復、Issue #105 position / trade / SL・TP reconciliation + 手動 CLI 追加)。
 
 ---
 
