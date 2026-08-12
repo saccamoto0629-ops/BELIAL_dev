@@ -68,6 +68,7 @@ from broker.broker_models import (
     PositionInfo,
 )
 from broker.fake_broker import FakeBroker
+from broker.oanda_live_adapter import OandaLiveAdapter
 from execution.execution_models import ExecutionRequest
 
 
@@ -87,10 +88,16 @@ class ExecutionMode(enum.Enum):
       is deliberately NOT named "paper": Paper Execution
       (``paper-execution/``) is an independent virtual-execution layer that
       never touches the broker boundary and never passes through this gate.
-    - ``DEMO`` / ``LIVE``: defined for configuration validation ONLY. No
-      adapter type is registered, so no such connection can be constructed
-      (fail closed by unrepresentability); a runner asked to use them must
-      refuse explicitly as unimplemented.
+    - ``DEMO``: defined for configuration validation ONLY. No adapter type
+      is registered, so no such connection can be constructed (fail closed
+      by unrepresentability); a runner asked to use it must refuse
+      explicitly as unimplemented.
+    - ``LIVE``: LOCKED (Issue #82). A connection can be built only through
+      ``execution/live_lock.py``, which requires EVERY live lock
+      (``execution_mode=live`` + ``ENABLE_LIVE_TRADING=true`` + live
+      credentials + the live endpoint + an explicit ``--confirm-live``)
+      and a verified-OFF Kill Switch. Any other runner asked to use it must
+      refuse explicitly.
     """
 
     DRY_RUN = "dry-run"
@@ -100,16 +107,19 @@ class ExecutionMode(enum.Enum):
     LIVE = "live"
 
 
-# Mode groups (Issue #78): which configured modes may ever reach a broker.
-# DRY_RUN / SHADOW structurally never submit; DEMO / LIVE are defined but
-# unimplemented -- a dispatcher must reject them explicitly, never fall
+# Mode groups (Issue #78 / #82): which configured modes may ever reach a
+# broker. DRY_RUN / SHADOW structurally never submit; DEMO is defined but
+# unimplemented; LIVE is implemented but LOCKED behind the live activation
+# lock. A dispatcher must reject the last two groups explicitly, never fall
 # through to a submission path.
 NON_SUBMITTING_MODES: frozenset[ExecutionMode] = frozenset(
     {ExecutionMode.DRY_RUN, ExecutionMode.SHADOW}
 )
-UNIMPLEMENTED_BROKER_MODES: frozenset[ExecutionMode] = frozenset(
-    {ExecutionMode.DEMO, ExecutionMode.LIVE}
-)
+UNIMPLEMENTED_BROKER_MODES: frozenset[ExecutionMode] = frozenset({ExecutionMode.DEMO})
+# Issue #82: modes whose connection exists but may be composed ONLY by the
+# live activation lock (``execution/live_lock.py``). Every other runner must
+# refuse them; being in ``BROKER_TYPE_BY_MODE`` is NOT permission to run.
+LOCKED_BROKER_MODES: frozenset[ExecutionMode] = frozenset({ExecutionMode.LIVE})
 
 
 def resolve_execution_mode(value) -> ExecutionMode:
@@ -132,13 +142,25 @@ def resolve_execution_mode(value) -> ExecutionMode:
 
 
 # Typed connection identity registry (Issue #75 review r1): which concrete
-# broker type may claim which execution mode. DEMO / LIVE deliberately have
-# NO entry -- no such adapter exists, so no such connection can be built.
-# DRY_RUN / SHADOW also have NO entry: those modes never own a broker
-# connection at all (Issue #78). A future adapter is added HERE, never by
-# loosening BrokerConnection.
+# broker type may claim which execution mode. DEMO deliberately has NO entry
+# -- the Demo Adapter exists (Issue #79) but its Execution-layer integration
+# is a separate Issue, so no demo connection can be built. DRY_RUN / SHADOW
+# also have NO entry: those modes never own a broker connection at all
+# (Issue #78). A future adapter is added HERE, never by loosening
+# BrokerConnection.
+#
+# LIVE -> OandaLiveAdapter (Issue #82). Registering it does NOT open the
+# live path: an ``OandaLiveAdapter`` INSTANCE cannot exist unless the live
+# endpoint, the live credentials, ``ENABLE_LIVE_TRADING=true`` and the
+# explicit ``--confirm-live`` argument were all satisfied at construction
+# (broker/oanda_live_adapter.py), and the sanctioned composer
+# (``execution/live_lock.py``) additionally requires a verified-OFF Kill
+# Switch and a policy that allows the live target. The registry entry only
+# means "a FakeBroker can never claim live, and a live adapter can never
+# claim anything else".
 BROKER_TYPE_BY_MODE: dict[ExecutionMode, type] = {
     ExecutionMode.FAKE: FakeBroker,
+    ExecutionMode.LIVE: OandaLiveAdapter,
 }
 
 
@@ -235,8 +257,11 @@ class BrokerConnection:
 
     - ``fake`` requires a ``FakeBroker`` instance (subclasses included);
     - a ``FakeBroker`` can claim nothing but ``fake``;
-    - ``demo`` / ``live`` connections cannot be constructed at all until a
-      real adapter type is registered (fail closed by unrepresentability).
+    - ``live`` requires an ``OandaLiveAdapter`` instance, which cannot
+      itself exist unless every live lock held at ITS construction
+      (Issue #82; the sanctioned composer is ``execution/live_lock.py``);
+    - ``demo`` connections cannot be constructed at all until a real
+      adapter type is registered (fail closed by unrepresentability).
 
     Whether the derived target is allowed for the mode stays a policy
     decision (``SafetyPolicy.allowed_connection_targets``), evaluated by the

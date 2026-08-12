@@ -57,6 +57,7 @@ from execution.execution_models import ExecutionRequest
 from execution.safety_gate import (
     AccountSafetySnapshot,
     ExecutionMode,
+    LOCKED_BROKER_MODES,
     MarketSafetySnapshot,
     SafetyGate,
     SafetyPolicy,
@@ -501,6 +502,17 @@ def _run_cli(argv: list[str] | None) -> int:
         print(
             f"execution mode {mode.value!r} is defined but NOT implemented (no broker "
             "adapter exists); refusing to run",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE_ERROR
+    if mode in LOCKED_BROKER_MODES:
+        # Issue #82: a live connection exists only behind the live activation
+        # lock and is composed only by python -m execution.live_startup_cli.
+        # The shadow runner never submits, so it refuses the mode outright
+        # rather than silently running something else under a live label.
+        print(
+            f"execution mode {mode.value!r} is locked behind the live activation lock "
+            "(python -m execution.live_startup_cli); the shadow runner never submits",
             file=sys.stderr,
         )
         return EXIT_USAGE_ERROR

@@ -677,7 +677,10 @@ def test_connection_mode_and_target_cannot_be_declared_by_the_caller():
 @pytest.mark.parametrize(
     ("mode", "target", "match"),
     [
-        pytest.param("live", "oanda-live", "no broker implementation is registered",
+        # Issue #82: ``live`` IS registered now -- to the live adapter alone.
+        # A FakeBroker claiming it must still be refused, now by the concrete
+        # type cross-check rather than by an empty registry.
+        pytest.param("live", "oanda-live", "requires a OandaLiveAdapter instance",
                      id="fakebroker-cannot-claim-live"),
         pytest.param("demo", "oanda-demo", "no broker implementation is registered",
                      id="fakebroker-cannot-claim-demo"),

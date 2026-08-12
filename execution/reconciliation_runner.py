@@ -11,8 +11,9 @@ SL / TP / closed-trade evidence) against either
   adapter itself refuses every non-demo endpoint at construction
   (fail-closed allowlist); this CLI adds nothing that could weaken that,
   and it does NOT register the adapter with the Safety Gate's submit path
-  (``BROKER_TYPE_BY_MODE`` stays FakeBroker-only -- reconciliation talks to
-  the broker directly, query operations only).
+  (``demo`` stays absent from ``BROKER_TYPE_BY_MODE`` -- reconciliation
+  talks to the broker directly, query operations only). It never touches
+  the live path either: this CLI has no ``--broker oanda-live`` option.
 - ``--broker fake`` -- an empty in-memory FakeBroker. A plumbing /
   diagnostics path: it proves the CLI wiring (DB resolution, dry-run
   no-effect, output shape) without any network. It seeds no data, so a run

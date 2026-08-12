@@ -15,6 +15,10 @@ import pytest
 
 from broker import broker_models as m
 from broker import oanda_demo_adapter as oa
+# The shared v20 translation engine (Issue #82): the demo module keeps the
+# demo-only allowlist / env vars / identity, the engine holds the internals
+# these tests reach into directly.
+from broker import oanda_v20_adapter as ov
 from broker.broker_interface import Broker
 
 TOKEN = "unit-test-token-not-a-real-secret"
@@ -891,7 +895,7 @@ def test_redirect_on_a_read_is_a_communication_failure_without_follow_up():
 def test_default_transport_disables_redirect_following():
     import inspect
 
-    source = inspect.getsource(oa._requests_transport)
+    source = inspect.getsource(ov._requests_transport)
     assert "allow_redirects=False" in source
 
 
@@ -1162,7 +1166,7 @@ def test_partially_overlapping_secrets_leave_no_fragment():
 
 def test_redact_secrets_interval_merging_matrix():
     # direct unit coverage of the pure interval-merger
-    redact = oa._redact_secrets
+    redact = ov._redact_secrets
     # multiple occurrences of the same secret
     assert redact("a SEC b SEC c", ("SEC",)) == "a *** b *** c"
     # three match intervals chaining into one merged span
@@ -1639,19 +1643,19 @@ def test_get_open_trades_auth_and_rate_limit_translate_like_other_reads():
 # --- timestamp parsing ----------------------------------------------------------
 
 def test_nanosecond_timestamps_are_truncated_to_microseconds():
-    parsed = oa._parse_utc_time("2026-01-02T03:04:05.987654321Z", "t")
+    parsed = ov._parse_utc_time("2026-01-02T03:04:05.987654321Z", "t")
     assert parsed == datetime(2026, 1, 2, 3, 4, 5, 987654, tzinfo=timezone.utc)
 
 
 def test_offset_timestamps_are_normalized_to_utc():
-    parsed = oa._parse_utc_time("2026-01-02T12:04:05.5+09:00", "t")
+    parsed = ov._parse_utc_time("2026-01-02T12:04:05.5+09:00", "t")
     assert parsed == datetime(2026, 1, 2, 3, 4, 5, 500000, tzinfo=timezone.utc)
 
 
 def test_naive_or_malformed_timestamps_are_rejected():
     for value in ("2026-01-02T03:04:05", "not-a-time", "", None):
         with pytest.raises(m.BrokerCommunicationError):
-            oa._parse_utc_time(value, "t")
+            ov._parse_utc_time(value, "t")
 
 
 # --- no network in this suite -----------------------------------------------------
@@ -2329,7 +2333,7 @@ def test_get_order_reissue_chain_depth_is_bounded():
     ]
     # 1001 <-> 2001 reference cycle: every fetched predecessor points back
     # into the chain, so only the depth bound can stop the walk
-    for _ in range(oa._MAX_REISSUE_CHAIN + 1):
+    for _ in range(ov._MAX_REISSUE_CHAIN + 1):
         responses.append(
             (200, {"order": chain_order(
                 "1001", state="FILLED", units="5", replaces="2001",
@@ -2346,7 +2350,7 @@ def test_get_order_reissue_chain_depth_is_bounded():
     with pytest.raises(m.BrokerCommunicationError) as exc_info:
         adapter.get_order("c-9")
     assert "depth" in str(exc_info.value)
-    assert len(transport.calls) <= oa._MAX_REISSUE_CHAIN + 1
+    assert len(transport.calls) <= ov._MAX_REISSUE_CHAIN + 1
 
 
 def test_get_order_reissue_chain_lookup_error_fails_closed():

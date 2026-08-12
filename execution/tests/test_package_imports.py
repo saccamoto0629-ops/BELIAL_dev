@@ -35,6 +35,9 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.shadow_report import main as shadow_report_main",
     "from execution.reconciliation_models import PositionDiscrepancy, PositionReconciliationSummary",
     "from execution.reconciliation_runner import main as reconciliation_runner_main",
+    "from execution.live_lock import build_live_connection, evaluate_live_activation",
+    "from execution.live_lock import LiveSafetySummary, load_live_safety_policy",
+    "from execution.live_startup_cli import main as live_startup_cli_main",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /
