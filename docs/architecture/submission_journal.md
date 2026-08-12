@@ -4,7 +4,7 @@ Broker 送信前後の送信試行を、Execution Order DB(Issue #74)とは**独
 
 > **重要な位置づけ**
 >
-> - Journal は**記録のみ**を行う。Broker 呼び出し・外部通信・実発注は一切行わない。OANDA Adapter・Live 接続・Live Execution runner・reconciliation の定期実行は引き続き未実装(非スコープ)。
+> - Journal は**記録のみ**を行う。Broker 呼び出し・外部通信・実発注は一切行わない。OANDA Demo / Live Adapter(Issue #79 / #82)と reconciliation(Issue #103〜#105)は実装済みだが、**定期実行する Live Execution runner・reconciliation の定期実行は未実装**であり、実口座での Live 運用は未解禁である。
 > - Paper Execution / Paper Signal / Strategy とは無関係・独立である(これらは Broker 境界に触れない)。
 > - 注文状態の唯一の正は既存 `broker.OrderState` のまま。Journal は注文状態機械を新設しない — 記録するのは**送信試行のライフサイクル**(Broker 呼び出しの前後関係と Execution DB 保存の成否)である。
 
@@ -132,6 +132,6 @@ service.submit(execution_request_id, market=...)
 
 ## 非スコープ
 
-- reconciliation runner の定期実行、Journal と Execution DB の突合の自動実行、Broker 照会結果による自動修復・entry の自動 close(`reconciliation_required` の解決は reconciliation 側の後続 Issue)
-- OANDA Adapter・Demo / Live API 接続・実口座への注文
+- reconciliation runner の定期実行、Journal と Execution DB の突合の自動実行、Broker 照会結果による自動修復・entry の自動 close(reconciliation の検出・修復・手動 CLI は Issue #103〜#105 で実装済み。定期実行は未実装)
+- OANDA Adapter・Demo / Live API 接続・実口座への注文(Adapter は Issue #79 / #82 で実装済み。Live 接続は全ロック成立時のみ・運用は未解禁)
 - 動的な資金管理、Strategy / Paper Signal の変更、Paper Execution への Broker 接続

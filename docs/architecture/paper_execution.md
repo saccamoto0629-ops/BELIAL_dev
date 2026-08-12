@@ -15,7 +15,8 @@ Paper Signal Generator(実装済み・仮説の記録のみ)
         ↓  paper_signals レコード
 Paper Execution(本書・設計のみ)
         ↓  仮想ポジション / 仮想損益レコード
-(将来)Live Execution ── Broker API による実注文。Paper Execution とは完全に別レイヤー
+Live Execution ── Broker API による実注文。Paper Execution とは完全に別レイヤー
+                  (基盤は broker/ + execution/ に実装済み。runner 未実装・運用未解禁)
 ```
 
 - **実発注・自動売買は一切行わない。** Paper Execution が生成するのは「もしこの仮説どおりに執行していたら」という仮想レコードだけである。
@@ -39,7 +40,7 @@ Paper Execution(本書・設計のみ)
 | シグナル仮説の生成・候補判定(Market Bias / MACD / freshness 等の評価) | Paper Signal Generator |
 | Signal の採用抑制(cooldown / re-entry / Market State フィルタ) | 上流(Signal生成・採用側)または将来の Portfolio / Risk 層(下記「責務境界」) |
 | 過去データの遡及検証 | Backtest(Validation) |
-| 実注文・実約定・実ポジション管理・Broker API 連携 | Live Execution(将来・未実装) |
+| 実注文・実約定・実ポジション管理・Broker API 連携 | Live Execution(`broker/` + `execution/` に基盤実装済み。Paper Execution はこれを一切使わない) |
 | ロット計算・レバレッジ計算・資金管理 | 非スコープ(将来検討) |
 | Discord通知 | 本設計(Issue #49)では非スコープとしたが、後続 Issue #83 で状態遷移通知として実装済み(`paper_execution_notifier.py`。末尾の「Discord通知(Issue #83)」) |
 

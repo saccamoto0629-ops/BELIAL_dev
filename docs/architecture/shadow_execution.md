@@ -4,13 +4,13 @@
 
 > **重要な位置づけ**
 >
-> - Shadow Mode は **Live 発注ではない**。Live Execution(実発注・Broker API 連携)は引き続き**未実装・非スコープ**であり、Shadow Mode はその**準備層の検証機能**である。
+> - Shadow Mode は **Live 発注ではない**。Live Execution の基盤(Broker API Adapter・送信境界・Live 接続ロック)は Issue #79 / #82 等で実装済みだが、**実発注を駆動する定期実行 runner は未実装・実口座での Live 運用は未解禁**であり、Shadow Mode はその**前段の検証機能**である(Live 運用開始の事前条件のひとつ「Shadow Mode で想定注文を確認済み」を担う)。
 > - **Paper Execution とは別物**。Shadow Mode は**仮想約定・仮想 Position・仮想 PnL を一切計算しない** — 記録するのは「送信予定だった注文内容」と「Gate を通過した / 拒否された」という監査事実だけである。
 > - Shadow 結果には Broker 応答を意味する値(`ACCEPTED` / `FILLED` / `PARTIALLY_FILLED` / `CANCELLED`、Broker reference id、fill price / quantity)が**構造的に存在しない**(schema にその列がない)。
 
 ## execution mode(統一語彙)
 
-mode の唯一の正は `execution.safety_gate.ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)。設定文字列は `resolve_execution_mode()` が設定ロード時に解決し、**未知の mode は起動時に明示拒否**する。`demo` / `live` は mode 定義と validation のみ(Adapter 型未登録のため `BrokerConnection` を構築できず、runner は未実装として明示拒否)。`fake` の送信経路は従来どおり `LiveOrderSubmissionService` ただ 1 つ。
+mode の唯一の正は `execution.safety_gate.ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)。設定文字列は `resolve_execution_mode()` が設定ロード時に解決し、**未知の mode は起動時に明示拒否**する。`demo` は mode 定義と validation のみ(Adapter 型未登録のため `BrokerConnection` を構築できず、runner は明示拒否)。`live` は Issue #82 で `OandaLiveAdapter` が登録済みだが **LOCKED** であり、`live_lock.build_live_connection()` 以外は構築できず shadow runner は `LOCKED_BROKER_MODES` として明示拒否する。`fake` の送信経路は従来どおり `LiveOrderSubmissionService` ただ 1 つ。
 
 ## Production Signal 入力経路(本 Issue の中核)
 
@@ -150,8 +150,8 @@ fault 境界: `shadow_claim` / `shadow_result_save`(completion)/ `safety_decisio
 
 ## 非スコープ(Issue #78 時点)
 
-- OANDA Adapter・Demo / Live 注文・Broker reconciliation・専用 reconciliation runner
-- 仮想約定・仮想 Position・仮想 PnL(Paper Execution の責務)・Production キャンセル(Issue #99)
+- OANDA Adapter・Demo / Live 注文・Broker reconciliation・専用 reconciliation runner(その後 Issue #79 / #82 / #103〜#105 で実装済み。Live 運用は未解禁)
+- 仮想約定・仮想 Position・仮想 PnL(Paper Execution の責務)・Production キャンセル(その後 Issue #99 で実装済み)
 - Strategy 変更・Paper Signal 生成ルール変更・Paper Execution 変更
 - 保護価格(SL/TP)の導出・数量計算(ロット計算)— Live Execution 領域
 - policy 変更後の同一 request 再評価(最初の記録が勝ち、適用 policy snapshot を併存保存)

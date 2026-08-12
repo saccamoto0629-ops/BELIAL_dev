@@ -4,10 +4,10 @@
 
 > **重要な位置づけ**
 >
-> - Live Execution 本体・実 Broker 接続・自動売買は引き続き未実装・非スコープ([Concept](../product/concept.md) の「非スコープ」)。本書は将来の Live Execution 運用で必要になる契約を先に確定するもの。
+> - **実発注を駆動する定期実行 runner・自動売買は引き続き未実装・非スコープ**([Concept](../product/concept.md) の「非スコープ」)。実 Broker 接続(OANDA Demo / Live Adapter)は Issue #79 / #82 で実装済みだが、Live 接続は全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。本書は Live Execution 運用で必要になる契約を確定するもの。
 > - 注文状態の唯一の正は既存 `broker.OrderState` / `ORDER_STATE_TRANSITIONS` のまま。**本設計は状態機械へ一切遷移を追加しない**(REJECTED は terminal のまま)。
 > - **Broker Order Reissue(Issue #102)とは別概念**である(下記「用語」)。
-> - OANDA 固有の拒否コード設計・Broker reconciliation 全体・UNKNOWN の自動再送は非スコープ(Issue #95 の非スコープをそのまま維持)。
+> - UNKNOWN の自動再送は非スコープ(Issue #95 の非スコープをそのまま維持)。OANDA 固有の拒否コード → `RejectionCategory` の写像は Issue #114 で Demo Adapter 内部に、Broker reconciliation は Issue #103〜#105 で実装済み(本書のスコープ外の別契約)。
 
 ## 設計判断の要約
 

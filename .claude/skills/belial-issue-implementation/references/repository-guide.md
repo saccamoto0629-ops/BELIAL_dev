@@ -12,7 +12,7 @@ BELIAL Issue 実装時に参照するコンポーネント・ドキュメント�
 | paper-execution | `paper-execution/` | (なし。設計書を参照) | `paper_execution.md` | `paper-execution/tests/` | `paper_positions.sqlite3` |
 | backtest | `backtest/` | `backtest/strategies/README.md`(Strategy 定義) | `strategy_definition.md`、実行方法は `docs/backtest.md` | `backtest/tests/` | (backtest 結果 DB。`backtest_store.py` 参照) |
 | broker | `broker/` | `broker/README.md` | `broker_interface.md` | `broker/tests/` | なし(インメモリのみ) |
-| execution | `execution/` | `execution/README.md` | `execution_request.md`, `safety_gate.md`, `shadow_execution.md` | `execution/tests/` | `execution_orders.sqlite3`(Issue #74)+ `safety_gate_decisions.sqlite3`(Safety Gate 判定監査。Issue #75)+ `shadow_results.sqlite3`(Shadow Mode 検証記録。Issue #78)。いずれも将来のLive Execution用 |
+| execution | `execution/` | `execution/README.md` | `execution_request.md`, `safety_gate.md`, `shadow_execution.md`, `submission_journal.md`, `broker_reconciliation.md`, `execution_reissue.md` | `execution/tests/` | `execution_orders.sqlite3`(Issue #74)+ `safety_gate_decisions.sqlite3`(Safety Gate 判定監査。Issue #75)+ `shadow_results.sqlite3`(Shadow Mode 検証記録。Issue #78)+ `submission_journal.sqlite3`(Issue #93)+ `kill_switch.sqlite3`(Issue #81)+ `broker_reconciliation.sqlite3`(Issue #103〜#105)。いずれも Live Execution 用(runner 未実装・運用未解禁) |
 
 全体像・DB 構成・データ連携は `docs/architecture/architecture.md`、責務レイヤーと非スコープは `docs/product/concept.md` が正。
 
@@ -92,7 +92,7 @@ SKILL.md §3 が要求する評価項目。変更ごとに全項目を `Relevant
 | dry-run・strict read の読み取りエラー・schema 不正を成功扱いしない(cycle failure として計上) | `docs/architecture/architecture.md`「dry-run 方針」 |
 | 異常系の failure channel・終了コード・再送・状態維持は失敗種別ごとに所有 docs と回帰テストの契約に従う(delivery 失敗と data-plane / outbox 失敗を同一視しない) | `docs/architecture/paper_execution.md`(失敗分類)、`docs/operations/operations.md`「Paper Execution 通知 outbox の運用」 |
 | Paper Signal は仮説、Paper Execution は仮想執行、Backtest は検証基盤 | `docs/product/concept.md`「設計思想」「レイヤー分離」 |
-| Live Execution は未実装・非スコープ | `docs/product/concept.md`「非スコープ」 |
+| Live Execution は基盤実装済みだが、定期実行 runner は未実装・実口座での Live 運用は未解禁 | `docs/product/concept.md`「非スコープ」、`docs/operations/operations.md`「Live 運用開始の事前条件」 |
 | 既存の運用導線(起動コマンド・systemd・CLI)を壊さない | `docs/operations/operations.md`「起動方式 / 本番運用」 |
 
 ## docs / Skill 変更の直接検証チェックリスト

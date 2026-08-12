@@ -5,7 +5,7 @@
 > **重要な位置づけ**
 >
 > - Safety Gate / 送信サービスは**将来の Live Execution 送信経路を安全にする部品のみ**を実装する。
-> - **定期実行する Live Execution runner は引き続き未実装**である。Issue #82 で `live` mode の接続は構築可能になったが、それは**全ロック(`execution_mode=live` + `ENABLE_LIVE_TRADING=true` + Live credential + Live endpoint + `--confirm-live`)が揃い、Kill Switch が検証可能に OFF で、safety policy が読める場合に限り**、唯一の composer `execution/live_lock.py` が組み立てるときだけである(下記「型付き接続 identity」)。OANDA **Demo** Adapter は Issue #79 で `broker/` に実装済みだが `BROKER_TYPE_BY_MODE` に `demo` は未登録のままで、`demo` 接続は構築できない。Live 運用開始の事前条件は [運用ドキュメント](../operations/operations.md) を参照(v1.5 全体の docs 同期は Issue #127)。
+> - **定期実行する Live Execution runner は引き続き未実装**である。Issue #82 で `live` mode の接続は構築可能になったが、それは**全ロック(`execution_mode=live` + `ENABLE_LIVE_TRADING=true` + Live credential + Live endpoint + `--confirm-live`)が揃い、Kill Switch が検証可能に OFF で、safety policy が読める場合に限り**、唯一の composer `execution/live_lock.py` が組み立てるときだけである(下記「型付き接続 identity」)。OANDA **Demo** Adapter は Issue #79 で `broker/` に実装済みだが `BROKER_TYPE_BY_MODE` に `demo` は未登録のままで、`demo` 接続は構築できない。Live 運用開始の事前条件は [運用ドキュメント](../operations/operations.md) を参照。
 > - **Paper Execution とは無関係・独立**である。Paper Execution(`paper-execution/`)は Broker 境界に触れない仮想執行レイヤーであり、Safety Gate を通らないし通る必要もない。
 > - Safety Gate は **Strategy からも Broker Adapter からも独立**する: Strategy は安全ポリシーを持たず、Broker 実装は Gate のロジックを持たない。依存は `execution → broker`(境界モデルのみ)の一方向。
 
@@ -252,7 +252,7 @@ kill switch の**状態の正はプロセスメモリではなく専用 SQLite**
 
 ## 非スコープ(Issue #75 時点で未実装)
 
-- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(`demo` / `live` の `BrokerConnection` は Adapter 型が登録されるまで構築不能)
+- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(現在: Demo / Live Adapter は Issue #79 / #82 で実装済み。`demo` の `BrokerConnection` は Adapter 型が登録されるまで構築不能のまま、`live` は Issue #82 で登録済みだが全ロック成立時のみ `live_lock.build_live_connection()` が構築できる。実口座での Live 運用は未解禁)
 - Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ)
 - 動的ロット計算・証拠金最適化・リスク量からの数量計算
 - 自動キャンセル判断(いつキャンセルするかの Strategy / 運用判断。公認キャンセル**経路**は Issue #99 で実装済みだが、それを呼ぶ判断側は非スコープ)

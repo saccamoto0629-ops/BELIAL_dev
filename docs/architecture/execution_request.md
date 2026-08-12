@@ -9,8 +9,8 @@ from execution import execution_store
 
 > **重要な位置づけ**
 >
-> - 本コンポーネントは **将来の Live Execution 用のモデル・状態永続化基盤のみ** を実装する。
-> - **Live Execution 本体・Broker API Adapter・実発注・reconciliation runner は未実装**である。このコンポーネントが存在しても Live Execution が実装済みになったわけではない。発注前の Safety Gate は Issue #75 で `execution/safety_gate.py` に実装済み([Safety Gate](safety_gate.md))だが、これも検証部品のみで実発注経路は存在しない。
+> - 本コンポーネントは **Live Execution 用のモデル・状態永続化基盤** を実装する(Issue #74。schema v5 = 再発行チェーン込み。Issue #95 / #104 / #115)。
+> - **実発注を駆動する定期実行 runner は未実装**であり、このコンポーネントが存在しても Live 運用が解禁されたわけではない。発注前の Safety Gate と唯一の送信境界は Issue #75 で([Safety Gate](safety_gate.md))、OANDA Demo / Live Adapter は Issue #79 / #82 で、reconciliation(検出・修復・手動 CLI)は Issue #103〜#105 で実装済み。Live 接続は Issue #82 の全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。
 > - 外部通信・Discord・S3・実注文はこのパッケージのどこにも存在しない。
 > - **Paper Signal / Paper Execution は従来どおり Broker 非依存**であり、本パッケージを import しない・させない(`execution/tests/test_package_imports.py` が回帰として固定)。
 > - 注文状態の唯一の正は既存の `broker.broker_models.OrderState` / `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)である。**本パッケージは注文状態 Enum・遷移表を一切新設しない。**
@@ -24,7 +24,8 @@ ExecutionRequest                ← execution/execution_models.py(BELIAL 内部�
     ↓ to_order_request()
 broker.OrderRequest             ← broker/broker_models.py(Broker 境界へ渡す要求)
     ↓
-(将来の) Broker Adapter          ← 未実装
+Broker Adapter                  ← broker/{fake_broker,oanda_demo_adapter,oanda_live_adapter}.py
+                                  (FakeBroker / Demo / Live。live は全ロック成立時のみ構築可能)
 
 execution_store                 ← execution/execution_store.py(SQLite 永続化)
     → broker.OrderState / validate_* を検証に使用(状態機械の正は broker 側)
@@ -272,8 +273,8 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 
 ## 非スコープ(Issue #74 時点で未実装)
 
-- Live Execution runner / ユースケース本体
-- Broker API 実装(OANDA 等の Adapter)・実注文送信・外部通信
+- Live Execution runner / ユースケース本体(現在も未実装)
+- Broker API 実装(OANDA 等の Adapter)・実注文送信・外部通信(その後 Issue #79 / #82 で Demo / Live Adapter を実装済み。Live 接続は全ロック成立時のみ・運用は未解禁)
 - Safety Gate(その後 Issue #75 で実装済み。[Safety Gate](safety_gate.md) を参照)
 - 自動照会・定期 reconciliation
 - 再送フロー(UNKNOWN の解決は照会結果の記録のみ)
