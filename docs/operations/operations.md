@@ -41,6 +41,11 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `SUBMISSION_JOURNAL_DB_PATH` | `execution/data/submission_journal.sqlite3` | 将来の Live Execution 用 Submission Journal DB のパス上書き(`execution/submission_journal.py`、Issue #93)。Broker 送信前後の送信試行を Execution Order DB と**独立に**耐久記録する(Journal 保存失敗時は fail-closed で送信されない)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Live Execution runner 未実装。テストは `tmp_path` を使用) |
 | `KILL_SWITCH_DB_PATH` | `execution/data/kill_switch.sqlite3` | Execution 層の**永続 Kill Switch** 状態 DB のパス上書き(`execution/kill_switch_store.py`、Issue #81)。相対パスは `execution/` 基準。本番は永続ボリューム上の絶対パス推奨。状態は append-only の遷移履歴(有効/無効・UTC 時刻・operator・reason)で、Safety Gate は毎評価この DB を再読する。**DB が読めない(未初期化・schema 不一致・破損)あいだは fail-closed で全新規送信が拒否される**(「OFF 扱い」にはならない)。操作は `python -m execution.kill_switch_cli`(下記 CLI 節)。**この DB を評価する Live Execution runner は現時点で存在しない**(Live 接続未実装。テストは `tmp_path` を使用) |
 | `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。schema v3(Issue #105)は position / trade / SL・TP 検出記録テーブル(`manual_review` のみ許可)と run の position summary 列を additive に追加(migration は v1 → v2 → v3 の段階適用、`init_reconciliation_db()` のみ)。**この DB を作成・更新する運用導線は手動 reconciliation CLI(`python -m execution.reconciliation_runner`。Issue #105、下記 CLI 節)だけであり**、scheduler / 常駐 Bot への組み込みは未実装(テストは `tmp_path` を使用) |
+| `ENABLE_LIVE_TRADING` | unset | Live 接続のマスタースイッチ(Issue #82)。**厳密に `true`(小文字)のときだけ有効**。`TRUE` / `1` / `yes` / 前後空白付きはすべて無効扱いで fail-closed。これ単独では Live 接続できない(下記「Live 有効化手順」の全条件が必要)。**Demo mode のプロセス環境には設定しない**(設定されていると Demo 起動チェックが fail-closed で拒否する) |
+| `OANDA_LIVE_API_TOKEN` | empty | OANDA **Live** Adapter(`broker/oanda_live_adapter.py`、Issue #82)の API token。Demo 用 `OANDA_API_TOKEN` とは**別変数**で、同一値を両方へ設定すると構築時に fail-closed で拒否。環境変数でのみ渡し、ログ・例外・docs・リポジトリへ実値を書かない |
+| `OANDA_LIVE_ACCOUNT_ID` | empty | OANDA Live Adapter の Live account id。Demo 用 `OANDA_ACCOUNT_ID` とは**別変数**で、同一値の共有は fail-closed。起動 summary には非可逆 digest(`account-<12桁>`)だけを表示し、実 ID は出力しない |
+| `OANDA_LIVE_API_URL` | **既定なし** | OANDA Live Adapter の接続先。**Live endpoint(`https://api-fxtrade.oanda.com`)のみ許可(allowlist)**。Demo endpoint・類似ホスト・未設定はすべて構築時に fail-closed で拒否する(Demo と違い**既定値を持たない** = 未設定は起動失敗)。拒否メッセージは設定値を一切 echo しない |
+| `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Live Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない**(reconciliation で解決する) |
 | `OANDA_API_TOKEN` | empty | OANDA Demo Adapter(`broker/oanda_demo_adapter.py`、Issue #79)の API token。**Demo(fxpractice)口座のトークンのみ**。環境変数でのみ渡し、ログ・例外・docs へ実値を書かない。**運用導線からこの Adapter を起動するプロセスは現時点で存在しない**(Execution 統合は未実装。opt-in の実 API テストのみが使用) |
 | `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない |
 | `OANDA_API_URL` | `https://api-fxpractice.oanda.com` | OANDA Demo Adapter の接続先。**Demo endpoint のみ許可(allowlist)**。Live endpoint(`fxtrade` を含む host)やその他の URL を指定すると構築時に fail-closed で起動拒否。HTTP redirect は追従しない(3xx は共通エラー化)ため、応答によって Demo endpoint 外へ接続が逸れることもない |
@@ -72,6 +77,8 @@ pytestで以下を検証している。
 - optional Providerが既定falseで呼ばれないこと
 
 外部APIアクセスはテストではMock化し、実Webhookや本物のAPIキーは使わない。
+
+**Live endpoint への接続テストは通常の pytest suite に存在しない**(Issue #82)。Live 関連テスト(`broker/tests/test_oanda_live_adapter.py` / `execution/tests/test_live_lock.py` / `execution/tests/test_live_startup_cli.py`)はすべて transport を注入した offline テストで、実 Live credential を要求せず、socket を開こうとしたら失敗する。OANDA Demo の実 API テストだけが `BELIAL_RUN_OANDA_DEMO_API_TESTS=1` の opt-in で、通常 CI では skip される。
 ## 起動方式 / 本番運用
 
 Linux運用パスは `/opt/berial` を想定する。
@@ -323,7 +330,129 @@ python -m execution.kill_switch_cli disable \
 - `enable` / `disable` が exit 1 でも、出力に `WAS RECORDED` があれば**その遷移は記録済み**である(履歴に破損行がある等で現在状態を確認できないだけ)。この場合 Gate は fail-closed のまま送信を止め続けるので、破損を解消してから `status` で再確認する。逆に `WAS RECORDED` がない exit 1 は、遷移が記録されていない(store 自体を開けない)ことを意味する。
 - 状態読み取りは**履歴全行の完全性を検証**してから状態を返す。帯域外編集で 1 行でも壊れていれば、その後に正常な `disable` を追記しても Gate・CLI とも fail-closed のまま(緊急停止のための `enable` は破損 DB でも記録できるが、状態が検証可能になるまで送信は止まったまま)。破損が疑われる場合は `status` の出力と `sqlite3 <db> 'SELECT * FROM kill_switch_transitions;'` で該当行を特定する。
 - 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(照合)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
-- 現時点で本番の常駐 Live Execution runner は存在しない(Live 接続未実装)。Kill Switch は将来の Live 送信 composition が `PersistentKillSwitchStateProvider` を配線することで効く契約であり、手順・状態 store・CLI はその運用準備として先行整備している(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
+- 現時点で本番の常駐 Live Execution runner は存在しない(Issue #82 で追加されたのは**Live 接続のロックと起動前 preflight** までで、定期実行する送信プロセスは未実装)。Kill Switch は Live 送信境界が `PersistentKillSwitchStateProvider` を読むことで効き、**この配線は契約ではなく強制**である(`LiveOrderSubmissionService` は execution mode が `live` の場合、gate が永続 Kill Switch reader を持たない composition を構築時に拒否する。in-memory provider では「OFF」を構造的に作れてしまい、読み取り不能を暗黙の OFF に変えるため)。加えて、`python -m execution.live_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
+
+### Live 接続の有効化 / 無効化 / 緊急停止(Issue #82)
+
+`python -m execution.live_startup_cli` は **Live 接続の二重以上のロック**を検証し、起動時 safety summary を表示する唯一の運用導線。**注文の送信・取消・照会は一切行わず、外部通信もしない**(接続オブジェクトを組み立てて破棄するだけ)。実発注は従来どおり `LiveOrderSubmissionService`(唯一の送信境界)と Safety Gate を通る。
+
+> **Issue #82 の merge だけで Live 運用を開始しない。** 下記「Live 運用開始の事前条件」をすべて満たすまで、この CLI は配線確認にとどめる。
+
+#### Live 有効化手順
+
+以下が**すべて**成立したときだけ Live 接続が構築できる。1つでも欠ければ fail-closed(exit 1)で拒否され、Broker call には到達しない。
+
+| # | 条件 | 設定場所 |
+|---|---|---|
+| 1 | execution mode が `live` | `--execution-mode live` |
+| 2 | Live enable flag | `ENABLE_LIVE_TRADING=true`(小文字厳密一致) |
+| 3 | Live credential | `OANDA_LIVE_API_TOKEN` / `OANDA_LIVE_ACCOUNT_ID`(Demo 用変数とは別。同一値の共有は拒否) |
+| 4 | Live endpoint | `OANDA_LIVE_API_URL=https://api-fxtrade.oanda.com`(既定値なし。allowlist 完全一致) |
+| 5 | 明示確認引数 | `--confirm-live` |
+| 6 | Kill Switch が**検証可能かつ OFF** | `python -m execution.kill_switch_cli status`(読めない・不明・ON はすべて拒否) |
+| 7 | Safety limits が読める | `--safety-config <path>`(許可銘柄・最大注文数量・最大ポジション数・許可 Live target。credential は書かない) |
+
+```bash
+cd /opt/berial
+source .venv/bin/activate
+
+# Live credential はプロセス環境にだけ渡す(リポジトリ・.env.example へ書かない)
+export ENABLE_LIVE_TRADING=true
+export OANDA_LIVE_API_TOKEN=...          # Live 口座専用。Demo と共有しない
+export OANDA_LIVE_ACCOUNT_ID=...         # Live 口座専用。Demo と共有しない
+export OANDA_LIVE_API_URL=https://api-fxtrade.oanda.com
+
+# 起動前 preflight: 全ロックの成立確認 + safety summary 表示(発注しない)
+python -m execution.live_startup_cli \
+    --execution-mode live --confirm-live \
+    --safety-config /etc/berial/live_safety.json
+
+# 機械可読(pure-ASCII JSON)
+python -m execution.live_startup_cli \
+    --execution-mode live --confirm-live \
+    --safety-config /etc/berial/live_safety.json --json
+```
+
+`--safety-config` の JSON は全項目必須・未知キー禁止(既定値なし):
+
+```json
+{
+  "policy_id": "live-v1",
+  "allowed_symbols": ["USD_JPY"],
+  "allowed_sides": ["buy"],
+  "max_order_quantity": "1000",
+  "max_positions_per_symbol": 1,
+  "max_positions_account": 2,
+  "max_reference_age_seconds": 30,
+  "max_spread_by_symbol": {"USD_JPY": "0.05"},
+  "allowed_live_targets": ["oanda-live"],
+  "require_stop_loss": true
+}
+```
+
+exit code: **0** = 全ロック成立(Live 接続を構築できた。発注はしていない)/ **1** = 拒否(いずれかのロック・Kill Switch・safety config)/ **2** = usage error(必須引数欠落)。
+
+起動時 safety summary に出るもの(いずれも非秘匿):execution mode / endpoint 種別ラベル(`live` / `demo` / `unknown` / `not-configured`)/ account id の**マスク表示**(非可逆 digest)/ 許可銘柄 / 最大注文数量 / 最大ポジション数(銘柄別・口座) / Kill Switch 状態(`enabled` / `disabled` / `unverifiable`) / Live confirmation の成立状態(5ロックのチェックリスト)。**API token・完全な account id・endpoint URL・Authorization header は出力・ログ・例外に一切出さない。**
+
+代表的な誤操作と結果(いずれも Broker call 前に拒否):
+
+| 状況 | rejection code |
+|---|---|
+| `execution_mode=live` だが `--confirm-live` なし | `live_confirmation_missing` |
+| `--confirm-live` はあるが `ENABLE_LIVE_TRADING` が `true` でない | `live_trading_disabled` |
+| Live credential 不足 | `live_credentials_missing` |
+| Live endpoint 未設定 / Demo endpoint / 不明 endpoint | `live_endpoint_invalid` |
+| Demo と Live の endpoint / credential 混在 | `demo_live_configuration_mixed` |
+| Kill Switch ON | `kill_switch_enabled` |
+| Kill Switch DB が読めない・schema 不正・状態不明 | `kill_switch_state_unverifiable` |
+| safety config が読めない / 不正 | `safety_policy_unavailable` |
+| policy が `oanda-live` を許可していない | `live_target_not_allowed` |
+| mode が `live` 以外 | `execution_mode_not_live` |
+
+#### Live 無効化手順
+
+**この順序で行う**(先に Kill Switch を入れてから止める。逆順だと停止までの間に送信余地が残る)。
+
+```bash
+# 1. Kill Switch を有効化する(以後すべての新規送信を Broker call 前に拒否)
+python -m execution.kill_switch_cli enable \
+    --operator "$(whoami)" --reason "live disable"
+
+# 2. Live process を停止する(常駐 runner を運用している場合)
+sudo systemctl stop <live-execution-unit>
+
+# 3. ENABLE_LIVE_TRADING を無効化する(環境ファイル・unit の Environment= から削除)
+unset ENABLE_LIVE_TRADING
+
+# 4. Live credential をプロセス環境から外す
+unset OANDA_LIVE_API_TOKEN OANDA_LIVE_ACCOUNT_ID OANDA_LIVE_API_URL
+
+# 5. 無効化されたことの確認(exit 1 + 拒否理由が出れば Live 接続は構築できない)
+python -m execution.live_startup_cli \
+    --execution-mode live --confirm-live \
+    --safety-config /etc/berial/live_safety.json; echo "exit=$?"
+```
+
+3 / 4 は環境ファイル(systemd の `EnvironmentFile=` など)からも削除する。プロセス環境だけで `unset` しても、再起動で復活する設定を残さないこと。
+
+#### 緊急停止手順
+
+**正は Issue #81 の Kill Switch 手順**(上記「Execution Kill Switch」節)。Live 注文停止までの導線は以下。
+
+1. `python -m execution.kill_switch_cli enable --operator <you> --reason "<incident>"` — 1 コマンドで停止。DB 未作成でも単一トランザクションで初期化+停止を記録する。
+2. これ以降、Safety Gate が**すべての新規 Broker 送信**を `kill_switch_enabled` で拒否する(プロセス再起動・多重起動・別プロセスからの送信にも効く)。`python -m execution.live_startup_cli` も接続を組み立てる前に拒否する。
+3. 停止確認: `python -m execution.kill_switch_cli status` / 送信側 WARN ログ `Safety Gate rejected ... codes=('kill_switch_enabled',)` / Safety Gate 判定監査 DB の拒否記録。
+4. 停止が確認できたら、上記「Live 無効化手順」の 2〜4(process 停止 → flag 無効化 → credential 除去)へ進む。
+5. 既に Broker 側へ出た注文は Kill Switch では取り消されない。未解決の注文は `python -m execution.reconciliation_runner` による照合と、`LiveOrderSubmissionService.cancel()`(唯一の取消境界)で扱う。**UNKNOWN の結果を再送で解決しないこと**(reconciliation で解決する)。
+
+#### Live 運用開始の事前条件(Issue #82 の merge だけでは開始しない)
+
+- FakeBroker 固定シナリオ試験が安定している(`python -m execution.scenario_runner`)
+- Shadow Mode で想定注文を確認済み(`python -m execution.shadow_runner` / shadow report)
+- Demo 口座で継続運転済み
+- Broker reconciliation が稼働している(`python -m execution.reconciliation_runner`)
+- Kill Switch が動作確認済み(enable → 送信拒否 → disable)
+- 発注数量・許可銘柄・リスク上限が `--safety-config` に設定済み
 
 ### Paper Signal 日次集計レポート(Issue #47)
 

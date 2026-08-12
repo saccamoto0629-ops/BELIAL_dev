@@ -111,7 +111,7 @@ timer + oneshot 方式の実際のunit配置・有効化はv1.5以降の検討�
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
-- Live Execution / Broker API(Pepperoni の実発注担当分。Broker 境界は Issue #73、ExecutionRequest / 注文状態永続化基盤は Issue #74、発注前 Safety Gate は Issue #75 で定義済み。実発注・OANDA Adapter・runner・reconciliation はまだ設計しない)
+- Live Execution / Broker API(Pepperoni の実発注担当分。Broker 境界は Issue #73、ExecutionRequest / 注文状態永続化基盤は Issue #74、発注前 Safety Gate は Issue #75、OANDA Demo Adapter は Issue #79、Broker reconciliation は Issue #103〜#105、Kill Switch は Issue #81、**OANDA Live Adapter と Live 接続の二重以上のロックは Issue #82** で実装済み。**実発注を駆動する定期実行 runner・自動売買はまだ設計しない**。v1.5 全体の記述同期は Issue #127)
 - 外部Strategy定義をPaper Signalへ接続し、Live相当のSignal生成とBacktestを同一定義で駆動する共有化
 
-Broker API による実注文・自動売買(Live Execution)は引き続き未実装・非スコープである。実装済みの外部Strategy定義をPaper Signal / Paper Executionへ接続する共有化は、現在のアーキテクチャの一部ではなく将来構想として扱う。
+Broker API による**自動売買・実発注を駆動する定期実行 runner**(Live Execution 本体)は引き続き未実装・非スコープである(Adapter・Safety Gate・Live 接続ロックは Issue #79 / #75 / #82 で実装済み。Live 運用開始は [運用ドキュメント](../operations/operations.md) の事前条件による。v1.5 全体の記述同期は Issue #127)。実装済みの外部Strategy定義をPaper Signal / Paper Executionへ接続する共有化は、現在のアーキテクチャの一部ではなく将来構想として扱う。

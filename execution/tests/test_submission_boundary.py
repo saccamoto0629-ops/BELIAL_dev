@@ -98,6 +98,22 @@ REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED = {
 }
 
 
+# Issue #82: the LIVE connection has exactly ONE production composer,
+# ``execution/live_lock.py``. The broker-layer locks (a live-only endpoint
+# allowlist, live-only credentials, the ``LiveActivation`` grant) already
+# make a live adapter unbuildable without ``ENABLE_LIVE_TRADING=true`` and
+# ``--confirm-live``, but the Kill Switch check, the safety-policy check and
+# the startup summary live in the composer -- so a second construction site
+# would be a live startup nobody reviewed. Tests construct these classes
+# directly on purpose (that is how the constructors' own refusals are
+# exercised).
+LIVE_CONNECTION_CONSTRUCTION_ALLOWED = {
+    "execution/live_lock.py",
+    "execution/tests",
+    "broker/tests",
+}
+
+
 def _python_files():
     for path in sorted(REPO_ROOT.rglob("*.py")):
         relative = path.relative_to(REPO_ROOT)
@@ -210,6 +226,36 @@ def test_reissue_boundary_services_are_built_only_by_the_composition_root(class_
     assert (
         _construction_offenders(class_name, REISSUE_BOUNDARY_CONSTRUCTION_ALLOWED) == []
     )
+
+
+@pytest.mark.parametrize(
+    "class_name", ["OandaLiveAdapter", "LiveActivation", "OandaLiveConfig"]
+)
+def test_the_live_connection_is_built_only_by_the_live_activation_lock(class_name):
+    """Issue #82: no production module other than the live activation lock
+    may build a live adapter, a live config or an activation grant."""
+    assert _construction_offenders(class_name, LIVE_CONNECTION_CONSTRUCTION_ALLOWED) == []
+
+
+def test_the_live_lock_holds_exactly_one_live_adapter_construction():
+    sites = _construction_sites(REPO_ROOT / "execution" / "live_lock.py", "OandaLiveAdapter")
+    assert len(sites) == 1, (
+        "execution/live_lock.py must hold exactly one OandaLiveAdapter construction "
+        f"(the gated one in build_live_connection), found lines {sites}"
+    )
+
+
+def test_the_v20_engine_is_never_constructed_outside_the_broker_layer():
+    """The shared OANDA v20 translation body is a BROKER-layer detail: the
+    execution layer talks to the concrete adapters (and to the Broker
+    protocol), never to the engine. Constants may be imported (endpoint host
+    markers are used for the fail-closed classification); the engine CLASS
+    may not be constructed outside the broker package -- doing so would be an
+    adapter with no endpoint allowlist behind it."""
+    offenders = _construction_offenders(
+        "OandaV20Adapter", {"broker", "execution/tests", "broker/tests"}
+    )
+    assert offenders == []
 
 
 @pytest.mark.parametrize(

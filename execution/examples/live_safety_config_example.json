@@ -1,0 +1,12 @@
+{
+  "policy_id": "live-safety-example-v1",
+  "allowed_symbols": ["USD_JPY"],
+  "allowed_sides": ["buy"],
+  "max_order_quantity": "1000",
+  "max_positions_per_symbol": 1,
+  "max_positions_account": 2,
+  "max_reference_age_seconds": 30,
+  "max_spread_by_symbol": {"USD_JPY": "0.05"},
+  "allowed_live_targets": ["oanda-live"],
+  "require_stop_loss": true
+}

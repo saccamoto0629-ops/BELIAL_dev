@@ -21,6 +21,7 @@ from execution.safety_gate import (
     BROKER_TYPE_BY_MODE,
     BrokerConnection,
     ExecutionMode,
+    LOCKED_BROKER_MODES,
     UNIMPLEMENTED_BROKER_MODES,
     resolve_execution_mode,
 )
@@ -565,10 +566,19 @@ def test_resolve_execution_mode_accepts_exactly_the_five_modes():
             resolve_execution_mode(bogus)
 
 
-def test_demo_and_live_stay_unimplemented_and_unconnectable():
-    assert UNIMPLEMENTED_BROKER_MODES == {ExecutionMode.DEMO, ExecutionMode.LIVE}
-    for mode in (ExecutionMode.DEMO, ExecutionMode.LIVE, ExecutionMode.SHADOW, ExecutionMode.DRY_RUN):
+def test_demo_stays_unimplemented_and_live_is_locked():
+    """Issue #82 changed exactly one thing here: ``live`` moved from
+    "unrepresentable" to "representable only behind the live activation
+    lock". ``demo`` is untouched, the non-submitting modes still own no
+    broker connection at all, and ``live`` maps to the live adapter -- never
+    to a FakeBroker."""
+    from broker.oanda_live_adapter import OandaLiveAdapter
+
+    assert UNIMPLEMENTED_BROKER_MODES == {ExecutionMode.DEMO}
+    assert LOCKED_BROKER_MODES == {ExecutionMode.LIVE}
+    for mode in (ExecutionMode.DEMO, ExecutionMode.SHADOW, ExecutionMode.DRY_RUN):
         assert mode not in BROKER_TYPE_BY_MODE
+    assert BROKER_TYPE_BY_MODE[ExecutionMode.LIVE] is OandaLiveAdapter
 
 
 def test_shadow_service_constructor_validation(tmp_path):

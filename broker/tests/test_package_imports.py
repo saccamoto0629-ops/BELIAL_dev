@@ -16,6 +16,11 @@ ROOT_LEVEL_IMPORTS = (
     "from broker.broker_models import OrderRequest, OrderResult",
     "from broker.fake_broker import FakeBroker",
     "from broker import broker_interface, broker_models, fake_broker",
+    # Issue #82: the shared v20 engine and both concrete adapters import
+    # from the repository root without any sys.path help.
+    "from broker.oanda_v20_adapter import OandaV20Adapter",
+    "from broker.oanda_demo_adapter import OandaDemoAdapter, OandaDemoConfig",
+    "from broker.oanda_live_adapter import LiveActivation, OandaLiveAdapter, OandaLiveConfig",
 )
 
 
@@ -43,7 +48,10 @@ def test_in_process_package_imports_expose_the_public_names():
     from broker.broker_interface import Broker
     from broker.broker_models import OrderRequest, OrderResult
     from broker.fake_broker import FakeBroker
+    from broker.oanda_demo_adapter import OandaDemoAdapter
+    from broker.oanda_live_adapter import OandaLiveAdapter
 
     assert Broker is not None
     assert OrderRequest is not None and OrderResult is not None
     assert FakeBroker is not None
+    assert OandaDemoAdapter is not None and OandaLiveAdapter is not None

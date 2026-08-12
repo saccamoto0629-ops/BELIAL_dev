@@ -131,6 +131,40 @@ jobs:
           python -c "import json; data=json.load(open('recon-run.json', encoding='ascii')); assert data['run_id'] == 'recon-ci-1' and data['position_scope'] is not None, data"
           test -f "$RUNNER_TEMP/recon-ci/broker_reconciliation.sqlite3"
 
+      # Issue #82: the live activation lock must fail CLOSED in an
+      # environment that carries no live configuration at all -- which is
+      # exactly what CI is. No credential is ever set here, so this step
+      # proves the refusal path end to end (exit 1, machine-readable codes,
+      # no kill switch DB created, no network).
+      - name: Run live startup preflight (must refuse, no credentials in CI)
+        run: |
+          set -e
+          set +e
+          python -m execution.live_startup_cli \
+            --execution-mode live --confirm-live \
+            --safety-config execution/examples/live_safety_config_example.json \
+            --kill-switch-db "$RUNNER_TEMP/live-ci/kill_switch.sqlite3" \
+            --json > live-preflight.json
+          status=$?
+          set -e
+          test "$status" -eq 1 || { echo "the live preflight must refuse (exit 1) in CI, got $status"; exit 1; }
+          python -c "import json; data=json.load(open('live-preflight.json', encoding='ascii')); assert data['allowed'] is False, data; assert 'live_trading_disabled' in data['rejection_codes'], data; assert 'kill_switch_state_unverifiable' in data['rejection_codes'], data"
+          test ! -e "$RUNNER_TEMP/live-ci" || { echo "the preflight must not create the kill switch DB"; exit 1; }
+          if grep -qi "api-fxtrade\|Bearer\|Authorization" live-preflight.json; then
+            echo "the preflight output must not carry endpoint/credential material"; exit 1
+          fi
+          # without --confirm-live the refusal must name that lock too
+          set +e
+          python -m execution.live_startup_cli \
+            --execution-mode live \
+            --safety-config execution/examples/live_safety_config_example.json \
+            --kill-switch-db "$RUNNER_TEMP/live-ci/kill_switch.sqlite3" \
+            --json > live-preflight-noconfirm.json
+          status=$?
+          set -e
+          test "$status" -eq 1 || { echo "a preflight without --confirm-live must refuse, got $status"; exit 1; }
+          python -c "import json; data=json.load(open('live-preflight-noconfirm.json', encoding='ascii')); assert 'live_confirmation_missing' in data['rejection_codes'], data"
+
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
       # the same rule; Issue #75 adds the Safety Gate modules; Issue #77 adds

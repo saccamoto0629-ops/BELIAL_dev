@@ -310,11 +310,21 @@ def test_dry_run_fails_explicitly_on_an_invalid_existing_db(tmp_path, capsys):
 # --- mode dispatch --------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", ["demo", "live"])
-def test_demo_and_live_are_refused_as_unimplemented(tmp_path, capsys, mode):
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        pytest.param("demo", "NOT implemented", id="demo-unimplemented"),
+        # Issue #82: live is no longer "unimplemented" -- it is LOCKED. The
+        # shadow runner must still refuse it (it never submits), and the
+        # refusal must point at the one command that may compose a live
+        # connection.
+        pytest.param("live", "live activation lock", id="live-locked"),
+    ],
+)
+def test_demo_and_live_are_refused_by_the_shadow_runner(tmp_path, capsys, mode, expected):
     code, data_dir = run(tmp_path, mode=mode)
     assert code == EXIT_USAGE_ERROR
-    assert "NOT implemented" in capsys.readouterr().err
+    assert expected in capsys.readouterr().err
     assert not data_dir.exists()
 
 

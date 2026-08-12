@@ -41,8 +41,10 @@ Broker API による実注文・実約定(**Live Execution**)は現行スコー�
 
 以下は実売買(**Live Execution**)に踏み込む領域であり、現行スコープ外である。
 
-- Broker API 連携(OANDA / XM / MT5 など)
-- 実発注・実約定・実ポジション管理
+> **Issue #82 による局所的な更新**: OANDA Demo Adapter(Issue #79)と OANDA Live Adapter + Live 接続の二重以上のロック(Issue #82)は `broker/` / `execution/` に実装済みで、全ロック成立時のみ `live` の `BrokerConnection` を構築できる。ただし**実発注を行う定期実行 runner・自動売買は引き続き未実装・非スコープ**であり、Live 運用開始は [運用ドキュメント](../operations/operations.md) の「Live 運用開始の事前条件」を満たすまで行わない。本節を含む v1.5 全体の記述同期は Issue #127 で行う。
+
+- Broker API 連携(OANDA / XM / MT5 など) — **Adapter は実装済み**(Demo: Issue #79 / Live: Issue #82。いずれも endpoint allowlist で 1 URL に固定)。定期実行する連携 runner は未実装
+- 実発注・実約定・実ポジション管理 — 実発注経路は `LiveOrderSubmissionService` の単一境界として存在するが、**これを駆動する常駐プロセスは未実装**
 - 自動売買(実口座での自動エントリー・自動Exit・損切り・利確)
 - ロット計算・レバレッジ計算・資金管理
 - 売買推奨文言の生成
@@ -77,7 +79,8 @@ Execution
     ├─ Paper Execution      … 実装済み(仮想約定のみ)
     │      ↓
     │  Virtual Position → Exit Evaluation → Execution Result(仮想損益)
-    └─ Live Execution       … 未実装(将来・非スコープ)
+    └─ Live Execution       … Broker 境界・Adapter・Safety Gate・Live 接続ロックのみ実装済み
+                              (Issue #73/#74/#75/#79/#82)。常駐 runner・自動売買は未実装
 ```
 
 | Layer | Responsibility | Status / Current modules |
@@ -88,7 +91,7 @@ Execution
 | Strategy / Method | 観測・分類情報から候補を生成・評価するルール。Paper Signal の現行ルールはコード実装、外部 Strategy 定義(YAML)は現在 Backtest 経路のみで使用 | 実装済み: `paper-signal/signal_generator.py`, `backtest/strategy_definition.py` |
 | Hypothesis / Paper Signal | Strategy / Method の評価結果を paper_only の仮説レコードとして生成・保存する。entry / exit は判断しない | 実装済み: `paper-signal/signal_generator.py`, `paper_signal_store.py` |
 | Execution (Paper Execution) | Paper Signal を入力に、時間進行に沿って仮想Entry・仮想ポジション管理・SL / TP / Exit 判定・仮想損益計算を行う | **実装済み**: `paper-execution/`(設計は [Paper Execution](../architecture/paper_execution.md)。Issue #49 設計、#50 / #51 実装)。Broker API・実注文は含まない |
-| Execution (Live Execution) | Broker API による実注文・実約定・実ポジション管理 | 未実装(将来・非スコープ)。Broker 境界(interface / 共通モデル / FakeBroker)は Issue #73 で `broker/` に、ExecutionRequest と注文状態の永続化基盤は Issue #74 で `execution/` に定義済み(いずれも基盤のみ・実発注なし) |
+| Execution (Live Execution) | Broker API による実注文・実約定・実ポジション管理 | **常駐 runner・自動売買は未実装**。基盤は実装済み: Broker 境界(Issue #73)/ ExecutionRequest・注文状態永続化(Issue #74)/ Safety Gate・単一送信境界(Issue #75)/ OANDA Demo Adapter(Issue #79)/ Kill Switch(Issue #81)/ **OANDA Live Adapter と Live 接続の二重以上のロック(Issue #82)**。Live 接続は全ロック成立時のみ構築でき、Live 運用開始は [運用ドキュメント](../operations/operations.md) の事前条件による |
 | Persistence | 各コンポーネントが独立した SQLite を所有する。初期化・既知migration・schema検証の保証範囲はstoreごとに異なる | 実装済み: `chart_collector.py`, `market_bias_store.py`, `paper_signal_store.py`, `backtest_store.py`, `position_store.py`。詳細は [Architecture](../architecture/architecture.md#sqlite-schema-validation--migration) |
 
 Backtest はこの直列フローには含まれない独立した **Validation レイヤー(検証基盤)** であり、過去のローソク足で Strategy / Execution ルールを遡及再生・評価する。Backtest と Paper Execution の役割差、および両者が共有するルールは [Architecture](../architecture/architecture.md#backtest-と-paper-execution-の役割差) を参照。
