@@ -345,4 +345,4 @@ Do not commit:
 
 `market-watch/` is an Alert-layer implementation: it detects and reports facts (crosses, touches, band breaks, RSI zone transitions). It does not implement trade judgement, scoring, entries, exits, lot sizing, stop-loss/take-profit, or broker API integration. Interpreting these alerts (Strategy/Method) and executing trades (Execution) are separate, currently out-of-scope layers — see [docs/product/concept.md](../docs/product/concept.md#レイヤー分離).
 
-For the full current specification (indicator formulas, Freshness/Bias Weight rules, SQLite schema, systemd examples), see [docs/architecture/market_watch.md](../docs/architecture/market_watch.md). For planned v1.4 Backtest work, see [docs/product/roadmap.md](../docs/product/roadmap.md).
+For the full current specification (indicator formulas, Freshness/Bias Weight rules, SQLite schema, systemd examples), see [docs/architecture/market_watch.md](../docs/architecture/market_watch.md). For the release history (v1.4 Backtest, v1.5 Paper Execution / Live Execution groundwork), see [docs/product/roadmap.md](../docs/product/roadmap.md).

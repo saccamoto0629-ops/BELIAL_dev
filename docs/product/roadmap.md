@@ -22,7 +22,7 @@ FedWatch / Economic Calendar は外部取得元が不安定なため、今後も
 - Chart Snapshotの定期投稿頻度調整
 - ATR / 出来高 / Fear & Greed / COT Report などの補助指標追加
 - デモ口座でのPaper Signal記録
-- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)は引き続き未実装・非スコープ
+- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)の基盤も v1.5(Issue #73〜#82 ほか。下記「v1.5」節)で実装済みだが、常駐 runner は未実装で実口座での Live 運用は未解禁
 
 これらは v1.3.1 以降の検討事項であり、v1.3.0では実装しない。
 
@@ -96,22 +96,45 @@ WantedBy=timers.target
 ```
 
 timer + oneshot 方式の実際のunit配置・有効化はv1.5以降の検討事項とする。
-## v1.4.1以降の実装と今後の検討
+## v1.5 — Paper Execution / Strategy 外部化 / Live Execution 基盤(現行 main)
 
-**v1.4.1タグ後に実装済み:**
+v1.5 は、`v1.4.1` タグ後に追加された以下の系統をまとめたリリースラインである。差分の詳細は [v1.5 リリースノート](../development/reports/v1.5_release_notes.md) を参照。
 
-- **Paper Execution**: Paper Signal を入力に、時間進行に沿って仮想約定・仮想ポジション管理・仮想Exit・仮想損益を行う執行層(Live Execution とは独立)。実注文・Broker API 連携・自動売買・ロット計算は含めない。Issue #49 で最小責務・状態遷移・約定規則を設計([Paper Execution](../architecture/paper_execution.md))、Issue #50 / #51 でデータモデル・保存層および Open / Close 判定エンジンを `paper-execution/` に実装した。
-- **外部Strategy定義(Backtest経路)**: Issue #52〜#54でYAML schema、loader / validator、`--strategy-file` / `--strategy` CLI、および `backtest/strategies/xauusd_1h_squeeze_breakout_v1.yaml` を実装した。外部定義を読み込むのは現在Backtest経路のみであり、Paper Signal / Paper Executionが同じ定義を共有する経路は未実装。
-- **Broker interface / FakeBroker(Issue #73)**: 将来の Live Execution に向けた Broker 境界(共通インターフェース・Broker 非依存の共通モデル)と、外部通信を一切行わないテストダブル FakeBroker を `broker/` に実装した([Broker Interface](../architecture/broker_interface.md))。これは**境界の定義のみ**であり、実発注・OANDA Adapter・Live Execution runner は引き続き未実装・非スコープ(Issue #73 時点で非スコープだった Safety Gate は、その後 Issue #75 で `execution/` に実装)。Paper Execution は従来どおり Broker 非依存の仮想執行のままで、この境界を使わない。
-- **Execution Request / 注文状態永続化基盤(Issue #74)**: Strategy / Signal から将来の Live Execution ユースケースへ渡す `ExecutionRequest` モデルと、注文状態・状態履歴(状態変更理由・broker_order_id・UNKNOWN 照会対象の抽出を含む)を SQLite へ永続化する基盤を `execution/` に実装した([Execution Request / Order Persistence](../architecture/execution_request.md))。注文状態は既存 `broker.OrderState` を唯一の正として再利用する。これも**将来の Live Execution 用のモデル・状態永続化基盤のみ**であり、Live Execution 本体・Broker API Adapter・実注文・reconciliation runner は引き続き未実装・非スコープ。
-- **発注前 Safety Gate(Issue #75)**: Broker 送信直前に許可銘柄・方向・数量・ポジション上限・SL / TP・価格鮮度・spread・market open / tradable・kill switch・execution mode × 接続先を fail-closed で検証し、判定(機械可読な拒否コード・policy_id)を SQLite へ監査保存する検証層を `execution/` に実装した([Safety Gate](../architecture/safety_gate.md))。`LiveOrderSubmissionService`(`execution/live_submission.py`)が唯一の公認送信経路で、判定の耐久保存 + read-back 検証と execution store の created→submitting 遷移(一度きり。二重送信・UNKNOWN 再送は拒否)に成功しない限り `Broker.submit_order()` へ到達できない。**検証・監査部品のみ**であり、OANDA Adapter・Live 接続・実発注・Live Execution runner は引き続き未実装・非スコープ。
+| Issue | 内容 | 状態 |
+|---|---|---|
+| #49〜#51 | **Paper Execution**: 保存済み Paper Signal からの仮想Entry / 仮想ポジション管理 / SL・TP・最大保有時間 Exit / 仮想損益(`paper-execution/`。[設計](../architecture/paper_execution.md)) | 実装済み |
+| #83 | Paper Execution の Discord 状態遷移通知(Transactional Outbox・at-least-once) | 実装済み |
+| #85 | Paper Execution の同時ポジション上限(`(symbol, timeframe, side)` スコープ・TOCTOU 防止) | 実装済み |
+| #52〜#54 | **外部 Strategy 定義(YAML)**: schema / loader / validation / `--strategy-file`・`--strategy` CLI(Backtest 経路のみ) | 実装済み |
+| #73 | **Broker interface / FakeBroker**: Broker 境界(共通インターフェース・共通モデル)と外部通信しないテストダブル(`broker/`。[設計](../architecture/broker_interface.md)) | 実装済み |
+| #74 / #76 | **Execution Request / 注文状態永続化** + 二重発注防止・idempotency(`execution/`。[設計](../architecture/execution_request.md)) | 実装済み |
+| #75 | **発注前 Safety Gate** + 判定監査保存 + 唯一の送信境界 `LiveOrderSubmissionService`([設計](../architecture/safety_gate.md)) | 実装済み |
+| #77 | **Execution 固定シナリオ試験**(`python -m execution.scenario_runner`。現在 48 シナリオ) | 実装済み |
+| #78 | **Shadow Mode**: Broker へ送信せず実判定経路を監査記録([設計](../architecture/shadow_execution.md)) | 実装済み |
+| #79 | **OANDA Demo Adapter**(Demo endpoint allowlist・fail-closed。Execution 層への組み込みは未実装) | 実装済み |
+| #81 | **Kill Switch**: 永続・fail-closed の緊急発注停止(`python -m execution.kill_switch_cli`) | 実装済み |
+| #93 / #99 | **Submission / Cancellation Journal** と公認キャンセル経路([設計](../architecture/submission_journal.md)) | 実装済み |
+| #102 / #114 | Broker 側 Order Reissue の状態機械 / 正規化拒否分類 `RejectionCategory` | 実装済み |
+| #95 / #115 / #116 / #117 | **再発行(reissue)系安全機構**: チェーン永続化(schema v5)・clearance・手動再発行 / 訂正差し替え / 自動再試行(既定無効)([設計](../architecture/execution_reissue.md)) | 実装済み |
+| #103〜#105 | **Broker reconciliation**: 差分検出 / 注文状態の安全な修復 / position・trade・SL・TP スコープ + 手動 CLI(`python -m execution.reconciliation_runner`。[設計](../architecture/broker_reconciliation.md)) | 実装済み |
+| #82 | **OANDA Live Adapter と Live 接続の二重以上のロック** + 起動前 preflight(`python -m execution.live_startup_cli`) | 実装済み |
 
-**今後の検討:**
+**v1.5 に含まれないもの(未実装):**
+
+- **実発注を駆動する定期実行 runner・自動売買**(Live Execution 本体の常駐プロセス)。まだ設計しない
+- `demo` mode の Execution 層統合(`BROKER_TYPE_BY_MODE` へ `demo` は未登録。OANDA Demo Adapter は手動 reconciliation CLI と opt-in 実 API テストのみが使用)
+- reconciliation の scheduler / 常駐 Bot への組み込み(手動 CLI のみ)
+- 外部 Strategy 定義の Paper Signal / Paper Execution との共有
+
+**v1.5 完了 = Live 実口座運用開始ではない。** Live 接続は Issue #82 の全ロック成立時のみ構築でき、実口座での Live 運用開始は [運用ドキュメント](../operations/operations.md) の「Live 運用開始の事前条件」(FakeBroker 固定シナリオ試験の安定 / Shadow Mode での想定注文確認 / Demo 口座での継続運転 / reconciliation 稼働 / Kill Switch 動作確認 / 発注数量・許可銘柄・リスク上限の設定)をすべて満たしたうえでの別途の運用判断である。
+
+## 今後の検討(v1.5 以降)
 
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
-- Live Execution / Broker API(Pepperoni の実発注担当分。Broker 境界は Issue #73、ExecutionRequest / 注文状態永続化基盤は Issue #74、発注前 Safety Gate は Issue #75、OANDA Demo Adapter は Issue #79、Broker reconciliation は Issue #103〜#105、Kill Switch は Issue #81、**OANDA Live Adapter と Live 接続の二重以上のロックは Issue #82** で実装済み。**実発注を駆動する定期実行 runner・自動売買はまだ設計しない**。v1.5 全体の記述同期は Issue #127)
+- Live Execution runner(Pepperoni の実発注担当分。基盤は v1.5 で実装済み。**実発注を駆動する定期実行 runner・自動売買はまだ設計しない**)
+- `demo` mode の Execution 層統合(`BROKER_TYPE_BY_MODE` への登録は別 Issue)
+- reconciliation の定期実行化
 - 外部Strategy定義をPaper Signalへ接続し、Live相当のSignal生成とBacktestを同一定義で駆動する共有化
-
-Broker API による**自動売買・実発注を駆動する定期実行 runner**(Live Execution 本体)は引き続き未実装・非スコープである(Adapter・Safety Gate・Live 接続ロックは Issue #79 / #75 / #82 で実装済み。Live 運用開始は [運用ドキュメント](../operations/operations.md) の事前条件による。v1.5 全体の記述同期は Issue #127)。実装済みの外部Strategy定義をPaper Signal / Paper Executionへ接続する共有化は、現在のアーキテクチャの一部ではなく将来構想として扱う。
+- Live 運用開始判断(上記事前条件の充足確認を含む。ドキュメント同期や実装完了をもって自動的に開始しない)

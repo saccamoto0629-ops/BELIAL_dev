@@ -13,7 +13,7 @@ from broker.fake_broker import FakeBroker
 > - Broker interface / FakeBroker は**将来の Live Execution 用の基盤(境界の定義)**である。
 > - FakeBroker は**外部通信しないテストダブル**である。ネットワーク・実DB・Discord・S3・sleep・乱数を使わない。
 > - **Paper Execution(`paper-execution/`)は従来どおり Broker 非依存の仮想執行**であり、本境界を使わない・使わせない。
-> - **OANDA Demo Adapter は Issue #79 で実装済み**(下記「OANDA Demo Adapter」節)。ただし **Demo の Execution 層への組み込み(`BROKER_TYPE_BY_MODE` への `demo` 登録)は未実装**である。**OANDA Live Adapter は Issue #82 で実装済み**(`broker/oanda_live_adapter.py`。共有変換エンジン `broker/oanda_v20_adapter.py` を Demo と共有し、Live 固有なのは endpoint allowlist・Live 専用 credential・identity・`LiveActivation` grant のみ)だが、**定期実行する Live Execution runner は未実装**であり、Adapter が存在しても Live 運用を開始してよいわけではない(事前条件は [運用ドキュメント](../operations/operations.md))。v1.5 全体の docs 同期は Issue #127。発注前の Safety Gate は Issue #75 で `execution/` に実装済み([Safety Gate](safety_gate.md))だが、Broker 実装からは独立した検証部品であり、本境界には何も追加しない。
+> - **OANDA Demo Adapter は Issue #79 で実装済み**(下記「OANDA Demo Adapter」節)。ただし **Demo の Execution 層への組み込み(`BROKER_TYPE_BY_MODE` への `demo` 登録)は未実装**である。**OANDA Live Adapter は Issue #82 で実装済み**(`broker/oanda_live_adapter.py`。共有変換エンジン `broker/oanda_v20_adapter.py` を Demo と共有し、Live 固有なのは endpoint allowlist・Live 専用 credential・identity・`LiveActivation` grant のみ)だが、**定期実行する Live Execution runner は未実装**であり、Adapter が存在しても Live 運用を開始してよいわけではない(事前条件は [運用ドキュメント](../operations/operations.md))。発注前の Safety Gate は Issue #75 で `execution/` に実装済み([Safety Gate](safety_gate.md))だが、Broker 実装からは独立した検証部品であり、本境界には何も追加しない。
 
 ## 依存方向
 

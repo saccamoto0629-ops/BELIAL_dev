@@ -57,7 +57,7 @@ Live 起動前 preflight(Issue #82): `python -m execution.live_startup_cli --exe
 | `scenario_models.py` | 固定シナリオ試験(Issue #77)のシナリオ定義ロード + closed-world schema validation(未知キー・未知 behavior/状態/拒否コード・型不一致・重複 scenario id を明示的に拒否。all-or-nothing ロード)。Issue #78 で `shadow` / `shadow_concurrent` ステップと Shadow 用 expected キーを追加 |
 | `scenario_runner.py` | 固定シナリオ実行器 + CLI(`python -m execution.scenario_runner`)。シナリオデータを**本番の Execution 経路そのまま**(`LiveOrderSubmissionService` / `SafetyGate` / `execution_store` / FakeBroker)へ流し、actual を収集して expected と比較する。判定ロジックの再実装なし(AST 検査で固定) |
 | `scenarios/` | 固定シナリオ定義(1ファイル = 1 シナリオの JSON)。正常約定・重複・Broker拒否・部分約定・timeout(UNKNOWN)・DB保存失敗・Safety Gate拒否・多重起動競合・Shadow Mode 系(Issue #78)・**キャンセル系(Issue #99: 成功 / Broker確定拒否 / terminal拒否 / 重複抑止 / timeout UNKNOWN / DB保存失敗)**など([下記](#固定シナリオ試験issue-77)) |
-| `examples/` | Shadow runner の cycle 入力サンプル(`shadow_cycle_example.json`) |
+| `examples/` | CLI 入力のサンプル: Shadow runner の cycle / 実行設定 / market・account snapshot(`shadow_cycle_example.json` / `shadow_execution_config_example.json` / `market_snapshot_example.json` / `account_snapshot_example.json`)と、Live 起動前 preflight の `--safety-config` サンプル(`live_safety_config_example.json`) |
 | `tests/` | `python -m pytest execution/tests -q`(`tmp_path` 配下の SQLite と FakeBroker のみ。外部通信・Discord・S3・sleep・実注文なし) |
 
 ## Safety Gate / 送信サービスの境界
@@ -187,7 +187,7 @@ DB 保存失敗は、シナリオ実行中だけ `execution_store` の対象関�
 ## 位置づけ(誤解しないこと)
 
 - 注文状態の唯一の正は既存の `broker.OrderState` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)。**本パッケージは注文状態 Enum・遷移表を新設しない。** CREATED / SUBMITTING は注文状態ではなく Execution Request 側の**送信フェーズ**(別フィールド)である。
-- Safety Gate は Live Execution 送信経路を安全にする**部品**であり、Issue #82 で Live 接続のロックと起動前 preflight が加わった。**定期実行する Live Execution runner は引き続き未実装**であり、Issue #82 の merge は Live 運用開始の判断ではない。reconciliation は Issue #103 の**差分検出**と Issue #104 の**注文状態の安全な修復**(内部 DB のみ・Broker write なし)まで実装済みで、position / SL・TP 照合と定期実行は未実装。`ExecutionMode` に `paper` は存在しない(Paper Execution は Broker 境界を使わず、Safety Gate を通らない)。
+- Safety Gate は Live Execution 送信経路を安全にする**部品**であり、Issue #82 で Live 接続のロックと起動前 preflight が加わった。**定期実行する Live Execution runner は引き続き未実装**であり、Issue #82 の merge は Live 運用開始の判断ではない。reconciliation は Issue #103 の**差分検出**、Issue #104 の**注文状態の安全な修復**(内部 DB のみ・Broker write なし)、Issue #105 の **position / trade / SL・TP スコープの検出**(`manual_review` のみ・修復経路なし)と手動 CLI まで実装済みで、**定期実行(scheduler 組み込み)は未実装**。`ExecutionMode` に `paper` は存在しない(Paper Execution は Broker 境界を使わず、Safety Gate を通らない)。
 - **Paper Signal / Paper Execution は本パッケージを使わない**(`tests/test_package_imports.py` が回帰として固定)。
 - UNKNOWN は即時再送可能状態ではない。照会対象として抽出し、後続照会結果の記録によってのみ確定状態へ解決する。state-only で記録できるのは UNKNOWN のみで、他のすべての観測は完全な `OrderResult` を `record_order_result` で記録する(stale snapshot による fill 消失・巻き戻しを DB 側 snapshot 検証で拒否)。
 

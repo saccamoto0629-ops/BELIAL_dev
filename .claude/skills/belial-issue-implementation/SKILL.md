@@ -27,7 +27,7 @@ BELIAL_dev の GitHub Issue を実装・修正するときの共通手順。Clau
    - テスト観点と pytest の対応: `docs/testing/test_specification.md`
    - Issue / PR 運用ルール: `docs/development/issues-guideline.md`
 2. **最小差分。** 既存運用を壊さない最小の変更で Issue の受け入れ条件を満たす。大きくなるなら分割を提案する。
-3. **レイヤー責務を壊さない。** Observation → Classification → Alert → Strategy → Hypothesis → Execution の責務分離(`docs/product/concept.md` の「レイヤー分離」)を超える変更をしない。特に Live Execution(実発注・Broker API 連携・自動売買)は非スコープ。
+3. **レイヤー責務を壊さない。** Observation → Classification → Alert → Strategy → Hypothesis → Execution の責務分離(`docs/product/concept.md` の「レイヤー分離」)を超える変更をしない。特に Live Execution の**運用領域**(実口座での Live 運用開始・実発注を駆動する定期実行 runner・自動売買)は非スコープであり、実装済みの Live Execution 基盤(Broker 境界・Adapter・Safety Gate・Live 接続ロック等)の安全契約を弱める変更をしない(現行の区別は `docs/product/concept.md` の「非スコープ」が正)。
 4. **不明点・未完了・既知制約を隠さない。** 確認できなかったこと、動かしていないこと、割り切った制約は、省略せず PR 本文と報告に明記する。推測で仕様を補わない。
 
 ## 実装フロー
