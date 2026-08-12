@@ -20,7 +20,7 @@ Live Execution ── Broker API による実注文。Paper Execution とは完�
 ```
 
 - **実発注・自動売買は一切行わない。** Paper Execution が生成するのは「もしこの仮説どおりに執行していたら」という仮想レコードだけである。
-- **Broker API(OANDA / XM / MT5 等)には接続しない。** 実装時には Paper Signal と同様に、broker API の import・発注関数呼び出しが存在しないことをテストで検証する(`test_module_source_has_no_broker_api_integration` と同型)。
+- **Broker API(OANDA / XM / MT5 等)には接続しない。** Paper Signal の `test_module_source_has_no_broker_api_integration` と同様に、`paper-execution/` が `broker` / `execution` パッケージを import しないことは `execution/tests/test_package_imports.py`(`FORBIDDEN_IMPORTERS`)が回帰として固定済みである。
 - **Backtest とは別物である。** Backtest は過去データを遡及再生する Validation 基盤(`backtest/`)であり、Paper Execution は **現在時刻に向かって前進する時間進行の中で** 確定足を1本ずつ消化する常駐処理である。ただし約定規則の語彙・保守的方針(`paper-signal/exit_policy.py` の same_candle_priority、`backtest/execution_model.py` の不利方向コスト)は共有し、両者の結果を比較可能に保つ。
 
 ## 責務(やること / やらないこと)
@@ -265,7 +265,7 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 
 - Paper Execution は **実発注・自動売買・Broker API 連携(OANDA / XM / MT5 等)・ロット計算・レバレッジ計算を一切含まない**。生成するのは paper_only の仮想レコードのみである。
 - `stop_loss_price` / `take_profit_price` は判定用のマーカーであり、broker への stop / limit 注文ではない(`exit_policy.py` と同じ「observation, not execution」の境界)。
-- Live Execution は将来の完全に別のレイヤーであり、Paper Execution のコード・データ・設定を実注文経路に転用しない。実装時は Paper Signal と同様、ソースコード上に broker API の import・発注呼び出しが存在しないことをテストで固定する。
+- Live Execution は完全に別のレイヤーであり、Paper Execution のコード・データ・設定を実注文経路に転用しない。Live Execution の基盤は `broker/` + `execution/` に実装済み(定期実行 runner は未実装・実口座での運用は未解禁)だが、この分離不変条件は変わらない: `paper-execution/` のソースコード上に broker API の import・発注呼び出しが存在しないことは `execution/tests/test_package_imports.py` が回帰として固定済みである。
 
 ## 他レイヤーとの入出力境界(まとめ)
 
