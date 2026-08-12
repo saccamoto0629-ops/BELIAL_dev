@@ -44,6 +44,14 @@ decision, a summary, a rendered line, a ``repr`` or an exception message.
 The summary reports the endpoint as a KIND label (``live`` / ``demo`` /
 ``unknown`` / ``not-configured``), and the account as the shared
 non-reversible digest ``broker.broker_models.safe_account_reference``.
+
+The same rule covers the safety CONFIGURATION, because the CLI copies its
+error text to stdout and to the JSON output (PR #128 Codex review r1/r2):
+no validation message echoes a configured VALUE, a configured KEY, or any
+document content the strict JSON loader would otherwise quote. An operator
+can paste a credential into any field, name a field with one, or duplicate
+such a key -- none of that reaches a log. Messages carry the schema field
+name (fixed vocabulary), the expected shape, and the file path only.
 """
 
 from __future__ import annotations
@@ -410,14 +418,31 @@ def load_live_safety_policy(path: str | Path) -> SafetyPolicy:
     """Load the live safety configuration from a JSON file (strict loader:
     duplicate keys, invalid UTF-8, oversized inputs and non-finite numbers
     are explicit errors). Any failure raises :class:`LiveSafetyConfigError`
-    -- the caller then passes ``policy=None`` and the startup is refused."""
-    return parse_live_safety_policy(
-        load_strict_json_file(
-            Path(path),
+    -- the caller then passes ``policy=None`` and the startup is refused.
+
+    The strict loader's own messages quote DOCUMENT CONTENT (the duplicate
+    key's name, the offending field name of a ``NaN``), and this text
+    reaches stdout and the JSON output through the CLI. That is the same
+    leak the value-free validation contract closes above, so the loader's
+    message is NOT forwarded: the failure classes are listed instead. The
+    PATH is kept -- it is the operator's own argument, printed by the CLI
+    anyway, and it is what makes the error actionable.
+    """
+    path = Path(path)
+    try:
+        raw = load_strict_json_file(
+            path,
             description="live safety configuration",
             error_cls=LiveSafetyConfigError,
         )
-    )
+    except LiveSafetyConfigError as exc:
+        raise LiveSafetyConfigError(
+            f"live safety configuration {path} was rejected before parsing (the document "
+            "content is not echoed): it is unreadable, oversized, not plain UTF-8, not "
+            "valid JSON, has duplicate object keys, contains NaN / Infinity, or exceeds "
+            "the nesting / string / array / object limits"
+        ) from exc
+    return parse_live_safety_policy(raw)
 
 
 def classify_endpoint(value) -> str:
@@ -551,9 +576,17 @@ def evaluate_live_activation(
     mode: ExecutionMode | None
     try:
         mode = resolve_execution_mode(execution_mode)
-    except ValueError as exc:
+    except ValueError:
         mode = None
-        reject(LiveLockCode.EXECUTION_MODE_NOT_LIVE, f"execution mode is unusable: {exc}")
+        # ``resolve_execution_mode`` quotes the value it was given; that text
+        # is not forwarded (PR #128 Codex review r1/r2 contract): the mode
+        # arrives from the command line, where an operator can mistype a
+        # credential just as easily as anywhere else.
+        reject(
+            LiveLockCode.EXECUTION_MODE_NOT_LIVE,
+            "the configured execution mode is not a known mode (the configured value is "
+            f"not echoed); a live connection requires exactly {ExecutionMode.LIVE.value!r}",
+        )
     if mode is not None and mode is not ExecutionMode.LIVE:
         reject(
             LiveLockCode.EXECUTION_MODE_NOT_LIVE,

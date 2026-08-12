@@ -548,6 +548,33 @@ def test_an_invalid_safety_configuration_never_echoes_the_value(tmp_path, overri
         pass
 
 
+def test_the_strict_loader_message_never_reaches_the_operator(tmp_path):
+    """The shared strict JSON loader quotes document content (a duplicate
+    key's name, the field of a NaN). That text is not forwarded, because the
+    CLI prints it -- the same leak class as the value/key findings."""
+    path = tmp_path / "live_safety.json"
+    for document in (
+        '{"policy_id": "a", "SECRET-DUPLICATE-KEY": 1, "SECRET-DUPLICATE-KEY": 2}',
+        '{"policy_id": NaN, "SECRET-FIELD": 1}',
+        '{"policy_id": "SECRET-VALUE"',
+    ):
+        path.write_text(document, encoding="utf-8")
+        with pytest.raises(LiveSafetyConfigError) as exc_info:
+            load_live_safety_policy(path)
+        assert "SECRET" not in str(exc_info.value), document
+        assert "not echoed" in str(exc_info.value)
+
+
+def test_an_unknown_execution_mode_value_is_not_echoed():
+    """The mode arrives from the command line and is operator input too."""
+    decision, _ = build(execution_mode="SECRET-MODE-VALUE")
+    assert decision.allowed is False
+    assert LiveLockCode.EXECUTION_MODE_NOT_LIVE.value in codes(decision)
+    rendered = " ".join(entry.message for entry in decision.rejections)
+    assert "SECRET-MODE-VALUE" not in rendered
+    assert decision.summary.execution_mode == "invalid"
+
+
 def test_unknown_safety_configuration_keys_are_not_echoed(tmp_path):
     """PR #128 Codex review r2 P1: a credential pasted as a KEY must not be
     printed either. Only the count and the allowed vocabulary are shown."""
