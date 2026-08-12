@@ -123,6 +123,50 @@ def test_adapter_refuses_to_exist_without_a_grant():
             live.OandaLiveAdapter(make_config(), activation, transport=FakeTransport())
 
 
+def test_a_grant_subclass_that_skips_validation_is_refused():
+    """PR #128 Codex review P1: a grant is only evidence if the validation
+    that makes it evidence actually ran. A subclass can override
+    ``__post_init__`` away, so only the exact validated class is accepted."""
+
+    class ForgedActivation(live.LiveActivation):
+        def __post_init__(self):  # skips BOTH lock checks
+            pass
+
+    forged = ForgedActivation(enable_live_trading_value=None, confirm_live=False)
+    assert isinstance(forged, live.LiveActivation)  # the hole isinstance would leave
+    with pytest.raises(live.LiveActivationError, match="exact LiveActivation grant"):
+        live.OandaLiveAdapter(make_config(), forged, transport=FakeTransport())
+
+
+def test_a_config_subclass_that_skips_the_allowlist_is_refused():
+    """The same hole on the config side: a subclass could carry empty
+    credentials or the demo endpoint straight past the allowlist."""
+
+    class ForgedConfig(live.OandaLiveConfig):
+        def __post_init__(self):  # skips the endpoint allowlist entirely
+            pass
+
+    forged = ForgedConfig(api_token="", account_id="", endpoint=demo.OANDA_DEMO_API_URL)
+    assert isinstance(forged, live.OandaLiveConfig)
+    with pytest.raises(ValueError, match="exactly a OandaLiveConfig"):
+        live.OandaLiveAdapter(forged, make_activation(), transport=FakeTransport())
+
+
+def test_the_demo_adapter_refuses_a_config_subclass_too():
+    """The same sealing applies to the demo adapter (strengthened, never
+    weakened, by Issue #82)."""
+
+    class ForgedDemoConfig(demo.OandaDemoConfig):
+        def __post_init__(self):
+            pass
+
+    forged = ForgedDemoConfig(
+        api_token="", account_id="", endpoint=live.OANDA_LIVE_API_URL
+    )
+    with pytest.raises(ValueError, match="exactly a OandaDemoConfig"):
+        demo.OandaDemoAdapter(forged, transport=FakeTransport())
+
+
 # --- lock 4 + 5: credentials and the endpoint allowlist ------------------------
 
 

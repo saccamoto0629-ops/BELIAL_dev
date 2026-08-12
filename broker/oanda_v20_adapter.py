@@ -510,9 +510,15 @@ class OandaV20Adapter:
                     f"{type(self).__name__} must declare {attribute}; the OANDA v20 engine "
                     "is abstract and has no default endpoint, label or identity"
                 )
-        if not isinstance(config, self.CONFIG_TYPE):
+        # EXACT type, not isinstance (PR #128 Codex review P1): a config
+        # SUBCLASS can override __post_init__ and skip the endpoint allowlist
+        # entirely, handing the adapter empty credentials or the other
+        # environment's endpoint. The allowlist is the whole point of the
+        # config type, so a type that merely claims to be one is refused.
+        if type(config) is not self.CONFIG_TYPE:
             raise ValueError(
-                f"config must be an {self.CONFIG_TYPE.__name__}, got {type(config).__name__}"
+                f"config must be exactly a {self.CONFIG_TYPE.__name__} (subclasses are "
+                f"refused: they can skip the endpoint allowlist), got {type(config).__name__}"
             )
         if transport is not None and not callable(transport):
             raise ValueError("transport must be a callable (method, url, headers, body, timeout)")

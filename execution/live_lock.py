@@ -264,6 +264,14 @@ _LIVE_POLICY_KEYS = frozenset(
 )
 
 
+# Every message below names the FIELD and the EXPECTED SHAPE and NEVER the
+# value that was found (PR #128 Codex review P1). The CLI copies this text
+# into its stdout / JSON output, so an operator who accidentally pastes a
+# token, a full account id or an endpoint URL into any field must not see it
+# echoed back into a log. The field NAMES are the closed-world schema keys,
+# which are fixed vocabulary, not operator data.
+
+
 def _require_key(mapping: dict, key: str):
     if key not in mapping:
         raise LiveSafetyConfigError(
@@ -274,13 +282,19 @@ def _require_key(mapping: dict, key: str):
 
 def _positive_decimal(value, name: str) -> Decimal:
     if not isinstance(value, str):
-        raise LiveSafetyConfigError(f"{name} must be a decimal string, got {value!r}")
+        raise LiveSafetyConfigError(
+            f"{name} must be a decimal string (the configured value is not echoed)"
+        )
     try:
         parsed = Decimal(value)
     except InvalidOperation:
-        raise LiveSafetyConfigError(f"{name} is not a valid decimal string: {value!r}") from None
+        raise LiveSafetyConfigError(
+            f"{name} is not a valid decimal string (the configured value is not echoed)"
+        ) from None
     if not parsed.is_finite() or parsed < 0:
-        raise LiveSafetyConfigError(f"{name} must be a non-negative finite decimal, got {value!r}")
+        raise LiveSafetyConfigError(
+            f"{name} must be a non-negative finite decimal (the configured value is not echoed)"
+        )
     return parsed
 
 
@@ -290,14 +304,18 @@ def _non_empty_str_list(mapping: dict, key: str) -> list[str]:
         raise LiveSafetyConfigError(f"{key} must be a non-empty list of strings")
     for entry in value:
         if not isinstance(entry, str) or not entry.strip():
-            raise LiveSafetyConfigError(f"{key} entries must be non-empty strings, got {entry!r}")
+            raise LiveSafetyConfigError(
+                f"{key} entries must be non-empty strings (the configured values are not echoed)"
+            )
     return list(value)
 
 
 def _config_int(mapping: dict, key: str, *, minimum: int) -> int:
     value = _require_key(mapping, key)
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise LiveSafetyConfigError(f"{key} must be an integer >= {minimum}, got {value!r}")
+        raise LiveSafetyConfigError(
+            f"{key} must be an integer >= {minimum} (the configured value is not echoed)"
+        )
     return value
 
 
@@ -307,11 +325,14 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
     configured ones (the mode/target check the Safety Gate already
     performs per submission)."""
     if not isinstance(raw, dict):
+        # A TYPE name is not operator data.
         raise LiveSafetyConfigError(
             f"live safety configuration must be an object, got {type(raw).__name__}"
         )
     unknown = set(raw) - _LIVE_POLICY_KEYS
     if unknown:
+        # Unknown KEYS are named: the schema is closed-world, so a key is
+        # either a known field name or a typo of one -- never a value.
         raise LiveSafetyConfigError(
             f"live safety configuration has unknown keys {sorted(unknown)}; "
             f"allowed: {sorted(_LIVE_POLICY_KEYS)}"
@@ -322,23 +343,28 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
             sides.append(OrderSide(entry))
         except ValueError:
             raise LiveSafetyConfigError(
-                f"allowed_sides entry {entry!r} must be one of "
-                f"{sorted(item.value for item in OrderSide)}"
+                "allowed_sides entries must each be one of "
+                f"{sorted(item.value for item in OrderSide)} "
+                "(the configured value is not echoed)"
             ) from None
     spreads_raw = _require_key(raw, "max_spread_by_symbol")
     if not isinstance(spreads_raw, dict) or not spreads_raw:
         raise LiveSafetyConfigError("max_spread_by_symbol must be a non-empty object")
+    # The per-symbol key is NOT interpolated into the error text: it is
+    # operator-supplied data like any value (PR #128 Codex review P1).
     spreads = {
-        symbol: _positive_decimal(spread, f"max_spread_by_symbol[{symbol}]")
+        symbol: _positive_decimal(spread, "max_spread_by_symbol entries")
         for symbol, spread in spreads_raw.items()
     }
     policy_id = _require_key(raw, "policy_id")
     if not isinstance(policy_id, str) or not policy_id.strip():
-        raise LiveSafetyConfigError(f"policy_id must be a non-empty string, got {policy_id!r}")
+        raise LiveSafetyConfigError(
+            "policy_id must be a non-empty string (the configured value is not echoed)"
+        )
     require_stop_loss = _require_key(raw, "require_stop_loss")
     if not isinstance(require_stop_loss, bool):
         raise LiveSafetyConfigError(
-            f"require_stop_loss must be a boolean, got {require_stop_loss!r}"
+            "require_stop_loss must be a boolean (the configured value is not echoed)"
         )
     try:
         return SafetyPolicy(
@@ -362,7 +388,18 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
     except LiveSafetyConfigError:
         raise
     except ValueError as exc:
-        raise LiveSafetyConfigError(f"live safety configuration is invalid: {exc}") from exc
+        # SafetyPolicy's own cross-field messages quote symbols, targets and
+        # limits, so they are NOT forwarded (PR #128 Codex review P1): the
+        # operator gets the constraint list, and the original exception stays
+        # available as ``__cause__`` for an interactive debugger only -- the
+        # CLI prints ``str(error)``, never the chain.
+        raise LiveSafetyConfigError(
+            "live safety configuration violates the safety-policy invariants (values are "
+            "not echoed): max_spread_by_symbol keys must exactly cover allowed_symbols, "
+            "symbols and targets must carry no surrounding whitespace, "
+            "max_order_quantity and max_reference_age_seconds must be > 0, and one "
+            "connection target may belong to only one execution mode"
+        ) from exc
 
 
 def load_live_safety_policy(path: str | Path) -> SafetyPolicy:
@@ -578,9 +615,9 @@ def evaluate_live_activation(
     ):
         reject(
             LiveLockCode.LIVE_TARGET_NOT_ALLOWED,
-            f"connection target {OANDA_LIVE_CONNECTION_TARGET!r} is not allowed for "
-            f"execution mode {ExecutionMode.LIVE.value!r} by policy "
-            f"{policy.policy_id!r}",
+            f"connection target {OANDA_LIVE_CONNECTION_TARGET!r} is not listed in the "
+            "safety configuration's allowed_live_targets (the configured values are not "
+            "echoed)",
         )
 
     # --- kill switch (fail closed: unreadable is as blocking as ON) -------
@@ -668,13 +705,34 @@ def build_live_connection(
     *,
     execution_mode,
     confirm_live: bool,
-    policy: SafetyPolicy | None,
-    state_provider,
-    environ: Mapping[str, str] | None = None,
+    safety_config_path: str | Path,
+    kill_switch_db_path: str | Path | None = None,
     transport: Callable | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> tuple[LiveActivationDecision, BrokerConnection | None]:
     """THE sanctioned composer of a live ``BrokerConnection``.
+
+    SEALED PROOFS (PR #128 Codex review P1). Every input this function
+    judges is obtained HERE, from the real source, and cannot be injected:
+
+    - the safety policy is LOADED from ``safety_config_path``; only a
+      filesystem path can be passed, never a ``SafetyPolicy`` object, so a
+      caller cannot hand over a permissive policy in place of one that
+      failed to load (a load failure becomes ``SAFETY_POLICY_UNAVAILABLE``);
+    - the kill-switch state comes from a ``PersistentKillSwitchStateProvider``
+      built HERE over ``kill_switch_db_path`` (default: the packaged /
+      ``KILL_SWITCH_DB_PATH`` location), so a provider that answers ``False``
+      cannot be substituted for a store that is ON or unreadable;
+    - the environment is ``os.environ`` itself, so a fabricated mapping
+      cannot stand in for a process that never had ``ENABLE_LIVE_TRADING``
+      set.
+
+    This is the same sealing rule ``LiveOrderSubmissionService`` applies to
+    its audit store and submission journal (Issue #75 / #93): a path can be
+    configured, an object cannot be injected.
+    :func:`evaluate_live_activation` remains injectable on purpose -- it
+    returns a DECISION and never a connection, so injected inputs there can
+    authorize nothing.
 
     Returns ``(decision, connection)``. The connection is ``None`` unless
     every lock held; when it is not ``None``, the adapter behind it was
@@ -683,20 +741,32 @@ def build_live_connection(
     decision here, once as an unrepresentable object in the broker layer.
 
     No order is placed here. Construction performs no network I/O.
-    ``transport`` / ``clock`` exist for tests and for a caller that must
-    inject an audited HTTP transport; the default transport is the
-    adapter's own single-attempt ``requests`` call.
+    ``transport`` / ``clock`` are the adapter's existing injection points
+    (the demo adapter has the same ones): they decide HOW the allowlisted
+    endpoint is reached, never WHETHER a lock held.
     """
+    # Imported here so the module stays importable without touching the
+    # kill-switch store, and so the store is opened only when a live startup
+    # is actually attempted.
+    from execution.kill_switch_store import PersistentKillSwitchStateProvider
+
+    policy: SafetyPolicy | None
+    try:
+        policy = load_live_safety_policy(safety_config_path)
+    except LiveSafetyConfigError:
+        # Fail closed: no policy at all, which the evaluation below turns
+        # into SAFETY_POLICY_UNAVAILABLE.
+        policy = None
     decision = evaluate_live_activation(
         execution_mode=execution_mode,
         confirm_live=confirm_live,
-        environ=environ,
+        environ=os.environ,
         policy=policy,
-        state_provider=state_provider,
+        state_provider=PersistentKillSwitchStateProvider(kill_switch_db_path),
     )
     if not decision.allowed:
         return decision, None
-    env = os.environ if environ is None else environ
+    env = os.environ
     try:
         config = OandaLiveConfig.from_env(env)
         activation = LiveActivation.from_environment(env, confirm_live=confirm_live)

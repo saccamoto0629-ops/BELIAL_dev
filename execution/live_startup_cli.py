@@ -41,10 +41,7 @@ import sys
 from pathlib import Path
 
 from execution.cli_streams import encoding_safe_streams
-from execution.kill_switch_store import (
-    PersistentKillSwitchStateProvider,
-    kill_switch_db_path,
-)
+from execution.kill_switch_store import kill_switch_db_path
 from execution.live_lock import (
     LiveSafetyConfigError,
     build_live_connection,
@@ -101,26 +98,28 @@ def _run_cli(argv: list[str] | None) -> int:
 
     # An unreadable safety configuration is NOT a usage error that stops the
     # summary: it is a lock failure, so the operator still sees the summary
-    # and the machine-readable refusal code.
-    policy = None
+    # and the machine-readable refusal code. This load is for the OPERATOR
+    # MESSAGE ONLY -- the composer loads the file itself from the same path
+    # and never accepts a policy object from here (PR #128 Codex review P1),
+    # so nothing this CLI computes can authorize a live connection. The
+    # message is value-free by construction (see live_lock's parser).
     config_error = None
     try:
-        policy = load_live_safety_policy(args.safety_config)
+        load_live_safety_policy(args.safety_config)
     except LiveSafetyConfigError as exc:
         config_error = str(exc)
 
-    # The provider only OPENS the store when the state is read (inside the
-    # evaluation): a missing / foreign / corrupt DB surfaces there as the
-    # fail-closed KILL_SWITCH_STATE_UNVERIFIABLE refusal, and this CLI never
+    # The kill-switch store is opened by the composer when it reads the
+    # state: a missing / foreign / corrupt DB surfaces there as the
+    # fail-closed KILL_SWITCH_STATE_UNVERIFIABLE refusal, and nothing here
     # creates the DB.
     db_path = args.kill_switch_db if args.kill_switch_db is not None else kill_switch_db_path()
-    state_provider = PersistentKillSwitchStateProvider(db_path)
 
     decision, connection = build_live_connection(
         execution_mode=args.execution_mode,
         confirm_live=args.confirm_live,
-        policy=policy,
-        state_provider=state_provider,
+        safety_config_path=args.safety_config,
+        kill_switch_db_path=db_path,
     )
     # The connection is composed only to PROVE every lock held; nothing is
     # sent through it here and it is dropped when this function returns.

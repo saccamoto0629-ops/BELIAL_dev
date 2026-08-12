@@ -267,6 +267,52 @@ def test_no_output_stream_ever_carries_a_secret(tmp_path, monkeypatch, capsys, j
             assert "Authorization" not in stream
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"policy_id": ""}, id="policy_id"),
+        pytest.param({"allowed_sides": ["PASTED-CREDENTIAL"]}, id="allowed_sides"),
+        pytest.param({"max_order_quantity": "PASTED-CREDENTIAL"}, id="max_order_quantity"),
+        pytest.param(
+            {"max_spread_by_symbol": {"USD_JPY": "PASTED-CREDENTIAL"}}, id="spread-value"
+        ),
+        pytest.param({"require_stop_loss": "PASTED-CREDENTIAL"}, id="require_stop_loss"),
+        pytest.param({"allowed_symbols": ["PASTED-CREDENTIAL", " "]}, id="allowed_symbols"),
+    ],
+)
+@pytest.mark.parametrize("json_flag", [[], ["--json"]])
+def test_a_credential_pasted_into_the_safety_config_is_never_printed(
+    tmp_path, monkeypatch, capsys, overrides, json_flag
+):
+    """PR #128 Codex review P1: an invalid field must be reported by NAME and
+    expected shape only -- the value never reaches stdout, stderr or the
+    machine-readable output."""
+    set_live_env(monkeypatch)
+    path = safety_config(tmp_path, **overrides)
+    assert run(tmp_path, "--confirm-live", *json_flag, config_path=path) == EXIT_REFUSED
+    captured = capsys.readouterr()
+    for stream in (captured.out, captured.err):
+        assert "PASTED-CREDENTIAL" not in stream
+
+
+def test_the_cli_cannot_hand_the_composer_a_policy_object(tmp_path, monkeypatch, capsys):
+    """PR #128 Codex review P1: the CLI loads the config only to render an
+    operator message; authorization always re-loads it inside the sealed
+    composer. A policy that the CLI could read but the composer could not is
+    still a refusal."""
+    import execution.live_startup_cli as cli
+
+    set_live_env(monkeypatch)
+    path = safety_config(tmp_path)
+    # The CLI's own read succeeds; the composer's read is made to fail.
+    def refusing_loader(config_path):
+        raise cli.LiveSafetyConfigError("configuration unreadable at composition time")
+
+    monkeypatch.setattr("execution.live_lock.load_live_safety_policy", refusing_loader)
+    assert run(tmp_path, "--confirm-live", config_path=path) == EXIT_REFUSED
+    assert "safety_policy_unavailable" in capsys.readouterr().err
+
+
 def test_the_masked_account_is_shown_instead_of_the_real_one(tmp_path, monkeypatch, capsys):
     set_live_env(monkeypatch)
     run(tmp_path, "--confirm-live", "--json")

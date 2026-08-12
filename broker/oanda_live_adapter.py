@@ -273,10 +273,17 @@ class OandaLiveAdapter(OandaV20Adapter):
     IDENTITY_TARGET = OANDA_LIVE_CONNECTION_TARGET
 
     def __init__(self, config, activation, *, transport=None, clock=None) -> None:
-        if not isinstance(activation, LiveActivation):
+        # EXACT type, not isinstance (PR #128 Codex review P1): a
+        # LiveActivation SUBCLASS can override __post_init__ and hand back a
+        # "grant" that proves nothing (confirm_live False, the env flag
+        # absent). A grant is only evidence if the validation that makes it
+        # evidence actually ran, so only the validated class is accepted.
+        # The config type is checked the same way by the engine.
+        if type(activation) is not LiveActivation:
             raise LiveActivationError(
-                "a live adapter requires a LiveActivation grant "
-                "(ENABLE_LIVE_TRADING=true plus the explicit --confirm-live argument), "
+                "a live adapter requires an exact LiveActivation grant "
+                "(ENABLE_LIVE_TRADING=true plus the explicit --confirm-live argument); "
+                "subclasses are refused because they can skip the grant's validation, "
                 f"got {type(activation).__name__}"
             )
         super().__init__(config, transport=transport, clock=clock)

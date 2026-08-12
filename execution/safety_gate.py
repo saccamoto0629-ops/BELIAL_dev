@@ -163,6 +163,25 @@ BROKER_TYPE_BY_MODE: dict[ExecutionMode, type] = {
     ExecutionMode.LIVE: OandaLiveAdapter,
 }
 
+# Modes whose registered broker type must match EXACTLY, subclasses refused
+# (PR #128 Codex review P1). ``fake`` deliberately allows subclasses -- the
+# test doubles that inject faults, lie about their identity or delegate to
+# super() are FakeBroker subclasses by design, and none of them can place a
+# real order. ``live`` cannot afford that: a subclass could override
+# ``__init__`` and never run the constructor that requires the activation
+# grant and the allowlisted config, producing an object that passes
+# ``isinstance`` while none of the locks were checked. So for live, the
+# registered type is the only acceptable type.
+EXACT_BROKER_TYPE_MODES: frozenset[ExecutionMode] = frozenset({ExecutionMode.LIVE})
+
+
+def _broker_type_matches(broker, mode: ExecutionMode, expected_type: type) -> bool:
+    """Type cross-check for the mode: exact for locked modes (see
+    :data:`EXACT_BROKER_TYPE_MODES`), ``isinstance`` for the rest."""
+    if mode in EXACT_BROKER_TYPE_MODES:
+        return type(broker) is expected_type
+    return isinstance(broker, expected_type)
+
 
 class SafetyRejectionCode(enum.Enum):
     """Machine-readable rejection codes. These values are the PRIMARY record
@@ -284,14 +303,15 @@ class BrokerConnection:
                 f"{mode.value!r}; only "
                 f"{sorted(known.value for known in BROKER_TYPE_BY_MODE)} connections can exist yet"
             )
-        if not isinstance(self.broker, expected_type):
+        if not _broker_type_matches(self.broker, mode, expected_type):
+            exactly = " exactly" if mode in EXACT_BROKER_TYPE_MODES else ""
             raise ValueError(
-                f"execution mode {mode.value!r} requires a "
+                f"execution mode {mode.value!r} requires{exactly} a "
                 f"{expected_type.__name__} instance, got {type(self.broker).__name__}"
             )
         claimed_modes = [
             known for known, broker_type in BROKER_TYPE_BY_MODE.items()
-            if isinstance(self.broker, broker_type)
+            if _broker_type_matches(self.broker, known, broker_type)
         ]
         if claimed_modes != [mode]:
             raise ValueError(
@@ -868,7 +888,9 @@ class SafetyGate:
                     f"{connection.execution_mode.value!r}/{connection.connection_target!r}",
                 )
             expected_type = BROKER_TYPE_BY_MODE.get(derived_mode)
-            if expected_type is None or not isinstance(connection.broker, expected_type):
+            if expected_type is None or not _broker_type_matches(
+                connection.broker, derived_mode, expected_type
+            ):
                 reject(
                     SafetyRejectionCode.EXECUTION_MODE_MISMATCH,
                     f"broker type {type(connection.broker).__name__} does not match execution "

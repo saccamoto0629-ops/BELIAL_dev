@@ -20,6 +20,7 @@ What is pinned:
   never reaches the broker.
 """
 
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -119,16 +120,26 @@ def evaluate(**overrides):
 
 
 def build(**overrides):
+    """Drive the DECISION path with injected inputs.
+
+    Injection is safe here on purpose (PR #128 Codex review P1):
+    ``evaluate_live_activation`` returns a decision and can never return a
+    connection, so nothing injected can authorize anything. The sealed
+    composer -- which loads the policy from a file, opens the real
+    kill-switch store and reads ``os.environ`` itself -- is exercised
+    separately in "the sealed composer" section below, and the second
+    element of the tuple is always ``None`` here.
+    """
     values = dict(
         execution_mode="live",
         confirm_live=True,
         environ=live_env(),
         policy=policy(),
         state_provider=StaticSafetyState(kill_switch_enabled=False),
-        transport=poisoned_transport,
     )
     values.update(overrides)
-    return build_live_connection(**values)
+    decision = evaluate_live_activation(**values)
+    return decision, None
 
 
 def codes(decision):
@@ -138,14 +149,13 @@ def codes(decision):
 # --- the happy path: every lock, and only then ---------------------------------
 
 
-def test_a_live_connection_is_composed_only_when_every_lock_holds():
+def test_every_lock_satisfied_is_the_only_allowed_decision():
     decision, connection = build()
     assert decision.allowed is True
     assert decision.rejections == ()
-    assert connection is not None
-    assert connection.execution_mode is ExecutionMode.LIVE
-    assert connection.connection_target == "oanda-live"
-    assert isinstance(connection.broker, OandaLiveAdapter)
+    # The evaluator NEVER composes: only the sealed composer does (see
+    # "the sealed composer" section).
+    assert connection is None
 
 
 # --- one lock at a time: each one alone refuses --------------------------------
@@ -365,9 +375,8 @@ def test_a_missing_persistent_kill_switch_store_refuses_the_startup(tmp_path):
     """The production provider, against a store that was never created:
     fail-closed, and the store is NOT created as a side effect."""
     db_path = tmp_path / "kill_switch.sqlite3"
-    decision, connection = build(state_provider=PersistentKillSwitchStateProvider(db_path))
+    decision, _ = build(state_provider=PersistentKillSwitchStateProvider(db_path))
     assert decision.allowed is False
-    assert connection is None
     assert codes(decision) == {LiveLockCode.KILL_SWITCH_STATE_UNVERIFIABLE.value}
     assert not db_path.exists()
 
@@ -384,9 +393,8 @@ def test_a_verified_off_persistent_kill_switch_allows_the_startup(tmp_path):
         reason="ready for live",
         changed_at_utc=NOW + timedelta(minutes=1),
     )
-    decision, connection = build(state_provider=PersistentKillSwitchStateProvider(db_path))
+    decision, _ = build(state_provider=PersistentKillSwitchStateProvider(db_path))
     assert decision.allowed is True
-    assert connection is not None
     assert decision.summary.kill_switch == KILL_SWITCH_DISABLED
 
 
@@ -414,6 +422,50 @@ def test_a_policy_that_does_not_allow_the_live_target_refuses_the_startup():
     assert decision.allowed is False
     assert connection is None
     assert codes(decision) == {LiveLockCode.LIVE_TARGET_NOT_ALLOWED.value}
+
+
+def test_a_live_adapter_subclass_cannot_claim_the_live_mode():
+    """PR #128 Codex review P1: an ``OandaLiveAdapter`` subclass could
+    override ``__init__`` and never run the constructor that demands the
+    grant and the allowlisted config, yet still satisfy ``isinstance``. The
+    live mode therefore requires the EXACT registered type."""
+    from broker.broker_models import BrokerConnectionIdentity
+    from execution.safety_gate import (
+        BROKER_TYPE_BY_MODE,
+        EXACT_BROKER_TYPE_MODES,
+        BrokerConnection,
+    )
+
+    class ForgedLiveAdapter(OandaLiveAdapter):
+        def __init__(self):  # never calls super(): no grant, no config
+            self._connection_identity = BrokerConnectionIdentity(
+                mode="live", target="oanda-live"
+            )
+
+        def connection_identity(self):
+            return self._connection_identity
+
+    forged = ForgedLiveAdapter()
+    assert isinstance(forged, OandaLiveAdapter)  # the hole isinstance would leave
+    assert EXACT_BROKER_TYPE_MODES == {ExecutionMode.LIVE}
+    assert BROKER_TYPE_BY_MODE[ExecutionMode.LIVE] is OandaLiveAdapter
+    with pytest.raises(ValueError, match="requires exactly a OandaLiveAdapter"):
+        BrokerConnection(broker=forged)
+
+
+def test_fake_broker_subclasses_are_still_accepted_for_the_fake_mode():
+    """The exact-type rule is scoped to the locked mode: the FakeBroker test
+    doubles (fault injection, identity lies, delegation) stay usable."""
+    from broker.fake_broker import FakeBroker
+    from execution.safety_gate import BrokerConnection
+
+    class DelegatingFake(FakeBroker):
+        pass
+
+    connection = BrokerConnection(
+        broker=DelegatingFake(default_fill_price=Decimal("150"), clock=lambda: NOW)
+    )
+    assert connection.execution_mode is ExecutionMode.FAKE
 
 
 def write_safety_config(tmp_path, **overrides):
@@ -464,6 +516,50 @@ def test_a_missing_safety_configuration_file_fails_closed(tmp_path):
 def test_an_invalid_safety_configuration_fails_closed(tmp_path, overrides):
     with pytest.raises(LiveSafetyConfigError):
         load_live_safety_policy(write_safety_config(tmp_path, **overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"policy_id": "SECRET-VALUE"}, id="policy_id-wrong-type-ok"),
+        pytest.param({"allowed_sides": ["SECRET-VALUE"]}, id="allowed_sides"),
+        pytest.param({"max_order_quantity": "SECRET-VALUE"}, id="max_order_quantity"),
+        pytest.param({"max_spread_by_symbol": {"USD_JPY": "SECRET-VALUE"}}, id="spread-value"),
+        pytest.param({"max_positions_account": "SECRET-VALUE"}, id="positions"),
+        pytest.param({"require_stop_loss": "SECRET-VALUE"}, id="require_stop_loss"),
+        pytest.param({"allowed_symbols": ["SECRET-VALUE", " "]}, id="allowed_symbols"),
+        pytest.param({"allowed_live_targets": [" "]}, id="allowed_live_targets"),
+        pytest.param({"max_reference_age_seconds": "SECRET-VALUE"}, id="reference-age"),
+        pytest.param({"max_spread_by_symbol": {"SECRET-VALUE": "0.05"}}, id="spread-key"),
+    ],
+)
+def test_an_invalid_safety_configuration_never_echoes_the_value(tmp_path, overrides):
+    """PR #128 Codex review P1: an operator who pastes a token / account id /
+    endpoint into ANY field must not see it echoed back -- the CLI copies
+    this message into stdout and the JSON output."""
+    path = write_safety_config(tmp_path, **overrides)
+    try:
+        load_live_safety_policy(path)
+    except LiveSafetyConfigError as exc:
+        assert "SECRET-VALUE" not in str(exc), str(exc)
+    else:  # a document that happens to stay valid is fine; nothing was printed
+        pass
+
+
+def test_a_policy_invariant_violation_never_echoes_the_values(tmp_path):
+    """SafetyPolicy's own cross-field messages quote symbols and targets, so
+    they are not forwarded: the operator gets the constraint list instead."""
+    path = write_safety_config(
+        tmp_path,
+        allowed_symbols=["SECRET-VALUE"],
+        max_spread_by_symbol={"OTHER-SECRET": "0.05"},
+    )
+    with pytest.raises(LiveSafetyConfigError) as exc_info:
+        load_live_safety_policy(path)
+    message = str(exc_info.value)
+    assert "SECRET-VALUE" not in message
+    assert "OTHER-SECRET" not in message
+    assert "max_spread_by_symbol keys must exactly cover allowed_symbols" in message
 
 
 def test_a_safety_configuration_missing_a_field_fails_closed(tmp_path):
@@ -580,10 +676,143 @@ def test_endpoint_classification_is_a_label_never_the_value(value, expected):
     assert classify_endpoint(value) == expected
 
 
+
+# --- the sealed composer -------------------------------------------------------
+#
+# build_live_connection() takes PATHS, not proofs (PR #128 Codex review P1):
+# it loads the policy itself, opens the real kill-switch store itself and
+# reads os.environ itself. These tests drive it exactly the way production
+# does -- real files, real environment -- and still never touch a network.
+
+
+def write_safety_config_file(tmp_path, **overrides):
+    return write_safety_config(tmp_path, **overrides)
+
+
+def released_kill_switch(tmp_path, *, enabled=False):
+    """A kill-switch store whose VERIFIED state is off (or on)."""
+    db_path = tmp_path / "kill_switch.sqlite3"
+    store = SQLiteKillSwitchStore(db_path)
+    store.initialize_and_record(
+        enabled=True, operator="ops", reason="initial halt", changed_at_utc=NOW
+    )
+    if not enabled:
+        store.record_transition(
+            enabled=False,
+            operator="ops",
+            reason="ready for live",
+            changed_at_utc=NOW + timedelta(minutes=1),
+        )
+    return db_path
+
+
+def seal_live_environment(monkeypatch, **overrides):
+    """Put the live configuration into the REAL process environment."""
+    values = {
+        ENV_ENABLE_LIVE_TRADING: ENABLE_LIVE_TRADING_TRUE,
+        ENV_LIVE_API_TOKEN: TOKEN,
+        ENV_LIVE_ACCOUNT_ID: ACCOUNT,
+        ENV_LIVE_API_URL: OANDA_LIVE_API_URL,
+        "OANDA_API_TOKEN": None,
+        "OANDA_ACCOUNT_ID": None,
+        "OANDA_API_URL": None,
+    }
+    values.update(overrides)
+    for name, value in values.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def sealed_build(tmp_path, monkeypatch, *, transport=None, config_path=None,
+                 kill_switch_db=None, confirm_live=True, execution_mode="live",
+                 **env_overrides):
+    seal_live_environment(monkeypatch, **env_overrides)
+    return build_live_connection(
+        execution_mode=execution_mode,
+        confirm_live=confirm_live,
+        safety_config_path=(
+            config_path if config_path is not None else write_safety_config(tmp_path)
+        ),
+        kill_switch_db_path=(
+            kill_switch_db if kill_switch_db is not None else released_kill_switch(tmp_path)
+        ),
+        transport=transport if transport is not None else poisoned_transport,
+    )
+
+
+def test_the_composer_accepts_no_injected_proof_at_all():
+    """The signature IS the guarantee: there is no parameter through which a
+    policy object, a kill-switch provider or an environment mapping can be
+    supplied, so a library caller cannot substitute a permissive one."""
+    parameters = set(inspect.signature(build_live_connection).parameters)
+    assert {"policy", "state_provider", "environ"} & parameters == set()
+    assert {"safety_config_path", "kill_switch_db_path"} <= parameters
+
+
+def test_the_sealed_composer_builds_a_live_connection_when_every_lock_holds(
+    tmp_path, monkeypatch
+):
+    decision, connection = sealed_build(tmp_path, monkeypatch)
+    assert decision.allowed is True
+    assert connection is not None
+    assert connection.execution_mode is ExecutionMode.LIVE
+    assert connection.connection_target == "oanda-live"
+    assert isinstance(connection.broker, OandaLiveAdapter)
+
+
+def test_the_sealed_composer_reads_the_real_environment(tmp_path, monkeypatch):
+    """A process that never had ENABLE_LIVE_TRADING set cannot be talked into
+    a live connection: the composer reads os.environ, not an argument."""
+    decision, connection = sealed_build(
+        tmp_path, monkeypatch, **{ENV_ENABLE_LIVE_TRADING: None}
+    )
+    assert decision.allowed is False
+    assert connection is None
+    assert LiveLockCode.LIVE_TRADING_DISABLED.value in codes(decision)
+
+
+def test_the_sealed_composer_loads_the_policy_itself(tmp_path, monkeypatch):
+    """An unreadable safety configuration cannot be replaced by a default
+    policy: the composer loads the file and refuses when it cannot."""
+    decision, connection = sealed_build(
+        tmp_path, monkeypatch, config_path=tmp_path / "absent.json"
+    )
+    assert decision.allowed is False
+    assert connection is None
+    assert codes(decision) == {LiveLockCode.SAFETY_POLICY_UNAVAILABLE.value}
+
+
+def test_the_sealed_composer_opens_the_real_kill_switch_store(tmp_path, monkeypatch):
+    decision, connection = sealed_build(
+        tmp_path, monkeypatch, kill_switch_db=released_kill_switch(tmp_path, enabled=True)
+    )
+    assert decision.allowed is False
+    assert connection is None
+    assert codes(decision) == {LiveLockCode.KILL_SWITCH_ENABLED.value}
+
+
+def test_the_sealed_composer_refuses_a_missing_kill_switch_store(tmp_path, monkeypatch):
+    db_path = tmp_path / "never_created.sqlite3"
+    decision, connection = sealed_build(tmp_path, monkeypatch, kill_switch_db=db_path)
+    assert decision.allowed is False
+    assert connection is None
+    assert codes(decision) == {LiveLockCode.KILL_SWITCH_STATE_UNVERIFIABLE.value}
+    assert not db_path.exists()
+
+
+def test_the_sealed_composer_still_needs_confirm_live(tmp_path, monkeypatch):
+    decision, connection = sealed_build(tmp_path, monkeypatch, confirm_live=False)
+    assert decision.allowed is False
+    assert connection is None
+    assert codes(decision) == {LiveLockCode.LIVE_CONFIRMATION_MISSING.value}
+
+
 # --- the sanctioned submission boundary is untouched ---------------------------
 
 
-def test_kill_switch_blocks_a_live_submission_before_any_broker_call(tmp_path):
+def test_kill_switch_blocks_a_live_submission_before_any_broker_call(tmp_path, monkeypatch):
     """The gate contract (Issue #75 / #81) applied to a REAL live connection:
     with the switch on, ``submit()`` is refused and NO ORDER is sent.
 
@@ -604,8 +833,9 @@ def test_kill_switch_blocks_a_live_submission_before_any_broker_call(tmp_path):
             raise AssertionError("no order may be sent while the kill switch is on")
         raise TransportConnectionError("read query refused in this test")
 
-    decision, connection = build(transport=recording_transport)
+    decision, connection = sealed_build(tmp_path, monkeypatch, transport=recording_transport)
     assert decision.allowed is True
+    assert connection is not None
 
     gate = SafetyGate(
         policy=policy(),
@@ -653,7 +883,7 @@ def test_kill_switch_blocks_a_live_submission_before_any_broker_call(tmp_path):
     assert set(calls) <= {"GET"}, "a state-changing broker call was attempted"
 
 
-def test_an_unreadable_kill_switch_blocks_a_live_submission_too(tmp_path):
+def test_an_unreadable_kill_switch_blocks_a_live_submission_too(tmp_path, monkeypatch):
     class BrokenProvider:
         def is_kill_switch_enabled(self):
             raise RuntimeError("kill switch DB is corrupt")
@@ -666,7 +896,8 @@ def test_an_unreadable_kill_switch_blocks_a_live_submission_too(tmp_path):
             raise AssertionError("no order may be sent on an unverifiable kill switch")
         raise TransportConnectionError("read query refused in this test")
 
-    _, connection = build(transport=recording_transport)
+    _, connection = sealed_build(tmp_path, monkeypatch, transport=recording_transport)
+    assert connection is not None
     gate = SafetyGate(
         policy=policy(), state_provider=BrokenProvider(), clock=lambda: NOW
     )
