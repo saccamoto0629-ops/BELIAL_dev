@@ -19,6 +19,7 @@ from broker.oanda_live_adapter import (
     ENV_LIVE_ACCOUNT_ID,
     ENV_LIVE_API_TOKEN,
     ENV_LIVE_API_URL,
+    ENV_LIVE_HTTP_TIMEOUT_SECONDS,
     OANDA_LIVE_API_URL,
 )
 from execution.kill_switch_store import SQLiteKillSwitchStore
@@ -50,6 +51,10 @@ def isolated_environment(monkeypatch):
         ENV_LIVE_API_TOKEN,
         ENV_LIVE_ACCOUNT_ID,
         ENV_LIVE_API_URL,
+        # an inherited timeout would change what the issuer seals, so the
+        # suite must not depend on the developer's or CI's shell for it
+        # (PR #128 Codex review r4 P2)
+        ENV_LIVE_HTTP_TIMEOUT_SECONDS,
         "OANDA_API_TOKEN",
         "OANDA_ACCOUNT_ID",
         "OANDA_API_URL",

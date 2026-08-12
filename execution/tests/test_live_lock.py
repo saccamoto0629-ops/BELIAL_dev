@@ -35,6 +35,7 @@ from broker.oanda_live_adapter import (
     ENV_LIVE_ACCOUNT_ID,
     ENV_LIVE_API_TOKEN,
     ENV_LIVE_API_URL,
+    ENV_LIVE_HTTP_TIMEOUT_SECONDS,
     OANDA_LIVE_API_URL,
     OandaLiveAdapter,
 )
@@ -459,7 +460,7 @@ def test_an_in_process_caller_with_an_empty_environment_gets_no_live_connection(
         LiveActivation(ENABLE_LIVE_TRADING_TRUE, True)
     with pytest.raises(LiveActivationError, match="must be ISSUED"):
         OandaLiveConfig(
-            issuance_witness=object(),
+            issuance_seal=b"forged",
             api_token=TOKEN,
             account_id=ACCOUNT,
             endpoint=OANDA_LIVE_API_URL,
@@ -833,6 +834,10 @@ def seal_live_environment(monkeypatch, **overrides):
         ENV_LIVE_API_TOKEN: TOKEN,
         ENV_LIVE_ACCOUNT_ID: ACCOUNT,
         ENV_LIVE_API_URL: OANDA_LIVE_API_URL,
+        # cleared, not set: an inherited timeout would change what the issuer
+        # seals, making these real-environment tests depend on the developer's
+        # or CI's shell (PR #128 Codex review r4 P2)
+        ENV_LIVE_HTTP_TIMEOUT_SECONDS: None,
         "OANDA_API_TOKEN": None,
         "OANDA_ACCOUNT_ID": None,
         "OANDA_API_URL": None,

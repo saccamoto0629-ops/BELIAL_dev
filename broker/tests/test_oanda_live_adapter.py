@@ -124,7 +124,7 @@ def test_a_grant_cannot_be_constructed_from_plain_values(monkeypatch):
         live.LiveActivation("true", True)
     with pytest.raises(live.LiveActivationError, match="must be ISSUED"):
         live.LiveActivation(
-            issuance_witness=object(), enable_live_trading_value="true", confirm_live=True
+            issuance_seal=b"forged", enable_live_trading_value="true", confirm_live=True
         )
 
 
@@ -138,7 +138,7 @@ def test_a_config_cannot_be_constructed_from_plain_values(monkeypatch):
         )
     with pytest.raises(live.LiveActivationError, match="must be ISSUED"):
         live.OandaLiveConfig(
-            issuance_witness=object(),
+            issuance_seal=b"forged",
             api_token=TOKEN,
             account_id=ACCOUNT,
             endpoint=live.OANDA_LIVE_API_URL,
@@ -154,23 +154,75 @@ def test_the_issuers_take_no_caller_supplied_mapping():
     assert "environ" not in inspect.signature(live.OandaLiveConfig.from_env).parameters
 
 
-def test_a_valid_witness_cannot_be_laundered_onto_invalid_values(monkeypatch):
-    """``dataclasses.replace`` copies the witness, so it is the obvious way
-    to try to keep the evidence while changing what it attests to. Every
-    field is re-validated, so it cannot be used that way."""
+def test_issued_evidence_is_bound_to_the_values_it_attests(monkeypatch):
+    """PR #128 Codex review r4 P1. The previous round used ONE shared
+    witness, so evidence was transferable and survived
+    ``dataclasses.replace``; an earlier version of this test only tried
+    replacements that fail FORMAT validation, which hid the real hole (a
+    valid-looking credential swap succeeded). The seal is now an HMAC over
+    the issuing kind plus the object's own values, so every case below
+    fails."""
     import dataclasses
 
     set_live_env(monkeypatch)
     grant = live.LiveActivation.from_environment(confirm_live=True)
     config = live.OandaLiveConfig.from_env()
+
+    # 1. NON-TRANSFERABLE: a grant's seal does not verify as a config's,
+    #    which was the reviewer's exact scenario (only ENABLE_LIVE_TRADING
+    #    set, then invented credentials stamped with the grant's witness).
+    with pytest.raises(live.LiveActivationError):
+        live.OandaLiveConfig(
+            issuance_seal=grant.issuance_seal,
+            api_token="invented",
+            account_id="invented",
+            endpoint=live.OANDA_LIVE_API_URL,
+        )
+    with pytest.raises(live.LiveActivationError):
+        live.LiveActivation(
+            issuance_seal=config.issuance_seal,
+            enable_live_trading_value="true",
+            confirm_live=True,
+        )
+
+    # 2. FIELD-BOUND: swapping an issued credential for another VALID one
+    #    (the case the old test missed) is refused, so the demo/live
+    #    separation check cannot be skipped this way.
     for attempt in (
+        lambda: dataclasses.replace(config, api_token="different-but-valid-token"),
+        lambda: dataclasses.replace(config, account_id="different-but-valid-account"),
+        lambda: dataclasses.replace(config, timeout_seconds=99.0),
         lambda: dataclasses.replace(grant, confirm_live=False),
         lambda: dataclasses.replace(grant, enable_live_trading_value="yes"),
-        lambda: dataclasses.replace(config, endpoint=demo.OANDA_DEMO_API_URL),
-        lambda: dataclasses.replace(config, api_token=""),
     ):
         with pytest.raises(live.LiveActivationError):
             attempt()
+
+
+def test_the_adapter_reverifies_the_seals_at_consumption(monkeypatch):
+    """A pickle round trip skips ``__post_init__`` entirely, so the
+    constructors' own check cannot catch a mutated copy -- the adapter
+    re-verifies both seals against the values it is about to use."""
+    import pickle
+
+    set_live_env(monkeypatch)
+    grant = live.LiveActivation.from_environment(confirm_live=True)
+    config = live.OandaLiveConfig.from_env()
+
+    mutated = pickle.loads(pickle.dumps(config))
+    object.__setattr__(mutated, "api_token", "swapped-after-unpickle")
+    with pytest.raises(live.LiveActivationError):
+        live.OandaLiveAdapter(mutated, grant, transport=FakeTransport())
+
+    mutated_grant = pickle.loads(pickle.dumps(grant))
+    object.__setattr__(mutated_grant, "confirm_live", False)
+    with pytest.raises(live.LiveActivationError):
+        live.OandaLiveAdapter(config, mutated_grant, transport=FakeTransport())
+
+    # An in-process round trip that preserves every value is the SAME
+    # evidence and stays usable.
+    intact = pickle.loads(pickle.dumps(config))
+    assert live.OandaLiveAdapter(intact, grant, transport=FakeTransport()) is not None
 
 
 def test_an_empty_environment_yields_no_grant_however_it_is_asked(monkeypatch):
@@ -228,7 +280,7 @@ def test_a_grant_subclass_that_skips_validation_is_refused(monkeypatch):
             pass
 
     forged = ForgedActivation(
-        issuance_witness=None, enable_live_trading_value=None, confirm_live=False
+        issuance_seal=None, enable_live_trading_value=None, confirm_live=False
     )
     assert isinstance(forged, live.LiveActivation)  # the hole isinstance would leave
     with pytest.raises(live.LiveActivationError, match="exact LiveActivation grant"):
@@ -244,7 +296,7 @@ def test_a_config_subclass_that_skips_the_allowlist_is_refused(monkeypatch):
             pass
 
     forged = ForgedConfig(
-        issuance_witness=None, api_token="", account_id="", endpoint=demo.OANDA_DEMO_API_URL
+        issuance_seal=None, api_token="", account_id="", endpoint=demo.OANDA_DEMO_API_URL
     )
     assert isinstance(forged, live.OandaLiveConfig)
     with pytest.raises(ValueError, match="exactly a OandaLiveConfig"):
