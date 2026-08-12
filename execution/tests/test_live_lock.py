@@ -41,6 +41,7 @@ from broker.oanda_live_adapter import (
 from broker.oanda_v20_adapter import TransportConnectionError
 from execution.execution_models import ExecutionRequest
 from execution.kill_switch_store import PersistentKillSwitchStateProvider, SQLiteKillSwitchStore
+from execution.live_lock import _compose_live_connection
 from execution.live_lock import (
     ENDPOINT_KIND_DEMO,
     ENDPOINT_KIND_LIVE,
@@ -53,6 +54,7 @@ from execution.live_lock import (
     LiveSafetyConfigError,
     build_live_connection,
     classify_endpoint,
+    endpoint_host_family,
     evaluate_live_activation,
     load_live_safety_policy,
 )
@@ -546,6 +548,18 @@ def test_an_invalid_safety_configuration_never_echoes_the_value(tmp_path, overri
         pass
 
 
+def test_unknown_safety_configuration_keys_are_not_echoed(tmp_path):
+    """PR #128 Codex review r2 P1: a credential pasted as a KEY must not be
+    printed either. Only the count and the allowed vocabulary are shown."""
+    path = write_safety_config(tmp_path, **{"SECRET-AS-A-KEY": "x"})
+    with pytest.raises(LiveSafetyConfigError) as exc_info:
+        load_live_safety_policy(path)
+    message = str(exc_info.value)
+    assert "SECRET-AS-A-KEY" not in message
+    assert "1 unknown field(s)" in message
+    assert "allowed fields" in message
+
+
 def test_a_policy_invariant_violation_never_echoes_the_values(tmp_path):
     """SafetyPolicy's own cross-field messages quote symbols and targets, so
     they are not forwarded: the operator gets the constraint list instead."""
@@ -665,8 +679,12 @@ def test_no_rejection_message_anywhere_carries_a_secret():
         (OANDA_LIVE_API_URL, ENDPOINT_KIND_LIVE),
         (OANDA_LIVE_API_URL + "/", ENDPOINT_KIND_LIVE),
         (OANDA_DEMO_API_URL, ENDPOINT_KIND_DEMO),
-        ("https://api-fxtrade.oanda.com.evil.example", ENDPOINT_KIND_LIVE),
-        ("https://something-fxpractice.example", ENDPOINT_KIND_DEMO),
+        # Lookalikes are UNKNOWN, never "live" / "demo": the safety summary
+        # must not tell an operator a refused endpoint is the live one
+        # (PR #128 Codex review r2 P2).
+        ("https://api-fxtrade.oanda.com.evil.example", ENDPOINT_KIND_UNKNOWN),
+        ("https://something-fxpractice.example", ENDPOINT_KIND_UNKNOWN),
+        ("http://api-fxtrade.oanda.com", ENDPOINT_KIND_UNKNOWN),
         ("https://example.invalid", ENDPOINT_KIND_UNKNOWN),
         ("", ENDPOINT_KIND_NOT_CONFIGURED),
         (None, ENDPOINT_KIND_NOT_CONFIGURED),
@@ -674,6 +692,41 @@ def test_no_rejection_message_anywhere_carries_a_secret():
 )
 def test_endpoint_classification_is_a_label_never_the_value(value, expected):
     assert classify_endpoint(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (OANDA_LIVE_API_URL, ENDPOINT_KIND_LIVE),
+        ("https://api-fxtrade.oanda.com.evil.example", ENDPOINT_KIND_LIVE),
+        (OANDA_DEMO_API_URL, ENDPOINT_KIND_DEMO),
+        ("https://something-fxpractice.example", ENDPOINT_KIND_DEMO),
+        ("https://example.invalid", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_the_host_family_helper_keeps_the_looks_like_detection(value, expected):
+    """Suspicion is not lost by the stricter labels: the MIXING checks still
+    see a live-looking host in the demo slot."""
+    assert endpoint_host_family(value) == expected
+
+
+def test_a_lookalike_endpoint_is_reported_as_unknown_in_the_summary():
+    decision, _ = build(
+        environ=live_env(**{ENV_LIVE_API_URL: "https://api-fxtrade.oanda.com.evil.example"})
+    )
+    assert decision.allowed is False
+    assert decision.summary.endpoint_kind == ENDPOINT_KIND_UNKNOWN
+    assert LiveLockCode.LIVE_ENDPOINT_INVALID.value in codes(decision)
+
+
+def test_a_live_looking_host_in_the_demo_slot_is_still_refused_as_mixed():
+    decision, _ = build(
+        environ=live_env(OANDA_API_URL="https://api-fxtrade.oanda.com.evil.example")
+    )
+    assert decision.allowed is False
+    assert LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED.value in codes(decision)
 
 
 
@@ -729,7 +782,10 @@ def sealed_build(tmp_path, monkeypatch, *, transport=None, config_path=None,
                  kill_switch_db=None, confirm_live=True, execution_mode="live",
                  **env_overrides):
     seal_live_environment(monkeypatch, **env_overrides)
-    return build_live_connection(
+    # The PRIVATE seam: the public composer takes no transport at all
+    # (PR #128 Codex review r2 P1), so the offline suite uses the internal
+    # construction path the seam exists for.
+    return _compose_live_connection(
         execution_mode=execution_mode,
         confirm_live=confirm_live,
         safety_config_path=(
@@ -739,16 +795,46 @@ def sealed_build(tmp_path, monkeypatch, *, transport=None, config_path=None,
             kill_switch_db if kill_switch_db is not None else released_kill_switch(tmp_path)
         ),
         transport=transport if transport is not None else poisoned_transport,
+        clock=lambda: NOW,
     )
 
 
 def test_the_composer_accepts_no_injected_proof_at_all():
     """The signature IS the guarantee: there is no parameter through which a
-    policy object, a kill-switch provider or an environment mapping can be
-    supplied, so a library caller cannot substitute a permissive one."""
+    policy object, a kill-switch provider, an environment mapping or a
+    TRANSPORT can be supplied, so a library caller can neither substitute a
+    permissive proof nor redirect the live Authorization header away from
+    the allowlisted endpoint (PR #128 Codex review r1/r2 P1)."""
     parameters = set(inspect.signature(build_live_connection).parameters)
-    assert {"policy", "state_provider", "environ"} & parameters == set()
+    assert {"policy", "state_provider", "environ", "transport", "clock"} & parameters == set()
     assert {"safety_config_path", "kill_switch_db_path"} <= parameters
+
+
+def test_the_public_composer_never_forwards_an_injected_transport(tmp_path, monkeypatch):
+    """The public path must reach the adapter with transport=None, so the
+    adapter falls back to its own single-attempt requests call against the
+    allowlisted URL."""
+    seen = {}
+
+    def recording_adapter(config, activation, *, transport=None, clock=None):
+        seen["transport"] = transport
+        seen["clock"] = clock
+        raise AssertionError("stop before any adapter exists")
+
+    seal_live_environment(monkeypatch)
+    monkeypatch.setattr("execution.live_lock.OandaLiveAdapter", recording_adapter)
+    decision, connection = build_live_connection(
+        execution_mode="live",
+        confirm_live=True,
+        safety_config_path=write_safety_config(tmp_path),
+        kill_switch_db_path=released_kill_switch(tmp_path),
+    )
+    assert seen == {"transport": None, "clock": None}
+    # the stand-in raised, so the composition fails closed rather than
+    # returning a half-built connection
+    assert connection is None
+    assert decision.allowed is False
+    assert codes(decision) == {LiveLockCode.LIVE_CONNECTION_REFUSED.value}
 
 
 def test_the_sealed_composer_builds_a_live_connection_when_every_lock_holds(

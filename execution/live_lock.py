@@ -331,11 +331,15 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
         )
     unknown = set(raw) - _LIVE_POLICY_KEYS
     if unknown:
-        # Unknown KEYS are named: the schema is closed-world, so a key is
-        # either a known field name or a typo of one -- never a value.
+        # The unknown key NAMES are not echoed either (PR #128 Codex review
+        # r2 P1): an operator can paste a token / account id / URL as a KEY
+        # just as easily as as a value, and this message reaches stdout and
+        # the JSON output. The count plus the allowed vocabulary is enough
+        # to fix the document.
         raise LiveSafetyConfigError(
-            f"live safety configuration has unknown keys {sorted(unknown)}; "
-            f"allowed: {sorted(_LIVE_POLICY_KEYS)}"
+            f"live safety configuration has {len(unknown)} unknown field(s) "
+            "(their names are not echoed); allowed fields: "
+            f"{sorted(_LIVE_POLICY_KEYS)}"
         )
     sides = []
     for entry in _non_empty_str_list(raw, "allowed_sides"):
@@ -419,10 +423,17 @@ def load_live_safety_policy(path: str | Path) -> SafetyPolicy:
 def classify_endpoint(value) -> str:
     """Classify a configured endpoint into a NON-SECRET kind label.
 
-    The value itself is never returned or echoed. Anything that is not
-    exactly one of the two allowlisted endpoints is ``unknown`` -- a host
-    that merely LOOKS live (contains the live marker) is still unknown,
-    because only the exact URL is ever connected to.
+    The value itself is never returned or echoed, and ONLY the two exactly
+    allowlisted endpoints earn the ``live`` / ``demo`` labels (PR #128 Codex
+    review r2 P2). A lookalike such as ``https://api-fxtrade.oanda.com.evil
+    .example`` is ``unknown``: it is refused by the exact allowlist, so
+    telling the operator "endpoint kind: live" in a SAFETY summary would
+    describe a connection that will never be made -- misleading exactly
+    where the summary has to be trustworthy.
+
+    Suspicion is not lost by this: :func:`endpoint_host_family` keeps the
+    marker-based "looks like" detection that the demo/live MIXING checks
+    need, and every non-exact endpoint still fails the endpoint lock.
     """
     if not isinstance(value, str) or not value.strip():
         return ENDPOINT_KIND_NOT_CONFIGURED
@@ -431,12 +442,27 @@ def classify_endpoint(value) -> str:
         return ENDPOINT_KIND_LIVE
     if normalized == OANDA_DEMO_API_URL:
         return ENDPOINT_KIND_DEMO
-    lowered = normalized.lower()
+    return ENDPOINT_KIND_UNKNOWN
+
+
+def endpoint_host_family(value) -> str | None:
+    """"Looks like" detection for the demo/live MIXING checks only.
+
+    Returns ``live`` / ``demo`` when the host merely CONTAINS the
+    corresponding OANDA marker, and ``None`` otherwise. Deliberately looser
+    than :func:`classify_endpoint`: putting a live-looking host in the DEMO
+    endpoint variable is a configuration mistake worth refusing even when
+    the URL would be rejected by the allowlist anyway. It is NEVER used as a
+    summary label, because "looks live" is not "is live".
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    lowered = value.strip().rstrip("/").lower()
     if OANDA_LIVE_HOST_MARKER in lowered:
         return ENDPOINT_KIND_LIVE
     if OANDA_DEMO_HOST_MARKER in lowered:
         return ENDPOINT_KIND_DEMO
-    return ENDPOINT_KIND_UNKNOWN
+    return None
 
 
 def _configured(environ: Mapping[str, str], name: str) -> str | None:
@@ -463,15 +489,13 @@ def _collect_credential_separation_rejections(
     - a DEMO run whose demo endpoint slot holds a LIVE endpoint;
     - the same token or the same account id configured for both.
     """
-    demo_endpoint_kind = classify_endpoint(environ.get(DEMO_ENV_API_URL))
-    if demo_endpoint_kind == ENDPOINT_KIND_LIVE:
+    if endpoint_host_family(environ.get(DEMO_ENV_API_URL)) == ENDPOINT_KIND_LIVE:
         reject(
             LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
             f"{DEMO_ENV_API_URL} (the DEMO endpoint variable) is configured with a live "
             "endpoint; demo and live endpoints must never be interchanged",
         )
-    live_endpoint_kind = classify_endpoint(environ.get(ENV_LIVE_API_URL))
-    if live_endpoint_kind == ENDPOINT_KIND_DEMO:
+    if endpoint_host_family(environ.get(ENV_LIVE_API_URL)) == ENDPOINT_KIND_DEMO:
         reject(
             LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
             f"{ENV_LIVE_API_URL} (the LIVE endpoint variable) is configured with a demo "
@@ -581,7 +605,7 @@ def evaluate_live_activation(
                 LiveLockCode.LIVE_ENDPOINT_INVALID,
                 f"{ENV_LIVE_API_URL} is not configured; the live endpoint has no default",
             )
-        elif live_endpoint_kind == ENDPOINT_KIND_DEMO:
+        elif endpoint_host_family(env.get(ENV_LIVE_API_URL)) == ENDPOINT_KIND_DEMO:
             reject(
                 LiveLockCode.LIVE_ENDPOINT_INVALID,
                 f"{ENV_LIVE_API_URL} points at a demo endpoint; a live connection "
@@ -707,10 +731,17 @@ def build_live_connection(
     confirm_live: bool,
     safety_config_path: str | Path,
     kill_switch_db_path: str | Path | None = None,
-    transport: Callable | None = None,
-    clock: Callable[[], datetime] | None = None,
 ) -> tuple[LiveActivationDecision, BrokerConnection | None]:
     """THE sanctioned composer of a live ``BrokerConnection``.
+
+    NO TRANSPORT INJECTION (PR #128 Codex review r2 P1). The endpoint
+    allowlist only means something if the composed connection actually
+    talks to the allowlisted endpoint: a caller-supplied transport would
+    receive the live ``Authorization`` header and could send it anywhere,
+    which is precisely what pinning the URL exists to prevent. The public
+    composer therefore always uses the adapter's own single-attempt
+    ``requests`` transport, and the injection seam lives on the
+    module-private :func:`_compose_live_connection` used by tests only.
 
     SEALED PROOFS (PR #128 Codex review P1). Every input this function
     judges is obtained HERE, from the real source, and cannot be injected:
@@ -741,9 +772,35 @@ def build_live_connection(
     decision here, once as an unrepresentable object in the broker layer.
 
     No order is placed here. Construction performs no network I/O.
-    ``transport`` / ``clock`` are the adapter's existing injection points
-    (the demo adapter has the same ones): they decide HOW the allowlisted
-    endpoint is reached, never WHETHER a lock held.
+    """
+    return _compose_live_connection(
+        execution_mode=execution_mode,
+        confirm_live=confirm_live,
+        safety_config_path=safety_config_path,
+        kill_switch_db_path=kill_switch_db_path,
+        transport=None,
+        clock=None,
+    )
+
+
+def _compose_live_connection(
+    *,
+    execution_mode,
+    confirm_live: bool,
+    safety_config_path: str | Path,
+    kill_switch_db_path: str | Path | None,
+    transport: Callable | None,
+    clock: Callable[[], datetime] | None,
+) -> tuple[LiveActivationDecision, BrokerConnection | None]:
+    """Internal composition seam -- TESTS ONLY for ``transport`` / ``clock``.
+
+    Production goes through :func:`build_live_connection`, which passes
+    ``None`` for both. The seam exists so the offline test suite can prove
+    "a live connection was composed" without a network and without a real
+    credential; it is deliberately private and is NOT part of the sanctioned
+    startup path. Every LOCK is evaluated here exactly as it is for
+    production -- the seam changes how the endpoint is reached, never
+    whether the startup is allowed.
     """
     # Imported here so the module stays importable without touching the
     # kill-switch store, and so the store is opened only when a live startup

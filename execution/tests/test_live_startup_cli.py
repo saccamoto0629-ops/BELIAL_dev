@@ -295,6 +295,17 @@ def test_a_credential_pasted_into_the_safety_config_is_never_printed(
         assert "PASTED-CREDENTIAL" not in stream
 
 
+def test_a_credential_pasted_as_a_config_key_is_never_printed(tmp_path, monkeypatch, capsys):
+    """PR #128 Codex review r2 P1: the unknown-field message reaches stdout
+    and the JSON output, so the key NAMES must not be in it either."""
+    set_live_env(monkeypatch)
+    path = safety_config(tmp_path, **{"PASTED-CREDENTIAL": "x"})
+    assert run(tmp_path, "--confirm-live", "--json", config_path=path) == EXIT_REFUSED
+    captured = capsys.readouterr()
+    for stream in (captured.out, captured.err):
+        assert "PASTED-CREDENTIAL" not in stream
+
+
 def test_the_cli_cannot_hand_the_composer_a_policy_object(tmp_path, monkeypatch, capsys):
     """PR #128 Codex review P1: the CLI loads the config only to render an
     operator message; authorization always re-loads it inside the sealed
