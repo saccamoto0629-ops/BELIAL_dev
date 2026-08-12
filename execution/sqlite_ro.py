@@ -19,8 +19,11 @@ reads) must therefore connect through :func:`connect_read_only`, which
   ``journal_mode``, ``writable_schema``, ...) are denied too; read-only
   pragmas (``table_info`` etc.) that the schema verification needs stay
   allowed,
-- never creates the file, its parent directory, or ``-wal`` / ``-shm`` side
-  files, and works inside a read-only directory,
+- never creates the file or its parent directory, creates no ``-wal`` /
+  ``-shm`` side files on the DEFAULT path, and works inside a read-only
+  directory (the side-file part is scoped: see "WAL databases" below --
+  a caller that passes ``allow_immutable_wal=False`` does materialize the
+  sidecars for a WAL file),
 - raises :class:`ReadOnlyDbMissingError` for a missing path instead of
   creating anything (callers decide whether "missing" means ``None`` / empty
   or an explicit failure).
@@ -34,9 +37,19 @@ no side files, no mtime change -- at the documented cost that an immutable
 probe sees a point-in-time view and must not race a concurrent writer (the
 same trade-off Paper Execution's snapshot-copy dry-run reads make).
 
+That immutable fallback is what makes the no-side-file property hold
+unconditionally on the DEFAULT path -- and a caller can OPT OUT of it
+(``allow_immutable_wal=False``, PR #126). Opting out is the right call when
+reading a stale committed value would be a safety failure rather than a
+staleness annoyance, and it comes with the inverse trade: for a WAL file the
+open DOES create ``-wal`` / ``-shm``. The two cannot be had together --
+reading WAL content requires the WAL index. Callers that opt out own that
+consequence and must state their own scoped contract (see
+``kill_switch_store``).
+
 A corrupted or foreign file still OPENS here (SQLite validates lazily); the
-callers' schema verification is what rejects it -- this module only
-guarantees that looking at a file never modifies the filesystem.
+callers' schema verification is what rejects it -- on the default path this
+module guarantees that looking at a file never modifies the filesystem.
 """
 
 from __future__ import annotations
@@ -136,8 +149,32 @@ def _is_wal_header(path: Path) -> bool:
     return len(header) >= 20 and header[:16] == b"SQLite format 3\x00" and header[18] == 2
 
 
-def connect_read_only(db_path: Path | str) -> sqlite3.Connection:
+def connect_read_only(
+    db_path: Path | str, *, allow_immutable_wal: bool = True
+) -> sqlite3.Connection:
     """Open ``db_path`` strictly read-only (see the module docstring).
+
+    ``allow_immutable_wal`` (default True, the long-standing behaviour) opts
+    a WAL-declaring file into the ``immutable=1`` path: no side files, no
+    mtime change, at the cost of a point-in-time view that IGNORES anything
+    still in ``-wal``. A caller whose correctness depends on never reading a
+    stale committed value must pass False (PR #126 Codex review P1: the kill
+    switch would otherwise be able to answer "disabled" from a snapshot that
+    predates a committed enable). With False the file is opened as a plain
+    ``mode=ro`` connection, which reads the WAL content -- and the caller can
+    then observe the real journal mode INSIDE its own read transaction
+    (``PRAGMA journal_mode``), with no separate header probe to race.
+
+    NOTE (review r4): with ``allow_immutable_wal=False``, opening a WAL file
+    makes SQLite recreate its ``-wal`` / ``-shm`` sidecars -- the module's
+    no-side-file guarantee holds for the DEFAULT path only. A caller that
+    opts out and still must not touch the filesystem has to reject WAL files
+    BEFORE calling this (``kill_switch_store._refuse_wal_header``), and even
+    then a conversion racing that probe leaves the sidecars behind: reading
+    WAL content requires the WAL index, so no open both sees ``-wal`` rows
+    and creates nothing. Opting out therefore trades the unconditional
+    no-side-file property for the guarantee of never reading a stale
+    committed value.
 
     The caller owns closing the connection (use ``contextlib.closing``).
     """
@@ -150,7 +187,7 @@ def connect_read_only(db_path: Path | str) -> sqlite3.Connection:
     # URI-special character (spaces, '?', '#', unicode) -- including Windows
     # drive letters -- so arbitrary filenames cannot smuggle URI parameters.
     uri = path.resolve().as_uri() + "?mode=ro"
-    if _is_wal_header(path):
+    if allow_immutable_wal and _is_wal_header(path):
         uri += "&immutable=1"
     connection = sqlite3.connect(
         uri, uri=True, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None
