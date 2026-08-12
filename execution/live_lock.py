@@ -858,8 +858,11 @@ def _compose_live_connection(
         return decision, None
     env = os.environ
     try:
-        config = OandaLiveConfig.from_env(env)
-        activation = LiveActivation.from_environment(env, confirm_live=confirm_live)
+        # Both are ISSUED from the REAL process environment (PR #128 Codex
+        # review r3): neither issuer accepts a mapping, so the adapter can
+        # only exist for the process it is actually running in.
+        config = OandaLiveConfig.from_env()
+        activation = LiveActivation.from_environment(confirm_live=confirm_live)
         adapter = OandaLiveAdapter(config, activation, transport=transport, clock=clock)
         connection = BrokerConnection(broker=adapter)
     except Exception as exc:

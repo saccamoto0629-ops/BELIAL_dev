@@ -1,11 +1,10 @@
 """OANDA Live Adapter — the LIVE-ONLY Broker implementation (Issue #82).
 
-*** A LIVE ADAPTER CANNOT EXIST UNLESS EVERY LOCK IS ALREADY SATISFIED. ***
+*** A LIVE ADAPTER CANNOT EXIST UNLESS THE ENVIRONMENT ITSELF SAYS SO. ***
 
 Issue #82 protects the live connection with more than one lock, so that no
-single mistyped value can reach a production account. Three of the locks
-are enforced HERE, at construction time, and the remaining two are
-enforced by the execution layer (``execution/live_lock.py``):
+single mistyped value can reach a production account. This module enforces
+locks 2-5; locks 1, 6 and 7 belong to the execution layer:
 
 1. ``execution_mode=live``  -- execution layer (this adapter reports the
    immutable identity ``live`` / ``oanda-live``, and
@@ -15,14 +14,23 @@ enforced by the execution layer (``execution/live_lock.py``):
 2. ``ENABLE_LIVE_TRADING=true``  -- :class:`LiveActivation`;
 3. an explicit ``--confirm-live`` startup argument  -- :class:`LiveActivation`;
 4. LIVE credentials (account id + token)  -- :class:`OandaLiveConfig`;
-5. the LIVE API endpoint, explicitly configured  -- :class:`OandaLiveConfig`.
+5. the LIVE API endpoint, explicitly configured  -- :class:`OandaLiveConfig`;
+6. a Kill Switch that is READABLE and OFF  -- ``execution/live_lock.py``;
+7. a loadable safety policy that allows the live target  -- same composer.
 
-Because 2-5 are CONSTRUCTOR preconditions, there is no "careful caller"
-path that builds a live adapter with only some of them: an
-``OandaLiveAdapter`` instance is itself evidence that they held. The
-execution layer adds the Kill Switch, the safety-policy checks and the
-startup summary on top (``execution/live_lock.py``), and every order still
-crosses the ONE sanctioned submission boundary
+Locks 2-5 are ISSUANCE preconditions, not merely constructor arguments
+(PR #128 Codex review r3): :class:`LiveActivation` and
+:class:`OandaLiveConfig` carry a module-private issuance witness that only
+their ``from_environment`` / ``from_env`` issuers supply, and those issuers
+read the REAL process environment. Writing ``LiveActivation("true", True)``
+by hand does not produce a grant, so an adapter instance means the process
+environment genuinely carried the flag, the credentials and the endpoint.
+
+What an adapter instance does NOT prove is locks 6 and 7: the Kill Switch
+and the safety policy are checked by the composer
+(``execution/live_lock.py``), which is the only production site allowed to
+build this class (pinned by ``execution/tests/test_submission_boundary.py``).
+Every order still crosses the ONE sanctioned submission boundary
 (``execution/live_submission.py``) through the Safety Gate -- this module
 adds no order path of its own and weakens nothing in the Broker contract.
 
@@ -108,27 +116,54 @@ class LiveActivationError(ValueError):
     """A live-activation lock is not satisfied (always fail-closed)."""
 
 
+# ISSUANCE WITNESS (PR #128 Codex review r3 P1). Evidence that a check ran
+# must not be constructible from plain field values: a caller could
+# otherwise write ``LiveActivation("true", True)`` in an empty process and
+# get an object that CLAIMS the environment was checked. This module-private
+# sentinel is passed only by the ``from_environment`` / ``from_env``
+# issuers, which read the REAL process environment; nothing outside this
+# module can name it without deliberately reaching into a private symbol,
+# and no combination of public arguments produces one.
+_ISSUANCE_WITNESS = object()
+
+
+def _require_issued(witness, what: str) -> None:
+    if witness is not _ISSUANCE_WITNESS:
+        raise LiveActivationError(
+            f"{what} must be ISSUED by reading the real process environment "
+            f"(use the from_environment / from_env constructor); an object built from "
+            "supplied field values is not evidence that anything was checked"
+        )
+
+
 @dataclass(frozen=True)
 class LiveActivation:
     """Evidence that BOTH out-of-band live locks were satisfied.
 
+    ISSUED, NOT CONSTRUCTED (PR #128 Codex review r3 P1): the first field is
+    a module-private issuance witness that only :meth:`from_environment`
+    supplies, and that method reads ``os.environ`` itself. A caller cannot
+    hand over ``"true"`` and ``True`` as ordinary values to manufacture a
+    grant in a process whose environment never had the flag set.
+
     ``enable_live_trading_value`` is the RAW ``ENABLE_LIVE_TRADING`` value
-    as it appeared in the process environment (kept raw on purpose: a
+    as it was found in the process environment (kept raw on purpose: a
     caller cannot launder ``"yes"`` / ``"1"`` / ``"TRUE"`` into a boolean
     somewhere upstream — only the exact lowercase ``"true"`` activates),
     and ``confirm_live`` is the explicit startup argument
     (``--confirm-live``), which must be exactly ``True``.
 
-    Obtain instances through :meth:`from_environment`; it reads the
-    environment itself, so the recorded value is the one that was actually
-    set. Constructing the object directly requires supplying the very same
-    proofs, so it is not a bypass — but it is also not the sanctioned path.
+    The grant covers locks 2 and 3 ONLY. It is NOT a statement that the
+    Kill Switch was read or that a safety policy was loaded -- those are
+    the composer's checks (``execution/live_lock.py``).
     """
 
+    issuance_witness: object = field(repr=False)
     enable_live_trading_value: str | None = field(repr=False)
     confirm_live: bool = False
 
     def __post_init__(self) -> None:
+        _require_issued(self.issuance_witness, "a LiveActivation grant")
         if self.confirm_live is not True:
             raise LiveActivationError(
                 "live trading requires the explicit --confirm-live startup argument; "
@@ -144,15 +179,20 @@ class LiveActivation:
             )
 
     @classmethod
-    def from_environment(
-        cls, environ: Mapping[str, str] | None = None, *, confirm_live: bool
-    ) -> "LiveActivation":
-        """The sanctioned way to obtain the grant: read
-        ``ENABLE_LIVE_TRADING`` from the process environment and combine it
-        with the explicit ``--confirm-live`` startup argument."""
-        env = os.environ if environ is None else environ
+    def from_environment(cls, *, confirm_live: bool) -> "LiveActivation":
+        """The ONLY way to obtain the grant: read ``ENABLE_LIVE_TRADING``
+        from the REAL process environment and combine it with the explicit
+        ``--confirm-live`` startup argument.
+
+        There is deliberately no ``environ`` parameter (PR #128 Codex review
+        r3 P1): a caller-supplied mapping would be exactly the "freely
+        constructed evidence" this issuance path exists to prevent. Tests
+        set the real environment (``monkeypatch.setenv``) like production
+        does.
+        """
         return cls(
-            enable_live_trading_value=env.get(ENV_ENABLE_LIVE_TRADING),
+            issuance_witness=_ISSUANCE_WITNESS,
+            enable_live_trading_value=os.environ.get(ENV_ENABLE_LIVE_TRADING),
             confirm_live=confirm_live,
         )
 
@@ -168,12 +208,18 @@ class OandaLiveConfig:
     the live adapter — the mirror image of the demo config's allowlist.
     """
 
+    issuance_witness: object = field(repr=False)
     api_token: str = field(repr=False)
     account_id: str = field(repr=False)
     endpoint: str = field(repr=False)
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
+        # ISSUED, NOT CONSTRUCTED (PR #128 Codex review r3 P1): a
+        # hand-built config would also skip the demo/live credential
+        # separation check, which only ``from_env`` can perform because only
+        # it sees the whole environment.
+        _require_issued(self.issuance_witness, "an OandaLiveConfig")
         if not isinstance(self.api_token, str) or not self.api_token.strip():
             raise LiveActivationError(
                 f"live api_token must be a non-empty string (set {ENV_LIVE_API_TOKEN})"
@@ -203,8 +249,8 @@ class OandaLiveConfig:
         require_positive_timeout(self.timeout_seconds)
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> "OandaLiveConfig":
-        """Build the live config from LIVE-only environment variables.
+    def from_env(cls) -> "OandaLiveConfig":
+        """ISSUE the live config from LIVE-only environment variables.
 
         ``OANDA_LIVE_API_TOKEN`` / ``OANDA_LIVE_ACCOUNT_ID`` /
         ``OANDA_LIVE_API_URL`` are ALL required — the live endpoint has no
@@ -217,8 +263,13 @@ class OandaLiveConfig:
         between demo and live makes "which account did this order hit?"
         unanswerable, which is exactly the failure Issue #82 exists to
         prevent.
+
+        Like :meth:`LiveActivation.from_environment` there is deliberately
+        no ``environ`` parameter (PR #128 Codex review r3 P1): the real
+        process environment is the only source, so the config an adapter
+        accepts always describes the process it is actually running in.
         """
-        env = os.environ if environ is None else environ
+        env = os.environ
         try:
             api_token = require_non_empty_env(env.get(ENV_LIVE_API_TOKEN), ENV_LIVE_API_TOKEN)
             account_id = require_non_empty_env(env.get(ENV_LIVE_ACCOUNT_ID), ENV_LIVE_ACCOUNT_ID)
@@ -228,6 +279,7 @@ class OandaLiveConfig:
             raise LiveActivationError(str(exc)) from None
         _refuse_shared_credentials(env, api_token=api_token, account_id=account_id)
         return cls(
+            issuance_witness=_ISSUANCE_WITNESS,
             api_token=api_token,
             account_id=account_id,
             endpoint=endpoint,

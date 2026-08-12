@@ -426,6 +426,46 @@ def test_a_policy_that_does_not_allow_the_live_target_refuses_the_startup():
     assert codes(decision) == {LiveLockCode.LIVE_TARGET_NOT_ALLOWED.value}
 
 
+def test_an_in_process_caller_with_an_empty_environment_gets_no_live_connection(monkeypatch):
+    """PR #128 Codex review r3 P1, stated as the reviewer framed it: a caller
+    that imports the broker classes directly, in a process whose environment
+    is EMPTY, must not be able to reach ``BrokerConnection(OandaLiveAdapter(...))``.
+
+    Both proofs are now ISSUED from the real environment, so the attempt
+    fails at the first step -- there is no set of field values that
+    manufactures them.
+    """
+    from broker.oanda_live_adapter import (
+        LiveActivation,
+        LiveActivationError,
+        OandaLiveConfig,
+    )
+
+    for name in (
+        ENV_ENABLE_LIVE_TRADING,
+        ENV_LIVE_API_TOKEN,
+        ENV_LIVE_ACCOUNT_ID,
+        ENV_LIVE_API_URL,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    # the issuers refuse, because the environment says nothing
+    with pytest.raises(LiveActivationError):
+        LiveActivation.from_environment(confirm_live=True)
+    with pytest.raises(LiveActivationError):
+        OandaLiveConfig.from_env()
+    # and hand-writing the proofs does not substitute for them
+    with pytest.raises(LiveActivationError, match="must be ISSUED"):
+        LiveActivation(ENABLE_LIVE_TRADING_TRUE, True)
+    with pytest.raises(LiveActivationError, match="must be ISSUED"):
+        OandaLiveConfig(
+            issuance_witness=object(),
+            api_token=TOKEN,
+            account_id=ACCOUNT,
+            endpoint=OANDA_LIVE_API_URL,
+        )
+
+
 def test_a_live_adapter_subclass_cannot_claim_the_live_mode():
     """PR #128 Codex review P1: an ``OandaLiveAdapter`` subclass could
     override ``__init__`` and never run the constructor that demands the
