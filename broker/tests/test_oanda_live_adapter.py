@@ -154,6 +154,25 @@ def test_the_issuers_take_no_caller_supplied_mapping():
     assert "environ" not in inspect.signature(live.OandaLiveConfig.from_env).parameters
 
 
+def test_a_valid_witness_cannot_be_laundered_onto_invalid_values(monkeypatch):
+    """``dataclasses.replace`` copies the witness, so it is the obvious way
+    to try to keep the evidence while changing what it attests to. Every
+    field is re-validated, so it cannot be used that way."""
+    import dataclasses
+
+    set_live_env(monkeypatch)
+    grant = live.LiveActivation.from_environment(confirm_live=True)
+    config = live.OandaLiveConfig.from_env()
+    for attempt in (
+        lambda: dataclasses.replace(grant, confirm_live=False),
+        lambda: dataclasses.replace(grant, enable_live_trading_value="yes"),
+        lambda: dataclasses.replace(config, endpoint=demo.OANDA_DEMO_API_URL),
+        lambda: dataclasses.replace(config, api_token=""),
+    ):
+        with pytest.raises(live.LiveActivationError):
+            attempt()
+
+
 def test_an_empty_environment_yields_no_grant_however_it_is_asked(monkeypatch):
     for name in _LIVE_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
