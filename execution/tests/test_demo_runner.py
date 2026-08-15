@@ -62,7 +62,12 @@ from execution.runner_composition import (
     build_demo_execution_runner,
     build_fake_execution_runner,
 )
-from execution.safety_gate import ExecutionMode, SafetyRejectionCode, StaticSafetyState
+from execution.safety_gate import (
+    ExecutionMode,
+    REAL_BROKER_MODES,
+    SafetyRejectionCode,
+    StaticSafetyState,
+)
 from execution.safety_store import SQLiteSafetyDecisionStore
 from execution.shadow_providers import StaticMarketSnapshotProvider
 from execution.submission_journal import (
@@ -442,6 +447,14 @@ def test_an_unreadable_kill_switch_stops_demo_submission(tmp_path, monkeypatch):
     assert outcome.status is RunnerItemStatus.REJECTED
     assert SafetyRejectionCode.STATE_QUERY_FAILED.value in outcome.rejection_codes
     assert transport.submit_calls == []
+
+
+def test_the_durable_kill_switch_requirement_covers_both_real_broker_modes():
+    """Issue #132 widened the boundary's durable-reader requirement from
+    ``live`` to every mode that reaches a real broker. Pinning the set keeps
+    a later edit from quietly narrowing it back to live-only, which would
+    let a demo runner keep submitting through an in-memory switch."""
+    assert REAL_BROKER_MODES == {ExecutionMode.DEMO, ExecutionMode.LIVE}
 
 
 def test_a_demo_boundary_refuses_an_in_memory_kill_switch(tmp_path, monkeypatch):
