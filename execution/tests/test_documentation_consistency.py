@@ -5,10 +5,10 @@ Why this test exists
 
 Registering ``demo`` as a runnable execution mode invalidated statements
 scattered across ~20 documents and a few docstrings ("the runner drives
-fake / shadow only", "demo is not integrated", "no runner exists"). Those
-statements are not decoration: an operator reading them concludes the demo
-path does not exist, and the PR #136 review found FOUR separate rounds of
-leftovers because each sweep was a hand-written grep that missed
+fake / shadow only", "demo is not registered in ``BROKER_TYPE_BY_MODE``").
+Those statements are not decoration: an operator reading them concludes the
+demo path does not exist, and the PR #136 review found FOUR separate rounds
+of leftovers because each sweep was a hand-written grep that missed
 paraphrases, whole files, and finally a spelling variant.
 
 So the claims that are now FALSE are pinned here instead of re-swept by
@@ -16,27 +16,41 @@ hand. This is the documentation equivalent of the AST pins in
 ``test_submission_boundary.py``: it does not check that prose is good, only
 that a specific set of statements known to be false cannot reappear.
 
-Two failure modes, both real
-----------------------------
+What this pin deliberately does NOT do (PR #136 review r6)
+----------------------------------------------------------
 
-The fourth review round hit BOTH of them in one pass, which is why the
-rules below are structured rather than a flat regex list:
+Review rounds 4, 5 and 6 were all spent on ONE rule: ``runner は未実装``
+("the runner is unimplemented"). That sentence is genuinely ambiguous in
+this repository, because BOTH readings are in use and both are written the
+same way:
 
-- **Too narrow** -- the first draft pinned only the slash spelling
-  ``Fake / Shadow only`` while ``execution/live_runner.py`` said ``Fake and
-  Shadow only``. The suite was green with a stale docstring in the runner's
-  own module, and the self-verification fixture used the same slash
-  spelling, so it could not notice. Every rule now carries the spellings
-  that actually occur, and :data:`REMOVED_BY_THIS_ISSUE` holds the REAL
-  sentences that were removed, spelling variants included.
-- **Too broad** -- the runner-existence rule used a fixed-width lookbehind,
-  so it exempted ``継続運転する常駐 runner は未実装`` but still flagged
-  ``継続運転する Live Execution runner は未実装``: the same true statement
-  with words in between. An over-broad rule pushes an author to delete an
-  accurate caveat about continuous operation, which is exactly the safety
-  statement this Issue must keep. Exemptions are therefore evaluated over
-  the whole CLAUSE containing the match (:func:`_clause_before`), not a
-  fixed number of characters.
+- the runner CORE exists since Issue #131 -- saying it does not is stale;
+- the RESIDENT / continuously-operating runner really is unimplemented, and
+  that caveat is a safety statement this Issue must keep.
+
+Distinguishing them needs to know which noun phrase the qualifier attaches
+to. Three successive attempts failed in both directions -- a fixed-width
+lookbehind flagged ``継続運転する Live Execution runner は未実装`` (true), and
+a clause-boundary heuristic then exempted
+``常駐対応は後続 Issue とするが、runner は未実装`` (stale) because a
+DIFFERENT assertion on the same line carried the qualifier. Widening the
+boundary list re-broke the first case: ``、`` splits
+``継続運転する常駐プロセスとして、Live Execution runner は未実装`` in the
+wrong place. Getting this right needs morphological analysis, which is far
+past what a regression pin should carry.
+
+**That rule and the whole exemption mechanism are therefore gone.** Every
+rule below matches an unambiguous, machine-checkable statement -- one that
+names a code identifier (``BROKER_TYPE_BY_MODE``, ``demo``) or spells out a
+restrictive mode list -- and no rule has an exemption. The consequence is
+stated plainly rather than hidden: **free-form prose about whether "the
+runner" exists is not policed by this file.** It is reviewed by humans,
+like the rest of the prose. What is pinned is the part where a machine can
+be certain.
+
+The one line that legitimately reads like a stale claim is listed verbatim
+in :data:`ALLOWED_LINES` and checked to still exist, so the allowlist
+cannot rot or be padded with speculative entries.
 
 Scope and limits
 ----------------
@@ -82,104 +96,86 @@ EXCLUDED_PREFIXES = (
 class StaleClaim:
     """One statement that Issue #132 made false.
 
-    ``exempt_if_clause_contains`` is checked against the text preceding the
-    match WITHIN THE SAME CLAUSE. It exists for claims whose wording is
-    false on its own but true under a qualifier -- "the runner is
-    unimplemented" is false, "the RESIDENT runner is unimplemented" is
-    true -- and the qualifier may sit several words away from the match.
+    A claim carries no exemptions. If a rule needs "except when ..." to
+    avoid flagging a true sentence, the rule is matching prose rather than
+    a fact, and belongs outside this pin (see the module docstring). The
+    only escape is :data:`ALLOWED_LINES`, which names a whole line.
     """
 
     pattern: str
-    exempt_if_clause_contains: str | None = None
 
     def __post_init__(self) -> None:
         re.compile(self.pattern)
-        if self.exempt_if_clause_contains is not None:
-            re.compile(self.exempt_if_clause_contains)
 
-
-#: Qualifiers that turn "the runner is unimplemented" into a TRUE statement
-#: about the continuous-operation process, which really does not exist yet.
-_CONTINUOUS_OPERATION = r"常駐|継続運転|定期実行|resident|continuous"
 
 STALE_CLAIMS = (
-    # --- the runner's mode list ------------------------------------------
-    # "Fake / Shadow / Demo" must never trip these, so each carries its
-    # limiting word. Both the slash and the "and" spelling occur in this
-    # repository (PR #136 review r4).
+    # --- the runner's mode list -------------------------------------------
+    # Each rule carries the LIMITING word ("only" / のみ / だけ / 限定), so a
+    # correct enumeration that includes demo cannot trip it. Both the slash
+    # and the "and" spelling occur in this repository (PR #136 review r4).
     StaleClaim(r"Fake / Shadow (のみ|限定|に限って)"),
     StaleClaim(r"Fake (/|and) Shadow only"),
     StaleClaim(r"`fake` / `shadow` (のみ|だけ|限定)"),
     StaleClaim(r"`fake` と `shadow` だけ"),
-    # The reST enumeration form (PR #136 review r5). The old
-    # ``live_runner`` module docstring wrote the mode list as
-    # ``fake`` and ``shadow``, which none of the rules above matched --
-    # so re-introducing that exact sentence passed. The rule is exempted
-    # when the same clause also names demo, which is how the CORRECTED
-    # sentence (``fake``, ``shadow`` and ``demo``) and the "which Issue
-    # added what" note in ``runner_composition`` are written.
-    StaleClaim(
-        r"``fake`` and ``shadow``",
-        exempt_if_clause_contains=r"demo|Demo",
-    ),
+    # The reST enumeration form (PR #136 review r5). A TWO-item backtick
+    # enumeration of exactly fake and shadow is stale on its own: the
+    # corrected text enumerates three modes and reads
+    # ``fake``, ``shadow`` and ``demo``, which does not contain this
+    # substring. The rule originally carried an "unless the clause mentions
+    # demo" exemption; review r6 showed that exempted the plainly stale
+    # "Demo remains unimplemented, so only ``fake`` and ``shadow`` may be
+    # run", so the exemption is gone and the rule stands alone.
+    StaleClaim(r"``fake`` and ``shadow``"),
     # --- demo's Execution-layer status ------------------------------------
-    StaleClaim(r"`demo` は mode 定義のみ"),
+    # This family names code identifiers, so it is unambiguous: either
+    # ``demo`` is in BROKER_TYPE_BY_MODE or it is not, and since Issue #132
+    # it is. These cover the eight sentences the Issue actually deleted
+    # (PR #136 review r6 found the first two of them uncovered).
+    StaleClaim(r"Execution 層への組み込み[^。]{0,60}未実装"),
+    StaleClaim(r"`demo` (は|が)未登録"),
+    StaleClaim(r"`demo` は登録されておらず"),
+    # Registration is DONE (live in Issue #82, demo in Issue #132); what
+    # gates construction now is the activation lock, not the registry.
+    # Broadening this from "実 Adapter 型..." caught two lines that had
+    # survived all six review rounds (safety_gate.md, execution/README.md).
+    StaleClaim(r"Adapter 型が登録されるまで"),
+    StaleClaim(r"定義と validation のみ"),
+    StaleClaim(r"mode 定義のみ"),
+    StaleClaim(r"``BROKER_TYPE_BY_MODE`` stays FakeBroker-only"),
+    StaleClaim(r"remain unconstructible"),
     StaleClaim(r"`BROKER_TYPE_BY_MODE` への `demo` 登録は未実装"),
-    # "v1.5 時点では ... 未登録" is a TRUE version-scoped statement.
-    StaleClaim(
-        r"`BROKER_TYPE_BY_MODE` へ `demo` は未登録",
-        exempt_if_clause_contains=r"v1\.5 時点では",
-    ),
     StaleClaim(r"(OANDA )?Demo integration is a separate Issue"),
     StaleClaim(r"OANDA Demo の runner 統合は未実装"),
     StaleClaim(r"実 Broker(OANDA Demo / Live)への runner 統合は未実装"),
     StaleClaim(r"OANDA Demo / Live へは runner から接続できない"),
     # --- the runner core's existence --------------------------------------
-    # NOT the resident / continuous process, which is genuinely still
-    # unimplemented -- and whose qualifier may be words away from "runner".
-    StaleClaim(
-        r"runner (は|が)?未実装",
-        exempt_if_clause_contains=_CONTINUOUS_OPERATION,
-    ),
+    # Only the form that says so NEXT TO "the foundations are implemented",
+    # which cannot be read as the resident-process caveat. The general
+    # "runner は未実装" rule was removed in review r6 -- see the module
+    # docstring for why it is not fixable here.
+    StaleClaim(r"実装済み[。・]runner 未実装"),
 )
 
-#: Clause separators. Japanese prose in this repository packs several
-#: independent statements into one line (markdown table cells especially),
-#: so an exemption earned by one clause must not cover the next.
-#:
-#: PR #136 review r5: ``。`` and ``|`` alone left a loophole -- in
-#: "常駐対応は後続 Issue とするが、runner は未実装" the qualifier belongs to a
-#: DIFFERENT assertion in the same sentence, yet it exempted the stale one.
-#: Writing 常駐 anywhere earlier was a free pass. Two more boundaries close
-#: it without cutting genuine qualification:
-#:
-#: - ``、`` -- the reading comma, which separates assertions;
-#: - a contrastive ``が`` followed by whitespace. Bare ``が`` is also the
-#:   subject marker ("継続運転が必要な runner"), where it must NOT split, and
-#:   there it is followed by a word rather than a space. In this repository
-#:   the space appears exactly when the clause switches to a Latin-script
-#:   term, which is the contrastive case we need to cut.
-#:
-#: Residual: a contrastive with neither comma nor space still slips. The
-#: adversarial fixtures below record what IS covered rather than claiming
-#: the split is complete.
-_CLAUSE_BOUNDARY = re.compile(r"[。|、]|が(?=\s)")
 
-
-def _clause_before(line: str, start: int) -> str:
-    """The text from the last clause boundary up to ``start``."""
-    boundaries = [match.end() for match in _CLAUSE_BOUNDARY.finditer(line, 0, start)]
-    return line[(boundaries[-1] if boundaries else 0):start]
+#: Whole lines that contain a stale-looking phrase and are nonetheless
+#: CORRECT. Matched verbatim against the stripped line, never as a
+#: substring rule, so an author cannot widen an exemption by accident:
+#: editing such a line breaks the allowlist on purpose and forces a review.
+#: :func:`test_every_allowed_line_still_exists` keeps the list honest.
+ALLOWED_LINES = frozenset({
+    # Version-scoped history: demo really was unregistered in v1.5, and the
+    # same line says Issue #132 implemented it. Removing the caveat would
+    # make the roadmap's own history wrong.
+    "- `demo` mode の Execution 層統合(v1.6 の Issue #132 で実装。"
+    "v1.5 時点では `BROKER_TYPE_BY_MODE` へ `demo` は未登録)",
+})
 
 
 def matches(claim: StaleClaim, line: str) -> bool:
-    """True when ``line`` makes ``claim`` without an exempting qualifier."""
-    for match in re.finditer(claim.pattern, line):
-        if claim.exempt_if_clause_contains is None:
-            return True
-        if not re.search(claim.exempt_if_clause_contains, _clause_before(line, match.start())):
-            return True
-    return False
+    """True when ``line`` states ``claim`` and is not an allowed line."""
+    if line.strip() in ALLOWED_LINES:
+        return False
+    return re.search(claim.pattern, line) is not None
 
 
 def _scanned_files():
@@ -211,6 +207,33 @@ def test_no_document_repeats_a_statement_demo_integration_made_false(claim):
         f"execution mode) but still appears at: {offenders}. Update the text, or -- if "
         "the mode registry itself changed -- update STALE_CLAIMS."
     )
+
+
+def test_every_allowed_line_still_exists():
+    """An allowlist that outlives the line it excuses is a silent hole: the
+    next author may write a genuinely stale sentence that happens to match
+    a stale entry. Each entry must still be present somewhere in scope."""
+    present = set()
+    for _relative, path in _scanned_files():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped in ALLOWED_LINES:
+                present.add(stripped)
+    assert present == set(ALLOWED_LINES), (
+        f"ALLOWED_LINES entries no longer in the repository: {set(ALLOWED_LINES) - present}. "
+        "Remove the entry, or restore the line it was written for."
+    )
+
+
+def test_every_allowed_line_actually_needs_the_allowance():
+    """The mirror check: an entry that no rule would flag is dead weight
+    and hides the fact that the rules moved on."""
+    for allowed in ALLOWED_LINES:
+        flagged = [claim.pattern for claim in STALE_CLAIMS
+                   if re.search(claim.pattern, allowed)]
+        assert flagged, (
+            f"{allowed!r} is allowlisted but no rule flags it; drop the entry."
+        )
 
 
 def test_the_mode_registry_is_what_the_documentation_claims():
@@ -289,6 +312,11 @@ def test_the_runner_still_refuses_live():
 # survived in execution/live_runner.py through three review rounds. So the
 # rules are exercised against the ACTUAL sentences this PR removed, and
 # against sentences that must never be flagged.
+#
+# Entries are copied VERBATIM from `git diff main...HEAD` deletions. A
+# paraphrase would let the fixture pass while the real sentence stayed
+# uncovered, which is how review rounds r4, r5 and r6 each found another
+# one.
 
 REMOVED_BY_THIS_ISSUE = (
     "駆動できる mode は **`fake` と `shadow` だけ**",
@@ -306,6 +334,62 @@ REMOVED_BY_THIS_ISSUE = (
     "Live Execution(基盤実装済み・runner 未実装・運用未解禁)",
     "                  (基盤は broker/ + execution/ に実装済み。runner 未実装・運用未解禁)",
     "`demo` は mode 定義のみで Execution 層への組み込み未実装",
+    # --- the "demo is not registered" family (review r6) ------------------
+    # Found by walking every deletion in `git diff main...HEAD` rather than
+    # by grepping for phrasings already known to the pin. The first two are
+    # the ones the review cited; the rest are their siblings, uncovered for
+    # the same reason.
+    "- OANDA **Demo** Adapter は Issue #79 で実装済み(Demo 口座での注文ライフサイクル検証用)。"
+    "ただし **Live 口座接続・Live Execution runner・Execution 層への組み込みは未実装**: "
+    "`execution.safety_gate.BROKER_TYPE_BY_MODE` に `demo` は未登録のままであり、",
+    "- **Execution 層への組み込みは未実装**: `execution.safety_gate.BROKER_TYPE_BY_MODE` に "
+    "`demo` は登録されておらず、`BrokerConnection(broker=OandaDemoAdapter(...))` は構築できない",
+    "  実装は `broker/`。Live 接続・Execution 層への組み込み・Live Execution 本体は未実装のまま。",
+    "> - **OANDA Demo Adapter は Issue #79 で実装済み**(下記「OANDA Demo Adapter」節)。ただし "
+    "**Live 口座接続・Live Execution runner・Execution 層への組み込み"
+    "(`BROKER_TYPE_BY_MODE` への `demo` 登録)は未実装**であり、",
+    "> - **Live 接続・実発注・Live Execution runner は引き続き未実装**である。OANDA **Demo** "
+    "Adapter は Issue #79 で `broker/` に実装済みだが `BROKER_TYPE_BY_MODE` に `demo` は未登録のため、",
+    "`demo` / `live` は**実 Adapter 型が登録されるまで接続オブジェクト自体を構築できない**"
+    "(表現不能による fail-closed)。",
+    "`demo` / `live` は mode 定義と validation のみ(Adapter 型未登録のため `BrokerConnection` を"
+    "構築できず、runner は未実装として明示拒否)。",
+    "- `demo` / `live`: **mode 定義と validation のみ。Execution 層への組み込みは未実装**。",
+    "- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続"
+    "(`demo` / `live` の `BrokerConnection` は Adapter 型が登録されるまで構築不能)",
+    "  (``BROKER_TYPE_BY_MODE`` stays FakeBroker-only -- reconciliation talks to",
+    "``live`` remain unconstructible (``BROKER_TYPE_BY_MODE``) and must be refused",
+    # the sentence review r6 constructed to show the demo-exemption was too
+    # loose: plainly stale, yet the old rule excused it because "Demo"
+    # appeared earlier in the clause
+    "Demo remains unimplemented, so only ``fake`` and ``shadow`` may be run.",
+    # the two lines that broadening "Adapter 型が登録されるまで" finally caught,
+    # verbatim as they stood before this round
+    "`demo` / `live` は引き続き**定義と validation のみ**で、"
+    "Adapter 型が登録されるまで接続を構築できない。",
+    "`fake` = FakeBroker のみ、`demo` / `live` は Adapter 型が登録されるまで**構築不能**。",
+)
+
+
+#: Deletions this Issue made that a LINE-BASED pin cannot cover, recorded so
+#: the gap is known rather than assumed absent. Both were found by walking
+#: every deletion in ``git diff main...HEAD`` (PR #136 review r6).
+#:
+#: - "``BROKER_TYPE_BY_MODE`` への ``demo`` 登録(Execution 統合)" appeared as
+#:   one item in a NON-SCOPE list. The words are neutral; only the heading
+#:   above them made the line a claim. The same words now appear -- correctly
+#:   -- in three documents describing the completed registration, so no rule
+#:   can separate them without reading the document structure.
+#: Making the pin document-structure-aware would rebuild the
+#: natural-language machinery this file just removed, so it stays for human
+#: review, which is where the rest of the prose already lives.
+#:
+#: (The neighbouring "``demo`` / ``live`` remain unconstructible" sentence
+#: also spanned two source lines, but its PREDICATE line carries the claim
+#: on its own and is pinned; a claim only escapes when no single line
+#: states it.)
+NOT_PINNABLE_LINE_BY_LINE = (
+    "structural: a neutral phrase whose meaning came from its section heading",
 )
 
 KEPT_ON_PURPOSE = (
@@ -316,20 +400,25 @@ KEPT_ON_PURPOSE = (
     "- **Fake / Shadow / Demo の責務**",
     # the module header that legitimately names which Issue added what
     "(Issue #131: Fake and Shadow; Issue #132: OANDA Demo).",
-    # ... and neither may the TRUE caveats about continuous operation,
-    # which are the safety statements this Issue must keep. The qualifier
-    # is ADJACENT here ...
+    # the corrected reST enumeration, which names three modes
+    "``fake``, ``shadow`` and ``demo`` may be run by this runner.",
+    # --- the resident-runner caveats ---------------------------------------
+    # These are TRUE: the continuously-operating process really is
+    # unimplemented, and saying so is a safety statement Issue #132 must
+    # keep. Rounds r4-r6 were spent trying to write a rule that flags the
+    # stale reading without flagging these; the rule was removed instead
+    # (see the module docstring). They stay here so that a future author
+    # who re-adds such a rule finds out immediately that it is over-broad.
     "継続運転する常駐 runner は未実装",
     "常駐 runner 未実装・実口座運用は未解禁",
     "定期実行 runner は未実装",
-    # ... and SEPARATED here, which the fixed-width lookbehind used to miss
-    # (PR #136 review r4).
     "継続運転する Live Execution runner は未実装",
     "定期実行の Live Execution runner は未実装",
     "常駐する送信 runner は未実装であり、runner core とは別である",
     "継続運転を担う常駐プロセスとしての runner が未実装",
-    # version-scoped history stays true
-    "v1.5 時点では `BROKER_TYPE_BY_MODE` へ `demo` は未登録",
+    # the case review r6 showed a clause-boundary heuristic gets WRONG: the
+    # qualifier is separated from its noun phrase by a reading comma
+    "継続運転する常駐プロセスとして、Live Execution runner は未実装",
     # concept.md line 64 was rewritten this round, but NOT because this
     # clause was false -- "the RESIDENT runner is unimplemented" is true.
     # What was stale there was an OMISSION (the sentence listed the
@@ -353,31 +442,17 @@ def test_the_pin_catches_the_statements_this_issue_removed(sentence):
 def test_the_pin_does_not_flag_a_correct_or_still_true_statement(sentence):
     """The costly failure mode: an over-broad rule that pressures an author
     into deleting an accurate caveat -- especially "the CONTINUOUS runner is
-    unimplemented", which must survive, qualifier adjacent or not."""
+    unimplemented", which must survive however it is phrased."""
     matched = [claim.pattern for claim in STALE_CLAIMS if matches(claim, sentence)]
     assert matched == [], f"{sentence!r} is correct but matched {matched}"
 
 
-#: Sentences where a continuous-operation qualifier appears, but belongs to
-#: a DIFFERENT assertion than the stale claim. Without these the exemption
-#: becomes "write 常駐 anywhere in the line and the stale claim passes"
-#: (PR #136 review r5).
-EXEMPTION_MUST_NOT_BE_EARNED_BY = (
-    # separate sentence
-    "継続運転する常駐プロセスは未実装。runner は未実装であり demo も動かない",
-    # separate assertion, reading comma
-    "常駐対応は後続 Issue とするが、runner は未実装",
-    # separate assertion, contrastive が before a Latin-script term
-    "常駐対応は後続 Issue とするが runner は未実装",
-    # markdown table cell: the qualifier is in the previous column
-    "| 常駐プロセスは未実装 | runner は未実装 |",
-)
-
-
-@pytest.mark.parametrize("line", EXEMPTION_MUST_NOT_BE_EARNED_BY)
-def test_an_exemption_does_not_leak_across_assertions(line):
-    """A qualifier earned by one assertion must not excuse a stale claim in
-    another one on the same line -- markdown table rows and Japanese
-    sentences both pack several statements together."""
-    claim = next(c for c in STALE_CLAIMS if c.exempt_if_clause_contains == _CONTINUOUS_OPERATION)
-    assert matches(claim, line), "the stale claim in the other assertion must still be caught"
+def test_no_rule_carries_a_natural_language_exemption():
+    """PR #136 review r6: exemptions are what made rounds r4-r6 necessary.
+    A rule that needs "except when the sentence also says X" is judging
+    prose, not a fact, and belongs outside this pin. :data:`ALLOWED_LINES`
+    is the only escape, and it names whole lines rather than phrases."""
+    assert [field for field in StaleClaim.__dataclass_fields__] == ["pattern"], (
+        "StaleClaim grew a field beyond 'pattern'. If it is an exemption, see the "
+        "module docstring: the rule likely belongs outside this pin instead."
+    )

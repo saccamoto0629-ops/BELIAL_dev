@@ -80,7 +80,7 @@ Demo 起動前 preflight(Issue #132): `python -m execution.demo_startup_cli --ex
 - `LiveOrderSubmissionService.submit()` は「意図復元 → 評価 → 判定の耐久保存 + read-back → Submission Journal 記録(Issue #93)→ created→submitting 遷移獲得 → Journal started 更新」に**すべて成功した呼び出しだけ**が `ExecutionRequest.to_order_request()` と `Broker.submit_order()` に到達する。
 - 1 件でも違反・kill switch 有効・Broker / store 照会失敗・判定保存 / read-back 失敗・**Journal 保存失敗**・二重送信・UNKNOWN 後の再送・想定外例外は fail-closed で送信しない。
 - **kill switch は永続かつ fail-closed**(Issue #81): production の状態源は `kill_switch_store.py` の SQLite(`PersistentKillSwitchStateProvider`)であり、有効化はプロセス再起動・サービス再構築・別プロセスをまたいで新規送信を停止し続ける。store が読めない(未初期化・schema 不一致・破損)あいだも `state_query_failed` で全新規送信が拒否される。reconciliation・read-only 照会・cancel 経路は Gate を通らないため停止中も実行できる。操作は `kill_switch_cli.py`(解除は明示 `--confirm-resume` 必須)。
-- `BrokerConnection` の mode / target は Broker 自身の `connection_identity()`(構築時 config 由来・不変)から**導出**され、mode は具象型と相互検証される: `fake` = FakeBroker のみ、`demo` / `live` は Adapter 型が登録されるまで**構築不能**。
+- `BrokerConnection` の mode / target は Broker 自身の `connection_identity()`(構築時 config 由来・不変)から**導出**され、mode は具象型と相互検証される: `fake` = FakeBroker のみ、`demo` / `live` は具象 Adapter 型と**完全一致**であり、接続は activation lock(`demo_lock.py` / `live_lock.py`)経由でのみ**構築可能**。
 - 迂回は「呼び出し側の注意」ではなく **AST 走査テスト**(`tests/test_submission_boundary.py`)で構造的に禁止する: `submit_order` / `to_order_request` の呼び出し箇所は公認箇所以外に存在できない。この境界は**誤用防止**であり、reflection 等による**故意回避の in-process 防止は言語的に不可能**(実 Adapter 導入時の運用境界で扱う。[設計書の該当節](../docs/architecture/safety_gate.md)参照)。
 - FakeBroker の `submitted_requests` により、全拒否経路で Broker 送信がゼロ件であることをテストする。
 

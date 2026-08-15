@@ -92,7 +92,7 @@ service.cancel(execution_request_id) -> CancelOutcome
 
 ## execution mode と Shadow 評価(Issue #78)
 
-execution mode の統一語彙は `ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)であり、設定文字列は `resolve_execution_mode()` がロード時に解決する(未知 mode は明示拒否)。`demo` / `live` は引き続き**定義と validation のみ**で、Adapter 型が登録されるまで接続を構築できない。
+execution mode の統一語彙は `ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)であり、設定文字列は `resolve_execution_mode()` がロード時に解決する(未知 mode は明示拒否)。`demo` / `live` は具象 Adapter 型が `BROKER_TYPE_BY_MODE` へ**完全一致**で登録済み(`live` は Issue #82、`demo` は Issue #132)であり、接続は各 activation lock(`execution/live_lock.py` / `execution/demo_lock.py`)を通してのみ構築できる。登録済みであることは解禁を意味せず、runner は `live` を明示拒否する。
 
 Shadow Mode(Issue #78)では Gate を `SafetyGate.evaluate_shadow(request, market=..., account=..., connection_target=...)` で評価する。live の `evaluate()` と**同一の共有チェック実装**を通るが、Broker connection を一切受け取らない:
 
