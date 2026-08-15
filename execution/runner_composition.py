@@ -570,9 +570,9 @@ def build_fake_execution_runner(
     if connection.execution_mode is not ExecutionMode.FAKE:
         raise RunnerModeError(
             f"the Live Execution runner may only be composed with a 'fake' connection "
-            f"here, got {connection.execution_mode.value!r}; demo integration and live "
-            "operation are separate Issues (live additionally requires "
-            "execution/live_lock.py)"
+            f"here, got {connection.execution_mode.value!r}; a demo connection is "
+            "composed by build_demo_execution_runner() from a DemoRuntimeGrant "
+            "(execution/demo_lock.py), and 'live' has no composition root at all"
         )
     if not isinstance(policy, SafetyPolicy):
         raise ValueError(f"policy must be a SafetyPolicy, got {policy!r}")

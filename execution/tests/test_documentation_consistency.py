@@ -48,6 +48,28 @@ runner" exists is not policed by this file.** It is reviewed by humans,
 like the rest of the prose. What is pinned is the part where a machine can
 be certain.
 
+Two corollaries, both learned the same way (review r7)
+------------------------------------------------------
+
+A pin is scanned against EVERY ``.md`` and ``.py`` in the repository, so a
+rule is not only a claim about the past -- it is a standing restriction on
+what anyone may write in the future. Two kinds of rule fail that test:
+
+- **Unanchored fragments.** ``mode 定義のみ`` / ``remain unconstructible`` /
+  ``Adapter 型が登録されるまで`` describe demo here, but they are ordinary
+  ways to describe ANY mode or adapter. As written they would fail CI on
+  "`sandbox` は mode 定義のみ" -- a sentence about a component that does
+  not exist yet and whose author has done nothing wrong. Every fragment is
+  now anchored to ``demo`` or ``BROKER_TYPE_BY_MODE``.
+- **Bare enumerations.** the bare "``fake`` and ``shadow``" pair was pinned on
+  its own, on the theory that correct text always names three modes. It
+  does not: "Issue #131 supports ``fake`` and ``shadow``; Issue #132 adds
+  ``demo``" is true, and was flagged. What is stale is LIMITING the runner
+  to the pair, so the rule requires the limiting word.
+
+The general shape: pin the claim, never the vocabulary the claim happens to
+use.
+
 The one line that legitimately reads like a stale claim is listed verbatim
 in :data:`ALLOWED_LINES` and checked to still exist, so the allowlist
 cannot rot or be padded with speculative entries.
@@ -117,20 +139,29 @@ STALE_CLAIMS = (
     StaleClaim(r"Fake (/|and) Shadow only"),
     StaleClaim(r"`fake` / `shadow` (のみ|だけ|限定)"),
     StaleClaim(r"`fake` と `shadow` だけ"),
-    # The reST enumeration form (PR #136 review r5). A TWO-item backtick
-    # enumeration of exactly fake and shadow is stale on its own: the
-    # corrected text enumerates three modes and reads
-    # ``fake``, ``shadow`` and ``demo``, which does not contain this
-    # substring. The rule originally carried an "unless the clause mentions
-    # demo" exemption; review r6 showed that exempted the plainly stale
-    # "Demo remains unimplemented, so only ``fake`` and ``shadow`` may be
-    # run", so the exemption is gone and the rule stands alone.
-    StaleClaim(r"``fake`` and ``shadow``"),
+    # The reST enumeration form (PR #136 review r5), restricted to the
+    # RESTRICTIVE claim. Review r6 removed an "unless the clause mentions
+    # demo" exemption from this rule; review r7 then showed the bare pair
+    # is not stale by itself -- "Issue #131 supports ``fake`` and
+    # ``shadow``; Issue #132 adds ``demo``" is a true sentence about the
+    # history. What is stale is limiting the runner TO those two, so the
+    # rule now requires the limiting word on either side of the pair.
+    StaleClaim(
+        r"(?i)\bonly\b[^。\n]{0,60}?``fake`` and ``shadow``"
+        r"|``fake`` and ``shadow``[^。\n]{0,30}?\bonly\b"
+    ),
     # --- demo's Execution-layer status ------------------------------------
-    # This family names code identifiers, so it is unambiguous: either
-    # ``demo`` is in BROKER_TYPE_BY_MODE or it is not, and since Issue #132
-    # it is. These cover the eight sentences the Issue actually deleted
-    # (PR #136 review r6 found the first two of them uncovered).
+    # Every pattern here NAMES what it is about -- ``demo`` or
+    # ``BROKER_TYPE_BY_MODE`` -- so it is unambiguous: either demo is in the
+    # registry or it is not, and since Issue #132 it is.
+    #
+    # Review r7: earlier drafts used the bare fragments ("mode 定義のみ",
+    # "remain unconstructible", "Adapter 型が登録されるまで"). Those are
+    # scanned against every .md and .py in the repository, so they would
+    # fail CI on a CORRECT sentence about some other mode or adapter --
+    # "`sandbox` は mode 定義のみ" is nobody's stale claim. A pin that
+    # forbids describing future components taxes the documentation it is
+    # supposed to protect, so each fragment is anchored to the demo claim.
     StaleClaim(r"Execution 層への組み込み[^。]{0,60}未実装"),
     StaleClaim(r"`demo` (は|が)未登録"),
     StaleClaim(r"`demo` は登録されておらず"),
@@ -138,22 +169,19 @@ STALE_CLAIMS = (
     # gates construction now is the activation lock, not the registry.
     # Broadening this from "実 Adapter 型..." caught two lines that had
     # survived all six review rounds (safety_gate.md, execution/README.md).
-    StaleClaim(r"Adapter 型が登録されるまで"),
-    StaleClaim(r"定義と validation のみ"),
-    StaleClaim(r"mode 定義のみ"),
+    StaleClaim(r"`demo`[^。\n]{0,40}(実 )?Adapter 型が登録されるまで"),
+    StaleClaim(r"`demo`[^。\n]{0,25}(mode )?定義(と validation )?のみ"),
     StaleClaim(r"``BROKER_TYPE_BY_MODE`` stays FakeBroker-only"),
-    StaleClaim(r"remain unconstructible"),
+    StaleClaim(r"remain unconstructible \(``BROKER_TYPE_BY_MODE``\)"),
     StaleClaim(r"`BROKER_TYPE_BY_MODE` への `demo` 登録は未実装"),
-    StaleClaim(r"(OANDA )?Demo integration is a separate Issue"),
+    # Both spellings of the "that is a different Issue" note. Review r7
+    # found the runner's OWN fake-composition error still saying it in
+    # lowercase, with "and live operation" wedged into the middle, so the
+    # rule matches the claim rather than one sentence shape.
+    StaleClaim(r"(?i)demo integration[^。\n]{0,40}separate Issue"),
     StaleClaim(r"OANDA Demo の runner 統合は未実装"),
     StaleClaim(r"実 Broker(OANDA Demo / Live)への runner 統合は未実装"),
     StaleClaim(r"OANDA Demo / Live へは runner から接続できない"),
-    # --- the runner core's existence --------------------------------------
-    # Only the form that says so NEXT TO "the foundations are implemented",
-    # which cannot be read as the resident-process caveat. The general
-    # "runner は未実装" rule was removed in review r6 -- see the module
-    # docstring for why it is not fixable here.
-    StaleClaim(r"実装済み[。・]runner 未実装"),
 )
 
 
@@ -331,8 +359,6 @@ REMOVED_BY_THIS_ISSUE = (
     "Only :data:`RUNNER_SUPPORTED_MODES` -- ``fake`` and ``shadow`` -- may be",
     "driven by this runner (OANDA Demo integration is a separate Issue, and",
     "**OANDA Demo / Live へは runner から接続できない**",
-    "Live Execution(基盤実装済み・runner 未実装・運用未解禁)",
-    "                  (基盤は broker/ + execution/ に実装済み。runner 未実装・運用未解禁)",
     "`demo` は mode 定義のみで Execution 層への組み込み未実装",
     # --- the "demo is not registered" family (review r6) ------------------
     # Found by walking every deletion in `git diff main...HEAD` rather than
@@ -381,7 +407,7 @@ REMOVED_BY_THIS_ISSUE = (
 #:   -- in three documents describing the completed registration, so no rule
 #:   can separate them without reading the document structure.
 #: Making the pin document-structure-aware would rebuild the
-#: natural-language machinery this file just removed, so it stays for human
+#: natural-language machinery this file removed, so these stay for human
 #: review, which is where the rest of the prose already lives.
 #:
 #: (The neighbouring "``demo`` / ``live`` remain unconstructible" sentence
@@ -389,7 +415,31 @@ REMOVED_BY_THIS_ISSUE = (
 #: on its own and is pinned; a claim only escapes when no single line
 #: states it.)
 NOT_PINNABLE_LINE_BY_LINE = (
-    "structural: a neutral phrase whose meaning came from its section heading",
+    (
+        "`BROKER_TYPE_BY_MODE` への `demo` 登録(Execution 統合)",
+        "structural: one item in a NON-SCOPE list. The words are neutral -- the "
+        "claim came from the heading above them -- and the same words now appear "
+        "correctly in three documents describing the completed registration.",
+    ),
+    (
+        "Live Execution(基盤実装済み・runner 未実装・運用未解禁)",
+        "ambiguous: asserts 'runner 未実装', which is false of the runner core and "
+        "true of the resident process. Rule 実装済み[。・]runner 未実装 covered this "
+        "until review r7 showed it also flags the true caveat "
+        "'Demo の 1-cycle API は実装済み。runner 未実装(systemd 常駐プロセスを指す)'.",
+    ),
+    (
+        "(基盤は broker/ + execution/ に実装済み。runner 未実装・運用未解禁)",
+        "ambiguous: same claim as the entry above, same reason.",
+    ),
+    (
+        "here, got {connection.execution_mode.value!r}; demo integration and live ",
+        "split: the runner's own fake-composition error said 'demo integration and "
+        "live operation are separate Issues' across TWO source lines, so no single "
+        "line states the claim (review r7 found it; the message is fixed). The "
+        "single-line spelling IS pinned; anchoring on 'demo integration and live' "
+        "alone would flag correct sentences pairing the two subjects.",
+    ),
 )
 
 KEPT_ON_PURPOSE = (
@@ -419,6 +469,18 @@ KEPT_ON_PURPOSE = (
     # the case review r6 showed a clause-boundary heuristic gets WRONG: the
     # qualifier is separated from its noun phrase by a reading comma
     "継続運転する常駐プロセスとして、Live Execution runner は未実装",
+    # ... and the case review r7 showed the LAST runner-existence rule got
+    # wrong, which is why that rule is gone too
+    "Demo の 1-cycle API は実装済み。runner 未実装(systemd 常駐プロセスを指す)",
+    # --- sentences about OTHER components (PR #136 review r7) --------------
+    # A pin is a standing restriction on future writing, not only a claim
+    # about the past. None of these is anybody's stale statement, and an
+    # unanchored fragment would have failed CI on all of them.
+    "`sandbox` は mode 定義のみ",
+    "`sandbox` / `paper` は Adapter 型が登録されるまで構築不能",
+    "``sandbox`` adapters remain unconstructible until a type is registered",
+    "Issue #131 supports ``fake`` and ``shadow``; Issue #132 adds ``demo``.",
+    "`demo` は Issue #132 で登録済みだが、`sandbox` は定義と validation のみ",
     # concept.md line 64 was rewritten this round, but NOT because this
     # clause was false -- "the RESIDENT runner is unimplemented" is true.
     # What was stale there was an OMISSION (the sentence listed the
@@ -445,6 +507,20 @@ def test_the_pin_does_not_flag_a_correct_or_still_true_statement(sentence):
     unimplemented", which must survive however it is phrased."""
     matched = [claim.pattern for claim in STALE_CLAIMS if matches(claim, sentence)]
     assert matched == [], f"{sentence!r} is correct but matched {matched}"
+
+
+@pytest.mark.parametrize(("text", "reason"), NOT_PINNABLE_LINE_BY_LINE,
+                         ids=lambda value: value[:40])
+def test_the_unpinnable_record_stays_honest(text, reason):
+    """These are recorded as OUT of the pin's reach. If a rule starts
+    catching one, the record is stale and should shrink -- an entry that
+    quietly became coverable makes the list read as an excuse rather than a
+    limit."""
+    caught = [claim.pattern for claim in STALE_CLAIMS if matches(claim, text)]
+    assert caught == [], (
+        f"{text!r} is listed as not pinnable but {caught} now catches it. "
+        f"Move it into REMOVED_BY_THIS_ISSUE. Recorded reason was: {reason}"
+    )
 
 
 def test_no_rule_carries_a_natural_language_exemption():
