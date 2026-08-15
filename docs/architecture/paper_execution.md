@@ -16,7 +16,7 @@ Paper Signal Generator(実装済み・仮説の記録のみ)
 Paper Execution(本書・設計のみ)
         ↓  仮想ポジション / 仮想損益レコード
 Live Execution ── Broker API による実注文。Paper Execution とは完全に別レイヤー
-                  (基盤は broker/ + execution/ に実装済み。runner 未実装・運用未解禁)
+                  (基盤 + runner core は broker/ + execution/ に実装済み。実口座運用は未解禁)
 ```
 
 - **実発注・自動売買は一切行わない。** Paper Execution が生成するのは「もしこの仮説どおりに執行していたら」という仮想レコードだけである。

@@ -4,7 +4,7 @@
 
 > **重要な位置づけ**
 >
-> - **実発注を駆動する定期実行 runner・自動売買は引き続き未実装・非スコープ**([Concept](../product/concept.md) の「非スコープ」)。実 Broker 接続(OANDA Demo / Live Adapter)は Issue #79 / #82 で実装済みだが、Live 接続は全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。本書は Live Execution 運用で必要になる契約を確定するもの。
+> - **実発注を継続運転する常駐プロセス・自動売買は引き続き未実装・非スコープ**([Concept](../product/concept.md) の「非スコープ」。runner core 自体は Issue #131 / #132 で `fake` / `shadow` / `demo` まで実装済み)。実 Broker 接続(OANDA Demo / Live Adapter)は Issue #79 / #82 で実装済みだが、Live 接続は全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。本書は Live Execution 運用で必要になる契約を確定するもの。
 > - 注文状態の唯一の正は既存 `broker.OrderState` / `ORDER_STATE_TRANSITIONS` のまま。**本設計は状態機械へ一切遷移を追加しない**(REJECTED は terminal のまま)。
 > - **Broker Order Reissue(Issue #102)とは別概念**である(下記「用語」)。
 > - UNKNOWN の自動再送は非スコープ(Issue #95 の非スコープをそのまま維持)。OANDA 固有の拒否コード → `RejectionCategory` の写像は Issue #114 で Demo Adapter 内部に、Broker reconciliation は Issue #103〜#105 で実装済み(本書のスコープ外の別契約)。
@@ -244,7 +244,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 | 親の終わり方 | Broker が確定拒否(REJECTED) | Broker 未到達(phase `created` + Journal `not_started`) | Broker が確定拒否(REJECTED) |
 | 許可カテゴリ | 全カテゴリ(運用者判断が根拠) | 該当なし(`OrderResult` が存在しない) | `transient` のみ |
 | 注文パラメータの訂正 | 可(不変条件の範囲内。数量は非増加。ただし `parameter` 拒否のみ policy 上限内の増量可) | 可(不変条件の範囲内。数量は非増加) | **不可(親と完全同一)** |
-| 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断(runner 未実装のため呼び出し元は未接続) |
+| 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断(runner core は #131 / #132 で実装済みだが、自動再試行の呼び出し元は未接続) |
 | 記録 | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = auto` + policy 識別子・根拠(必須) |
 | 回数上限 | policy `max_manual_reissues_per_signal`(**既定 2**。#116 `ReissuePolicy`) | policy `max_gate_corrections_per_signal`(**既定 2**) | policy `max_auto_reissues_per_signal`(**既定 0 = 無効**) |
 | 追加条件 | — | Gate 判定 / Journal 事前条件(上記)。crash boundary 3 は対象外 | cooldown(連打防止)・kill switch 有効時は不可 |

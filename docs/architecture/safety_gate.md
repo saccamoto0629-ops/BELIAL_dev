@@ -45,7 +45,7 @@ service.submit(execution_request_id, market=...)
 
 一方、**deliberate circumvention(故意の回避)— 例えば `getattr` による動的呼び出し・monkeypatch・reflection — を in-process の Python で防止することは言語的に不可能**である。これは本実装固有の限界ではなく、いかなる実行時 capability 方式・封印方式を導入しても、同じ reflection でその機構自体を偽装できる(無限後退)。また、Adapter 側に承認状態の検査を持たせる方式は「Broker Adapter は Safety Gate のロジックを持たない」(Issue #75)および Broker 境界の責務分離(Issue #73)と矛盾するため採らない。
 
-故意回避に対する実効的な境界は、実 Adapter 導入時に**プロセス・運用境界**として設計する(Broker 認証情報を Live Execution runner プロセス以外へ渡さない、Adapter の構築を runner の composition root に限定する、コードレビュー + CI)。これは Live Adapter / runner 設計 Issue(非スコープ)の一部として後続 Issue で扱う。
+故意回避に対する実効的な境界は**プロセス・運用境界**として設計する(Adapter は Issue #79 / #82 で導入済み)(Broker 認証情報を Live Execution runner プロセス以外へ渡さない、Adapter の構築を runner の composition root に限定する、コードレビュー + CI)。これは Live Adapter / runner 設計 Issue(非スコープ)の一部として後続 Issue で扱う。
 - **二重送信防止**: `submit()` は `client_order_id` を受け取らない。使えるのは register 時に固定された保存済みの値だけであり(NOT NULL + UNIQUE + 不変、Issue #74)、同じ意図が新しい broker キーで再送されることは構造的に起きない。送信試行自体も `created → submitting` 遷移(一度きり・`BEGIN IMMEDIATE` 直列化)を獲得した呼び出しに限られる。
 - **UNKNOWN の再送禁止**: timeout・通信失敗を含む submit の例外は UNKNOWN として記録され(「未発注」へ降格しない)、以後の `submit()` は phase≠created により `duplicate_submission` で拒否される。UNKNOWN の解決は後続照会の記録のみ(Issue #74)。
 - **Broker 呼び出し後の失敗は拒否へ変換しない**: 注文が存在しうるため、例外はそのまま伝播する。**受領済み `OrderResult` の保存(`record_order_result`)が失敗した場合も、state-only UNKNOWN へのフォールバック記録を試みてから元例外を re-raise する** — Broker に存在する注文が永続化エラーの陰に消えることはない。フォールバックまで失敗した場合(order DB 全体の障害)は critical ログを残し、注文は phase `submitting` / state `pending` のまま **`execution_store.list_unresolved_submissions()`** で照会対象として取得できる(下記)。
@@ -252,7 +252,7 @@ kill switch の**状態の正はプロセスメモリではなく専用 SQLite**
 
 ## 非スコープ(Issue #75 時点で未実装)
 
-- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(現在: Demo / Live Adapter は Issue #79 / #82 で実装済み。`demo` の `BrokerConnection` は Adapter 型が登録されるまで構築不能のまま、`live` は Issue #82 で登録済みだが全ロック成立時のみ `live_lock.build_live_connection()` が構築できる。実口座での Live 運用は未解禁)
+- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(現在: Demo / Live Adapter は Issue #79 / #82 で実装済み。`demo` は Issue #132 で登録され、全ロック成立時のみ `demo_lock.build_demo_connection()` が構築できる。`live` は Issue #82 で登録済みだが全ロック成立時のみ `live_lock.build_live_connection()` が構築できる。実口座での Live 運用は未解禁)
 - Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ。その後 Issue #131 で runner core を `fake` / `shadow` で、Issue #132 で `demo` を実装済み。`live` の駆動と継続運転の運用導線は引き続き非スコープ)
 - 動的ロット計算・証拠金最適化・リスク量からの数量計算
 - 自動キャンセル判断(いつキャンセルするかの Strategy / 運用判断。公認キャンセル**経路**は Issue #99 で実装済みだが、それを呼ぶ判断側は非スコープ)

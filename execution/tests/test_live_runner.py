@@ -1,4 +1,8 @@
-"""Issue #131: the Live Execution runner core (Fake / Shadow only).
+"""Issue #131: the Live Execution runner core (Fake / Shadow).
+
+The ``demo`` mode this runner also drives since Issue #132 is covered by
+``execution/tests/test_demo_runner.py``; the mode-dispatch tests below pin
+which modes are runnable at all.
 
 The runner adds a LIFECYCLE around the existing boundaries; these tests pin
 that it adds nothing else. They cover, end to end through the production

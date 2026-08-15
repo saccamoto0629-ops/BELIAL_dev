@@ -548,8 +548,11 @@ def build_fake_execution_runner(
 
     The connection's mode is DERIVED from the broker instance, so passing a
     non-fake connection is refused here -- a demo or live adapter cannot be
-    driven by this runner (OANDA Demo integration is a separate Issue, and
-    live operation additionally requires the live activation lock).
+    driven by THIS runner. Demo has its own composition root
+    (``build_demo_execution_runner``, which takes a ``DemoRuntimeGrant``
+    issued by ``execution/demo_lock.py``), and live operation has no
+    composition root here at all: it additionally requires the live
+    activation lock and remains un-released.
 
     ``state_provider`` is the gate's kill-switch source and is consulted on
     EVERY submission (the gate re-reads it per evaluation); pass

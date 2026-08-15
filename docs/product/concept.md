@@ -61,7 +61,7 @@ BELIAL は、いきなり実売買へ進まない。まず市場を観測し、�
 
 ## レイヤー分離
 
-処理は次の直列フローで進む。Paper Execution までが実装済み・運用中である。Live Execution は基盤(Broker 境界・Adapter・Safety Gate・Live 接続ロック)まで実装済みだが、常駐 runner が未実装のためリアルタイムフローとしては駆動されず、実口座での運用も未解禁である。
+処理は次の直列フローで進む。Paper Execution までが実装済み・運用中である。Live Execution は基盤(Broker 境界・Adapter・Safety Gate・Live 接続ロック)と runner core(Issue #131 の `fake` / `shadow`、Issue #132 の `demo`)まで実装済みだが、**継続運転する常駐プロセスが未実装**のためリアルタイムフローとしては駆動されず、実口座での運用も未解禁である。
 
 ```text
 Observation
