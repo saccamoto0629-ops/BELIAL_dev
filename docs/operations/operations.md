@@ -293,7 +293,16 @@ python -m execution.reconciliation_runner --broker fake --dry-run
 
 `python -m execution.kill_switch_cli` は Execution 層の**永続 Kill Switch** を操作する唯一の運用導線。有効化すると Safety Gate(`kill_switch_enabled`)が**すべての新規 Broker 送信**を拒否する。状態は SQLite(`KILL_SWITCH_DB_PATH`、既定 `execution/data/kill_switch.sqlite3`)に append-only の履歴として永続化されるため、**プロセス再起動・多重起動・別プロセスからの送信にも停止が効き続ける**。reconciliation・read-only 照会・cancel は Gate を通らないため停止中も実行できる。この CLI は Broker・ネットワークへ一切触れない。
 
-**実行中の送信に対する即時性(Issue #132 / PR #136 レビュー P1)**: Safety Gate は評価の冒頭で Kill Switch を読むが、その後に Broker への安全確認 GET(建玉・口座状態)と Journal / Order Store への書き込みが挟まる。実口座・Practice 口座への送信ではこれらがネットワーク往復になるため、**評価中に Kill Switch を ON にしても既に評価が始まっていた 1 件は送信され得た**。現在は `LiveOrderSubmissionService` が Broker 呼び出しの直前に**永続 Kill Switch をもう一度読む**(`REAL_BROKER_MODES` = `demo` / `live` のみ)。ON はもちろん、**読み取り不能でも送信しない**(fail-closed)。この再チェックは Journal の `started` マークより前に位置するため、拒否された場合の Journal エントリは `not_started` のままで、**Broker へ一切送っていない**ことの耐久的な証拠になる。停止された intent は phase `submitting` に留まり自動再送はされない(`SubmissionJournal.list_unresolved()` / `execution_store.list_unresolved_submissions()` で可視)。
+**実行中の送信に対する即時性(Issue #132 / PR #136 レビュー P1)**: Safety Gate は評価の冒頭で Kill Switch を読むが、その後に Broker への安全確認 GET(建玉・口座状態)と Journal / Order Store への書き込みが挟まる。実口座・Practice 口座への送信ではこれらがネットワーク往復になるため、**評価中に Kill Switch を ON にしても既に評価が始まっていた 1 件は送信され得た**。現在は `LiveOrderSubmissionService` が Broker 呼び出しまでに**永続 Kill Switch を 2 回読む**(`REAL_BROKER_MODES` = `demo` / `live` のみ)。いずれも ON はもちろん**読み取り不能でも送信しない**(fail-closed)。
+
+| 読み取り位置 | 塞ぐ window | 拒否時の Journal |
+|---|---|---|
+| Journal の `started` マークの**前** | Broker 安全確認 GET・clearance 照会・Journal / Store 書き込み(ネットワーク往復を含む) | **`not_started`** = Broker へ一切送っていないことの耐久的証拠。reconciliation 案件は発生しない |
+| `started` マークの**後**(= `submit_order()` の直前) | `mark_broker_call_started` 自身(SQLite の busy timeout は 30 秒) | **`started` のまま unresolved**(保守側へ倒す) |
+
+2 回目の拒否で Journal を終端化しないのは意図的である。`started` = **Broker が注文を保持している可能性がある**という不変条件は reconciliation が依拠するものであり、`started` からの「送っていないことが証明済み」遷移を作るとこの不変条件が弱まる。万一その遷移が実際には POST 済みの経路で発火すれば注文を静かに失う — reconciliation 案件 1 件よりはるかに悪い。緊急停止時に unresolved が 1 件残るのは、どのみち reconciliation を行う場面での妥当なコストと判断している。なお runner 側は制御フロー上の事実として `NOT_SENT` を報告する。
+
+停止された intent は phase `submitting` に留まり自動再送はされない(`SubmissionJournal.list_unresolved()` / `execution_store.list_unresolved_submissions()` で可視)。
 
 EC2 上での緊急停止(enable は 1 コマンド。DB 未作成でも初期化して停止する):
 

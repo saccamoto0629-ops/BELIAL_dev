@@ -72,6 +72,7 @@ from execution.safety_store import SQLiteSafetyDecisionStore
 from execution.shadow_providers import StaticMarketSnapshotProvider
 from execution.submission_journal import (
     BROKER_CALL_NOT_STARTED,
+    BROKER_CALL_STARTED,
     OUTCOME_COMPLETED,
     OUTCOME_OPEN,
     OUTCOME_RECONCILIATION_REQUIRED,
@@ -517,6 +518,51 @@ def test_a_kill_switch_that_becomes_unreadable_mid_submission_stops_the_post(
     assert outcome.status is RunnerItemStatus.REJECTED
     assert outcome.broker_contact is BrokerContact.NOT_SENT
     assert SafetyRejectionCode.STATE_QUERY_FAILED.value in outcome.rejection_codes
+
+
+def test_a_kill_switch_flipped_during_the_journal_start_write_stops_the_post(
+    tmp_path, monkeypatch
+):
+    """PR #136 review P1 (second round), reproduced: the switch is pressed
+    while ``mark_broker_call_started`` is waiting or writing.
+
+    That transition is a SQLite write with a 30-second busy timeout, so it is
+    a real window -- the read before it had already returned False. The last
+    read now sits after this write, leaving zero operations before the POST.
+    """
+    original = SubmissionJournal.mark_broker_call_started
+    flipped = []
+
+    def flip_after_marking(self, execution_request_id, *, at_utc):
+        original(self, execution_request_id, at_utc=at_utc)
+        if not flipped:
+            SQLiteKillSwitchStore(tmp_path / KILL_SWITCH_DB).record_transition(
+                enabled=True,
+                operator="ops",
+                reason="halt during the journal start write",
+                changed_at_utc=NOW + timedelta(seconds=1),
+            )
+            flipped.append(execution_request_id)
+
+    monkeypatch.setattr(SubmissionJournal, "mark_broker_call_started", flip_after_marking)
+
+    runner, transport, _grant = build_demo(tmp_path, monkeypatch)
+    register(tmp_path)
+
+    outcome = only(runner.run_cycle())
+
+    assert flipped, "the journal start mark never ran; the reproduction is not valid"
+    assert transport.submit_calls == [], "an order POST was issued after the kill switch went ON"
+    assert outcome.status is RunnerItemStatus.REJECTED
+    assert outcome.broker_contact is BrokerContact.NOT_SENT
+    assert SafetyRejectionCode.KILL_SWITCH_ENABLED.value in outcome.rejection_codes
+    # The journal stays CONSERVATIVE here on purpose: the mark was already
+    # written, and 'started' => the broker may hold this order is the
+    # invariant reconciliation relies on. The entry is left unresolved
+    # rather than terminalized out of 'started'.
+    entries = SubmissionJournal(tmp_path / JOURNAL_DB).list_unresolved()
+    assert [entry.broker_call_state for entry in entries] == [BROKER_CALL_STARTED]
+    assert [entry.outcome for entry in entries] == [OUTCOME_OPEN]
 
 
 def test_an_unreadable_kill_switch_stops_demo_submission(tmp_path, monkeypatch):
