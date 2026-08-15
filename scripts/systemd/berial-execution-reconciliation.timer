@@ -1,0 +1,37 @@
+[Unit]
+# Periodic trigger for berial-execution-reconciliation.service (Issue #133):
+# every 15 minutes, on the quarter hour, in UTC.
+#
+# UTC on purpose: reconciliation compares timestamps that are stored and
+# compared in UTC everywhere in this repository, and a fixed-offset local
+# calendar would only add a translation nobody needs. (Unlike the daily
+# report timers, this schedule has no "report day" to align with.)
+#
+# Verify on the target host with:
+#   systemd-analyze calendar '*:0/15:00 UTC'
+#
+# Copy to /etc/systemd/system/ next to
+# berial-execution-reconciliation.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now berial-execution-reconciliation.timer
+# Deliberately not part of scripts/restart_all.sh: re-activating a Persistent
+# timer that missed its schedule can start the service immediately.
+Description=Run Berial broker reconciliation every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15:00 UTC
+# If the host was down at the scheduled minute, run once as soon as possible
+# after boot instead of waiting for the next quarter hour: a restart is
+# exactly when a reconciliation pass is most useful (in-flight submissions may
+# have been interrupted, and pending repair claims need their takeover).
+Persistent=true
+# Spread the start so a fixed-minute burst does not collide with the other
+# timers; well below the 15-minute period, so no tick is ever skipped.
+RandomizedDelaySec=2m
+# systemd does not start a second instance of a unit that is still running,
+# so a slow cycle simply skips the tick it overlaps. The CLI's own entry lock
+# covers the case systemd cannot see: a MANUAL run alongside a timer run.
+Unit=berial-execution-reconciliation.service
+
+[Install]
+WantedBy=timers.target

@@ -70,6 +70,12 @@ EXIT_USAGE_ERROR = 2
 _BROKER_FAKE = "fake"
 _BROKER_OANDA_DEMO = "oanda-demo"
 
+#: The brokers a reconcile-only path may talk to. There is deliberately no
+#: ``oanda-live`` member: reconciliation never touches the live path, and the
+#: scheduled cycle CLI (Issue #133) reuses THIS tuple so the two CLIs cannot
+#: drift apart on which targets exist.
+BROKER_CHOICES: tuple[str, ...] = (_BROKER_OANDA_DEMO, _BROKER_FAKE)
+
 
 class ReconcileOnlyViolationError(RuntimeError):
     """A mutating (or account-reading) broker operation was reached from the
@@ -143,7 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--broker",
         required=True,
-        choices=(_BROKER_OANDA_DEMO, _BROKER_FAKE),
+        choices=BROKER_CHOICES,
         help=(
             "'oanda-demo': the OANDA DEMO account from OANDA_API_TOKEN / "
             "OANDA_ACCOUNT_ID (non-demo endpoints are refused, fail-closed); "
@@ -202,14 +208,25 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_db_paths(args) -> tuple[Path, Path]:
-    execution_db = args.execution_db
-    reconciliation_db = args.reconciliation_db
-    if args.data_dir is not None:
+def resolve_db_paths(
+    *,
+    execution_db: Path | None = None,
+    reconciliation_db: Path | None = None,
+    data_dir: Path | None = None,
+) -> tuple[Path, Path]:
+    """Resolve (execution DB, reconciliation DB) from the CLI overrides.
+
+    Precedence: an explicit per-DB path wins over ``--data-dir``, which wins
+    over the environment / packaged defaults. Shared with the scheduled cycle
+    CLI (Issue #133) so both boundaries resolve a data directory identically
+    -- a cycle must not silently reconcile a different DB pair than the
+    manual CLI an operator just ran.
+    """
+    if data_dir is not None:
         if execution_db is None:
-            execution_db = args.data_dir / "execution_orders.sqlite3"
+            execution_db = data_dir / "execution_orders.sqlite3"
         if reconciliation_db is None:
-            reconciliation_db = args.data_dir / "broker_reconciliation.sqlite3"
+            reconciliation_db = data_dir / "broker_reconciliation.sqlite3"
     if execution_db is None:
         execution_db = execution_store.execution_db_path()
     if reconciliation_db is None:
@@ -217,8 +234,34 @@ def _resolve_db_paths(args) -> tuple[Path, Path]:
     return Path(execution_db), Path(reconciliation_db)
 
 
+def parse_utc_argument(text: str) -> datetime:
+    """Parse a fixed ISO-8601 observation clock, refusing naive / non-UTC
+    values. Shared with the scheduled cycle CLI (Issue #133)."""
+    value = datetime.fromisoformat(text)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("--now must be timezone-aware")
+    if value.utcoffset().total_seconds() != 0:
+        raise ValueError("--now must be UTC (offset 0)")
+    return value
+
+
+def _resolve_db_paths(args) -> tuple[Path, Path]:
+    return resolve_db_paths(
+        execution_db=args.execution_db,
+        reconciliation_db=args.reconciliation_db,
+        data_dir=args.data_dir,
+    )
+
+
 def _build_broker(kind: str):
     """Construct the (unwrapped) broker for ``kind``.
+
+    Returns ``(broker, identity_label, query_timeout_seconds_or_None)``. The
+    timeout is the adapter's CONFIGURED HTTP timeout, carried out of the one
+    place that already knows it (Issue #133): the repair service validates
+    ``broker timeout < claim lease`` and cannot read the value off the
+    adapter itself, so a scheduled repair pass would otherwise skip that
+    validation entirely. ``fake`` has no timeout to report (no network).
 
     ``oanda-demo`` raises ``ValueError`` with the adapter's fixed, secret-free
     messages when the environment is missing or names a non-demo endpoint --
@@ -226,21 +269,29 @@ def _build_broker(kind: str):
     refusal). The adapter import is lazy so the fake path never touches the
     HTTP stack."""
     if kind == _BROKER_FAKE:
-        return FakeBroker(), "fake / fake"
+        return FakeBroker(), "fake / fake", None
     from broker.oanda_demo_adapter import OandaDemoAdapter, OandaDemoConfig
 
-    adapter = OandaDemoAdapter(OandaDemoConfig.from_env())
+    config = OandaDemoConfig.from_env()
+    adapter = OandaDemoAdapter(config)
     identity = adapter.connection_identity()
-    return adapter, f"{identity.mode} / {identity.target}"
+    return adapter, f"{identity.mode} / {identity.target}", config.timeout_seconds
 
 
-def _parse_now(text: str) -> datetime:
-    value = datetime.fromisoformat(text)
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("--now must be timezone-aware")
-    if value.utcoffset().total_seconds() != 0:
-        raise ValueError("--now must be UTC (offset 0)")
-    return value
+def build_reconcile_only_broker(kind: str) -> tuple[ReconcileOnlyBroker, str, float | None]:
+    """Build the broker for ``kind``, ALREADY wrapped in the reconcile-only
+    facade, plus its secret-free identity label and configured query timeout.
+
+    The public composition entry point shared with the scheduled cycle CLI
+    (Issue #133). It exists so that adding a periodic reconciliation boundary
+    adds NO second construction site for the OANDA Demo adapter and NO second
+    place where an unwrapped broker briefly exists: the caller cannot obtain
+    the raw adapter through this function at all. ``ValueError`` propagates
+    from the adapter's construction-time refusals (missing credentials, any
+    non-demo endpoint) with its fixed, secret-free messages.
+    """
+    broker, label, timeout_seconds = _build_broker(kind)
+    return ReconcileOnlyBroker(broker), label, timeout_seconds
 
 
 def _default_run_id() -> str:
@@ -287,7 +338,14 @@ def _position_discrepancy_payload(discrepancy) -> dict:
     }
 
 
-def _run_payload(run: ReconciliationRun, *, broker_label: str, dry_run: bool, recorded_to) -> dict:
+def run_payload(run: ReconciliationRun, *, broker_label: str, dry_run: bool, recorded_to) -> dict:
+    """Render one reconciliation run as a machine-readable payload.
+
+    Public since Issue #133: the scheduled cycle CLI embeds the SAME run
+    shape under its own ``reconciliation`` key, so an operator (and any log
+    parser) reads one description of a run regardless of which boundary
+    produced it.
+    """
     counts = run.resolution_counts()
     summary = run.position_summary
     return {
@@ -398,13 +456,13 @@ def _run_cli(argv: list[str] | None) -> int:
     fixed_now = None
     if args.now is not None:
         try:
-            fixed_now = _parse_now(args.now)
+            fixed_now = parse_utc_argument(args.now)
         except ValueError as exc:
             print(f"invalid --now value: {exc}", file=sys.stderr)
             return EXIT_USAGE_ERROR
 
     try:
-        broker, broker_label = _build_broker(args.broker)
+        broker, broker_label, _query_timeout = _build_broker(args.broker)
     except ValueError as exc:
         # The adapter's construction-time refusals (missing credentials, any
         # non-demo endpoint) arrive here with fixed, secret-free messages.
@@ -436,7 +494,7 @@ def _run_cli(argv: list[str] | None) -> int:
         print(f"reconciliation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_DISCREPANCIES
 
-    payload = _run_payload(
+    payload = run_payload(
         run,
         broker_label=broker_label,
         dry_run=args.dry_run,

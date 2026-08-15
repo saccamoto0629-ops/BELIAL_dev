@@ -131,6 +131,35 @@ jobs:
           python -c "import json; data=json.load(open('recon-run.json', encoding='ascii')); assert data['run_id'] == 'recon-ci-1' and data['position_scope'] is not None, data"
           test -f "$RUNNER_TEMP/recon-ci/broker_reconciliation.sqlite3"
 
+      # Issue #133: the SCHEDULED (oneshot) reconciliation cycle contract --
+      # the process a systemd timer starts. Same FakeBroker-only stance as
+      # the manual CLI. dry-run must create nothing (not even the entry
+      # lock); a recorded cycle must record the run and leave the lock file
+      # behind; a cycle attempted while the lock is HELD must be suppressed
+      # (exit 0, outcome suppressed_locked) and record nothing.
+      - name: Run scheduled reconciliation cycle CLI (dry-run, cycle, overlap)
+        run: |
+          set -e
+          python -m execution.reconciliation_schedule_cli --broker fake --dry-run --data-dir "$RUNNER_TEMP/recon-cycle-ci" --now 2026-01-01T00:00:00+00:00 --run-id cycle-ci-dry --json > cycle-dry.json
+          python -c "import json; data=json.load(open('cycle-dry.json', encoding='ascii')); assert data['dry_run'] and data['reconciliation']['recorded_to'] is None, data"
+          test ! -e "$RUNNER_TEMP/recon-cycle-ci" || { echo "dry-run must not create any file"; exit 1; }
+          python -m execution.reconciliation_schedule_cli --broker fake --data-dir "$RUNNER_TEMP/recon-cycle-ci" --now 2026-01-01T00:00:00+00:00 --run-id cycle-ci-1 --repair --repair-owner-id ci-owner --json > cycle-run.json
+          python -c "import json; data=json.load(open('cycle-run.json', encoding='ascii')); assert data['run_id'] == 'cycle-ci-1' and data['repair_enabled'] and data['outcome'] == 'clean', data"
+          test -f "$RUNNER_TEMP/recon-cycle-ci/broker_reconciliation.sqlite3"
+          test -f "$RUNNER_TEMP/recon-cycle-ci/reconciliation_cycle.lock"
+          # overlap: hold the entry lock, then attempt a cycle in-process
+          python - <<'PY'
+          import os, pathlib
+          from execution.reconciliation_schedule import cycle_lock, cycle_lock_path_for
+          from execution import reconciliation_schedule_cli as cli
+          data_dir = pathlib.Path(os.environ["RUNNER_TEMP"]) / "recon-cycle-ci"
+          lock = cycle_lock_path_for(data_dir / "broker_reconciliation.sqlite3")
+          with cycle_lock(lock):
+              code = cli.main(["--broker", "fake", "--data-dir", str(data_dir), "--run-id", "cycle-ci-2"])
+          assert code == 0, code
+          PY
+          python -c "import sys; sys.path.insert(0,'.'); from execution import reconciliation_store as s; from pathlib import Path; import os; db=Path(os.environ['RUNNER_TEMP'])/'recon-cycle-ci'/'broker_reconciliation.sqlite3'; ids=[r.run_id for r in s.list_reconciliation_runs(db_path=db)]; assert ids == ['cycle-ci-1'], ids"
+
       # Issue #82: the live activation lock must fail CLOSED in an
       # environment that carries no live configuration at all -- which is
       # exactly what CI is. No credential is ever set here, so this step

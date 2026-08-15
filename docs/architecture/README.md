@@ -43,10 +43,12 @@ BELIAL の設計資料を置く。
   再発行許可)・手動再発行 / 訂正差し替え / 自動再試行(既定無効)の登録ユースケース。状態機械は不変
   (REJECTED は terminal のまま)で、再発行可否は Broker 中立の正規化拒否分類(Issue #114)で決める。
   実装は `execution/{reissue_service,reissue_clearance,reissue_composition,reissue_evidence}.py` + execution store schema v5。
-- [Broker Reconciliation](broker_reconciliation.md)(Issue #103〜#105): 内部注文状態と Broker 状態の
+- [Broker Reconciliation](broker_reconciliation.md)(Issue #103〜#105 / #133): 内部注文状態と Broker 状態の
   差分検出(#103)、`auto_repair_candidate` に限定した注文状態の安全な修復(#104)、position / trade /
-  SL・TP スコープの検出(#105。`manual_review` のみ・修復経路なし)、および OANDA Demo 専用の
-  手動 reconciliation CLI(`python -m execution.reconciliation_runner`)。scheduler への組み込みは未実装。
+  SL・TP スコープの検出(#105。`manual_review` のみ・修復経路なし)、OANDA Demo 専用の
+  手動 reconciliation CLI(`python -m execution.reconciliation_runner`)、および定期実行のための
+  独立した oneshot cycle(#133。`python -m execution.reconciliation_schedule_cli` + systemd timer。
+  Execution 送信 runner とは別の実行単位で、submit / cancel 能力を構造的に持たない)。
 - [Shadow Mode / Shadow Execution](shadow_execution.md)(Issue #78): 実 Signal・実設定・Safety Gate を
   通常の Production 経路で実行しつつ Broker へは一切送信せず、生成された注文候補と Gate 判定を
   検証記録として保存する Shadow Mode。execution mode(`dry-run` / `shadow` / `fake` / `demo` / `live`)の

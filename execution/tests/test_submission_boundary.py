@@ -39,6 +39,12 @@ SUBMIT_ORDER_ALLOWED = {
     # the ReconcileOnlyBroker facade RAISES on submit/cancel (the assertion
     # itself must call the poisoned method).
     "execution/tests/test_reconciliation_runner_cli.py",
+    # Issue #133: the scheduled-cycle suite seeds the FakeBroker with the
+    # broker-side state a periodic cycle observes, and pins the SAME poisoned
+    # facade the cycle is structurally required to hold. Fixtures and
+    # assertions only -- the schedule modules themselves are separately
+    # pinned to zero submit/cancel calls.
+    "execution/tests/test_reconciliation_schedule.py",
     # Issue #93: FaultAfterResponseBroker is a FakeBroker SUBCLASS test
     # double whose override delegates to super().submit_order() and then
     # injects an Execution-DB fault -- the post-response crash window the
@@ -68,6 +74,9 @@ CANCEL_ORDER_ALLOWED = {
     "execution/tests/test_broker_reconciliation_repair.py",
     # Issue #105: pins that ReconcileOnlyBroker.cancel_order RAISES.
     "execution/tests/test_reconciliation_runner_cli.py",
+    # Issue #133: the scheduled-cycle suite pins the same refusal on the
+    # facade the cycle is required to hold.
+    "execution/tests/test_reconciliation_schedule.py",
     # Issue #116: the QueryOnlyBroker facade's pure delegation (see
     # SUBMIT_ORDER_ALLOWED above); no test there cancels anything.
     "execution/tests/test_reissue_clearance.py",
@@ -548,3 +557,86 @@ def test_the_runner_modules_never_write_execution_state_directly():
             for lineno in _method_call_sites(path, function) + _name_call_sites(path, function):
                 offenders.append(f"execution/{name}:{lineno} calls {function}")
     assert offenders == []
+
+
+# Issue #133: the scheduled reconciliation boundary is a SEPARATE execution
+# unit that composes the existing reconcile-only services. It owns no broker,
+# builds no adapter and updates no order state itself -- the same structural
+# stance the Live Execution runner modules are held to, applied to the
+# periodic audit path.
+SCHEDULE_MODULES = ("reconciliation_schedule.py", "reconciliation_schedule_cli.py")
+
+
+def test_the_schedule_modules_never_import_a_broker_implementation():
+    """A scheduled cycle receives the reconcile-only facade and nothing else.
+    Importing the Broker protocol or any concrete adapter here would create a
+    call surface the "no submit / no cancel" contract forbids -- and would let
+    the schedule path grow its own broker instead of reusing the one composer
+    (``reconciliation_runner.build_reconcile_only_broker``)."""
+    offenders = []
+    for name in SCHEDULE_MODULES:
+        for lineno, module in _imported_modules(REPO_ROOT / "execution" / name):
+            if module.startswith("broker."):
+                offenders.append(f"execution/{name}:{lineno} imports {module}")
+    assert offenders == []
+
+
+def test_the_schedule_modules_never_construct_a_broker_or_a_connection():
+    """Adding a periodic boundary must add NO second construction site for
+    the OANDA Demo adapter: if the schedule path could build one itself it
+    would choose the config it was measured against, and it could hold the
+    RAW adapter (submit/cancel included) instead of the poisoned facade."""
+    offenders = []
+    for name in SCHEDULE_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for composer in CONNECTION_COMPOSERS + (
+            "OandaDemoAdapter",
+            "OandaDemoConfig",
+            "OandaLiveAdapter",
+            "FakeBroker",
+        ):
+            for lineno in _method_call_sites(path, composer) + _name_call_sites(path, composer):
+                offenders.append(f"execution/{name}:{lineno} calls {composer}")
+    assert offenders == []
+
+
+def test_the_schedule_modules_never_write_execution_state_directly():
+    """Every internal order-state change a cycle can cause belongs to the
+    Issue #104 repair service, with its claim / lease / generation / fencing
+    contract. A "convenient" direct store write in the scheduler would be an
+    auto-repair around that contract."""
+    offenders = []
+    for name in SCHEDULE_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for function in EXECUTION_STORE_WRITE_FUNCTIONS:
+            for lineno in _method_call_sites(path, function) + _name_call_sites(path, function):
+                offenders.append(f"execution/{name}:{lineno} calls {function}")
+    assert offenders == []
+
+
+def test_the_schedule_modules_never_run_a_repair_pass_outside_apply_or_recovery():
+    """The repair entry points a cycle may use are exactly the two existing
+    ones. Anything else here would mean the scheduler re-implemented part of
+    the attempt lifecycle instead of driving it."""
+    allowed = {"repair", "recover_pending_attempts"}
+    tree = ast.parse(
+        (REPO_ROOT / "execution" / "reconciliation_schedule.py").read_text(encoding="utf-8")
+    )
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    forbidden = {
+        "reserve_repair_attempt",
+        "finalize_repair_attempt",
+        "create_takeover_intent",
+        "mark_takeover_fence_installed",
+        "mark_takeover_claim_promoted",
+        "complete_takeover_intent",
+        "cancel_takeover_intent",
+        "renew_takeover_intent_lease",
+        "insert_blocked_takeover_intent",
+    }
+    assert called & forbidden == set()
+    assert allowed & called == allowed  # both entry points really are driven

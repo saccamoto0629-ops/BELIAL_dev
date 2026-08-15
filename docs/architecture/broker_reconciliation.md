@@ -1,13 +1,13 @@
-# Broker Reconciliation — 差分検出と安全な注文状態修復(Issue #103 / #104 / #105)
+# Broker Reconciliation — 差分検出と安全な注文状態修復(Issue #103 / #104 / #105 / #133)
 
-BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出基盤**(Issue #103)と、そのうち安全に確定できる注文状態だけを内部へ冪等に反映する**修復サービス**(Issue #104)、および照合範囲を position / trade / transaction / SL・TP へ広げた **position スコープ検出**(Issue #105)。実装は `execution/`(`reconciliation_models.py` / `reconciliation_repair_models.py` / `reconciliation_store.py` / `broker_reconciliation.py` / `broker_reconciliation_repair.py` / `reconciliation_runner.py`)にある。
+BELIAL 内部の注文状態と Broker 側の注文状態を照合し、不一致を分類・記録する**検出基盤**(Issue #103)と、そのうち安全に確定できる注文状態だけを内部へ冪等に反映する**修復サービス**(Issue #104)、および照合範囲を position / trade / transaction / SL・TP へ広げた **position スコープ検出**(Issue #105)。それらを**定期実行するための独立した oneshot 境界**(Issue #133)。実装は `execution/`(`reconciliation_models.py` / `reconciliation_repair_models.py` / `reconciliation_store.py` / `broker_reconciliation.py` / `broker_reconciliation_repair.py` / `reconciliation_runner.py` / `reconciliation_schedule.py` / `reconciliation_schedule_cli.py`)にある。
 
 > **重要な位置づけ**
 >
 > - **検出サービスは検出専用(detection only)である。** 内部注文状態を変更しない・Broker へ注文を送信しない・Broker 注文をキャンセルしない。Broker へは**照会系操作のみ**(`get_order` / `list_orders` / `get_positions` / `get_open_trades` / `get_closed_trades`)を発行する。
 > - **修復サービスが変更できるのは BELIAL 内部の注文状態だけであり、必ず既存の注文状態機械を経由する。** Broker への write 操作(submit / cancel / replace / close)は一切行わず、Broker へは `get_order` のみを発行する。SQL の直接 UPDATE も行わない(唯一の書き込み経路は `execution_store.record_order_result`。AST 検査で固定)。
 > - **position / trade / transaction / SL・TP の照合(Issue #105)は検出 + `manual_review` 分類のみで、修復経路が存在しない。** position 系 discrepancy はモデル不変条件と DB CHECK の両方で `manual_review` 固定であり、修復サービスは order discrepancy(`run.discrepancies`)しか読まないため、position 系記録は構造的に修復へ到達できない。Broker 側のみの position / trade の自動採用・内部のみ position の自動 close・SL / TP の自動再作成・変更は行わない。
-> - scheduler・常駐 Bot への組み込みは行っていない。実行はサービス API の明示的な呼び出し、または手動 CLI(`python -m execution.reconciliation_runner`。Issue #105)のみ。
+> - **定期実行は Execution 送信 runner とは独立した実行単位で行う**(Issue #133)。実行経路はサービス API の明示的な呼び出し、手動 CLI(`python -m execution.reconciliation_runner`。Issue #105)、または scheduled cycle CLI(`python -m execution.reconciliation_schedule_cli`。systemd timer + oneshot)の 3 つのみ。常駐 Bot・送信 runner への組み込みは行っていない。scheduled cycle も既存の `ReconcileOnlyBroker` facade しか受け取れず、submit / cancel 能力を構造的に持たない。
 > - 注文状態の唯一の正は既存の `broker.OrderState` と `validate_order_state_transition()` / `validate_order_result_update()`([Broker Interface](broker_interface.md)、Issue #73)。本基盤は**注文状態 Enum・遷移表を新設・緩和しない**(position ドメインにも並行状態機械を導入しない — 観測値は文字列レンダリングで記録される監査情報である)。
 
 ```python
@@ -158,6 +158,32 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 - `--orders-only`: Issue #103 スコープに限定。`--run-id` / `--now` / `--json`(pure ASCII)/ `--execution-db` / `--reconciliation-db` / `--data-dir` は他の execution CLI と同じ流儀。
 - exit code: 0 = 差分・部分失敗なし / 1 = 差分または部分失敗あり(実行時失敗を含む)/ 2 = usage・設定エラー(非 Demo 拒否を含む)。
 - 通常 CI・pytest は実 Demo API へ接続しない(FakeBroker 経路 + 環境変数による拒否テスト + monkeypatch した offline adapter のみ。実 API 試験は従来どおり `BELIAL_RUN_OANDA_DEMO_API_TESTS=1` の opt-in スイートに分離)。
+
+### 定期実行 cycle(`python -m execution.reconciliation_schedule_cli`、Issue #133)
+
+上記の照合を**継続運転中に定期実行する**ための境界。第一候補どおり **systemd timer + oneshot service** で駆動し(`scripts/systemd/berial-execution-reconciliation.{service,timer}`)、**Execution 送信 runner とは独立した実行単位**とする。
+
+**なぜ送信 runner に統合しないか**: 送信 runner のライフサイクルは「intent を選ぶ → 送信境界へ渡す → 結果を観測する」であり、reconciliation のライフサイクルは「両側を観測し分類し、必要なら Broker の事実を内部状態機械へ反映する」である。失敗の性質が違い、触ってよい対象が違い、**互いに独立して停止・再起動できること自体が要件**である(reconciliation の停止が送信を止めず、送信の停止が監査を止めない)。`execution/live_runner.py` は Issue #131 の非スコープ宣言どおり reconciliation を呼ばない。
+
+1 cycle の構成(`execution/reconciliation_schedule.py` の `run_reconciliation_cycle()`):
+
+1. **排他入場** — cycle 全体を advisory lock で保護する(既定 `<reconciliation DB のディレクトリ>/reconciliation_cycle.lock`)。
+2. **takeover recovery**(`--repair` 時のみ)— crash した前回 cycle が残した pending attempt を、既存の `recover_pending_attempts()` で**新しい観測の前に**引き継ぐ。後に回すと、回収された更新が直前の観測を stale にするだけになるため。監査 DB がまだ存在しない初回 cycle では pending が存在し得ないので、DB を作ってまで問い合わせない。
+3. **検出** — `BrokerOrderReconciliationService.run()`(既定で position スコープ込み)。run が監査 DB へ記録されることが restart をまたいだ追跡可能性の実体である。
+4. **修復**(`--repair` 時のみ)— 直前に記録した run に対する `repair(mode=APPLY)`。
+
+**構造的に持たない能力**:
+
+- cycle が受け取れる Broker は `ReconcileOnlyBroker` **だけ**である(型で拒否する。`get_order` / `get_positions` を持つだけの duck-typed オブジェクトも拒否される)。broker 実装を import せず、`BrokerConnection` を組み立てず、adapter を構築しない — 4 点とも `execution/tests/test_submission_boundary.py` の AST 検査で固定。OANDA Demo Adapter の構築サイトは `demo_lock.py` と `reconciliation_runner.py` のままで、**Issue #133 は新しい構築サイトを増やしていない**(cycle CLI は `reconciliation_runner.build_reconcile_only_broker()` を経由する)。
+- cycle 自身は分類も状態更新もしない。`auto_repair_candidate` / `manual_review` の判定は検出サービスの、修復可否は修復サービスの責務であり、claim / lease / generation / takeover / fencing 契約はそのまま使われる(緩めない・再実装しない)。execution store の書き込み API を cycle が直接呼ばないことも AST 検査で固定。
+
+**overlap / concurrent run**: timer 駆動の `Type=oneshot` unit は systemd 自身が二重起動しないが、**手動実行と timer 実行の重なり**はそれでは防げないため、cycle 全体を advisory lock で保護する。lock は「空の SQLite ファイルを `BEGIN IMMEDIATE` で保持する」形式で、POSIX / Windows で同一に動作し、プロセス消滅時に OS が解放する(crash 後に手で消す stale lock が残らない)。同一プロセス内の 2 つ目の取得も拒否されるため、排他そのものをテストで固定できる。busy な lock は**失敗ではなく抑止**(`CycleAlreadyRunningError` → CLI は WARNING と `outcome: "suppressed_locked"` を出して exit 0)。
+
+この lock が保証するのは **入場の排他**だけである。「2 つの worker が同一 discrepancy / repair claim を掴まない」ことは、従来どおり修復サービスの durable な claim / lease / generation / fencing が保証する(lock の有無に依存しない)。
+
+**dry-run**: 完全に無副作用。`detect()` 経路のみを使い、監査 DB を作成・migration・書き込みせず、execution DB も作成せず、**lock file も開かない・作らない**。`--repair` との併用は usage error(記録済み run が存在しないため)。
+
+**restart 継続性**: cycle が生む情報はすべてプロセス終了前に永続化される(run と discrepancy = 監査 DB、repair attempt = claim 行 → finalized 行 + takeover intent)。戻り値の `ReconciliationCycleReport` はその**ビュー**であって記録ではない。再起動後は次の cycle が lease 期限切れの pending を引き継ぎ、運用者は `run_id` から `get_reconciliation_run()` / `list_repair_attempts()` / `list_pending_repair_attempts()` で追跡できる。BLOCKED な takeover が 1 件でもあれば、差分ゼロでも cycle は clean を名乗らない(exit 1)。
 
 ## 自動修復(Issue #104、`broker_reconciliation_repair.py`)
 
@@ -615,6 +641,26 @@ result = repairer.repair(run_id="recon-...", mode=RepairMode.DRY_RUN)   # 評価
 recovered = repairer.recover_pending_attempts()                         # lease 切れ pending の takeover
 ```
 
+```python
+from execution.reconciliation_runner import build_reconcile_only_broker
+from execution.reconciliation_schedule import run_reconciliation_cycle, cycle_lock_path_for
+
+broker, label, query_timeout = build_reconcile_only_broker("oanda-demo")  # 既に facade で包まれている
+report = run_reconciliation_cycle(                       # Issue #133: 1 cycle(oneshot)
+    broker=broker,                                       # ReconcileOnlyBroker 以外は拒否
+    execution_db_path="execution/data/demo/execution_orders.sqlite3",
+    reconciliation_db_path="execution/data/demo/broker_reconciliation.sqlite3",
+    run_id="recon-cycle-...",
+    cycle_lock_path=cycle_lock_path_for("execution/data/demo/broker_reconciliation.sqlite3"),
+    repair_enabled=True,                                 # 既定 False(検出のみ)
+    repair_owner_id="demo-recon-1",
+    broker_timeout_seconds=query_timeout,                # lease 未満であることを構築時に検証
+)
+report.is_clean            # 差分・部分失敗・blocked takeover・修復エラーが無い
+report.recovered_attempts  # crash した前回 cycle から引き継いだ attempt
+report.repair_attempts     # この cycle の attempt(auto_repair_candidate のみが進む)
+```
+
 `detect()` は reconciliation DB を作成しない(dry-run 的な確認に使える)。`run()` は `init_reconciliation_db()`(冪等)の後に append する。`repair()` は**保存済み run のみ**を入力とし、APPLY モードでは既存 DB を検証(必要なら v1 → v2 migration)してから処理する(DB が存在しなければエラー。新規作成はしない)。run-level 停止時は `ReconciliationRepairRunError.attempts` に完了済み attempt が添付される(監査 DB からも取得可能)。`recover_pending_attempts()` は **lease が切れた pending だけ**を対象にするので、live な repair pass と同時に走らせても安全である(何度呼んでも、回収済み = finalized の attempt には二度と触れない)。
 
 ### reissue clearance からの利用(Issue #116)
@@ -623,10 +669,10 @@ intent reissue の clearance 観測(`execution/reissue_clearance.py` の `Reissu
 
 ## 非スコープ(Issue #105 時点)
 
-Broker への注文送信・キャンセル・replace・close(修復は内部 DB のみ)、Broker 側のみの注文・position・trade の自動採用、Broker に存在しない内部 position の自動 close、SL / TP 注文の自動再作成・自動変更、Broker 状態の推測(照会失敗・曖昧一致からの状態確定を含む)、無条件の自動決済、position / trade / SL・TP ドメインへの修復拡張(検出 + `manual_review` のみ)、scheduler / 常駐 Bot への組み込み、Live 接続解禁、position 数量レベルの不一致検出(presence 比較のみ。per-trade 検査が細粒度を担う)。
+Broker への注文送信・キャンセル・replace・close(修復は内部 DB のみ)、Broker 側のみの注文・position・trade の自動採用、Broker に存在しない内部 position の自動 close、SL / TP 注文の自動再作成・自動変更、Broker 状態の推測(照会失敗・曖昧一致からの状態確定を含む)、無条件の自動決済、position / trade / SL・TP ドメインへの修復拡張(検出 + `manual_review` のみ)、常駐 Bot / Execution 送信 runner への組み込み(定期実行は Issue #133 の独立した oneshot cycle で行う)、reconciliation 経路への submit / cancel 能力追加、Live 接続解禁、position 数量レベルの不一致検出(presence 比較のみ。per-trade 検査が細粒度を担う)。
 
 claim / takeover まわりの非スコープ: **処理中の lease heartbeat**(固定 lease + `broker_timeout < lease_duration` の構築時検証で代替。intent の lease は「再開の排他」としてのみ CAS で取り直す)、hung worker の強制中断(lease 期限切れによる takeover のみ)、worker 間の分散ロックサービス、blocked からの自動復旧(人手の判断が要る)、intent / fence 行の GC(監査証跡として保持)。
 
 ## テスト
 
-`execution/tests/test_reconciliation_models.py` / `test_reconciliation_repair_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py` / `test_broker_reconciliation_repair.py` / `test_position_reconciliation.py`(Issue #105)/ `test_reconciliation_runner_cli.py`(Issue #105 CLI)、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py` / `test_broker_models.py` / `test_oanda_demo_adapter.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker(OANDA は fake transport / offline stub)のみで、外部通信・Discord・実 DB 更新は発生しない。
+`execution/tests/test_reconciliation_models.py` / `test_reconciliation_repair_models.py` / `test_reconciliation_store.py` / `test_broker_reconciliation.py` / `test_broker_reconciliation_repair.py` / `test_position_reconciliation.py`(Issue #105)/ `test_reconciliation_runner_cli.py`(Issue #105 CLI)/ `test_reconciliation_schedule.py`(Issue #133 定期実行 cycle と oneshot CLI)/ `scripts/tests/test_reconciliation_units.py`(Issue #133 systemd テンプレートの静的検査)、および `broker/tests/test_fake_broker.py` / `test_broker_interface.py` / `test_broker_models.py` / `test_oanda_demo_adapter.py`。観点は [テスト仕様](../testing/test_specification.md) を参照。すべて `tmp_path` の SQLite と in-memory FakeBroker(OANDA は fake transport / offline stub)のみで、外部通信・Discord・実 DB 更新は発生しない。

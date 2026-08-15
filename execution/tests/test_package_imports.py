@@ -44,6 +44,8 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.demo_startup_cli import main as demo_startup_cli_main",
     "from execution.live_runner import ExecutionRunner, RUNNER_SUPPORTED_MODES",
     "from execution.runner_composition import build_demo_execution_runner",
+    "from execution.reconciliation_schedule import run_reconciliation_cycle, cycle_lock",
+    "from execution.reconciliation_schedule_cli import main as reconciliation_schedule_cli_main",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /

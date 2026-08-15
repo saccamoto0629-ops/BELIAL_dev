@@ -1,0 +1,81 @@
+[Unit]
+# Berial scheduled broker reconciliation, oneshot (Issue #133). Triggered by
+# berial-execution-reconciliation.timer; runs ONE reconcile-only cycle
+# (orders + positions / trades / transactions / SL / TP) against the OANDA
+# DEMO account and records it in the reconciliation audit DB.
+#
+# RECONCILE-ONLY, structurally: the CLI hands the reconciliation services a
+# facade whose submit_order / cancel_order / get_account_state raise
+# unconditionally. No order is ever placed, cancelled, closed, re-sent or
+# SL/TP-modified from this unit -- with or without --repair.
+#
+# This unit is INDEPENDENT of any Execution submission runner: it has its own
+# schedule, its own lock and its own failure surface, so a stalled
+# reconciliation never blocks submissions and a stalled runner never blocks
+# the audit. Do not merge the two into one unit.
+#
+# Copy/adapt this template to
+# /etc/systemd/system/berial-execution-reconciliation.service, then:
+#   systemctl daemon-reload
+#   systemctl enable --now berial-execution-reconciliation.timer
+# (enable the TIMER, not this service; starting the service runs one cycle now.)
+# See docs/operations/operations.md for the full deploy/enable/verify steps.
+#
+# Exit codes: 0 = clean, or suppressed because another cycle held the lock
+# (normal under a timer); 1 = discrepancies / partial failure / blocked
+# takeover / a repair pass that stopped part-way -- the unit shows "failed"
+# and journalctl -u berial-execution-reconciliation explains why; 2 = usage or
+# configuration error (including every non-demo OANDA endpoint refusal).
+Description=Berial scheduled broker reconciliation (reconcile-only, oneshot)
+Documentation=file:/opt/berial/docs/architecture/broker_reconciliation.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/berial
+# "python -m execution.reconciliation_schedule_cli" resolves the package from
+# WorkingDirectory (sys.path[0]); PYTHONPATH is set as well so a future
+# WorkingDirectory change cannot silently import a different tree.
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/berial
+# DEMO credentials only: OANDA_API_TOKEN / OANDA_ACCOUNT_ID (fxpractice).
+# This file must NOT carry ENABLE_LIVE_TRADING or any OANDA_LIVE_* variable.
+# "-" keeps a missing file non-fatal; the CLI then refuses at startup with a
+# secret-free message and exits 2.
+EnvironmentFile=-/opt/berial/execution/.env
+# --data-dir points at the DEMO data directory: demo and fake must never
+# share one (docs/operations/operations.md). --json keeps the journal
+# machine-readable; drop it for human-readable output.
+ExecStart=/opt/berial/.venv/bin/python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir /opt/berial/execution/data/demo --json
+# Opt-in repair: REPLACE the ExecStart line above (do not add a second one --
+# systemd runs every ExecStart of a oneshot service in sequence, which would
+# run two cycles per tick) with the line below, and only after reviewing
+# docs/architecture/broker_reconciliation.md. It lets the cycle reflect
+# auto_repair_candidate ORDER observations into BELIAL's own order state
+# through the existing state machine. manual_review (broker-only orders,
+# contradicted outcomes, and EVERY position / trade / transaction / SL / TP
+# discrepancy) is never repaired, and nothing is ever sent to the broker.
+# Give each deployment a stable, distinct owner id.
+#   ExecStart=/opt/berial/.venv/bin/python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir /opt/berial/execution/data/demo --repair --repair-owner-id demo-recon-1 --json
+# stdout/stderr to the journal (journalctl -u berial-execution-reconciliation).
+StandardOutput=journal
+StandardError=journal
+# One cycle must not outlive its schedule: a hung broker query would keep the
+# entry lock and suppress every later tick. Kill it and let the next tick run.
+TimeoutStartSec=600
+# Deliberately no Restart=: a failing oneshot must stay failed until the next
+# timer run instead of looping against a broker that is refusing queries.
+# Sandbox: read-only system, no home access, writes limited to the execution
+# data directory (audit DB, order DB, cycle lock). The "-" prefix keeps a
+# not-yet-created data directory from failing namespace setup.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-/opt/berial/execution/data
+
+# No [Install] section on purpose: this unit is started by its timer (or
+# manually) and is not enabled on its own.
