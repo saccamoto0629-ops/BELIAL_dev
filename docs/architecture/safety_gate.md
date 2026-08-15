@@ -253,7 +253,7 @@ kill switch の**状態の正はプロセスメモリではなく専用 SQLite**
 ## 非スコープ(Issue #75 時点で未実装)
 
 - OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(現在: Demo / Live Adapter は Issue #79 / #82 で実装済み。`demo` の `BrokerConnection` は Adapter 型が登録されるまで構築不能のまま、`live` は Issue #82 で登録済みだが全ロック成立時のみ `live_lock.build_live_connection()` が構築できる。実口座での Live 運用は未解禁)
-- Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ。その後 Issue #131 で runner core を `fake` / `shadow` 限定で実装済み。`demo` / `live` の駆動と運用導線は引き続き非スコープ)
+- Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ。その後 Issue #131 で runner core を `fake` / `shadow` で、Issue #132 で `demo` を実装済み。`live` の駆動と継続運転の運用導線は引き続き非スコープ)
 - 動的ロット計算・証拠金最適化・リスク量からの数量計算
 - 自動キャンセル判断(いつキャンセルするかの Strategy / 運用判断。公認キャンセル**経路**は Issue #99 で実装済みだが、それを呼ぶ判断側は非スコープ)
 - Strategy / Paper Signal の売買ロジック変更、Paper Execution への Broker 接続

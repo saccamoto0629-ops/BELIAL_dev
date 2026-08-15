@@ -273,7 +273,7 @@ fence 行は repair 完了後も**保持**する(cleanup 不要): 新しい atte
 
 ## 非スコープ(Issue #74 時点で未実装)
 
-- Live Execution runner / ユースケース本体(その後 Issue #131 で runner core を `fake` / `shadow` 限定で実装済み。作業キューは `list_pending_execution_requests()`。実 Broker への統合・運用導線は未実装)
+- Live Execution runner / ユースケース本体(その後 Issue #131 で runner core を `fake` / `shadow` で、Issue #132 で `demo` を実装済み。作業キューは `list_pending_execution_requests()`。継続運転の運用導線は未実装)
 - Broker API 実装(OANDA 等の Adapter)・実注文送信・外部通信(その後 Issue #79 / #82 で Demo / Live Adapter を実装済み。Live 接続は全ロック成立時のみ・運用は未解禁)
 - Safety Gate(その後 Issue #75 で実装済み。[Safety Gate](safety_gate.md) を参照)
 - 自動照会・定期 reconciliation

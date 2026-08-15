@@ -134,6 +134,6 @@ Alert は「何が起きたか」という事実の通知であり、売買判�
 
 ## 実装上の注意
 
-- Pepperoni の現行の運用担当は **Paper Execution**(仮想約定のみ。`paper-execution/`)である。**Live Execution は基盤(Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)まで実装済み**だが、実発注を駆動する常駐 runner・自動売買は未実装であり、**実口座での Live 運用は未解禁**である(責務の正は [Architecture](../architecture/architecture.md)、運用条件の正は [Operations](../operations/operations.md))。
+- Pepperoni の現行の運用担当は **Paper Execution**(仮想約定のみ。`paper-execution/`)である。**Live Execution は基盤(Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)と runner core(Issue #131 の `fake` / `shadow`、Issue #132 の `demo`)まで実装済み**だが、自動売買・継続運転の運用導線は未実装であり、**実口座での Live 運用は未解禁**である(責務の正は [Architecture](../architecture/architecture.md)、運用条件の正は [Operations](../operations/operations.md))。
 - 過去データで仮説を遡及検証する **Backtest** は独立した検証基盤であり、Execution レイヤーそのものではない。結果の集約は花椒の担当領域として扱う。
 - 候補キャラクター(Jalapeño / Habanero / Paprika / Carolina)は未採用であり、実装上の責務を割り当てない。

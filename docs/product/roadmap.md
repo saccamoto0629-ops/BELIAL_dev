@@ -111,7 +111,7 @@ v1.5 は、`v1.4.1` タグ後に追加された以下の系統をまとめたリ
 | #75 | **発注前 Safety Gate** + 判定監査保存 + 唯一の送信境界 `LiveOrderSubmissionService`([設計](../architecture/safety_gate.md)) | 実装済み |
 | #77 | **Execution 固定シナリオ試験**(`python -m execution.scenario_runner`。現在 48 シナリオ) | 実装済み |
 | #78 | **Shadow Mode**: Broker へ送信せず実判定経路を監査記録([設計](../architecture/shadow_execution.md)) | 実装済み |
-| #79 | **OANDA Demo Adapter**(Demo endpoint allowlist・fail-closed。Execution 層への組み込みは未実装) | 実装済み |
+| #79 | **OANDA Demo Adapter**(Demo endpoint allowlist・fail-closed。Execution 層への統合は v1.6 の Issue #132) | 実装済み |
 | #81 | **Kill Switch**: 永続・fail-closed の緊急発注停止(`python -m execution.kill_switch_cli`) | 実装済み |
 | #93 / #99 | **Submission / Cancellation Journal** と公認キャンセル経路([設計](../architecture/submission_journal.md)) | 実装済み |
 | #102 / #114 | Broker 側 Order Reissue の状態機械 / 正規化拒否分類 `RejectionCategory` | 実装済み |

@@ -24,7 +24,7 @@ Paper Signal (保存済みレコード)
       -> Execution Result (仮想損益を Position Store へ記録)
 ```
 
-- **Live Execution(Broker API による実注文)は上記のリアルタイムフローに存在しない**。基盤(Broker 境界・OANDA Demo / Live Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)は `broker/` / `execution/` に実装済みで、Issue #131 で **runner core も Fake / Shadow に限って実装済み**だが、**実 Broker(OANDA Demo / Live)への runner 統合は未実装**のためリアルタイムフローとしては駆動されず、**実口座での Live 運用も未解禁**である(下記「Alert / Strategy / Signal / Execution の責務分離」)。
+- **Live Execution(Broker API による実注文)は上記のリアルタイムフローに存在しない**。基盤(Broker 境界・OANDA Demo / Live Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)は `broker/` / `execution/` に実装済みで、Issue #131 で **runner core**(Fake / Shadow)、Issue #132 で **OANDA Demo mode の統合**まで実装済みだが、**継続運転する運用導線(systemd 常駐・定期 reconciliation)は未実装**のためリアルタイムフローとしては駆動されず、**実口座での Live 運用も未解禁**である(下記「Alert / Strategy / Signal / Execution の責務分離」)。
 - 過去のローソク足上で Strategy / Execution ルールを再生・評価する **Backtest** は、このリアルタイムフローとは独立した検証基盤である(下記「Backtest と Paper Execution の役割差」)。
 
 ## コンポーネント関係
