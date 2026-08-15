@@ -474,6 +474,54 @@ class LiveOrderSubmissionService:
             return prepared, None
 
         decision, order_request = prepared
+
+        # LAST kill switch read (PR #136 review P1, third round), at the
+        # ACTUAL call site. Two earlier placements each left work behind
+        # them: before the journal ``started`` mark left that write's
+        # 30-second busy timeout, and inside ``_prepare`` left the
+        # ``to_order_request`` construction plus the return/unpack -- a
+        # review reproduced a Demo POST by enabling the switch from inside
+        # ``to_order_request``. The OrderRequest is now fully built BEFORE
+        # this read, so the next statement is the broker call itself.
+        #
+        # This is as tight as an unsynchronised read can be, and the claim
+        # is deliberately no stronger than that: the switch can still flip
+        # in the instant after the read returns. Nothing of OURS runs in
+        # between -- closing that last instant would require binding the
+        # read and the call into one synchronisation protocol with the
+        # switch, which no HTTP broker call can offer.
+        #
+        # A refusal here leaves the journal entry ``started`` / ``open``,
+        # i.e. unresolved, on purpose. ``started`` => THE BROKER MAY HOLD
+        # THIS ORDER is the invariant reconciliation relies on; a "provably
+        # not called" terminal transition out of ``started`` would weaken
+        # it, and if it ever fired where the POST *had* gone out the order
+        # would be silently lost -- far worse than a reconciliation case.
+        # Refusing after the mark is indistinguishable, to the journal, from
+        # a crash between the mark and the call, which it already models
+        # conservatively. The RUNNER reports NOT_SENT, which is true by
+        # control flow; the journal stays conservative.
+        #
+        # REAL_BROKER_MODES only: fake / shadow own no network-facing
+        # account and answer from memory.
+        if self._connection.execution_mode in REAL_BROKER_MODES:
+            refusal = self._kill_switch_refusal()
+            if refusal is not None:
+                _LOGGER.critical(
+                    "kill switch refused execution_request_id=%s at the broker call "
+                    "site; the broker was NOT called, but the journal entry stays "
+                    "'started' (conservative) and is listed by "
+                    "SubmissionJournal.list_unresolved() until reconciliation clears it",
+                    execution_request_id,
+                )
+                refused = self._recorded(
+                    self._decision(
+                        execution_request_id, (refusal,), checked_at_utc=self._now()
+                    )
+                )
+                self._log_rejection(refused)
+                return refused, None
+
         # ---- past this point the broker may hold the order: failures are
         # recorded as UNKNOWN and re-raised, never converted to rejections;
         # journal writes are best-effort (critical log) and never block ----
@@ -1199,46 +1247,6 @@ class LiveOrderSubmissionService:
                     checked_at_utc=self._now(),
                 )
             )
-
-        # LAST kill switch read (PR #136 review P1, second round). The read
-        # above still left one window: ``mark_broker_call_started`` is a
-        # SQLite transaction with a 30-second busy timeout, so a switch
-        # pressed while that write waits was seen only AFTER the order had
-        # gone out. Reading here leaves ZERO operations between the last
-        # read and ``submit_order``.
-        #
-        # A refusal here leaves the entry at ``started`` / ``open``, i.e.
-        # unresolved, and that is deliberate. The journal's core invariant is
-        # ``started`` => THE BROKER MAY HOLD THIS ORDER, which is what
-        # reconciliation relies on; a "provably not called" terminal
-        # transition out of ``started`` would weaken exactly that invariant,
-        # and if it ever fired on a path where the POST *had* been issued the
-        # order would be silently lost -- far worse than a reconciliation
-        # case. Refusing after the mark is indistinguishable, from the
-        # journal's point of view, from a crash between the mark and the
-        # call, and the journal already models that conservatively.
-        #
-        # So the two reads split the cost: the early one keeps the common
-        # case clean (``not_started``, no reconciliation), and this one
-        # closes the residual window at the price of one unresolved entry
-        # during an emergency halt -- when an operator is reconciling anyway.
-        # The RUNNER still reports NOT_SENT, which is true by control flow;
-        # the journal stays conservative on purpose.
-        if self._connection.execution_mode in REAL_BROKER_MODES:
-            refusal = self._kill_switch_refusal()
-            if refusal is not None:
-                _LOGGER.critical(
-                    "kill switch refused execution_request_id=%s AFTER the journal "
-                    "start mark; the broker was NOT called, but the entry stays "
-                    "'started' (conservative) and is listed by "
-                    "SubmissionJournal.list_unresolved() until reconciliation clears it",
-                    execution_request_id,
-                )
-                return self._recorded(
-                    self._decision(
-                        execution_request_id, (refusal,), checked_at_utc=self._now()
-                    )
-                )
 
         return decision, request.to_order_request(
             client_order_id=row["client_order_id"],

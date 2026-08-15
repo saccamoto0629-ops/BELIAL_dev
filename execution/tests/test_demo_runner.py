@@ -565,6 +565,47 @@ def test_a_kill_switch_flipped_during_the_journal_start_write_stops_the_post(
     assert [entry.outcome for entry in entries] == [OUTCOME_OPEN]
 
 
+def test_a_kill_switch_flipped_while_the_order_request_is_built_stops_the_post(
+    tmp_path, monkeypatch
+):
+    """PR #136 review P1 (third round), reproduced: the switch is pressed
+    while ``ExecutionRequest.to_order_request`` runs.
+
+    That construction, the return from ``_prepare`` and the unpack in
+    ``submit`` all used to sit AFTER the last read. The read now lives at
+    the broker call site, with the OrderRequest already built, so the next
+    statement is the POST itself.
+    """
+    from execution.execution_models import ExecutionRequest
+
+    original = ExecutionRequest.to_order_request
+    flipped = []
+
+    def flip_while_building(self, **kwargs):
+        if not flipped:
+            SQLiteKillSwitchStore(tmp_path / KILL_SWITCH_DB).record_transition(
+                enabled=True,
+                operator="ops",
+                reason="halt while the order request is built",
+                changed_at_utc=NOW + timedelta(seconds=1),
+            )
+            flipped.append(self.execution_request_id)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(ExecutionRequest, "to_order_request", flip_while_building)
+
+    runner, transport, _grant = build_demo(tmp_path, monkeypatch)
+    register(tmp_path)
+
+    outcome = only(runner.run_cycle())
+
+    assert flipped, "to_order_request never ran; the reproduction is not valid"
+    assert transport.submit_calls == [], "an order POST was issued after the kill switch went ON"
+    assert outcome.status is RunnerItemStatus.REJECTED
+    assert outcome.broker_contact is BrokerContact.NOT_SENT
+    assert SafetyRejectionCode.KILL_SWITCH_ENABLED.value in outcome.rejection_codes
+
+
 def test_an_unreadable_kill_switch_stops_demo_submission(tmp_path, monkeypatch):
     runner, transport, _grant = build_demo(tmp_path, monkeypatch)
     register(tmp_path)

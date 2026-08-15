@@ -298,9 +298,11 @@ python -m execution.reconciliation_runner --broker fake --dry-run
 | 読み取り位置 | 塞ぐ window | 拒否時の Journal |
 |---|---|---|
 | Journal の `started` マークの**前** | Broker 安全確認 GET・clearance 照会・Journal / Store 書き込み(ネットワーク往復を含む) | **`not_started`** = Broker へ一切送っていないことの耐久的証拠。reconciliation 案件は発生しない |
-| `started` マークの**後**(= `submit_order()` の直前) | `mark_broker_call_started` 自身(SQLite の busy timeout は 30 秒) | **`started` のまま unresolved**(保守側へ倒す) |
+| **Broker 呼び出し地点そのもの**(`submit_order()` の直前。OrderRequest 構築済み) | `mark_broker_call_started` 自身(SQLite の busy timeout は 30 秒)と OrderRequest 構築 | **`started` のまま unresolved**(保守側へ倒す) |
 
 2 回目の拒否で Journal を終端化しないのは意図的である。`started` = **Broker が注文を保持している可能性がある**という不変条件は reconciliation が依拠するものであり、`started` からの「送っていないことが証明済み」遷移を作るとこの不変条件が弱まる。万一その遷移が実際には POST 済みの経路で発火すれば注文を静かに失う — reconciliation 案件 1 件よりはるかに悪い。緊急停止時に unresolved が 1 件残るのは、どのみち reconciliation を行う場面での妥当なコストと判断している。なお runner 側は制御フロー上の事実として `NOT_SENT` を報告する。
+
+**保証の範囲を正確に**: 2 回目の読み取りと Broker 呼び出しの間に**自プロセスの処理は 1 つも入らない**が、読み取りが返った直後の一瞬に switch が ON になる可能性は残る。これを消すには読み取りと呼び出し開始を**同一の同期プロトコル**へ束縛する必要があり、HTTP の Broker 呼び出しではそれを提供できない。したがって契約は「**評価中の enable が Broker 呼び出し前に効く**」であって「原子的」ではない。
 
 停止された intent は phase `submitting` に留まり自動再送はされない(`SubmissionJournal.list_unresolved()` / `execution_store.list_unresolved_submissions()` で可視)。
 
