@@ -71,7 +71,9 @@ from execution.safety_gate import (
 from execution.safety_store import SQLiteSafetyDecisionStore
 from execution.shadow_providers import StaticMarketSnapshotProvider
 from execution.submission_journal import (
+    BROKER_CALL_NOT_STARTED,
     OUTCOME_COMPLETED,
+    OUTCOME_OPEN,
     OUTCOME_RECONCILIATION_REQUIRED,
     SubmissionJournal,
 )
@@ -436,6 +438,85 @@ def test_a_kill_switch_flipped_mid_run_stops_the_next_demo_submission(tmp_path, 
     assert SafetyRejectionCode.KILL_SWITCH_ENABLED.value in outcome.rejection_codes
     assert len(transport.submit_calls) == 1
     assert stored(tmp_path, "exec-2")["submission_phase"] == execution_store.PHASE_CREATED
+
+
+class HaltingDemoTransport(DemoTransport):
+    """A demo transport that runs a callback during the FIRST broker call of
+    a submission (PR #136 review P1).
+
+    ``/openPositions`` is the gate's first network round trip, so a callback
+    fired there lands exactly in the window between the gate reading the kill
+    switch and the order POST -- the window the review reproduced.
+    """
+
+    def __init__(self, during_open_positions, **kwargs):
+        super().__init__(**kwargs)
+        self._during_open_positions = during_open_positions
+        self.fired = []
+
+    def __call__(self, method, url, headers, body, timeout):
+        if url.endswith("/openPositions") and not self.fired:
+            self.fired.append(url)
+            self._during_open_positions()
+        return super().__call__(method, url, headers, body, timeout)
+
+
+def test_a_kill_switch_flipped_during_the_safety_gets_stops_the_order_post(
+    tmp_path, monkeypatch
+):
+    """PR #136 review P1, reproduced: the operator presses the switch WHILE
+    this submission is being evaluated.
+
+    The gate reads the switch before its broker safety GETs, so between that
+    read and the POST there is a window of real network round trips. The
+    switch is enabled from inside the ``/openPositions`` callback here, and
+    the POST must not happen.
+    """
+
+    def halt():
+        SQLiteKillSwitchStore(tmp_path / KILL_SWITCH_DB).record_transition(
+            enabled=True,
+            operator="ops",
+            reason="halt mid-submission",
+            changed_at_utc=NOW + timedelta(seconds=1),
+        )
+
+    transport = HaltingDemoTransport(halt, order_responses=[fill_response()])
+    runner, _transport, _grant = build_demo(tmp_path, monkeypatch, transport=transport)
+    register(tmp_path)
+
+    outcome = only(runner.run_cycle())
+
+    assert transport.fired, "the window was never entered; the reproduction is not valid"
+    assert transport.submit_calls == [], "an order POST was issued after the kill switch went ON"
+    assert outcome.status is RunnerItemStatus.REJECTED
+    assert outcome.broker_contact is BrokerContact.NOT_SENT
+    assert SafetyRejectionCode.KILL_SWITCH_ENABLED.value in outcome.rejection_codes
+    # the journal must still prove the broker was never called
+    entries = SubmissionJournal(tmp_path / JOURNAL_DB).list_unresolved()
+    assert [entry.outcome for entry in entries] == [OUTCOME_OPEN]
+    assert entries[0].broker_call_state == BROKER_CALL_NOT_STARTED
+
+
+def test_a_kill_switch_that_becomes_unreadable_mid_submission_stops_the_post(
+    tmp_path, monkeypatch
+):
+    """The same window, but the switch becomes UNREADABLE rather than ON. An
+    unreadable switch may never read as OFF, so this refuses too."""
+    transport = HaltingDemoTransport(
+        lambda: (tmp_path / KILL_SWITCH_DB).write_bytes(b"not a database"),
+        order_responses=[fill_response()],
+    )
+    runner, _transport, _grant = build_demo(tmp_path, monkeypatch, transport=transport)
+    register(tmp_path)
+
+    outcome = only(runner.run_cycle())
+
+    assert transport.fired
+    assert transport.submit_calls == []
+    assert outcome.status is RunnerItemStatus.REJECTED
+    assert outcome.broker_contact is BrokerContact.NOT_SENT
+    assert SafetyRejectionCode.STATE_QUERY_FAILED.value in outcome.rejection_codes
 
 
 def test_an_unreadable_kill_switch_stops_demo_submission(tmp_path, monkeypatch):

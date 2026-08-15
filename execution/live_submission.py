@@ -1142,6 +1142,41 @@ class LiveOrderSubmissionService:
         except Exception as exc:
             return self._recorded(self._transition_failure_decision(execution_request_id, exc))
 
+        # FINAL kill switch recheck (Issue #132, PR #136 review P1). The gate
+        # read the switch at the TOP of its evaluation -- before the broker
+        # safety GETs (open positions, account state), before the clearance
+        # scope query, and before the journal / store writes above. On a real
+        # account those steps are network round trips, so an operator who
+        # pressed the switch during them would still have seen the order go
+        # out. "Enabling the kill switch stops orders before the broker call
+        # and takes effect immediately" is an operations contract, so the
+        # switch is read once more here.
+        #
+        # PLACEMENT is deliberate: this is the last point before the broker
+        # call at which a refusal is still provably clean. The ``started``
+        # mark below is the journal's "the broker may hold this order"
+        # barrier -- refusing after it would file a reconciliation case for a
+        # call that never happened. Refusing here leaves the entry
+        # ``not_started``, which is durable proof the broker was never
+        # contacted, exactly like the journal-failure path underneath.
+        #
+        # The intent stays at phase ``submitting`` and is NOT retried: the
+        # duplicate guard is untouched, and "stop" fails closed rather than
+        # arming a resend. The halted intents are the ones the operator wants
+        # to see, and list_unresolved_submissions() lists them.
+        #
+        # REAL_BROKER_MODES only: fake / shadow own no network-facing account
+        # and answer from memory, so a second read there would change nothing
+        # except their providers' call counts.
+        if self._connection.execution_mode in REAL_BROKER_MODES:
+            refusal = self._kill_switch_refusal()
+            if refusal is not None:
+                return self._recorded(
+                    self._decision(
+                        execution_request_id, (refusal,), checked_at_utc=self._now()
+                    )
+                )
+
         # Durable submission journal, SECOND barrier (Issue #93): the
         # ``started`` mark is the LAST write before the broker call, so a
         # ``not_started`` journal entry always proves the broker was never
@@ -1171,6 +1206,39 @@ class LiveOrderSubmissionService:
             client_order_id=row["client_order_id"],
             created_at_utc=now,
         )
+
+    def _kill_switch_refusal(self) -> SafetyRejection | None:
+        """Read the durable kill switch once more, fail closed.
+
+        Mirrors :meth:`SafetyGate._collect_kill_switch_rejections` exactly:
+        an exception or a non-boolean answer is a BROKEN PROVIDER, not an
+        "off" -- both refuse, because the whole point of the durable reader
+        is that an unreadable switch may never read as OFF. Only a literal
+        ``False`` allows the broker call.
+
+        Returns the rejection to record, or ``None`` to proceed.
+        """
+        try:
+            state = self._gate.state_provider.is_kill_switch_enabled()
+        except Exception as exc:
+            return SafetyRejection(
+                SafetyRejectionCode.STATE_QUERY_FAILED,
+                f"the final kill switch recheck before the broker call failed: {exc}; "
+                "the broker was NOT called (fail closed)",
+            )
+        if not isinstance(state, bool):
+            return SafetyRejection(
+                SafetyRejectionCode.STATE_QUERY_FAILED,
+                f"the final kill switch recheck returned non-boolean {state!r}; "
+                "the broker was NOT called (fail closed)",
+            )
+        if state:
+            return SafetyRejection(
+                SafetyRejectionCode.KILL_SWITCH_ENABLED,
+                "the kill switch was enabled after the safety evaluation and before "
+                "the broker call; the broker was NOT called",
+            )
+        return None
 
     def _transition_failure_decision(self, execution_request_id: str, exc: Exception) -> SafetyDecision:
         """Classify a failed ``created -> submitting`` transition by the
