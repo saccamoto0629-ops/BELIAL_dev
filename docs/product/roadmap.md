@@ -22,7 +22,7 @@ FedWatch / Economic Calendar は外部取得元が不安定なため、今後も
 - Chart Snapshotの定期投稿頻度調整
 - ATR / 出来高 / Fear & Greed / COT Report などの補助指標追加
 - デモ口座でのPaper Signal記録
-- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)の基盤も v1.5(Issue #73〜#82 ほか。下記「v1.5」節)で、runner core は v1.6(Issue #131。`fake` / `shadow` のみ)で実装済みだが、実 Broker へ実発注を駆動する常駐 runner は未実装で実口座での Live 運用は未解禁
+- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)の基盤も v1.5(Issue #73〜#82 ほか。下記「v1.5」節)で、runner core は v1.6(Issue #131 の `fake` / `shadow` と Issue #132 の `demo`)で実装済みだが、継続運転する常駐 runner は未実装で実口座での Live 運用は未解禁
 
 これらは v1.3.1 以降の検討事項であり、v1.3.0では実装しない。
 

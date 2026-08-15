@@ -183,7 +183,7 @@ jobs:
           status=$?
           set -e
           test "$status" -eq 1 || { echo "the demo preflight must refuse (exit 1) in CI, got $status"; exit 1; }
-          python -c "import json; data=json.load(open('demo-preflight.json', encoding='ascii')); assert data['allowed'] is False, data; assert 'demo_credentials_missing' in data['rejection_codes'], data; assert 'kill_switch_state_unverifiable' in data['rejection_codes'], data"
+          python -c "import json; data=json.load(open('demo-preflight.json', encoding='ascii')); assert data['allowed'] is False, data; assert 'demo_credentials_missing' in data['rejection_codes'], data; assert 'kill_switch_state_unverifiable' in data['rejection_codes'], data; assert data['safety_summary']['demo_confirmed'] is False, data"
           test ! -e "$RUNNER_TEMP/demo-ci" || { echo "the preflight must not create the kill switch DB"; exit 1; }
           if grep -qi "api-fxpractice\|api-fxtrade\|Bearer\|Authorization" demo-preflight.json; then
             echo "the preflight output must not carry endpoint/credential material"; exit 1

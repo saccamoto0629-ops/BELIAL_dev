@@ -41,6 +41,7 @@ from broker.oanda_live_adapter import (
     ENV_LIVE_ACCOUNT_ID,
     ENV_LIVE_API_TOKEN,
     ENV_LIVE_API_URL,
+    ENV_LIVE_HTTP_TIMEOUT_SECONDS,
     OANDA_LIVE_API_URL,
 )
 from execution.demo_lock import (
@@ -166,6 +167,94 @@ def test_a_complete_demo_configuration_satisfies_every_lock(tmp_path):
     assert all(satisfied for _, satisfied in decision.summary.locks)
 
 
+def test_the_checklist_shows_all_seven_locks(tmp_path):
+    """PR #136 Codex review P2: the two locks that most often refuse a
+    startup -- the safety policy and the Kill Switch -- were visible only as
+    rejection codes, never on the checklist an operator reads."""
+    decision = evaluate(tmp_path)
+    assert dict(decision.summary.locks) == {
+        "execution_mode=demo": True,
+        "demo credentials configured": True,
+        "demo endpoint allowlisted": True,
+        "no live configuration present": True,
+        "demo account matches the pinned digest": True,
+        "safety policy allows the demo target": True,
+        "kill switch verified OFF": True,
+    }
+    rendered = decision.summary.render()
+    assert "[x] safety policy allows the demo target" in rendered
+    assert "[x] kill switch verified OFF" in rendered
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "unsatisfied_lock"),
+    [
+        pytest.param({"execution_mode": "fake"}, "execution_mode=demo", id="mode"),
+        pytest.param(
+            {"env": {ENV_ACCOUNT_ID: ACCOUNT}}, "demo credentials configured", id="credentials"
+        ),
+        pytest.param(
+            {"env": demo_env(**{ENV_API_URL: OANDA_LIVE_API_URL})},
+            "demo endpoint allowlisted",
+            id="endpoint",
+        ),
+        pytest.param(
+            {"env": demo_env(**{ENV_LIVE_API_TOKEN: LIVE_TOKEN})},
+            "no live configuration present",
+            id="live-config",
+        ),
+        pytest.param(
+            {"env": demo_env(**{ENV_ACCOUNT_ID: "101-000-OTHER-002"})},
+            "demo account matches the pinned digest",
+            id="account",
+        ),
+        pytest.param({"policy": None, "pin": None}, "safety policy allows the demo target",
+                     id="policy-unavailable"),
+    ],
+)
+def test_a_refused_startup_never_reports_demo_confirmed(tmp_path, kwargs, unsatisfied_lock):
+    """PR #136 Codex review P2: ``demo_confirmed`` is bound to the FINAL
+    decision, so the machine-readable summary can never contradict its own
+    ``allowed`` field -- including for refusals the lock checklist does not
+    enumerate."""
+    decision = evaluate(tmp_path, **kwargs)
+    assert decision.allowed is False
+    assert decision.summary.demo_confirmed is False
+    assert dict(decision.summary.locks)[unsatisfied_lock] is False
+    assert decision.summary.to_dict()["demo_confirmed"] is False
+
+
+@pytest.mark.parametrize(
+    "state_kind", ["enabled", "unverifiable", "non-boolean", "missing"]
+)
+def test_a_kill_switch_refusal_never_reports_demo_confirmed(tmp_path, state_kind):
+    """The refusal Codex's finding was about: every other lock holds, so a
+    checklist-derived ``demo_confirmed`` answered "true" for a startup that
+    was refused because trading is halted."""
+
+    class Broken:
+        def is_kill_switch_enabled(self):
+            raise RuntimeError("store is gone")
+
+    class Liar:
+        def is_kill_switch_enabled(self):
+            return "no"
+
+    state = {
+        "enabled": lambda: PersistentKillSwitchStateProvider(
+            kill_switch_db(tmp_path, enabled=True)
+        ),
+        "unverifiable": Broken,
+        "non-boolean": Liar,
+        "missing": lambda: PersistentKillSwitchStateProvider(tmp_path / "absent.sqlite3"),
+    }[state_kind]()
+    decision = evaluate(tmp_path, state=state)
+    assert decision.allowed is False
+    assert decision.summary.demo_confirmed is False
+    assert dict(decision.summary.locks)["kill switch verified OFF"] is False
+    assert decision.summary.to_dict()["demo_confirmed"] is False
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_code"),
     [
@@ -244,12 +333,40 @@ def test_the_live_endpoint_in_the_demo_slot_is_refused_twice(tmp_path):
         (ENV_LIVE_API_TOKEN, LIVE_TOKEN),
         (ENV_LIVE_ACCOUNT_ID, LIVE_ACCOUNT),
         (ENV_LIVE_API_URL, OANDA_LIVE_API_URL),
+        # PR #136 Codex review P2: the live TIMEOUT variable carries no
+        # secret and cannot reach a live endpoint on its own, but the lock
+        # promises "no live configuration present" -- a process holding a
+        # leftover live tuning variable had an environment meant for live,
+        # and must not pass that lock.
+        (ENV_LIVE_HTTP_TIMEOUT_SECONDS, "10"),
     ],
 )
 def test_a_demo_process_may_not_carry_any_live_configuration(tmp_path, live_var, value):
     decision = evaluate(tmp_path, env=demo_env(**{live_var: value}))
     assert decision.allowed is False
     assert DemoLockCode.DEMO_LIVE_CONFIGURATION_MIXED.value in codes(decision)
+    assert dict(decision.summary.locks)["no live configuration present"] is False
+
+
+def test_the_live_only_variable_list_covers_every_live_adapter_variable():
+    """PR #136 Codex review P2: the separation lock is only as complete as
+    this list, and the list is hand-maintained. Adding a variable to the live
+    adapter without adding it here would silently re-open the gap, so the
+    coverage is pinned against the adapter module's own exports rather than
+    against a second hand-written list."""
+    from broker import oanda_live_adapter as live_adapter
+    from execution.demo_lock import _LIVE_ONLY_ENV_VARS
+
+    exported = {
+        getattr(live_adapter, name)
+        for name in dir(live_adapter)
+        if name.startswith("ENV_") and isinstance(getattr(live_adapter, name), str)
+    }
+    missing = exported - set(_LIVE_ONLY_ENV_VARS)
+    assert missing == set(), (
+        "every environment variable the live adapter reads must be refused in a demo "
+        f"process; missing from _LIVE_ONLY_ENV_VARS: {sorted(missing)}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -296,6 +413,8 @@ def test_a_policy_that_does_not_allow_the_demo_target_refuses_the_startup(tmp_pa
     decision = evaluate(tmp_path, policy=policy)
     assert decision.allowed is False
     assert DemoLockCode.DEMO_TARGET_NOT_ALLOWED.value in codes(decision)
+    assert decision.summary.demo_confirmed is False
+    assert dict(decision.summary.locks)["safety policy allows the demo target"] is False
 
 
 def test_a_non_policy_object_is_refused(tmp_path):
@@ -617,6 +736,22 @@ def test_the_cli_fails_closed_on_a_refused_startup(tmp_path, monkeypatch, capsys
     assert cli(tmp_path, monkeypatch, kill_switch=kill_switch_db(tmp_path, enabled=True)) == 1
     captured = capsys.readouterr()
     assert DemoLockCode.KILL_SWITCH_ENABLED.value in captured.err
+    assert "[ ] kill switch verified OFF" in captured.out
+
+
+def test_the_cli_json_never_reports_a_refused_startup_as_confirmed(
+    tmp_path, monkeypatch, capsys
+):
+    """PR #136 Codex review P2: the machine-readable preflight output must
+    not answer ``demo_confirmed: true`` next to ``allowed: false``."""
+    assert (
+        cli(tmp_path, monkeypatch, "--json", kill_switch=kill_switch_db(tmp_path, enabled=True))
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["allowed"] is False
+    assert payload["safety_summary"]["demo_confirmed"] is False
+    assert payload["safety_summary"]["locks"]["kill switch verified OFF"] is False
 
 
 def test_the_cli_refuses_a_live_mode_and_never_composes_anything(tmp_path, monkeypatch, capsys):

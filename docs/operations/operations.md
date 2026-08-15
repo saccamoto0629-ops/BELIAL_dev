@@ -45,7 +45,7 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `OANDA_LIVE_API_TOKEN` | empty | OANDA **Live** Adapter(`broker/oanda_live_adapter.py`、Issue #82)の API token。Demo 用 `OANDA_API_TOKEN` とは**別変数**で、同一値を両方へ設定すると構築時に fail-closed で拒否。環境変数でのみ渡し、ログ・例外・docs・リポジトリへ実値を書かない |
 | `OANDA_LIVE_ACCOUNT_ID` | empty | OANDA Live Adapter の Live account id。Demo 用 `OANDA_ACCOUNT_ID` とは**別変数**で、同一値の共有は fail-closed。起動 summary には非可逆 digest(`account-<12桁>`)だけを表示し、実 ID は出力しない |
 | `OANDA_LIVE_API_URL` | **既定なし** | OANDA Live Adapter の接続先。**Live endpoint(`https://api-fxtrade.oanda.com`)のみ許可(allowlist)**。Demo endpoint・類似ホスト・未設定はすべて構築時に fail-closed で拒否する(Demo と違い**既定値を持たない** = 未設定は起動失敗)。拒否メッセージは設定値を一切 echo しない |
-| `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Live Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない**(reconciliation で解決する) |
+| `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Live Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない**(reconciliation で解決する)。**Demo mode のプロセス環境には設定しない**(他の `OANDA_LIVE_*` と同様、設定されていると Demo 起動チェックが fail-closed で拒否する。Issue #132) |
 | `OANDA_API_TOKEN` | empty | OANDA Demo Adapter(`broker/oanda_demo_adapter.py`、Issue #79)の API token。**Demo(fxpractice)口座のトークンのみ**。環境変数でのみ渡し、ログ・例外・docs へ実値を書かない。Issue #132 で Execution 層へ統合されたため、**この変数は Demo mode の実送信経路でも使われる**(`python -m execution.demo_startup_cli` / demo runner)。ほかに手動 reconciliation CLI(`python -m execution.reconciliation_runner --broker oanda-demo`。reconcile-only)と opt-in の実 API テストが使用する |
 | `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない。**Demo mode(Issue #132)では safety config の `expected_account_reference`(非可逆 digest)と一致することが起動条件**であり、不一致は Broker 送信前に fail-closed で拒否される |
 | `OANDA_API_URL` | `https://api-fxpractice.oanda.com` | OANDA Demo Adapter の接続先。**Demo endpoint のみ許可(allowlist)**。Live endpoint(`fxtrade` を含む host)やその他の URL を指定すると構築時に fail-closed で起動拒否され、Demo mode では demo 起動ロック(Issue #132)も同じ値を独立に検証する(未設定 = 既定の Practice endpoint であり、ロックを迂回するわけではない)。HTTP redirect は追従しない(3xx は共通エラー化)ため、応答によって Demo endpoint 外へ接続が逸れることもない |
@@ -345,7 +345,7 @@ python -m execution.kill_switch_cli disable \
 | 1 | execution mode が `demo` | `--execution-mode demo` |
 | 2 | Demo credential | `OANDA_API_TOKEN` / `OANDA_ACCOUNT_ID`(Live 用変数とは別) |
 | 3 | Demo endpoint | `OANDA_API_URL` 未設定、または `https://api-fxpractice.oanda.com` 完全一致 |
-| 4 | **Live 設定が 1 つも無いこと** | `ENABLE_LIVE_TRADING` / `OANDA_LIVE_API_TOKEN` / `OANDA_LIVE_ACCOUNT_ID` / `OANDA_LIVE_API_URL` を Demo プロセス環境から外す |
+| 4 | **Live 設定が 1 つも無いこと** | `ENABLE_LIVE_TRADING` / `OANDA_LIVE_API_TOKEN` / `OANDA_LIVE_ACCOUNT_ID` / `OANDA_LIVE_API_URL` / `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` を Demo プロセス環境から外す(**Live Adapter が読む変数はすべて対象**。秘密を持たない timeout 変数も、残っていれば「Live 用に用意された環境」の証拠として拒否する) |
 | 5 | account identity の一致 | safety config の `expected_account_reference` が `OANDA_ACCOUNT_ID` の digest と一致 |
 | 6 | Safety limits が読める | `--safety-config <path>`(許可銘柄・最大注文数量・最大ポジション数・許可 Demo target。credential は書かない) |
 | 7 | Kill Switch が**検証可能かつ OFF** | `python -m execution.kill_switch_cli status`(読めない・不明・ON はすべて拒否) |
@@ -395,7 +395,7 @@ exit code: **0** = 全ロック成立(Demo 接続を構築できた。発注は�
 | mode が `demo` 以外 | `execution_mode_not_demo` |
 | Demo credential 不足 | `demo_credentials_missing` |
 | `OANDA_API_URL` が Practice endpoint 以外 | `demo_endpoint_invalid` |
-| Demo プロセスに live 設定が存在 / Demo と Live の値が共有 | `demo_live_configuration_mixed` |
+| Demo プロセスに live 設定が存在(`OANDA_LIVE_*` のいずれか 1 つでも)/ Demo と Live の値が共有 | `demo_live_configuration_mixed` |
 | `OANDA_ACCOUNT_ID` が pin された口座と不一致 | `demo_account_mismatch` |
 | safety config が読めない / 不正 / account pin が無い | `safety_policy_unavailable` |
 | policy が `oanda-demo` を許可していない | `demo_target_not_allowed` |
@@ -528,16 +528,16 @@ python -m execution.live_startup_cli \
 - Kill Switch が動作確認済み(enable → 送信拒否 → disable)
 - 発注数量・許可銘柄・リスク上限が `--safety-config` に設定済み
 
-Issue #131(runner core)の merge も同様に Live 運用開始の判断ではない — runner が駆動できるのは `fake` / `shadow` だけである(下記)。
+Issue #131(runner core)・Issue #132(Demo 統合)の merge も同様に Live 運用開始の判断ではない — runner が駆動できるのは `fake` / `shadow` / `demo` であり、`live` は明示拒否される(下記)。
 
-#### Live Execution runner core(Issue #131)
+#### Live Execution runner core(Issue #131 / #132)
 
-Issue #131 で **runner core**(`execution/live_runner.py` + `execution/runner_composition.py`)を実装した。ExecutionRequest の取得 / 対象選択、1 cycle を表す `run_cycle()`、常駐ループ境界 `run_forever()`、graceful shutdown、cycle 単位の失敗局所化、fail-closed を提供する。
+Issue #131 で **runner core**(`execution/live_runner.py` + `execution/runner_composition.py`)を実装した。ExecutionRequest の取得 / 対象選択、1 cycle を表す `run_cycle()`、常駐ループ境界 `run_forever()`、graceful shutdown、cycle 単位の失敗局所化、fail-closed を提供する。Issue #132 で **`demo` mode を統合**した(上記「Demo mode の起動」節)。
 
 **運用上の現状**:
 
-- 駆動できる mode は **`fake` と `shadow` だけ**。`demo`(未実装)/ `live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知 mode は `RunnerModeError` で拒否される。**OANDA Demo / Live へは runner から接続できない**。
-- **CLI・systemd 等の運用導線は未実装**であり、現時点で runner を起動する運用手順は存在しない(ライブラリ API とテストからのみ駆動される)。この文書に runner の起動コマンドが載るのは、OANDA Demo 統合と運用導線の Issue が完了してからである。
+- 駆動できる mode は **`fake` / `shadow` / `demo`**。`live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知 mode は `RunnerModeError` で拒否される。**OANDA Live へは runner から接続できない**。`demo` は `demo_lock.build_demo_connection()` が発行した grant からのみ組み立てられる。
+- **systemd 等の継続運転導線は未実装**であり、現時点で runner を常駐させる運用手順は存在しない(ライブラリ API とテストからのみ駆動される。`python -m execution.demo_startup_cli` は preflight であって runner を起動しない)。この文書に runner の常駐起動コマンドが載るのは、継続運転の Issue が完了してからである。
 - Kill Switch は**送信判定ごとに** Safety Gate 経由で再評価される(`KILL_SWITCH_DB_PATH` の永続 provider を配線した場合、有効化はプロセス再起動をまたいで新規送信を止め続ける。読めない場合も fail-closed)。
 - **reconciliation の定期実行は runner に含まれない**(引き続き手動 CLI)。runner は送信結果が不明(`unresolved`)な注文を**再送しない**。解決は reconciliation の責務である。
 - dry-run は完全無副作用(Broker 呼び出し・Order Store / Journal / Shadow Store 書き込み・DB 作成・migration のいずれも行わない)。

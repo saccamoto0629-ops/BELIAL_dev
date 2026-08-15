@@ -10,7 +10,7 @@ from execution import execution_store
 > **重要な位置づけ**
 >
 > - 本コンポーネントは **Live Execution 用のモデル・状態永続化基盤** を実装する(Issue #74。schema v5 = 再発行チェーン込み。Issue #95 / #104 / #115)。
-> - **実 Broker へ実発注を駆動する runner は未実装**であり、このコンポーネントが存在しても Live 運用が解禁されたわけではない(Issue #131 の runner core は `fake` / `shadow` のみを駆動し、`demo` / `live` は fail-closed で拒否する)。発注前の Safety Gate と唯一の送信境界は Issue #75 で([Safety Gate](safety_gate.md))、OANDA Demo / Live Adapter は Issue #79 / #82 で、reconciliation(検出・修復・手動 CLI)は Issue #103〜#105 で実装済み。Live 接続は Issue #82 の全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。
+> - **実口座 Live 運用は未解禁**であり、このコンポーネントが存在しても解禁されたわけではない(Issue #131 の runner core と Issue #132 の Demo 統合により runner が駆動できるのは `fake` / `shadow` / `demo` で、`live` は fail-closed で拒否する。継続運転の運用導線も未実装)。発注前の Safety Gate と唯一の送信境界は Issue #75 で([Safety Gate](safety_gate.md))、OANDA Demo / Live Adapter は Issue #79 / #82 で、reconciliation(検出・修復・手動 CLI)は Issue #103〜#105 で実装済み。Live 接続は Issue #82 の全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。
 > - Discord / S3 への送信はこのパッケージのどこにも存在しない。外部通信は Broker Adapter 経由のみ: 手動 reconciliation CLI が OANDA Demo Adapter で行う**読み取り専用**照会、Issue #132 の demo 活性化ロックが全ロック成立時に組み立てる Demo(Practice)接続、Issue #82 の全ロックが成立した Live 接続だけである。**実注文へ到達し得る経路は唯一の送信境界 `LiveOrderSubmissionService` のみ**で、FakeBroker / Shadow / 通常の pytest・CI では外部通信は発生しない(Demo runner のテストも注入 transport の offline wire を使う)。
 > - **Paper Signal / Paper Execution は従来どおり Broker 非依存**であり、本パッケージを import しない・させない(`execution/tests/test_package_imports.py` が回帰として固定)。
 > - 注文状態の唯一の正は既存の `broker.broker_models.OrderState` / `ORDER_STATE_TRANSITIONS` / `validate_order_state_transition()` / `validate_order_result_update()`(Issue #73 / PR #87)である。**本パッケージは注文状態 Enum・遷移表を一切新設しない。**

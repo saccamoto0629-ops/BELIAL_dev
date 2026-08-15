@@ -86,6 +86,7 @@ from broker.oanda_live_adapter import (
     ENV_LIVE_ACCOUNT_ID,
     ENV_LIVE_API_TOKEN,
     ENV_LIVE_API_URL,
+    ENV_LIVE_HTTP_TIMEOUT_SECONDS,
 )
 from execution.safety_config import (
     SafetyConfigError,
@@ -120,11 +121,24 @@ _ACCOUNT_REFERENCE_PATTERN = re.compile(r"account-[0-9a-f]{12}")
 #: them: sharing a value is already refused by the separation checks, but a
 #: process holding both configurations at once is exactly the "one typo away
 #: from a production order" deployment Issue #82 refuses to normalize.
+#:
+#: This is the COMPLETE ``OANDA_LIVE_*`` / live-flag set the live adapter
+#: reads (broker/oanda_live_adapter.py), not just the credential-bearing
+#: ones (PR #136 Codex review P2). ``OANDA_LIVE_HTTP_TIMEOUT_SECONDS``
+#: carries no secret and cannot by itself reach a live endpoint, but the
+#: lock's contract is "no live configuration is present", not "no live
+#: configuration that would work on its own": a process holding a leftover
+#: live tuning variable is a process whose environment was meant for live,
+#: and answering "no live configuration present: satisfied" there would be
+#: false. Adding a variable to the live adapter therefore means adding it
+#: here -- ``test_demo_lock.py`` pins that this tuple covers every
+#: ``ENV_LIVE_*`` name the adapter module exports.
 _LIVE_ONLY_ENV_VARS = (
     ENV_ENABLE_LIVE_TRADING,
     ENV_LIVE_API_TOKEN,
     ENV_LIVE_ACCOUNT_ID,
     ENV_LIVE_API_URL,
+    ENV_LIVE_HTTP_TIMEOUT_SECONDS,
 )
 
 
@@ -523,8 +537,10 @@ def evaluate_demo_activation(
             "non-reversible digests and neither account id is echoed",
         )
 
-    # --- safety policy ----------------------------------------------------
+    # --- lock 6: the safety policy ----------------------------------------
+    policy_ok = True
     if policy is None or expected_account_reference is None:
+        policy_ok = False
         reject(
             DemoLockCode.SAFETY_POLICY_UNAVAILABLE,
             "the demo safety configuration could not be loaded; a demo connection is "
@@ -532,6 +548,7 @@ def evaluate_demo_activation(
         )
         policy = None
     elif not isinstance(policy, SafetyPolicy):
+        policy_ok = False
         reject(
             DemoLockCode.SAFETY_POLICY_UNAVAILABLE,
             f"policy must be a SafetyPolicy, got {type(policy).__name__}",
@@ -540,6 +557,7 @@ def evaluate_demo_activation(
     elif OANDA_DEMO_CONNECTION_TARGET not in policy.allowed_connection_targets.get(
         ExecutionMode.DEMO, frozenset()
     ):
+        policy_ok = False
         reject(
             DemoLockCode.DEMO_TARGET_NOT_ALLOWED,
             f"connection target {OANDA_DEMO_CONNECTION_TARGET!r} is not listed in the "
@@ -547,28 +565,35 @@ def evaluate_demo_activation(
             "echoed)",
         )
 
-    # --- kill switch (fail closed: unreadable is as blocking as ON) -------
-    kill_switch_label = read_kill_switch(
+    # --- lock 7: kill switch (fail closed: unreadable is as blocking as ON)
+    kill_switch = read_kill_switch(
         state_provider,
         reject,
         enabled_code=DemoLockCode.KILL_SWITCH_ENABLED,
         unverifiable_code=DemoLockCode.KILL_SWITCH_STATE_UNVERIFIABLE,
         subject="demo connection",
-    ).label
+    )
 
+    # The checklist an operator reads covers ALL SEVEN locks the module
+    # docstring lists (PR #136 Codex review P2). It previously stopped at the
+    # five environment-shaped ones, which left the two that most often refuse
+    # a startup -- the safety policy and the Kill Switch -- visible only as
+    # rejection codes.
     summary = _summary(
         mode=mode,
         account_reference=account_reference,
         expected_account_reference=expected_account_reference,
         policy=policy,
         endpoint_kind=demo_endpoint_kind,
-        kill_switch_label=kill_switch_label,
+        kill_switch_label=kill_switch.label,
         locks=(
             ("execution_mode=demo", mode_is_demo),
             ("demo credentials configured", credentials_ok),
             ("demo endpoint allowlisted", bool(endpoint_ok)),
             ("no live configuration present", separation_ok),
             ("demo account matches the pinned digest", account_ok),
+            ("safety policy allows the demo target", policy_ok),
+            ("kill switch verified OFF", not kill_switch.blocked),
         ),
         rejections=rejections,
     )
@@ -611,7 +636,16 @@ def _summary(
         ),
         max_positions_account=policy.max_positions_account if policy is not None else None,
         kill_switch=kill_switch_label,
-        demo_confirmed=all(satisfied for _, satisfied in locks),
+        # Bound to the FINAL decision, not to the lock checklist (PR #136
+        # Codex review P2). A checklist can only report what it enumerates,
+        # so deriving this from ``locks`` made a refused startup -- kill
+        # switch ON, safety policy unavailable, demo target not allowed --
+        # still answer ``demo_confirmed: true`` in the machine-readable
+        # output, i.e. a safety summary contradicting its own ``allowed``
+        # field. ``not rejections`` is exactly the condition
+        # ``DemoActivationDecision.allowed`` is built from, so the two can
+        # never disagree, whatever future refusal is added.
+        demo_confirmed=not rejections,
         locks=locks,
         rejection_codes=tuple(entry.code.value for entry in rejections),
     )
