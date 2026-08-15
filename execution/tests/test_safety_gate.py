@@ -682,7 +682,10 @@ def test_connection_mode_and_target_cannot_be_declared_by_the_caller():
         # type cross-check rather than by an empty registry.
         pytest.param("live", "oanda-live", "requires exactly a OandaLiveAdapter instance",
                      id="fakebroker-cannot-claim-live"),
-        pytest.param("demo", "oanda-demo", "no broker implementation is registered",
+        # Issue #132: ``demo`` IS registered now -- to the demo adapter
+        # alone, and by EXACT type, so neither a FakeBroker nor an adapter
+        # subclass that skipped the endpoint allowlist can claim it.
+        pytest.param("demo", "oanda-demo", "requires exactly a OandaDemoAdapter instance",
                      id="fakebroker-cannot-claim-demo"),
         pytest.param("mystery", "somewhere", "unknown execution mode",
                      id="unknown-mode"),

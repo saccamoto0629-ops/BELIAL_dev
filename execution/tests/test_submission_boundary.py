@@ -114,6 +114,34 @@ LIVE_CONNECTION_CONSTRUCTION_ALLOWED = {
 }
 
 
+# Issue #132: the DEMO connection has exactly ONE production composer,
+# ``execution/demo_lock.py`` -- the same single-composer stance as live. The
+# adapter's own endpoint allowlist already makes a non-practice demo adapter
+# unbuildable (Issue #79), but the account pin, the demo/live separation, the
+# safety-policy check and the Kill Switch check live in the composer, so a
+# second construction site would be a demo startup nobody reviewed.
+#
+# ``execution/reconciliation_runner.py`` is the ONE documented exception and
+# is not a submission path: it builds the adapter for RECONCILE-ONLY queries
+# and immediately wraps it in ``ReconcileOnlyBroker``, whose submit / cancel /
+# account operations raise unconditionally (Issue #105). It never builds a
+# ``BrokerConnection``, so nothing it constructs can reach the submission
+# boundary.
+DEMO_CONNECTION_CONSTRUCTION_ALLOWED = {
+    "execution/demo_lock.py",
+    "execution/reconciliation_runner.py",
+    "execution/tests",
+    "broker/tests",
+}
+
+# Issue #132: the demo runtime grant is what authorizes a demo runner, so it
+# is issued by the lock alone.
+DEMO_GRANT_CONSTRUCTION_ALLOWED = {
+    "execution/demo_lock.py",
+    "execution/tests",
+}
+
+
 def _python_files():
     for path in sorted(REPO_ROOT.rglob("*.py")):
         relative = path.relative_to(REPO_ROOT)
@@ -235,6 +263,28 @@ def test_the_live_connection_is_built_only_by_the_live_activation_lock(class_nam
     """Issue #82: no production module other than the live activation lock
     may build a live adapter, a live config or an activation grant."""
     assert _construction_offenders(class_name, LIVE_CONNECTION_CONSTRUCTION_ALLOWED) == []
+
+
+@pytest.mark.parametrize("class_name", ["OandaDemoAdapter", "OandaDemoConfig"])
+def test_the_demo_connection_is_built_only_by_the_demo_activation_lock(class_name):
+    """Issue #132: no production module other than the demo activation lock
+    (and the reconcile-only CLI, which never composes a ``BrokerConnection``)
+    may build a demo adapter or a demo config."""
+    assert _construction_offenders(class_name, DEMO_CONNECTION_CONSTRUCTION_ALLOWED) == []
+
+
+def test_the_demo_runtime_grant_is_issued_only_by_the_demo_activation_lock():
+    """Issue #132: the grant is what ``build_demo_execution_runner`` accepts,
+    so forging one elsewhere in production would bypass every demo lock."""
+    assert _construction_offenders("DemoRuntimeGrant", DEMO_GRANT_CONSTRUCTION_ALLOWED) == []
+
+
+def test_the_demo_lock_holds_exactly_one_demo_adapter_construction():
+    sites = _construction_sites(REPO_ROOT / "execution" / "demo_lock.py", "OandaDemoAdapter")
+    assert len(sites) == 1, (
+        "execution/demo_lock.py must hold exactly one OandaDemoAdapter construction "
+        f"(the gated one in _compose_demo_connection), found lines {sites}"
+    )
 
 
 def test_the_live_lock_holds_exactly_one_live_adapter_construction():
@@ -450,6 +500,38 @@ def test_the_runner_modules_never_import_a_broker_implementation():
         for lineno, module in _imported_modules(REPO_ROOT / "execution" / name):
             if module.startswith("broker.") and module != "broker.broker_models":
                 offenders.append(f"execution/{name}:{lineno} imports {module}")
+    assert offenders == []
+
+
+# Issue #132: ``runner_composition`` imports the demo GRANT type from the
+# activation lock, which transitively imports the demo adapter. The import
+# above therefore no longer proves the runner cannot reach a broker on its
+# own -- so the composers themselves are pinned: a runner module may accept a
+# grant, never mint one.
+CONNECTION_COMPOSERS = (
+    "build_demo_connection",
+    "_compose_demo_connection",
+    "build_live_connection",
+    "_compose_live_connection",
+)
+
+
+def test_the_runner_modules_never_compose_a_broker_connection():
+    """Issue #132: a demo runner is composed FROM a ``DemoRuntimeGrant`` the
+    activation lock issued. If a runner module could call a composer itself
+    it could choose the arguments -- the safety config path, the kill-switch
+    DB path -- and so choose which locks it was measured against."""
+    offenders = []
+    for name in RUNNER_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for composer in CONNECTION_COMPOSERS + (
+            "OandaDemoAdapter",
+            "OandaDemoConfig",
+            "OandaLiveAdapter",
+            "FakeBroker",
+        ):
+            for lineno in _method_call_sites(path, composer) + _name_call_sites(path, composer):
+                offenders.append(f"execution/{name}:{lineno} calls {composer}")
     assert offenders == []
 
 

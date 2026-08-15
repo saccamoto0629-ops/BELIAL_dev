@@ -4,13 +4,13 @@
 
 > **重要な位置づけ**
 >
-> - Shadow Mode は **Live 発注ではない**。Live Execution の基盤(Broker API Adapter・送信境界・Live 接続ロック)は Issue #79 / #82 等で実装済みだが、**実 Broker へ実発注を駆動する runner は未実装・実口座での Live 運用は未解禁**であり(Issue #131 の runner core は `fake` / `shadow` のみを駆動する)、Shadow Mode はその**前段の検証機能**である(Live 運用開始の事前条件のひとつ「Shadow Mode で想定注文を確認済み」を担う)。
+> - Shadow Mode は **Live 発注ではない**。Live Execution の基盤(Broker API Adapter・送信境界・Live 接続ロック)は Issue #79 / #82 等で実装済みだが、**実口座での Live 運用は未解禁**であり(Issue #131 / #132 の runner core が駆動できるのは `fake` / `shadow` / `demo` までで、`live` は拒否される)、Shadow Mode はその**前段の検証機能**である(Live 運用開始の事前条件のひとつ「Shadow Mode で想定注文を確認済み」を担う)。
 > - **Paper Execution とは別物**。Shadow Mode は**仮想約定・仮想 Position・仮想 PnL を一切計算しない** — 記録するのは「送信予定だった注文内容」と「Gate を通過した / 拒否された」という監査事実だけである。
 > - Shadow 結果には Broker 応答を意味する値(`ACCEPTED` / `FILLED` / `PARTIALLY_FILLED` / `CANCELLED`、Broker reference id、fill price / quantity)が**構造的に存在しない**(schema にその列がない)。
 
 ## execution mode(統一語彙)
 
-mode の唯一の正は `execution.safety_gate.ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)。設定文字列は `resolve_execution_mode()` が設定ロード時に解決し、**未知の mode は起動時に明示拒否**する。`demo` は mode 定義と validation のみ(Adapter 型未登録のため `BrokerConnection` を構築できず、runner は明示拒否)。`live` は Issue #82 で `OandaLiveAdapter` が登録済みだが **LOCKED** であり、`live_lock.build_live_connection()` 以外は構築できず shadow runner は `LOCKED_BROKER_MODES` として明示拒否する。`fake` の送信経路は従来どおり `LiveOrderSubmissionService` ただ 1 つ。
+mode の唯一の正は `execution.safety_gate.ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)。設定文字列は `resolve_execution_mode()` が設定ロード時に解決し、**未知の mode は起動時に明示拒否**する。`demo` は Issue #132 で `OandaDemoAdapter` が登録済みだが、`BrokerConnection` を構築してよいのは `demo_lock.build_demo_connection()` だけであり、**shadow runner は `demo` を明示拒否する**(shadow は一切送信しないため、demo 口座へ接触したと読める label で shadow cycle を走らせない)。`live` は Issue #82 で `OandaLiveAdapter` が登録済みだが **LOCKED** であり、`live_lock.build_live_connection()` 以外は構築できず shadow runner は `LOCKED_BROKER_MODES` として明示拒否する。`fake` の送信経路は従来どおり `LiveOrderSubmissionService` ただ 1 つ。
 
 ## Production Signal 入力経路(本 Issue の中核)
 

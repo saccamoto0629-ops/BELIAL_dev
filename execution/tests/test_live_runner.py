@@ -1,4 +1,8 @@
-"""Issue #131: the Live Execution runner core (Fake / Shadow only).
+"""Issue #131: the Live Execution runner core (Fake / Shadow).
+
+The ``demo`` mode this runner also drives since Issue #132 is covered by
+``execution/tests/test_demo_runner.py``; the mode-dispatch tests below pin
+which modes are runnable at all.
 
 The runner adds a LIFECYCLE around the existing boundaries; these tests pin
 that it adds nothing else. They cover, end to end through the production
@@ -302,16 +306,21 @@ def stub_runner(**kwargs):
 # --- mode dispatch (fail closed) ---------------------------------------------
 
 
-def test_only_fake_and_shadow_are_runnable():
-    assert RUNNER_SUPPORTED_MODES == {ExecutionMode.FAKE, ExecutionMode.SHADOW}
+def test_only_fake_shadow_and_demo_are_runnable():
+    """Issue #132 added ``demo``; ``live`` stays out of the runner entirely."""
+    assert RUNNER_SUPPORTED_MODES == {
+        ExecutionMode.FAKE,
+        ExecutionMode.SHADOW,
+        ExecutionMode.DEMO,
+    }
     assert resolve_runner_mode("fake") is ExecutionMode.FAKE
     assert resolve_runner_mode(ExecutionMode.SHADOW) is ExecutionMode.SHADOW
+    assert resolve_runner_mode("demo") is ExecutionMode.DEMO
 
 
 @pytest.mark.parametrize(
     "mode, expected",
     [
-        ("demo", "NOT implemented"),
         ("live", "live activation lock"),
         ("dry-run", "runner FLAG"),
         ("paper", "unknown execution mode"),
@@ -324,7 +333,7 @@ def test_unsupported_modes_are_refused_with_a_reason(mode, expected):
     assert expected in str(excinfo.value)
 
 
-@pytest.mark.parametrize("mode", [ExecutionMode.DEMO, ExecutionMode.LIVE, ExecutionMode.DRY_RUN])
+@pytest.mark.parametrize("mode", [ExecutionMode.LIVE, ExecutionMode.DRY_RUN])
 def test_the_runner_refuses_an_executor_for_an_unsupported_mode(mode):
     with pytest.raises(RunnerModeError):
         stub_runner(stub={"mode": mode})

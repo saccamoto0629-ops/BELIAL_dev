@@ -36,19 +36,19 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `CHART_DB_PATH` | `market-watch/data/chart_data.sqlite3` | Chart DBのパス上書き(`market-watch/chart_collector.py`) |
 | `MARKET_BIAS_DB_PATH` | `news-feed-bot/data/market_bias.sqlite3` | Market Bias DBのパス上書き。Backtestから別プロセスで参照する場合に使う(`news-feed-bot/market_bias_store.py`) |
 | `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む(v3 で通知 outbox テーブル `paper_execution_notifications` を追加、v4(Issue #85)で `cancelled` の terminal_reason へ `position_limit` を追加 — pre-v4 DB は positions テーブルの transactional rebuild で移行)。dry-run では作成・migration せず、本体+WAL/SHM の snapshot コピーに対する読み取り専用スキーマ確認のみ行う(実 DB へ接続しない) |
-| `EXECUTION_ORDER_DB_PATH` | `execution/data/execution_orders.sqlite3` | Live Execution 用 Execution Order DB のパス上書き(`execution/execution_store.py`、Issue #74。schema v5)。相対パスは `execution/` 基準。**この DB を定期的に作成・更新する常駐プロセスは存在しない**(Issue #131 の Live Execution runner core は `fake` / `shadow` のみを駆動するライブラリ API で、CLI / systemd 等の運用導線は未実装。テストは `tmp_path` を使用)。手動 reconciliation CLI(`python -m execution.reconciliation_runner`)は照合時にこの DB を**読み取り**、修復サービス(Issue #104。API 明示呼び出しのみ)は状態機械経由で更新する |
-| `SAFETY_GATE_DECISION_DB_PATH` | `execution/data/safety_gate_decisions.sqlite3` | Safety Gate 判定監査 DB のパス上書き(`execution/safety_store.py`、Issue #75)。相対パスは `execution/` 基準。**この DB へ書き込む運用導線は Shadow Mode CLI(`python -m execution.shadow_runner`。Gate 判定の監査保存)のみ**で、定期実行する送信プロセスは存在しない(Issue #131 の runner core は `fake` / `shadow` を駆動するライブラリ API のみ。テストは `tmp_path` を使用) |
-| `SUBMISSION_JOURNAL_DB_PATH` | `execution/data/submission_journal.sqlite3` | Live Execution 用 Submission / Cancellation Journal DB のパス上書き(`execution/submission_journal.py`、Issue #93 / #99)。Broker 送信前後の送信試行を Execution Order DB と**独立に**耐久記録する(Journal 保存失敗時は fail-closed で送信されない)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新するプロセスは現時点で存在しない**(Issue #131 の runner core は `fake` mode でこの Journal を通るが、CLI / systemd 等の運用導線は未実装。テストは `tmp_path` を使用) |
-| `KILL_SWITCH_DB_PATH` | `execution/data/kill_switch.sqlite3` | Execution 層の**永続 Kill Switch** 状態 DB のパス上書き(`execution/kill_switch_store.py`、Issue #81)。相対パスは `execution/` 基準。本番は永続ボリューム上の絶対パス推奨。状態は append-only の遷移履歴(有効/無効・UTC 時刻・operator・reason)で、Safety Gate は毎評価この DB を再読する。**DB が読めない(未初期化・schema 不一致・破損)あいだは fail-closed で全新規送信が拒否される**(「OFF 扱い」にはならない)。操作は `python -m execution.kill_switch_cli`(下記 CLI 節)。Live 送信境界(`LiveOrderSubmissionService`)と Live 起動前 preflight(`python -m execution.live_startup_cli`)がこの DB を fail-closed に評価する(Issue #82)。**定期的に評価する常駐 Live Execution runner は存在しない**(Issue #131 の runner core は `fake` / `shadow` を駆動するライブラリ API で、各送信判定ごとにこの Kill Switch を Safety Gate 経由で再評価する。CLI / systemd 等の運用導線は未実装。テストは `tmp_path` を使用) |
+| `EXECUTION_ORDER_DB_PATH` | `execution/data/execution_orders.sqlite3` | Live Execution 用 Execution Order DB のパス上書き(`execution/execution_store.py`、Issue #74。schema v5)。相対パスは `execution/` 基準。**この DB を定期的に作成・更新する常駐プロセスは存在しない**(Issue #131 / #132 の Live Execution runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、systemd 等の継続運転導線は未実装。**Demo 運用では Fake と data-dir を分ける**。テストは `tmp_path` を使用)。手動 reconciliation CLI(`python -m execution.reconciliation_runner`)は照合時にこの DB を**読み取り**、修復サービス(Issue #104。API 明示呼び出しのみ)は状態機械経由で更新する |
+| `SAFETY_GATE_DECISION_DB_PATH` | `execution/data/safety_gate_decisions.sqlite3` | Safety Gate 判定監査 DB のパス上書き(`execution/safety_store.py`、Issue #75)。相対パスは `execution/` 基準。**この DB へ書き込む運用導線は Shadow Mode CLI(`python -m execution.shadow_runner`。Gate 判定の監査保存)のみ**で、定期実行する送信プロセスは存在しない(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API のみ。`demo` runner を回すと Demo の Gate 判定もここへ耐久記録される。テストは `tmp_path` を使用) |
+| `SUBMISSION_JOURNAL_DB_PATH` | `execution/data/submission_journal.sqlite3` | Live Execution 用 Submission / Cancellation Journal DB のパス上書き(`execution/submission_journal.py`、Issue #93 / #99)。Broker 送信前後の送信試行を Execution Order DB と**独立に**耐久記録する(Journal 保存失敗時は fail-closed で送信されない)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新する常駐プロセスは現時点で存在しない**(Issue #131 / #132 の runner core は `fake` / `demo` mode でこの Journal を通るが、systemd 等の継続運転導線は未実装。テストは `tmp_path` を使用) |
+| `KILL_SWITCH_DB_PATH` | `execution/data/kill_switch.sqlite3` | Execution 層の**永続 Kill Switch** 状態 DB のパス上書き(`execution/kill_switch_store.py`、Issue #81)。相対パスは `execution/` 基準。本番は永続ボリューム上の絶対パス推奨。状態は append-only の遷移履歴(有効/無効・UTC 時刻・operator・reason)で、Safety Gate は毎評価この DB を再読する。**DB が読めない(未初期化・schema 不一致・破損)あいだは fail-closed で全新規送信が拒否される**(「OFF 扱い」にはならない)。操作は `python -m execution.kill_switch_cli`(下記 CLI 節)。Live 送信境界(`LiveOrderSubmissionService`)と Live 起動前 preflight(`python -m execution.live_startup_cli`)がこの DB を fail-closed に評価する(Issue #82)。**定期的に評価する常駐 Live Execution runner は存在しない**(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、各送信判定ごとにこの Kill Switch を Safety Gate 経由で再評価する。systemd 等の継続運転導線は未実装。テストは `tmp_path` を使用)。**Demo / Live の送信境界はこの永続 store の reader を必須とする**(`REAL_BROKER_MODES`。in-memory provider では境界を構築できない。Issue #132)。Demo 起動前 preflight(`python -m execution.demo_startup_cli`)もこの DB を fail-closed に評価する |
 | `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。schema v3(Issue #105)は position / trade / SL・TP 検出記録テーブル(`manual_review` のみ許可)と run の position summary 列を additive に追加(migration は v1 → v2 → v3 の段階適用、`init_reconciliation_db()` のみ)。**この DB を作成・更新する運用導線は手動 reconciliation CLI(`python -m execution.reconciliation_runner`。Issue #105、下記 CLI 節)だけであり**、scheduler / 常駐 Bot への組み込みは未実装(テストは `tmp_path` を使用) |
 | `ENABLE_LIVE_TRADING` | unset | Live 接続のマスタースイッチ(Issue #82)。**厳密に `true`(小文字)のときだけ有効**。`TRUE` / `1` / `yes` / 前後空白付きはすべて無効扱いで fail-closed。これ単独では Live 接続できない(下記「Live 有効化手順」の全条件が必要)。**Demo mode のプロセス環境には設定しない**(設定されていると Demo 起動チェックが fail-closed で拒否する) |
 | `OANDA_LIVE_API_TOKEN` | empty | OANDA **Live** Adapter(`broker/oanda_live_adapter.py`、Issue #82)の API token。Demo 用 `OANDA_API_TOKEN` とは**別変数**で、同一値を両方へ設定すると構築時に fail-closed で拒否。環境変数でのみ渡し、ログ・例外・docs・リポジトリへ実値を書かない |
 | `OANDA_LIVE_ACCOUNT_ID` | empty | OANDA Live Adapter の Live account id。Demo 用 `OANDA_ACCOUNT_ID` とは**別変数**で、同一値の共有は fail-closed。起動 summary には非可逆 digest(`account-<12桁>`)だけを表示し、実 ID は出力しない |
 | `OANDA_LIVE_API_URL` | **既定なし** | OANDA Live Adapter の接続先。**Live endpoint(`https://api-fxtrade.oanda.com`)のみ許可(allowlist)**。Demo endpoint・類似ホスト・未設定はすべて構築時に fail-closed で拒否する(Demo と違い**既定値を持たない** = 未設定は起動失敗)。拒否メッセージは設定値を一切 echo しない |
-| `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Live Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない**(reconciliation で解決する) |
-| `OANDA_API_TOKEN` | empty | OANDA Demo Adapter(`broker/oanda_demo_adapter.py`、Issue #79)の API token。**Demo(fxpractice)口座のトークンのみ**。環境変数でのみ渡し、ログ・例外・docs へ実値を書かない。運用導線でこの Adapter を使うのは**手動 reconciliation CLI(`python -m execution.reconciliation_runner --broker oanda-demo`。reconcile-only)**と opt-in の実 API テストのみ(Execution 層への組み込み = `BROKER_TYPE_BY_MODE` への `demo` 登録は未実装のため、送信経路からは使われない) |
-| `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない |
-| `OANDA_API_URL` | `https://api-fxpractice.oanda.com` | OANDA Demo Adapter の接続先。**Demo endpoint のみ許可(allowlist)**。Live endpoint(`fxtrade` を含む host)やその他の URL を指定すると構築時に fail-closed で起動拒否。HTTP redirect は追従しない(3xx は共通エラー化)ため、応答によって Demo endpoint 外へ接続が逸れることもない |
+| `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Live Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない**(reconciliation で解決する)。**Demo mode のプロセス環境には設定しない**(他の `OANDA_LIVE_*` と同様、設定されていると Demo 起動チェックが fail-closed で拒否する。Issue #132) |
+| `OANDA_API_TOKEN` | empty | OANDA Demo Adapter(`broker/oanda_demo_adapter.py`、Issue #79)の API token。**Demo(fxpractice)口座のトークンのみ**。環境変数でのみ渡し、ログ・例外・docs へ実値を書かない。Issue #132 で Execution 層へ統合されたため、**この変数は Demo mode の実送信経路でも使われる**(`python -m execution.demo_startup_cli` / demo runner)。ほかに手動 reconciliation CLI(`python -m execution.reconciliation_runner --broker oanda-demo`。reconcile-only)と opt-in の実 API テストが使用する |
+| `OANDA_ACCOUNT_ID` | empty | OANDA Demo Adapter の Demo account id。環境変数でのみ渡し、実値を出力しない。**Demo mode(Issue #132)では safety config の `expected_account_reference`(非可逆 digest)と一致することが起動条件**であり、不一致は Broker 送信前に fail-closed で拒否される |
+| `OANDA_API_URL` | `https://api-fxpractice.oanda.com` | OANDA Demo Adapter の接続先。**Demo endpoint のみ許可(allowlist)**。Live endpoint(`fxtrade` を含む host)やその他の URL を指定すると構築時に fail-closed で起動拒否され、Demo mode では demo 起動ロック(Issue #132)も同じ値を独立に検証する(未設定 = 既定の Practice endpoint であり、ロックを迂回するわけではない)。HTTP redirect は追従しない(3xx は共通エラー化)ため、応答によって Demo endpoint 外へ接続が逸れることもない |
 | `OANDA_HTTP_TIMEOUT_SECONDS` | `10` | OANDA Demo Adapter の HTTP timeout 秒数。timeout 時は `BrokerTimeoutError`(注文状態 UNKNOWN)となり、**自動再送はしない** |
 | `BELIAL_RUN_OANDA_DEMO_API_TESTS` | unset | `1` のときだけ OANDA Demo 実 API テスト(`broker/tests/test_oanda_demo_adapter_demo_api.py`)を実行する opt-in フラグ。通常 CI では未設定のため全件 skip され、8 スイートは外部通信しないまま |
 | `PAPER_EXECUTION_DISCORD_WEBHOOK_URL` | empty | Paper Execution 状態遷移通知(仮想約定・仮想損益。Issue #83)の Discord Webhook。`paper-execution/.env` またはプロセス環境変数。Paper Signal の `DISCORD_WEBHOOK_URL` とは別変数(責務分離)。Transactional Outbox 方式: 通知 outbox 行は Position 遷移と同一トランザクションで確定するため、Webhook 未設定でも記録され消えない。未設定時は claim せず attempt を消費せず滞留し、URL 設定後に `DELIVERY_BATCH_LIMIT`=20 件/cycle で順次配送する。配送は at-least-once(HTTP 成功後 success 記録前に停止すると同一 Event ID の重複があり得る)。配送失敗は position 状態・`--once` 終了コードへ影響せず、後続 cycle で自動再送(上限5回、以後 `dead_letter`) |
@@ -293,6 +293,38 @@ python -m execution.reconciliation_runner --broker fake --dry-run
 
 `python -m execution.kill_switch_cli` は Execution 層の**永続 Kill Switch** を操作する唯一の運用導線。有効化すると Safety Gate(`kill_switch_enabled`)が**すべての新規 Broker 送信**を拒否する。状態は SQLite(`KILL_SWITCH_DB_PATH`、既定 `execution/data/kill_switch.sqlite3`)に append-only の履歴として永続化されるため、**プロセス再起動・多重起動・別プロセスからの送信にも停止が効き続ける**。reconciliation・read-only 照会・cancel は Gate を通らないため停止中も実行できる。この CLI は Broker・ネットワークへ一切触れない。
 
+**実行中の送信に対する即時性(Issue #132 / PR #136 レビュー P1)**: Safety Gate は評価の冒頭で Kill Switch を読むが、その後に Broker への安全確認 GET(建玉・口座状態)と Journal / Order Store への書き込みが挟まる。実口座・Practice 口座への送信ではこれらがネットワーク往復になるため、**評価中に Kill Switch を ON にしても既に評価が始まっていた 1 件は送信され得た**。現在は `LiveOrderSubmissionService` が Broker 呼び出しまでに**永続 Kill Switch を 2 回読む**(`REAL_BROKER_MODES` = `demo` / `live` のみ)。いずれも ON はもちろん**読み取り不能でも送信しない**(fail-closed)。
+
+| 読み取り位置 | 塞ぐ window | 拒否時の Journal |
+|---|---|---|
+| Journal の `started` マークの**前** | Broker 安全確認 GET・clearance 照会・Journal / Store 書き込み(ネットワーク往復を含む) | **`not_started`** = Broker へ一切送っていないことの耐久的証拠。reconciliation 案件は発生しない |
+| **Broker 呼び出し地点そのもの**(`submit_order()` の直前。OrderRequest 構築済み) | `mark_broker_call_started` 自身(SQLite の busy timeout は 30 秒)と OrderRequest 構築 | **`started` のまま unresolved**(保守側へ倒す) |
+
+2 回目の拒否で Journal を終端化しないのは意図的である。`started` = **Broker が注文を保持している可能性がある**という不変条件は reconciliation が依拠するものであり、`started` からの「送っていないことが証明済み」遷移を作るとこの不変条件が弱まる。万一その遷移が実際には POST 済みの経路で発火すれば注文を静かに失う — reconciliation 案件 1 件よりはるかに悪い。緊急停止時に unresolved が 1 件残るのは、どのみち reconciliation を行う場面での妥当なコストと判断している。なお runner 側は制御フロー上の事実として `NOT_SENT` を報告する。
+
+#### Kill Switch と Broker 送信の契約(Issue #132 時点)
+
+**保証すること**
+
+1. Broker 送信の**直前に**永続 Kill Switch を再取得する(`REAL_BROKER_MODES` = `demo` / `live`)。
+2. **その取得時点で** ON、または読み取り不能であれば**送信しない**(fail-closed)。読み取り不能を OFF とみなすことはない。
+
+**保証しないこと**
+
+3. **最終 read が `False` を返した時点から、外部 HTTP call が開始されるまでの原子的排他は保証しない。**
+   別プロセスがこの区間で Kill Switch を enable した場合、その 1 件が送信され得る。
+4. 厳密な atomic immediate-stop(read と call 開始を同一の同期プロトコルへ束縛する)は
+   **本 Issue のスコープ外**であり、**将来の別 Issue** とする。新しい inter-process synchronization
+   protocol の導入が必要になるため、Demo runner 統合(Issue #132)では扱わない。
+
+この区間の race は**既知の非保証領域**であり、契約違反ではない。上記 3 の性質上、
+「Kill Switch を enable すれば実行中の送信が必ず止まる」とは言えない — 言えるのは
+「**enable 後に最終 read へ到達した送信は止まる**」である。実用上の競合 window
+(Safety Gate 評価中・Broker 安全確認 GET 中・Journal start 書き込み中・OrderRequest 構築中)は
+すべて regression test で閉じている。
+
+停止された intent は phase `submitting` に留まり自動再送はされない(`SubmissionJournal.list_unresolved()` / `execution_store.list_unresolved_submissions()` で可視)。
+
 EC2 上での緊急停止(enable は 1 コマンド。DB 未作成でも初期化して停止する):
 
 ```bash
@@ -330,7 +362,81 @@ python -m execution.kill_switch_cli disable \
 - `enable` / `disable` が exit 1 でも、出力に `WAS RECORDED` があれば**その遷移は記録済み**である(履歴に破損行がある等で現在状態を確認できないだけ)。この場合 Gate は fail-closed のまま送信を止め続けるので、破損を解消してから `status` で再確認する。逆に `WAS RECORDED` がない exit 1 は、遷移が記録されていない(store 自体を開けない)ことを意味する。
 - 状態読み取りは**履歴全行の完全性を検証**してから状態を返す。帯域外編集で 1 行でも壊れていれば、その後に正常な `disable` を追記しても Gate・CLI とも fail-closed のまま(緊急停止のための `enable` は破損 DB でも記録できるが、状態が検証可能になるまで送信は止まったまま)。破損が疑われる場合は `status` の出力と `sqlite3 <db> 'SELECT * FROM kill_switch_transitions;'` で該当行を特定する。
 - 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(照合)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
-- 現時点で本番の常駐 Live Execution runner は存在しない(Issue #82 で追加されたのは**Live 接続のロックと起動前 preflight** までで、定期実行する送信プロセスは未実装)。Kill Switch は Live 送信境界が `PersistentKillSwitchStateProvider` を読むことで効き、**この配線は契約ではなく強制**である(`LiveOrderSubmissionService` は execution mode が `live` の場合、gate が永続 Kill Switch reader を持たない composition を構築時に拒否する。in-memory provider では「OFF」を構造的に作れてしまい、読み取り不能を暗黙の OFF に変えるため)。加えて、`python -m execution.live_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
+- 現時点で本番の**継続運転する常駐** Live Execution runner は存在しない(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、systemd 等の運用導線は未実装)。Kill Switch は Live 送信境界が `PersistentKillSwitchStateProvider` を読むことで効き、**この配線は契約ではなく強制**である(`LiveOrderSubmissionService` は execution mode が `demo` / `live`(= `REAL_BROKER_MODES`。Issue #132)の場合、gate が永続 Kill Switch reader を持たない composition を構築時に拒否する。in-memory provider では「OFF」を構造的に作れてしまい、読み取り不能を暗黙の OFF に変えるため)。加えて、`python -m execution.live_startup_cli` / `python -m execution.demo_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
+
+### Demo mode の起動(Issue #132)
+
+`python -m execution.demo_startup_cli` は **Demo(OANDA Practice)接続のロック**を検証し、起動時 safety summary を表示する運用導線。**注文の送信・取消・照会は一切行わず、外部通信もしない**(接続オブジェクトを組み立てて破棄するだけ)。実送信は従来どおり `LiveOrderSubmissionService`(唯一の送信境界)と Safety Gate を通る。
+
+> **Demo は「緩い Live」ではない。** 実在の Practice 口座へ実注文を出す経路であり、Safety Gate・Submission Journal・注文状態機械・**永続 Kill Switch** はすべて Live と同じ契約で適用される。逆に、**Demo が動くことは Live 解禁の根拠にならない**: Demo と Live は credential 変数・endpoint・composer・safety config のいずれも共有しない。
+
+以下が**すべて**成立したときだけ Demo 接続が構築できる。1つでも欠ければ fail-closed(exit 1)で拒否され、Broker call には到達しない。
+
+| # | 条件 | 設定場所 |
+|---|---|---|
+| 1 | execution mode が `demo` | `--execution-mode demo` |
+| 2 | Demo credential | `OANDA_API_TOKEN` / `OANDA_ACCOUNT_ID`(Live 用変数とは別) |
+| 3 | Demo endpoint | `OANDA_API_URL` 未設定、または `https://api-fxpractice.oanda.com` 完全一致 |
+| 4 | **Live 設定が 1 つも無いこと** | `ENABLE_LIVE_TRADING` / `OANDA_LIVE_API_TOKEN` / `OANDA_LIVE_ACCOUNT_ID` / `OANDA_LIVE_API_URL` / `OANDA_LIVE_HTTP_TIMEOUT_SECONDS` を Demo プロセス環境から外す(**Live Adapter が読む変数はすべて対象**。秘密を持たない timeout 変数も、残っていれば「Live 用に用意された環境」の証拠として拒否する) |
+| 5 | account identity の一致 | safety config の `expected_account_reference` が `OANDA_ACCOUNT_ID` の digest と一致 |
+| 6 | Safety limits が読める | `--safety-config <path>`(許可銘柄・最大注文数量・最大ポジション数・許可 Demo target。credential は書かない) |
+| 7 | Kill Switch が**検証可能かつ OFF** | `python -m execution.kill_switch_cli status`(読めない・不明・ON はすべて拒否) |
+
+```bash
+cd /opt/berial
+source .venv/bin/activate
+
+# Demo credential はプロセス環境にだけ渡す(リポジトリ・.env.example へ書かない)
+export OANDA_API_TOKEN=...               # Demo 口座専用。Live と共有しない
+export OANDA_ACCOUNT_ID=...              # Demo 口座専用。Live と共有しない
+# OANDA_API_URL は未設定でよい(既定が Practice endpoint)
+
+# 起動前 preflight: ロックの成立確認 + safety summary 表示(発注しない)
+python -m execution.demo_startup_cli \
+    --execution-mode demo \
+    --safety-config /etc/berial/demo_safety.json
+```
+
+`--safety-config` の JSON は全項目必須・未知キー禁止(既定値なし)。雛形は
+[`execution/examples/demo_safety_config_example.json`](../../execution/examples/demo_safety_config_example.json):
+
+```json
+{
+  "policy_id": "demo-v1",
+  "allowed_symbols": ["USD_JPY"],
+  "allowed_sides": ["buy"],
+  "max_order_quantity": "1000",
+  "max_positions_per_symbol": 1,
+  "max_positions_account": 2,
+  "max_reference_age_seconds": 30,
+  "max_spread_by_symbol": {"USD_JPY": "0.05"},
+  "allowed_demo_targets": ["oanda-demo"],
+  "expected_account_reference": "account-0123456789ab",
+  "require_stop_loss": true
+}
+```
+
+**`expected_account_reference` の求め方**: 値は account id そのものではなく**非可逆 digest**(`account-<12桁 hex>`)であり、秘密ではない。上の preflight を一度実行し、summary の `account (masked)` に出た値をそのまま貼る(**拒否された実行でも表示される**ので、初回の bootstrap に使える)。生の account id を書くと形状検証で拒否され、値は出力されない。
+
+exit code: **0** = 全ロック成立(Demo 接続を構築できた。発注はしていない)/ **1** = 拒否 / **2** = usage error。
+
+代表的な誤操作と結果(いずれも Broker call 前に拒否):
+
+| 状況 | rejection code |
+|---|---|
+| mode が `demo` 以外 | `execution_mode_not_demo` |
+| Demo credential 不足 | `demo_credentials_missing` |
+| `OANDA_API_URL` が Practice endpoint 以外 | `demo_endpoint_invalid` |
+| Demo プロセスに live 設定が存在(`OANDA_LIVE_*` のいずれか 1 つでも)/ Demo と Live の値が共有 | `demo_live_configuration_mixed` |
+| `OANDA_ACCOUNT_ID` が pin された口座と不一致 | `demo_account_mismatch` |
+| safety config が読めない / 不正 / account pin が無い | `safety_policy_unavailable` |
+| policy が `oanda-demo` を許可していない | `demo_target_not_allowed` |
+| Kill Switch ON | `kill_switch_enabled` |
+| Kill Switch DB が読めない・schema 不正・状態不明 | `kill_switch_state_unverifiable` |
+
+**緊急停止は Live と同じ**: `python -m execution.kill_switch_cli enable` を入れれば、Demo の新規送信も Broker call 前に停止する(Gate が送信判定ごとに永続 store を読み直し、送信境界が Broker 呼び出し直前にもう一度読むため、実行中の runner にも反映される)。**enable と送信が同時に走った場合の原子性は保証しない** — 上記「Kill Switch と Broker 送信の契約」を参照。
+
+**未整備(別 Issue)**: Demo の継続運転(systemd 常駐・定期 reconciliation)は本 Issue の範囲外である。`demo` runner はライブラリ API(`execution.runner_composition.build_demo_execution_runner`)として利用でき、この CLI は preflight のみで runner を起動しない。Demo と Fake は同じ store 形状(`execution_orders` / `submission_journal` / `safety_gate_decisions`)を使うため、**運用では data-dir を分けて namespace を分離する**。
 
 ### Live 接続の有効化 / 無効化 / 緊急停止(Issue #82)
 
@@ -449,21 +555,21 @@ python -m execution.live_startup_cli \
 
 - FakeBroker 固定シナリオ試験が安定している(`python -m execution.scenario_runner`)
 - Shadow Mode で想定注文を確認済み(`python -m execution.shadow_runner` / shadow report)
-- Demo 口座で継続運転済み
+- Demo 口座で継続運転済み(Issue #132 で `demo` mode の runner 統合と起動ロックは実装済み。**継続運転そのもの**= 定期 reconciliation・systemd 常駐は別 Issue で、この項目は未達)
 - Broker reconciliation が稼働している(`python -m execution.reconciliation_runner`)
 - Kill Switch が動作確認済み(enable → 送信拒否 → disable)
 - 発注数量・許可銘柄・リスク上限が `--safety-config` に設定済み
 
-Issue #131(runner core)の merge も同様に Live 運用開始の判断ではない — runner が駆動できるのは `fake` / `shadow` だけである(下記)。
+Issue #131(runner core)・Issue #132(Demo 統合)の merge も同様に Live 運用開始の判断ではない — runner が駆動できるのは `fake` / `shadow` / `demo` であり、`live` は明示拒否される(下記)。
 
-#### Live Execution runner core(Issue #131)
+#### Live Execution runner core(Issue #131 / #132)
 
-Issue #131 で **runner core**(`execution/live_runner.py` + `execution/runner_composition.py`)を実装した。ExecutionRequest の取得 / 対象選択、1 cycle を表す `run_cycle()`、常駐ループ境界 `run_forever()`、graceful shutdown、cycle 単位の失敗局所化、fail-closed を提供する。
+Issue #131 で **runner core**(`execution/live_runner.py` + `execution/runner_composition.py`)を実装した。ExecutionRequest の取得 / 対象選択、1 cycle を表す `run_cycle()`、常駐ループ境界 `run_forever()`、graceful shutdown、cycle 単位の失敗局所化、fail-closed を提供する。Issue #132 で **`demo` mode を統合**した(上記「Demo mode の起動」節)。
 
 **運用上の現状**:
 
-- 駆動できる mode は **`fake` と `shadow` だけ**。`demo`(未実装)/ `live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知 mode は `RunnerModeError` で拒否される。**OANDA Demo / Live へは runner から接続できない**。
-- **CLI・systemd 等の運用導線は未実装**であり、現時点で runner を起動する運用手順は存在しない(ライブラリ API とテストからのみ駆動される)。この文書に runner の起動コマンドが載るのは、OANDA Demo 統合と運用導線の Issue が完了してからである。
+- 駆動できる mode は **`fake` / `shadow` / `demo`**。`live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知 mode は `RunnerModeError` で拒否される。**OANDA Live へは runner から接続できない**。`demo` は `demo_lock.build_demo_connection()` が発行した grant からのみ組み立てられる。
+- **systemd 等の継続運転導線は未実装**であり、現時点で runner を常駐させる運用手順は存在しない(ライブラリ API とテストからのみ駆動される。`python -m execution.demo_startup_cli` は preflight であって runner を起動しない)。この文書に runner の常駐起動コマンドが載るのは、継続運転の Issue が完了してからである。
 - Kill Switch は**送信判定ごとに** Safety Gate 経由で再評価される(`KILL_SWITCH_DB_PATH` の永続 provider を配線した場合、有効化はプロセス再起動をまたいで新規送信を止め続ける。読めない場合も fail-closed)。
 - **reconciliation の定期実行は runner に含まれない**(引き続き手動 CLI)。runner は送信結果が不明(`unresolved`)な注文を**再送しない**。解決は reconciliation の責務である。
 - dry-run は完全無副作用(Broker 呼び出し・Order Store / Journal / Shadow Store 書き込み・DB 作成・migration のいずれも行わない)。

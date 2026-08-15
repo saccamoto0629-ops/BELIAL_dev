@@ -16,7 +16,7 @@ Paper Signal Generator(実装済み・仮説の記録のみ)
 Paper Execution(本書・設計のみ)
         ↓  仮想ポジション / 仮想損益レコード
 Live Execution ── Broker API による実注文。Paper Execution とは完全に別レイヤー
-                  (基盤は broker/ + execution/ に実装済み。runner 未実装・運用未解禁)
+                  (基盤 + runner core は broker/ + execution/ に実装済み。実口座運用は未解禁)
 ```
 
 - **実発注・自動売買は一切行わない。** Paper Execution が生成するのは「もしこの仮説どおりに執行していたら」という仮想レコードだけである。
@@ -265,7 +265,7 @@ Backtest の `--no-reentry` / `--cooldown-minutes` / `--allowed-market-states`(I
 
 - Paper Execution は **実発注・自動売買・Broker API 連携(OANDA / XM / MT5 等)・ロット計算・レバレッジ計算を一切含まない**。生成するのは paper_only の仮想レコードのみである。
 - `stop_loss_price` / `take_profit_price` は判定用のマーカーであり、broker への stop / limit 注文ではない(`exit_policy.py` と同じ「observation, not execution」の境界)。
-- Live Execution は完全に別のレイヤーであり、Paper Execution のコード・データ・設定を実注文経路に転用しない。Live Execution の基盤は `broker/` + `execution/` に実装済み(定期実行 runner は未実装・実口座での運用は未解禁)だが、この分離不変条件は変わらない: `paper-execution/` のソースコード上に broker API の import・発注呼び出しが存在しないことは `execution/tests/test_package_imports.py` が回帰として固定済みである。
+- Live Execution は完全に別のレイヤーであり、Paper Execution のコード・データ・設定を実注文経路に転用しない。Live Execution の基盤と runner core は `broker/` + `execution/` に実装済み(Issue #131 / #132 で `fake` / `shadow` / `demo` を駆動できるが、継続運転の運用導線は未実装・実口座での運用は未解禁)だが、この分離不変条件は変わらない: `paper-execution/` のソースコード上に broker API の import・発注呼び出しが存在しないことは `execution/tests/test_package_imports.py` が回帰として固定済みである。
 
 ## 他レイヤーとの入出力境界(まとめ)
 

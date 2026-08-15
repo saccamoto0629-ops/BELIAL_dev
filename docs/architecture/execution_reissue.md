@@ -4,7 +4,7 @@
 
 > **重要な位置づけ**
 >
-> - **実発注を駆動する定期実行 runner・自動売買は引き続き未実装・非スコープ**([Concept](../product/concept.md) の「非スコープ」)。実 Broker 接続(OANDA Demo / Live Adapter)は Issue #79 / #82 で実装済みだが、Live 接続は全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。本書は Live Execution 運用で必要になる契約を確定するもの。
+> - **実発注を継続運転する常駐プロセス・自動売買は引き続き未実装・非スコープ**([Concept](../product/concept.md) の「非スコープ」。runner core 自体は Issue #131 / #132 で `fake` / `shadow` / `demo` まで実装済み)。実 Broker 接続(OANDA Demo / Live Adapter)は Issue #79 / #82 で実装済みだが、Live 接続は全ロック成立時のみ構築でき、実口座での Live 運用は未解禁である。本書は Live Execution 運用で必要になる契約を確定するもの。
 > - 注文状態の唯一の正は既存 `broker.OrderState` / `ORDER_STATE_TRANSITIONS` のまま。**本設計は状態機械へ一切遷移を追加しない**(REJECTED は terminal のまま)。
 > - **Broker Order Reissue(Issue #102)とは別概念**である(下記「用語」)。
 > - UNKNOWN の自動再送は非スコープ(Issue #95 の非スコープをそのまま維持)。OANDA 固有の拒否コード → `RejectionCategory` の写像は Issue #114 で Demo Adapter 内部に、Broker reconciliation は Issue #103〜#105 で実装済み(本書のスコープ外の別契約)。
@@ -244,7 +244,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 | 親の終わり方 | Broker が確定拒否(REJECTED) | Broker 未到達(phase `created` + Journal `not_started`) | Broker が確定拒否(REJECTED) |
 | 許可カテゴリ | 全カテゴリ(運用者判断が根拠) | 該当なし(`OrderResult` が存在しない) | `transient` のみ |
 | 注文パラメータの訂正 | 可(不変条件の範囲内。数量は非増加。ただし `parameter` 拒否のみ policy 上限内の増量可) | 可(不変条件の範囲内。数量は非増加) | **不可(親と完全同一)** |
-| 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断(runner 未実装のため呼び出し元は未接続) |
+| 起点 | 運用者の明示操作(CLI / 運用手順) | 運用者の明示操作 | Live Execution runner の policy 判断(runner core は #131 / #132 で実装済みだが、自動再試行の呼び出し元は未接続) |
 | 記録 | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = manual` + 運用者識別子・理由(必須) | `initiated_by = auto` + policy 識別子・根拠(必須) |
 | 回数上限 | policy `max_manual_reissues_per_signal`(**既定 2**。#116 `ReissuePolicy`) | policy `max_gate_corrections_per_signal`(**既定 2**) | policy `max_auto_reissues_per_signal`(**既定 0 = 無効**) |
 | 追加条件 | — | Gate 判定 / Journal 事前条件(上記)。crash boundary 3 は対象外 | cooldown(連打防止)・kill switch 有効時は不可 |
@@ -272,7 +272,7 @@ signal S(signal_id は仮説の識別子。再発行で変わらない)
 2. **合成は composition root に集約する** — `execution/reissue_composition.py` の `build_reissue_boundary()` が 1 つの policy から両サービスを構築して `ReissueBoundary`(`submission` / `registration` / `policy`)を返す。`current_policy` は Gate が評価する `SafetyPolicy` と**同一インスタンス**であることも要求する(訂正 eligibility が「現在適用中の policy」と比較する対象が、実際に強制されている policy と一致するため)。
 3. **迂回の構造的禁止**: `execution/tests/test_submission_boundary.py` が「production コードで両サービスを構築してよいのは composition root だけ」を**リポジトリ全体の AST 走査**で固定する(`Broker.submit_order` の境界固定と同じ方式)。必須引数だけでは「別々に構成した 2 つの policy を明示的に渡す」ことが依然可能だったため、この pin が実質的な強制になる。**強制が pin に依存する以上、pin 自体もテストする**(PR #122 レビュー r4): bare name・`from ... import X as Alias` の別名束縛・`mod.ReissueService(...)` の module 修飾という**全静的形の検出**をメタテストで固定している。完全に動的な構築(`getattr(mod, "...")()`)は AST の静的可視範囲外であり、これは `submit_order` 境界固定が従来から持つ既知の限界と同じである([Safety Gate](safety_gate.md) の非スコープ「in-process での故意回避の完全防止」)。
 
-**残余(明示的な境界)**: オブジェクト同一性は**プロセス内**の保証である。登録(運用者操作)と送信(将来の Live Execution runner)が別プロセスになれば、両者は**1 つの設定ソース**から policy を読む必要があり、composition root はそこまでは強制できない(現時点で runner は未実装 = 非スコープであり、プロセスは 1 つしかない)。いずれの場合も store 側の fail-closed 検査が最終防衛線として残る — 登録トランザクションは clearance が current かつ `valid` であることを、`mark_submitting()` は status / 口座スコープ / 鮮度を送信の瞬間に再検証する。
+**残余(明示的な境界)**: オブジェクト同一性は**プロセス内**の保証である。登録(運用者操作)と送信(将来の Live Execution runner)が別プロセスになれば、両者は**1 つの設定ソース**から policy を読む必要があり、composition root はそこまでは強制できない(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を 1 プロセス内で駆動し、送信境界は `reissue_composition.build_reissue_boundary()` 経由でのみ構築されるため、現時点では両者が同一プロセスの同一オブジェクトを共有する。プロセス分離は継続運転の運用導線と同じく未実装 = 非スコープ)。いずれの場合も store 側の fail-closed 検査が最終防衛線として残る — 登録トランザクションは clearance が current かつ `valid` であることを、`mark_submitting()` は status / 口座スコープ / 鮮度を送信の瞬間に再検証する。
 
 ## 監査・再起動耐性・並行実行
 

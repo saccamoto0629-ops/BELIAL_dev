@@ -18,12 +18,13 @@ BELIAL の設計資料を置く。
   Broker 境界(共通インターフェース・共通モデル)と、外部通信を一切行わないテストダブル FakeBroker、
   Demo 専用の OANDA Demo Adapter(Issue #79。Live endpoint は fail-closed で拒否)、および
   Live 専用の OANDA Live Adapter(Issue #82。全ロック成立時のみ構築可能)。実装は `broker/`。
-  Demo Adapter の Execution 層への組み込み(`BROKER_TYPE_BY_MODE` への `demo` 登録)と
-  定期実行する Live Execution runner は未実装のまま。実口座での Live 運用は未解禁。
+  Demo Adapter は Issue #132 で Execution 層へ統合され(`BROKER_TYPE_BY_MODE` への `demo` 登録 +
+  唯一の composer `execution/demo_lock.py`)、runner から Demo 口座へ実送信できる。
+  継続運転の運用導線は未整備で、実口座での Live 運用は未解禁。
 - [Execution Request / Order Persistence](execution_request.md)(Issue #74。schema v5 = #95 / #104 / #115):
   Strategy / Signal から Live Execution ユースケースへ渡す ExecutionRequest モデルと、注文状態・状態履歴・
   再発行チェーンの SQLite 永続化基盤。注文状態は既存 `broker.OrderState` を唯一の正として再利用する。
-  実装は `execution/`。これを駆動する定期実行 runner は未実装のまま。
+  実装は `execution/`。これを駆動する runner core は Issue #131 / #132 で `fake` / `shadow` / `demo` まで実装済み。
 - [Safety Gate / Live Order Submission](safety_gate.md)(Issue #75、#81、#82、#99): Broker 送信直前の
   fail-closed 検証層、判定の SQLite 監査保存、唯一の公認送信・キャンセル経路 `LiveOrderSubmissionService`、
   永続 Kill Switch(Issue #81)、および Live 接続の二重以上のロック + 起動前 preflight(Issue #82)。

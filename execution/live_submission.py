@@ -1,9 +1,12 @@
 """LiveOrderSubmissionService -- THE single sanctioned submission boundary
 for the FUTURE Live Execution layer (Issue #75, review r1).
 
-*** NOTHING HERE CONNECTS TO A REAL BROKER. The only Broker implementation
-that can exist today is FakeBroker (see ``BrokerConnection``); no OANDA
-adapter, no live connection, no production runner exists. ***
+*** THIS SERVICE IS THE ONLY PLACE AN ORDER CROSSES INTO A BROKER. *** The
+broker behind it may be a FakeBroker, the OANDA DEMO adapter (Issue #132,
+composed only by ``execution/demo_lock.py``) or the OANDA LIVE adapter
+(Issue #82, composed only by ``execution/live_lock.py`` and NOT released for
+real-account operation); the contract below is identical for all three, and
+both real-broker modes additionally require the DURABLE Kill Switch reader.
 
 This service closes the official Live Execution submission path into ONE
 boundary. The raw broker adapter is wired INTO the service (via the typed
@@ -135,6 +138,7 @@ from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
     MarketSafetySnapshot,
+    REAL_BROKER_MODES,
     SafetyDecision,
     SafetyGate,
     SafetyRejection,
@@ -303,23 +307,29 @@ class LiveOrderSubmissionService:
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
         if not isinstance(gate, SafetyGate):
             raise ValueError(f"gate must be a SafetyGate, got {gate!r}")
-        # A LIVE submission boundary must read a DURABLE kill switch (Issue
-        # #82; PR #128 Codex review r5 P1). Composition-time evidence cannot
-        # be made unforgeable inside one process -- anything that can reach a
-        # module-private signer can equally read the credentials out of the
-        # environment -- so the control that has to hold is here, where it is
-        # checkable: an in-memory provider (or any subclass free to override
-        # the query) would make "the kill switch is off" true by construction
-        # and turn an unreadable switch into a silent OFF, which Issue #82
-        # forbids. ``fake`` / shadow compositions keep their static providers.
-        if connection.execution_mode is ExecutionMode.LIVE and (
+        # A REAL-BROKER submission boundary must read a DURABLE kill switch
+        # (Issue #82; PR #128 Codex review r5 P1; extended to ``demo`` by
+        # Issue #132). Composition-time evidence cannot be made unforgeable
+        # inside one process -- anything that can reach a module-private
+        # signer can equally read the credentials out of the environment --
+        # so the control that has to hold is here, where it is checkable: an
+        # in-memory provider (or any subclass free to override the query)
+        # would make "the kill switch is off" true by construction and turn
+        # an unreadable switch into a silent OFF, which Issue #82 forbids.
+        # ``demo`` is included because an operator pressing the Kill Switch
+        # means "stop sending orders", not "stop sending orders unless the
+        # account is a practice one" -- a demo runner that could be composed
+        # with a static provider would keep submitting. ``fake`` / shadow
+        # compositions keep their static providers (no network, no account).
+        if connection.execution_mode in REAL_BROKER_MODES and (
             type(gate.state_provider) is not PersistentKillSwitchStateProvider
         ):
             raise ValueError(
-                "a live submission boundary requires the gate to read the persistent "
-                "kill switch (exactly a PersistentKillSwitchStateProvider, so the state "
-                "cannot be answered from memory and an unreadable switch cannot read as "
-                f"OFF), got {type(gate.state_provider).__name__}"
+                f"a {connection.execution_mode.value} submission boundary requires the "
+                "gate to read the persistent kill switch (exactly a "
+                "PersistentKillSwitchStateProvider, so the state cannot be answered from "
+                "memory and an unreadable switch cannot read as OFF), got "
+                f"{type(gate.state_provider).__name__}"
             )
         if not isinstance(decision_db_path, (str, Path)):
             # The audit trail is SEALED inside the service (Issue #75 review
@@ -464,6 +474,60 @@ class LiveOrderSubmissionService:
             return prepared, None
 
         decision, order_request = prepared
+
+        # LAST kill switch read (PR #136 review P1, third round), at the
+        # ACTUAL call site. Two earlier placements each left work behind
+        # them: before the journal ``started`` mark left that write's
+        # 30-second busy timeout, and inside ``_prepare`` left the
+        # ``to_order_request`` construction plus the return/unpack -- a
+        # review reproduced a Demo POST by enabling the switch from inside
+        # ``to_order_request``. The OrderRequest is now fully built BEFORE
+        # this read, so the next statement is the broker call itself.
+        #
+        # WHAT THIS GUARANTEES (and what it does not), see
+        # docs/operations/operations.md "Kill Switch と Broker 送信の契約":
+        #   guaranteed -- the switch is re-read immediately before the call,
+        #     and an ON or unreadable answer AT THAT MOMENT refuses;
+        #   NOT guaranteed -- mutual exclusion between the read returning
+        #     False and the outbound HTTP call starting. Another process
+        #     enabling the switch in that interval may still see this one
+        #     order sent. That race is a KNOWN, DOCUMENTED non-guarantee,
+        #     not a contract violation.
+        # Closing it needs the read and the call bound into one
+        # inter-process synchronisation protocol, which is out of scope for
+        # Issue #132 and left to a future Issue.
+        #
+        # A refusal here leaves the journal entry ``started`` / ``open``,
+        # i.e. unresolved, on purpose. ``started`` => THE BROKER MAY HOLD
+        # THIS ORDER is the invariant reconciliation relies on; a "provably
+        # not called" terminal transition out of ``started`` would weaken
+        # it, and if it ever fired where the POST *had* gone out the order
+        # would be silently lost -- far worse than a reconciliation case.
+        # Refusing after the mark is indistinguishable, to the journal, from
+        # a crash between the mark and the call, which it already models
+        # conservatively. The RUNNER reports NOT_SENT, which is true by
+        # control flow; the journal stays conservative.
+        #
+        # REAL_BROKER_MODES only: fake / shadow own no network-facing
+        # account and answer from memory.
+        if self._connection.execution_mode in REAL_BROKER_MODES:
+            refusal = self._kill_switch_refusal()
+            if refusal is not None:
+                _LOGGER.critical(
+                    "kill switch refused execution_request_id=%s at the broker call "
+                    "site; the broker was NOT called, but the journal entry stays "
+                    "'started' (conservative) and is listed by "
+                    "SubmissionJournal.list_unresolved() until reconciliation clears it",
+                    execution_request_id,
+                )
+                refused = self._recorded(
+                    self._decision(
+                        execution_request_id, (refusal,), checked_at_utc=self._now()
+                    )
+                )
+                self._log_rejection(refused)
+                return refused, None
+
         # ---- past this point the broker may hold the order: failures are
         # recorded as UNKNOWN and re-raised, never converted to rejections;
         # journal writes are best-effort (critical log) and never block ----
@@ -1132,6 +1196,39 @@ class LiveOrderSubmissionService:
         except Exception as exc:
             return self._recorded(self._transition_failure_decision(execution_request_id, exc))
 
+        # FINAL kill switch recheck (Issue #132, PR #136 review P1). The gate
+        # read the switch at the TOP of its evaluation -- before the broker
+        # safety GETs (open positions, account state), before the clearance
+        # scope query, and before the journal / store writes above. On a real
+        # account those steps are network round trips, so an operator who
+        # pressed the switch during them would still have seen the order go
+        # out. The operations contract is that a submission reaching this
+        # point after an enable is refused -- not that an in-flight send is
+        # stopped atomically -- so the switch is read once more here.
+        #
+        # This is the EARLY of two reads (see the second one below the
+        # ``started`` mark). Refusing here leaves the journal entry
+        # ``not_started`` -- durable proof the broker was never contacted --
+        # so the common case (the switch pressed during the slow broker GETs)
+        # terminalizes cleanly and files no reconciliation case.
+        #
+        # The intent stays at phase ``submitting`` and is NOT retried: the
+        # duplicate guard is untouched, and "stop" fails closed rather than
+        # arming a resend. The halted intents are the ones the operator wants
+        # to see, and list_unresolved_submissions() lists them.
+        #
+        # REAL_BROKER_MODES only: fake / shadow own no network-facing account
+        # and answer from memory, so a second read there would change nothing
+        # except their providers' call counts.
+        if self._connection.execution_mode in REAL_BROKER_MODES:
+            refusal = self._kill_switch_refusal()
+            if refusal is not None:
+                return self._recorded(
+                    self._decision(
+                        execution_request_id, (refusal,), checked_at_utc=self._now()
+                    )
+                )
+
         # Durable submission journal, SECOND barrier (Issue #93): the
         # ``started`` mark is the LAST write before the broker call, so a
         # ``not_started`` journal entry always proves the broker was never
@@ -1161,6 +1258,39 @@ class LiveOrderSubmissionService:
             client_order_id=row["client_order_id"],
             created_at_utc=now,
         )
+
+    def _kill_switch_refusal(self) -> SafetyRejection | None:
+        """Read the durable kill switch once more, fail closed.
+
+        Mirrors :meth:`SafetyGate._collect_kill_switch_rejections` exactly:
+        an exception or a non-boolean answer is a BROKEN PROVIDER, not an
+        "off" -- both refuse, because the whole point of the durable reader
+        is that an unreadable switch may never read as OFF. Only a literal
+        ``False`` allows the broker call.
+
+        Returns the rejection to record, or ``None`` to proceed.
+        """
+        try:
+            state = self._gate.state_provider.is_kill_switch_enabled()
+        except Exception as exc:
+            return SafetyRejection(
+                SafetyRejectionCode.STATE_QUERY_FAILED,
+                f"the final kill switch recheck before the broker call failed: {exc}; "
+                "the broker was NOT called (fail closed)",
+            )
+        if not isinstance(state, bool):
+            return SafetyRejection(
+                SafetyRejectionCode.STATE_QUERY_FAILED,
+                f"the final kill switch recheck returned non-boolean {state!r}; "
+                "the broker was NOT called (fail closed)",
+            )
+        if state:
+            return SafetyRejection(
+                SafetyRejectionCode.KILL_SWITCH_ENABLED,
+                "the kill switch was enabled after the safety evaluation and before "
+                "the broker call; the broker was NOT called",
+            )
+        return None
 
     def _transition_failure_decision(self, execution_request_id: str, exc: Exception) -> SafetyDecision:
         """Classify a failed ``created -> submitting`` transition by the

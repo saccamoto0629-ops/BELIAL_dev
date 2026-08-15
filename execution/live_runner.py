@@ -1,5 +1,6 @@
 """Live Execution runner core (Issue #131) -- the LIFECYCLE around the
-existing submission / shadow boundaries. Fake and Shadow only.
+existing submission / shadow boundaries. Fake and Shadow, plus OANDA Demo
+since Issue #132; ``live`` is refused here (see "Modes" below).
 
 *** THIS MODULE NEVER TALKS TO A BROKER. It holds no ``Broker`` /
 ``BrokerConnection``, imports neither, and calls neither ``submit_order``
@@ -49,12 +50,17 @@ What the runner is NOT
 Modes (fail closed)
 -------------------
 
-Only :data:`RUNNER_SUPPORTED_MODES` -- ``fake`` and ``shadow`` -- may be
-run. ``demo`` is defined but unimplemented, ``live`` is locked behind the
-live activation lock (``execution/live_lock.py``), and ``dry-run`` is a
-runner FLAG (``dry_run=True``), not a mode to dispatch on. All four cases
-are refused with :class:`RunnerModeError` before anything is selected --
-never by falling through to a submission path.
+Only :data:`RUNNER_SUPPORTED_MODES` -- ``fake``, ``shadow`` and ``demo``
+(Issue #132) -- may be run. ``live`` is locked behind the live activation
+lock (``execution/live_lock.py``) and is refused here, and ``dry-run`` is a
+runner FLAG (``dry_run=True``), not a mode to dispatch on. Both cases -- and
+every unknown mode string -- are refused with :class:`RunnerModeError`
+before anything is selected, never by falling through to a submission path.
+
+``demo`` drives a REAL (practice) OANDA account: it is runnable, but only
+from a connection the demo activation lock composed, and its submissions
+cross exactly the same single boundary, Safety Gate, Journal and durable
+Kill Switch as every other mode.
 
 Dry run
 -------
@@ -101,12 +107,15 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_MAX_ITEMS_PER_CYCLE = 10
 MAX_ITEMS_PER_CYCLE_LIMIT = 1000
 
-#: The ONLY execution modes this runner may drive (Issue #131). ``demo``
-#: (unimplemented) and ``live`` (locked) are explicitly refused; adding a
-#: mode here is a deliberate, reviewed act -- never a side effect of wiring
-#: a new adapter.
+#: The ONLY execution modes this runner may drive (Issue #131, extended to
+#: ``demo`` by Issue #132). ``live`` stays explicitly refused; adding a mode
+#: here is a deliberate, reviewed act -- never a side effect of wiring a new
+#: adapter. ``demo`` was added together with its own activation lock
+#: (``execution/demo_lock.py``), which is what a demo runner must be composed
+#: from -- membership here is permission to RUN a mode, never permission to
+#: build its connection.
 RUNNER_SUPPORTED_MODES: frozenset[ExecutionMode] = frozenset(
-    {ExecutionMode.FAKE, ExecutionMode.SHADOW}
+    {ExecutionMode.FAKE, ExecutionMode.SHADOW, ExecutionMode.DEMO}
 )
 
 
@@ -128,7 +137,9 @@ def resolve_runner_mode(value) -> ExecutionMode:
         raise RunnerModeError(str(exc)) from None
     if mode in RUNNER_SUPPORTED_MODES:
         return mode
-    if mode in UNIMPLEMENTED_BROKER_MODES:
+    if mode in UNIMPLEMENTED_BROKER_MODES:  # pragma: no cover - empty since Issue #132
+        # Kept as the standing guard for a mode added to ``ExecutionMode``
+        # without an adapter: it must be refused here, never fall through.
         raise RunnerModeError(
             f"execution mode {mode.value!r} is defined but NOT implemented (no broker "
             "adapter is registered for it); the Live Execution runner refuses it "

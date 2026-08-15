@@ -18,7 +18,7 @@ BELIAL軍団の眷属は、炎・辛味・スパイスをモチーフとした�
 ```text
 Berial(軍団長 / 市場監視・全体判断・戦略立案)
   ├─ Pepperoni  # Entry / Position / Execution(Paper Execution は実装済み・運用中、
-  │             #   Live Execution は基盤実装済み・runner 未実装・実口座運用は未解禁)
+  │             #   Live Execution は基盤 + runner core 実装済み・実口座運用は未解禁)
   ├─ 花椒       # Paper Signal / Test 結果・データ集約、外部データ窓口
   └─ Tabasco    # Chart Alert / Discord 通知
 ```
@@ -40,7 +40,7 @@ Pepperoni は、Berial から渡された市場判断をもとに、Entry / Posi
 
 裁量判断は苦手だが、命令を忠実かつ高速に実行することを得意とする。市場判断そのものは Berial が担当し、Pepperoni は「いつ、どの条件で、どの注文を出すか」を実装上の責務として受け持つ。
 
-Execution 層は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定。**基盤実装済み・常駐 runner 未実装・実口座運用は未解禁** = `broker/` + `execution/`)に分かれる。現行実装で Pepperoni の担当領域のうち日常運用されているのは Paper Execution であり、仮想position の pending / open / closed / expired / cancelled 管理、仮想 Open / Close 判定、SL / TP / 最大保有時間の判定、Paper Signal からの仮想執行がすでに実装されている。いずれも仮想レコードのみで、実発注は行わない。過去データで仮説を検証する Backtest(検証基盤)とは別レイヤーである。
+Execution 層は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定。**基盤 + runner core 実装済み・継続運転の常駐プロセスは未実装・実口座運用は未解禁** = `broker/` + `execution/`)に分かれる。現行実装で Pepperoni の担当領域のうち日常運用されているのは Paper Execution であり、仮想position の pending / open / closed / expired / cancelled 管理、仮想 Open / Close 判定、SL / TP / 最大保有時間の判定、Paper Signal からの仮想執行がすでに実装されている。いずれも仮想レコードのみで、実発注は行わない。過去データで仮説を検証する Backtest(検証基盤)とは別レイヤーである。
 
 ## Pepperoni の責務
 
@@ -67,7 +67,7 @@ Execution 層は **Paper Execution**(仮想約定・仮想ポジション管理�
 ```text
 Berial
   └─ Pepperoni  # Live Execution の運用(未解禁)
-      ├─ 定期実行 runner(実発注の駆動。未実装)
+      ├─ 継続運転の常駐 runner(実発注の駆動。未実装。runner core 自体は #131 / #132 で実装済み)
       ├─ 自動売買(未実装)
       └─ 実口座での Live 運用開始(Issue #82 の merge だけでは開始しない。
           運用ドキュメントの事前条件を満たしたうえで別途判断)
@@ -134,6 +134,6 @@ Alert は「何が起きたか」という事実の通知であり、売買判�
 
 ## 実装上の注意
 
-- Pepperoni の現行の運用担当は **Paper Execution**(仮想約定のみ。`paper-execution/`)である。**Live Execution は基盤(Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)まで実装済み**だが、実発注を駆動する常駐 runner・自動売買は未実装であり、**実口座での Live 運用は未解禁**である(責務の正は [Architecture](../architecture/architecture.md)、運用条件の正は [Operations](../operations/operations.md))。
+- Pepperoni の現行の運用担当は **Paper Execution**(仮想約定のみ。`paper-execution/`)である。**Live Execution は基盤(Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)と runner core(Issue #131 の `fake` / `shadow`、Issue #132 の `demo`)まで実装済み**だが、自動売買・継続運転の運用導線は未実装であり、**実口座での Live 運用は未解禁**である(責務の正は [Architecture](../architecture/architecture.md)、運用条件の正は [Operations](../operations/operations.md))。
 - 過去データで仮説を遡及検証する **Backtest** は独立した検証基盤であり、Execution レイヤーそのものではない。結果の集約は花椒の担当領域として扱う。
 - 候補キャラクター(Jalapeño / Habanero / Paprika / Carolina)は未採用であり、実装上の責務を割り当てない。

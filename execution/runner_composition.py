@@ -1,10 +1,10 @@
 """Composition roots and mode executors for the Live Execution runner
-(Issue #131) -- Fake and Shadow only.
+(Issue #131: Fake and Shadow; Issue #132: OANDA Demo).
 
 *** WIRING ONLY. Nothing here decides whether an order may be sent, and
 nothing here writes a store directly: each executor resolves ONE work item
 and hands it to the production service that owns the decision
-(``LiveOrderSubmissionService`` for ``fake``,
+(``LiveOrderSubmissionService`` for ``fake`` / ``demo``,
 ``run_production_shadow_cycle`` for ``shadow``). There is no "simple
 submit", no "simple state update" and no "convenient repair" path. ***
 
@@ -16,12 +16,41 @@ submit", no "simple state update" and no "convenient repair" path. ***
                     -> created -> submitting (won exactly once)
                     -> FakeBroker
                     -> Journal + execution store outcome
+    demo   : execution store (phase 'created')
+               -> LiveOrderSubmissionService.submit()
+                    -> ... the IDENTICAL chain ...
+                    -> OandaDemoAdapter (practice endpoint, allowlisted)
+                    -> Journal + execution store outcome
     shadow : paper signal store (executable signals)
                -> run_production_shadow_cycle()
                     -> shadow claim (idempotency)
                     -> Safety Gate (shadow evaluation)
                     -> durable decision + read-back
                     -> shadow result (intended order, never submitted)
+
+Fake / Shadow / Demo are three different things
+-----------------------------------------------
+
+- ``fake``   -- an IN-MEMORY broker. Full submission semantics, no network,
+                no account. Persists to the execution store / journal like
+                any submission, which is what makes it the state-machine
+                rehearsal. Kill switch: any ``SafetyStateProvider``.
+- ``shadow`` -- NO broker exists on the path at all. It records what WOULD
+                have been ordered into its OWN store (``shadow_results``);
+                it never touches the execution order store, the submission
+                journal or the order state machine, and it produces no
+                fills, positions or PnL (that is Paper Execution's separate
+                layer).
+- ``demo``   -- a REAL OANDA practice account over HTTPS. Same stores, same
+                state machine and same journal as ``fake``; different
+                failure modes (timeouts / unknown outcomes are real) and a
+                MANDATORY durable Kill Switch reader. It is composed only
+                from a ``DemoRuntimeGrant`` the demo activation lock issued.
+
+The three never share persistence: shadow writes ``shadow_results.sqlite3``
+and nothing else; fake and demo write the execution order store + submission
+journal, and an operator keeps them apart by pointing the demo runner at its
+own data directory (docs/operations/operations.md).
 
 Why the executors are this thin
 -------------------------------
@@ -40,21 +69,28 @@ module.
 Broker exposure
 ---------------
 
-The fake executor receives the SUBMISSION SERVICE, not a broker and not a
-``BrokerConnection``: there is no attribute on it through which a broker
-call could be made. The shadow executor has no broker-shaped argument at
-all (the shadow service structurally cannot accept one). The composition
-root builds the fake connection and immediately hands it to
-``build_reissue_boundary`` -- the only sanctioned builder of the submission
-service -- and keeps no reference of its own.
+The submission executors receive the SUBMISSION SERVICE, not a broker and
+not a ``BrokerConnection``: there is no attribute on them through which a
+broker call could be made. The shadow executor has no broker-shaped argument
+at all (the shadow service structurally cannot accept one). Each composition
+root hands its connection straight to ``build_reissue_boundary`` -- the only
+sanctioned builder of the submission service -- and keeps no reference of
+its own. Neither module in the runner pair imports a broker implementation
+or composes a connection; both facts are pinned by
+``execution/tests/test_submission_boundary.py``.
 
 Modes
 -----
 
-``build_fake_execution_runner`` refuses any connection whose derived mode is
-not ``fake`` (so a demo / live adapter can never be wired into this runner),
-and ``ExecutionRunner`` refuses any executor outside
-``RUNNER_SUPPORTED_MODES``. OANDA Demo integration is a separate Issue.
+Each composition root refuses any connection whose DERIVED mode is not its
+own (a demo or live adapter can never be wired into the fake runner, and
+vice versa), and ``ExecutionRunner`` refuses any executor outside
+``RUNNER_SUPPORTED_MODES``. ``build_demo_execution_runner`` goes further: it
+accepts no loose connection at all, only a ``DemoRuntimeGrant`` issued by
+``execution/demo_lock.py``, and it builds the gate's kill-switch reader
+itself from the granted store path -- so a demo runner cannot exist without
+the demo locks having held, and cannot be handed a provider that answers
+"off" from memory. ``live`` has no composition root here at all.
 
 Dry run
 -------
@@ -73,6 +109,8 @@ from threading import Event
 from typing import Callable
 
 from execution import execution_store
+from execution.demo_lock import DemoRuntimeGrant
+from execution.kill_switch_store import PersistentKillSwitchStateProvider
 from execution.live_runner import (
     BrokerContact,
     DEFAULT_MAX_ITEMS_PER_CYCLE,
@@ -114,15 +152,28 @@ def _require_provider(provider, method: str, name: str) -> None:
         raise ValueError(f"{name} must expose a non-empty source_id, got {source_id!r}")
 
 
-class FakeSubmissionCycleExecutor:
-    """The ``fake`` mode executor: pending intents -> the ONE sanctioned
-    submission boundary.
+class SubmissionCycleExecutor:
+    """Base executor for every mode that SUBMITS: pending intents -> the ONE
+    sanctioned submission boundary.
 
     Work queue: ``execution_store.list_pending_execution_requests()`` (phase
     ``created``), read strictly read-only from the SAME order DB the
     submission service writes -- the path is taken from the service itself,
     so a driver cannot be pointed at a different file.
+
+    The body is IDENTICAL for every submitting mode on purpose (Issue #132):
+    the fake path and the demo path must not be able to drift apart, because
+    the whole value of rehearsing on ``fake`` is that ``demo`` then runs the
+    same code. The subclasses differ in exactly one declaration --
+    :attr:`REQUIRED_MODE`, the mode of the submission boundary they accept --
+    and a boundary of any other mode is refused at construction, before
+    anything can be selected.
     """
+
+    #: The submission boundary mode this executor exists for. A subclass
+    #: without it cannot be instantiated (no default: an executor that
+    #: accepts "whatever mode it is handed" is the bug this prevents).
+    REQUIRED_MODE: ExecutionMode | None = None
 
     def __init__(
         self,
@@ -130,17 +181,24 @@ class FakeSubmissionCycleExecutor:
         submission: LiveOrderSubmissionService,
         market_provider: MarketSnapshotProvider,
     ) -> None:
+        if not isinstance(self.REQUIRED_MODE, ExecutionMode):
+            raise RunnerModeError(  # pragma: no cover - guards a future subclass
+                f"{type(self).__name__} must declare REQUIRED_MODE; a submission "
+                "executor without a fixed mode would accept any boundary"
+            )
         if not isinstance(submission, LiveOrderSubmissionService):
             raise ValueError(
                 f"submission must be a LiveOrderSubmissionService, got {submission!r}"
             )
-        if submission.execution_mode is not ExecutionMode.FAKE:
-            # Fail closed on the mode BEFORE anything can be selected: this
-            # executor exists for the fake verification path only (Issue
-            # #131). Demo integration and live operation are separate,
-            # separately reviewed Issues.
+        if submission.execution_mode is not self.REQUIRED_MODE:
+            # Fail closed on the mode BEFORE anything can be selected: an
+            # executor is bound to ONE mode's boundary, so a runner can never
+            # be wired onto a connection of a different mode (Issue #131 /
+            # #132). Live operation remains a separate, un-released path with
+            # no executor at all.
             raise RunnerModeError(
-                f"the fake cycle executor requires a 'fake' submission boundary, got "
+                f"the {self.REQUIRED_MODE.value} cycle executor requires a "
+                f"{self.REQUIRED_MODE.value!r} submission boundary, got "
                 f"{submission.execution_mode.value!r}"
             )
         _require_provider(market_provider, "get_market_snapshot", "market_provider")
@@ -150,7 +208,7 @@ class FakeSubmissionCycleExecutor:
 
     @property
     def execution_mode(self) -> ExecutionMode:
-        return ExecutionMode.FAKE
+        return self.REQUIRED_MODE
 
     @property
     def source_id(self) -> str:
@@ -245,13 +303,13 @@ class FakeSubmissionCycleExecutor:
     def plan(self, item_id: str) -> RunnerItemOutcome:
         """Dry run: report whether this intent WOULD be submitted.
 
-        Deliberately stops before the Safety Gate. A fake submission cannot
-        be evaluated without durably recording the decision and journaling
-        the attempt, so "evaluate but skip the writes" would be a weakened
-        copy of the submission path -- exactly the shortcut Issue #131
-        forbids. Being a FakeBroker is not a licence to call a broker in a
-        dry run either. The only I/O here is a read-only store probe that
-        never creates a file.
+        Deliberately stops before the Safety Gate. A submission cannot be
+        evaluated without durably recording the decision and journaling the
+        attempt, so "evaluate but skip the writes" would be a weakened copy
+        of the submission path -- exactly the shortcut Issue #131 forbids.
+        "It is only a FakeBroker" / "it is only a practice account" is not a
+        licence to call a broker in a dry run either. The only I/O here is a
+        read-only store probe that never creates a file.
         """
         row = execution_store.get_execution_order(item_id, db_path=self._order_db_path)
         if row is None:
@@ -281,6 +339,28 @@ class FakeSubmissionCycleExecutor:
                 "through the sanctioned boundary; nothing was evaluated or persisted"
             ),
         )
+
+
+class FakeSubmissionCycleExecutor(SubmissionCycleExecutor):
+    """The ``fake`` mode executor (Issue #131): an IN-MEMORY broker, full
+    submission semantics, no network and no account."""
+
+    REQUIRED_MODE = ExecutionMode.FAKE
+
+
+class DemoSubmissionCycleExecutor(SubmissionCycleExecutor):
+    """The ``demo`` mode executor (Issue #132): the SAME body, pointed at a
+    real OANDA practice account.
+
+    Nothing is relaxed for demo and nothing is added: the differences that
+    matter (a network that can time out, an outcome that can be genuinely
+    UNKNOWN, a mandatory durable Kill Switch) live in the submission
+    boundary and the demo activation lock, which is exactly where they
+    belong. An executor that "handled demo specially" would be a second
+    submission path.
+    """
+
+    REQUIRED_MODE = ExecutionMode.DEMO
 
 
 class ShadowCycleExecutor:
@@ -468,8 +548,11 @@ def build_fake_execution_runner(
 
     The connection's mode is DERIVED from the broker instance, so passing a
     non-fake connection is refused here -- a demo or live adapter cannot be
-    driven by this runner (OANDA Demo integration is a separate Issue, and
-    live operation additionally requires the live activation lock).
+    driven by THIS runner. Demo has its own composition root
+    (``build_demo_execution_runner``, which takes a ``DemoRuntimeGrant``
+    issued by ``execution/demo_lock.py``), and live operation has no
+    composition root here at all: it additionally requires the live
+    activation lock and remains un-released.
 
     ``state_provider`` is the gate's kill-switch source and is consulted on
     EVERY submission (the gate re-reads it per evaluation); pass
@@ -487,9 +570,9 @@ def build_fake_execution_runner(
     if connection.execution_mode is not ExecutionMode.FAKE:
         raise RunnerModeError(
             f"the Live Execution runner may only be composed with a 'fake' connection "
-            f"here, got {connection.execution_mode.value!r}; demo integration and live "
-            "operation are separate Issues (live additionally requires "
-            "execution/live_lock.py)"
+            f"here, got {connection.execution_mode.value!r}; a demo connection is "
+            "composed by build_demo_execution_runner() from a DemoRuntimeGrant "
+            "(execution/demo_lock.py), and 'live' has no composition root at all"
         )
     if not isinstance(policy, SafetyPolicy):
         raise ValueError(f"policy must be a SafetyPolicy, got {policy!r}")
@@ -519,6 +602,90 @@ def build_fake_execution_runner(
         "composed the fake execution runner: target=%s order_db=%s dry_run=%s",
         connection.connection_target,
         Path(order_db_path),
+        dry_run,
+    )
+    return ExecutionRunner(
+        executor=executor,
+        clock=clock,
+        max_items_per_cycle=max_items_per_cycle,
+        dry_run=dry_run,
+        stop_event=stop_event,
+        runner_id=runner_id,
+    )
+
+
+def build_demo_execution_runner(
+    *,
+    grant: DemoRuntimeGrant,
+    market_provider: MarketSnapshotProvider,
+    order_db_path: str | Path,
+    decision_db_path: str | Path,
+    journal_db_path: str | Path,
+    clock: Callable[[], datetime],
+    reissue_policy: ReissuePolicy | None = None,
+    max_items_per_cycle: int = DEFAULT_MAX_ITEMS_PER_CYCLE,
+    dry_run: bool = False,
+    stop_event: Event | None = None,
+    runner_id: str = "demo-execution-runner",
+) -> ExecutionRunner:
+    """Compose the ``demo`` mode runner (Issue #132).
+
+    The ONLY input that authorizes anything is ``grant`` -- a
+    :class:`~execution.demo_lock.DemoRuntimeGrant`, which
+    ``execution/demo_lock.py`` issues only after every demo lock held
+    (configured mode, demo credentials, the allowlisted practice endpoint,
+    demo/live separation, the pinned account identity, a policy allowing the
+    demo target, and a verified-OFF Kill Switch). There is deliberately NO
+    ``connection`` / ``policy`` / ``state_provider`` parameter:
+
+    - the connection cannot be swapped for a differently-composed one;
+    - the gate enforces the SAME policy whose demo target the lock checked,
+      not a second policy the caller happened to build;
+    - the kill-switch reader is constructed HERE, over the granted store
+      path, as the durable ``PersistentKillSwitchStateProvider`` -- which
+      the submission boundary independently REQUIRES for every real-broker
+      mode, so an in-memory "off" cannot be wired in even by mistake.
+
+    The gate re-reads that provider on EVERY evaluation, so a Kill Switch
+    flipped while the runner is resident stops the very next submission.
+
+    Unless ``dry_run`` is set, the sealed audit stores the boundary writes
+    (safety decisions, submission journal) are initialized here. A DRY RUN
+    initializes NOTHING: no file is created and no schema migrated, and the
+    runner calls ``plan()``, which never reaches a broker.
+    """
+    if not isinstance(grant, DemoRuntimeGrant):
+        raise ValueError(
+            "grant must be a DemoRuntimeGrant issued by execution/demo_lock.py "
+            f"(a demo runner is never composed from loose parts), got {grant!r}"
+        )
+    gate = SafetyGate(
+        policy=grant.policy,
+        state_provider=PersistentKillSwitchStateProvider(grant.kill_switch_db_path),
+        clock=clock,
+    )
+    if not dry_run:
+        SQLiteSafetyDecisionStore(Path(decision_db_path)).initialize()
+        SubmissionJournal(Path(journal_db_path)).initialize()
+    boundary = build_reissue_boundary(
+        connection=grant.connection,
+        gate=gate,
+        current_policy=grant.policy,
+        reissue_policy=reissue_policy if reissue_policy is not None else ReissuePolicy(),
+        decision_db_path=decision_db_path,
+        order_db_path=order_db_path,
+        journal_db_path=journal_db_path,
+        clock=clock,
+    )
+    executor = DemoSubmissionCycleExecutor(
+        submission=boundary.submission, market_provider=market_provider
+    )
+    _LOGGER.info(
+        "composed the demo execution runner: target=%s order_db=%s kill_switch_db=%s "
+        "dry_run=%s",
+        grant.connection.connection_target,
+        Path(order_db_path),
+        grant.kill_switch_db_path,
         dry_run,
     )
     return ExecutionRunner(

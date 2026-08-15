@@ -38,6 +38,12 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.live_lock import build_live_connection, evaluate_live_activation",
     "from execution.live_lock import LiveSafetySummary, load_live_safety_policy",
     "from execution.live_startup_cli import main as live_startup_cli_main",
+    "from execution.safety_config import parse_safety_policy, classify_endpoint",
+    "from execution.demo_lock import build_demo_connection, evaluate_demo_activation",
+    "from execution.demo_lock import DemoRuntimeGrant, load_demo_safety_policy",
+    "from execution.demo_startup_cli import main as demo_startup_cli_main",
+    "from execution.live_runner import ExecutionRunner, RUNNER_SUPPORTED_MODES",
+    "from execution.runner_composition import build_demo_execution_runner",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /

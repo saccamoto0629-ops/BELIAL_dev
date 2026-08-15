@@ -5,7 +5,7 @@
 > **重要な位置づけ**
 >
 > - Safety Gate / 送信サービスは**将来の Live Execution 送信経路を安全にする部品のみ**を実装する。
-> - **Live Execution runner core は Issue #131 で `fake` / `shadow` に限って実装済み**であり(`execution/live_runner.py`。送信は本ドキュメントの単一境界のみを通り、Kill Switch は**送信判定ごとに**本 Gate が再評価する)、**実 Broker(OANDA Demo / Live)への runner 統合・CLI / systemd 等の運用導線は未実装**である。Issue #82 で `live` mode の接続は構築可能になったが、それは**全ロック(`execution_mode=live` + `ENABLE_LIVE_TRADING=true` + Live credential + Live endpoint + `--confirm-live`)が揃い、Kill Switch が検証可能に OFF で、safety policy が読める場合に限り**、唯一の composer `execution/live_lock.py` が組み立てるときだけである(下記「型付き接続 identity」)。OANDA **Demo** Adapter は Issue #79 で `broker/` に実装済みだが `BROKER_TYPE_BY_MODE` に `demo` は未登録のままで、`demo` 接続は構築できない。Live 運用開始の事前条件は [運用ドキュメント](../operations/operations.md) を参照。
+> - **Live Execution runner core は Issue #131 で実装**され(`execution/live_runner.py`。送信は本ドキュメントの単一境界のみを通り、Kill Switch は**送信判定ごとに**本 Gate が再評価する)、Issue #132 で **OANDA Demo mode が runner へ正式統合**された(runner が駆動できるのは `fake` / `shadow` / `demo`。`live` は拒否)。**reconciliation の定期実行・systemd 等の継続運転導線は未実装**である。Issue #82 で `live` mode の接続は構築可能になったが、それは**全ロック(`execution_mode=live` + `ENABLE_LIVE_TRADING=true` + Live credential + Live endpoint + `--confirm-live`)が揃い、Kill Switch が検証可能に OFF で、safety policy が読める場合に限り**、唯一の composer `execution/live_lock.py` が組み立てるときだけである(下記「型付き接続 identity」)。OANDA **Demo** Adapter は Issue #79 で `broker/` に実装され、Issue #132 で `BROKER_TYPE_BY_MODE` に `demo` として登録された。ただし `demo` 接続を組み立ててよいのは唯一の composer `execution/demo_lock.py` だけであり、**mode 設定・Demo credential・Practice endpoint の allowlist・live 設定の不在・safety config に pin された account digest との一致・demo target を許可する policy・検証可能に OFF の Kill Switch が全部揃ったときに限る**。Live 運用開始の事前条件は [運用ドキュメント](../operations/operations.md) を参照。
 > - **Paper Execution とは無関係・独立**である。Paper Execution(`paper-execution/`)は Broker 境界に触れない仮想執行レイヤーであり、Safety Gate を通らないし通る必要もない。
 > - Safety Gate は **Strategy からも Broker Adapter からも独立**する: Strategy は安全ポリシーを持たず、Broker 実装は Gate のロジックを持たない。依存は `execution → broker`(境界モデルのみ)の一方向。
 
@@ -45,7 +45,7 @@ service.submit(execution_request_id, market=...)
 
 一方、**deliberate circumvention(故意の回避)— 例えば `getattr` による動的呼び出し・monkeypatch・reflection — を in-process の Python で防止することは言語的に不可能**である。これは本実装固有の限界ではなく、いかなる実行時 capability 方式・封印方式を導入しても、同じ reflection でその機構自体を偽装できる(無限後退)。また、Adapter 側に承認状態の検査を持たせる方式は「Broker Adapter は Safety Gate のロジックを持たない」(Issue #75)および Broker 境界の責務分離(Issue #73)と矛盾するため採らない。
 
-故意回避に対する実効的な境界は、実 Adapter 導入時に**プロセス・運用境界**として設計する(Broker 認証情報を Live Execution runner プロセス以外へ渡さない、Adapter の構築を runner の composition root に限定する、コードレビュー + CI)。これは Live Adapter / runner 設計 Issue(非スコープ)の一部として後続 Issue で扱う。
+故意回避に対する実効的な境界は**プロセス・運用境界**として設計する(Adapter は Issue #79 / #82 で導入済み)(Broker 認証情報を Live Execution runner プロセス以外へ渡さない、Adapter の構築を runner の composition root に限定する、コードレビュー + CI)。これは Live Adapter / runner 設計 Issue(非スコープ)の一部として後続 Issue で扱う。
 - **二重送信防止**: `submit()` は `client_order_id` を受け取らない。使えるのは register 時に固定された保存済みの値だけであり(NOT NULL + UNIQUE + 不変、Issue #74)、同じ意図が新しい broker キーで再送されることは構造的に起きない。送信試行自体も `created → submitting` 遷移(一度きり・`BEGIN IMMEDIATE` 直列化)を獲得した呼び出しに限られる。
 - **UNKNOWN の再送禁止**: timeout・通信失敗を含む submit の例外は UNKNOWN として記録され(「未発注」へ降格しない)、以後の `submit()` は phase≠created により `duplicate_submission` で拒否される。UNKNOWN の解決は後続照会の記録のみ(Issue #74)。
 - **Broker 呼び出し後の失敗は拒否へ変換しない**: 注文が存在しうるため、例外はそのまま伝播する。**受領済み `OrderResult` の保存(`record_order_result`)が失敗した場合も、state-only UNKNOWN へのフォールバック記録を試みてから元例外を re-raise する** — Broker に存在する注文が永続化エラーの陰に消えることはない。フォールバックまで失敗した場合(order DB 全体の障害)は critical ログを残し、注文は phase `submitting` / state `pending` のまま **`execution_store.list_unresolved_submissions()`** で照会対象として取得できる(下記)。
@@ -92,7 +92,7 @@ service.cancel(execution_request_id) -> CancelOutcome
 
 ## execution mode と Shadow 評価(Issue #78)
 
-execution mode の統一語彙は `ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)であり、設定文字列は `resolve_execution_mode()` がロード時に解決する(未知 mode は明示拒否)。`demo` / `live` は引き続き**定義と validation のみ**で、Adapter 型が登録されるまで接続を構築できない。
+execution mode の統一語彙は `ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)であり、設定文字列は `resolve_execution_mode()` がロード時に解決する(未知 mode は明示拒否)。`demo` / `live` は具象 Adapter 型が `BROKER_TYPE_BY_MODE` へ**完全一致**で登録済み(`live` は Issue #82、`demo` は Issue #132)であり、接続は各 activation lock(`execution/live_lock.py` / `execution/demo_lock.py`)を通してのみ構築できる。登録済みであることは解禁を意味せず、runner は `live` を明示拒否する。
 
 Shadow Mode(Issue #78)では Gate を `SafetyGate.evaluate_shadow(request, market=..., account=..., connection_target=...)` で評価する。live の `evaluate()` と**同一の共有チェック実装**を通るが、Broker connection を一切受け取らない:
 
@@ -107,7 +107,7 @@ Shadow Mode(Issue #78)では Gate を `SafetyGate.evaluate_shadow(request, marke
 execution mode / 接続先は**呼び出し側が申告する文字列ではない**。すべての Broker 実装は、自身の**構築時接続 config に由来する不変の identity**(`broker_models.BrokerConnectionIdentity`)を `connection_identity()` で自己申告する義務を負い、`BrokerConnection` は mode・接続先を **Broker インスタンスから導出**する(申告用の引数は存在せず、渡そうとすると `TypeError`):
 
 - FakeBroker の identity は mode `"fake"` 固定 + 構築時 `connection_target`(実 Adapter の endpoint URL に相当する構築時 config)。将来の Adapter は自身の実接続設定から identity を返す(mode / target を接続 config と別に申告する経路は存在しない)。
-- 導出された mode は Broker の具象型と相互検証される(`BROKER_TYPE_BY_MODE` レジストリ): `fake` は `FakeBroker`(サブクラス含む)のみ、`FakeBroker` は `fake` 以外を名乗れない。`live` は `OandaLiveAdapter` のみ(Issue #82。**その instance 自体が全ロック成立の証拠**であり、FakeBroker が `live` を名乗ることはできない)。`demo` は**実 Adapter 型が登録されるまで接続オブジェクト自体を構築できない**(表現不能による fail-closed)。
+- 導出された mode は Broker の具象型と相互検証される(`BROKER_TYPE_BY_MODE` レジストリ): `fake` は `FakeBroker`(サブクラス含む)のみ、`FakeBroker` は `fake` 以外を名乗れない。`live` は `OandaLiveAdapter` のみ(Issue #82。**その instance 自体が全ロック成立の証拠**であり、FakeBroker が `live` を名乗ることはできない)。`demo` は `OandaDemoAdapter` のみ(Issue #132。**live と同じく具象型完全一致を要求する** — subclass が `__init__` を迂回すると endpoint allowlist を飛ばせるため)。
 - mode ごとの許可接続先(`SafetyPolicy.allowed_connection_targets`。exact・大文字小文字区別・1 接続先 1 mode)は Gate が判定し、未知の接続先・大文字小文字違い(`FAKE`)は `execution_mode_mismatch` で拒否する。
 - Gate は**評価のたびに identity を Broker 実体から再導出**し、組み立て後に identity がドリフトした場合・identity メソッドが欠損 / 破損した場合も `execution_mode_mismatch` で fail-closed に拒否する。
 
@@ -252,8 +252,8 @@ kill switch の**状態の正はプロセスメモリではなく専用 SQLite**
 
 ## 非スコープ(Issue #75 時点で未実装)
 
-- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(現在: Demo / Live Adapter は Issue #79 / #82 で実装済み。`demo` の `BrokerConnection` は Adapter 型が登録されるまで構築不能のまま、`live` は Issue #82 で登録済みだが全ロック成立時のみ `live_lock.build_live_connection()` が構築できる。実口座での Live 運用は未解禁)
-- Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ。その後 Issue #131 で runner core を `fake` / `shadow` 限定で実装済み。`demo` / `live` の駆動と運用導線は引き続き非スコープ)
+- OANDA Adapter・OANDA Demo / Live API・実口座への注文・Live 接続(現在: Demo / Live Adapter は Issue #79 / #82 で実装済み。`demo` は Issue #132 で登録され、全ロック成立時のみ `demo_lock.build_demo_connection()` が構築できる。`live` は Issue #82 で登録済みだが全ロック成立時のみ `live_lock.build_live_connection()` が構築できる。実口座での Live 運用は未解禁)
+- Production Live Execution runner(サービスを呼ぶ本体側ユースケース・スケジューラ。その後 Issue #131 で runner core を `fake` / `shadow` で、Issue #132 で `demo` を実装済み。`live` の駆動と継続運転の運用導線は引き続き非スコープ)
 - 動的ロット計算・証拠金最適化・リスク量からの数量計算
 - 自動キャンセル判断(いつキャンセルするかの Strategy / 運用判断。公認キャンセル**経路**は Issue #99 で実装済みだが、それを呼ぶ判断側は非スコープ)
 - Strategy / Paper Signal の売買ロジック変更、Paper Execution への Broker 接続

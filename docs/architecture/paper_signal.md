@@ -18,13 +18,13 @@ Market Snapshot(可視化)─ Market Bias(市場状態の分類)
                                          └─ Paper Signal Generator(paper-signal/, 本章)
                                                   │
                                                   ├─ Paper Execution(実装済み・仮想約定のみ)
-                                                  └─ Live Execution(基盤実装済み・runner 未実装・運用未解禁)
+                                                  └─ Live Execution(基盤 + runner core 実装済み・実口座運用は未解禁)
 ```
 
 Paper Signal は、Market Bias が示す「市場の大まかな方向」と、Chart Snapshot が示す「チャート状態(1h)」を組み合わせて、シグナル仮説を記録するだけの層である。Paper Signal 自身は entry / exit を一切決めない。
 
 - **Paper Execution**: Paper Signal を入力として、時間進行に沿って仮想約定・仮想ポジション管理・Exit・仮想損益を行うレイヤー。**実装済み**(`paper-execution/`。設計は [Paper Execution(最小設計)](paper_execution.md) の Issue #49、実装は Issue #50 / #51)。仮想レコードのみで、Broker API・実注文は含まない。
-- **Live Execution**: Broker API を利用した実注文・実約定・実ポジション管理のレイヤー。**基盤(`broker/` + `execution/`)は実装済みだが、実発注を駆動する定期実行 runner は未実装で、実口座での Live 運用は未解禁**。
+- **Live Execution**: Broker API を利用した実注文・実約定・実ポジション管理のレイヤー。**基盤と runner core(`broker/` + `execution/`)は実装済みで、runner が駆動できるのは `fake` / `shadow`(Issue #131)と `demo`(Issue #132)まで。継続運転の運用導線は未実装で、実口座での Live 運用は未解禁**。
 
 Paper Execution(実装済み)も Live Execution(基盤実装済み・運用未解禁)も Paper Signal の外側の別レイヤーであり、本章(Paper Signal)では扱わない。
 
@@ -149,6 +149,6 @@ Paper Signal Generator は、以下を**実装しない**。
 - 利確・損切り(stop-loss / take-profit)判断
 - エントリー実行
 
-これらの entry / exit / 発注は Paper Signal の外側の執行層の責務である。仮想の entry / exit・仮想ポジション・仮想損益は **Paper Execution**(実装済み、`paper-execution/`)が担い、Broker API による実発注は **Live Execution**(基盤実装済み・runner 未実装・運用未解禁)の責務である。Paper Signal Generator 自身は entry / exit をいっさい決めない。なお TP / SL の評価は Backtest(検証基盤)が過去データ上で遡及的に行うが、これは検証用シミュレーションであって Paper Execution レイヤーの実装ではない。
+これらの entry / exit / 発注は Paper Signal の外側の執行層の責務である。仮想の entry / exit・仮想ポジション・仮想損益は **Paper Execution**(実装済み、`paper-execution/`)が担い、Broker API による実発注は **Live Execution**(基盤 + runner core 実装済み。runner は `fake` / `shadow` / `demo` を駆動でき、実口座 Live 運用は未解禁)の責務である。Paper Signal Generator 自身は entry / exit をいっさい決めない。なお TP / SL の評価は Backtest(検証基盤)が過去データ上で遡及的に行うが、これは検証用シミュレーションであって Paper Execution レイヤーの実装ではない。
 
 `paper-signal/signal_generator.py` のソースコードは、broker APIのimportや発注関数呼び出しが存在しないことをテスト(`test_module_source_has_no_broker_api_integration`)で検証する。生成されるレコードの各フィールド値にも、order / lot / leverage / stop-loss / take-profit 等の語が含まれないことを検証する。
