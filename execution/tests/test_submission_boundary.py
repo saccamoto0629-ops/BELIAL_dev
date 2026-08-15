@@ -407,3 +407,62 @@ def test_shadow_modules_never_import_broker_implementations():
                 if module in ("broker.fake_broker", "broker.broker_interface"):
                     offenders.append(f"execution/{name}:{node.lineno} imports {module}")
     assert offenders == []
+
+
+# Issue #131: the Live Execution runner core drives the existing boundaries;
+# it owns no broker and writes no execution state itself.
+RUNNER_MODULES = ("live_runner.py", "runner_composition.py")
+
+# Every execution-store function that CHANGES an order's state or creates one.
+# The runner must reach all of them only THROUGH the sanctioned services, so
+# that no "convenient" runner-side state update or auto-repair can exist.
+EXECUTION_STORE_WRITE_FUNCTIONS = (
+    "init_db",
+    "create_execution_order",
+    "create_reissue_execution_order",
+    "mark_submitting",
+    "record_order_state",
+    "record_order_result",
+    "register_repair_fence",
+    "record_reissue_clearance",
+)
+
+
+def _imported_modules(path: pathlib.Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend((node.lineno, alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append((node.lineno, node.module))
+    return imported
+
+
+def test_the_runner_modules_never_import_a_broker_implementation():
+    """Issue #131: the runner is a LIFECYCLE, not a submission path. The
+    broker connection is composed elsewhere and handed to the sanctioned
+    submission service, so neither runner module may import the Broker
+    protocol or any concrete adapter -- there is no object through which the
+    runner could construct or call a broker (fake, demo or live alike)."""
+    offenders = []
+    for name in RUNNER_MODULES:
+        for lineno, module in _imported_modules(REPO_ROOT / "execution" / name):
+            if module.startswith("broker.") and module != "broker.broker_models":
+                offenders.append(f"execution/{name}:{lineno} imports {module}")
+    assert offenders == []
+
+
+def test_the_runner_modules_never_write_execution_state_directly():
+    """Issue #131: every state change belongs to the sanctioned services
+    (``LiveOrderSubmissionService`` / the shadow service). A runner that
+    could call the store's write API directly could invent a "simple state
+    update" or an auto-repair around the state machine -- exactly what the
+    single-boundary design forbids."""
+    offenders = []
+    for name in RUNNER_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for function in EXECUTION_STORE_WRITE_FUNCTIONS:
+            for lineno in _method_call_sites(path, function) + _name_call_sites(path, function):
+                offenders.append(f"execution/{name}:{lineno} calls {function}")
+    assert offenders == []
