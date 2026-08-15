@@ -849,30 +849,44 @@ def test_the_shadow_kill_switch_is_evaluated_through_the_gate(tmp_path):
     assert SafetyRejectionCode.KILL_SWITCH_ENABLED.value in codes(outcome)
 
 
-def test_a_recorded_signal_is_not_selected_again(tmp_path):
+def test_an_already_recorded_signal_is_an_explicit_duplicate(tmp_path):
+    """Candidates are NOT filtered by "a record already exists" (PR #135
+    Codex review P1): the claim classifies them, so a payload-equal re-run
+    is an explicit duplicate that evaluates nothing and writes neither a
+    second record nor a second decision."""
     runner = build_shadow(tmp_path, signal_ids=("sig-1", "sig-2"))
 
     first = runner.run_cycle()
     second = runner.run_cycle()
 
     assert {item.item_id for item in first.outcomes} == {"sig-1", "sig-2"}
-    assert second.processed == 0
+    assert {item.status for item in first.outcomes} == {RunnerItemStatus.RECORDED}
+    assert {item.status for item in second.outcomes} == {RunnerItemStatus.DUPLICATE}
+    assert {item.broker_contact for item in second.outcomes} == {BrokerContact.NOT_SENT}
+    assert second.ok
     assert len(shadow_store.list_shadow_results(db_path=tmp_path / SHADOW_DB)) == 2
+    assert len(decisions(tmp_path, "sigreq-sig-1")) == 1
 
 
-def test_a_re_selected_signal_is_an_explicit_duplicate(tmp_path):
-    """The selection filter is an optimization; the shadow store's claim is
-    the actual idempotency guarantee, so forcing a re-run must NOT create a
-    second record or a second decision."""
-    runner = build_shadow(tmp_path)
-    runner.run_cycle()
-    runner._executor.select = lambda *, limit: ("sig-1",)
+def test_a_changed_shadow_payload_is_a_conflict_not_a_silent_skip(tmp_path):
+    """The documented fail-loud case (PR #135 Codex review P1): re-running a
+    recorded signal under a CHANGED configuration must surface the identity
+    conflict instead of reporting "nothing to do". A signal-id-only
+    selection filter would have hidden exactly this."""
+    build_shadow(tmp_path).run_cycle()
+    reconfigured = build_shadow(
+        tmp_path, seed=False, config=shadow_config(quantity=Decimal("2"))
+    )
 
-    outcome = only(runner.run_cycle())
+    report = reconfigured.run_cycle()
 
-    assert outcome.status is RunnerItemStatus.DUPLICATE
+    outcome = only(report)
+    assert outcome.status is RunnerItemStatus.FAILED
     assert outcome.broker_contact is BrokerContact.NOT_SENT
-    assert len(shadow_store.list_shadow_results(db_path=tmp_path / SHADOW_DB)) == 1
+    assert "conflict" in outcome.detail.lower() and not report.ok
+    # The recorded cycle is untouched: no second record, no second decision.
+    results = shadow_store.list_shadow_results(db_path=tmp_path / SHADOW_DB)
+    assert len(results) == 1 and results[0].request.quantity == Decimal("1")
     assert len(decisions(tmp_path, "sigreq-sig-1")) == 1
 
 
@@ -882,7 +896,7 @@ def test_a_shadow_restart_on_the_same_stores_records_once(tmp_path):
 
     report = restarted.run_cycle()
 
-    assert report.processed == 0
+    assert [item.status for item in report.outcomes] == [RunnerItemStatus.DUPLICATE]
     assert len(shadow_store.list_shadow_results(db_path=tmp_path / SHADOW_DB)) == 1
 
 
@@ -1172,6 +1186,8 @@ def test_a_failing_callback_never_breaks_the_loop():
         dict(interval_seconds="30"),
         dict(interval_seconds=1, max_cycles=0),
         dict(interval_seconds=1, sleeper="not callable"),
+        dict(interval_seconds=float("inf")),
+        dict(interval_seconds=threading.TIMEOUT_MAX + 1000),
     ],
 )
 def test_the_loop_refuses_invalid_pacing_arguments(kwargs):
@@ -1311,3 +1327,21 @@ def test_a_non_iterable_selection_fails_the_cycle_instead_of_raising():
 
     assert report.selection_error is not None and report.outcomes == ()
     assert executor.executed == []
+
+
+def test_an_interval_beyond_the_platform_limit_is_refused_before_any_cycle():
+    """PR #135 Codex review P2: the default sleeper is
+    ``threading.Event.wait``, which raises OverflowError above the platform
+    timeout limit. Such an interval must be refused at the boundary -- not
+    kill a resident runner after its first cycle."""
+    runner, executor = stub_runner(stub={"items": ("a",)})
+
+    with pytest.raises(ValueError) as excinfo:
+        runner.run_forever(interval_seconds=float("inf"))
+
+    assert "platform timeout limit" in str(excinfo.value)
+    assert executor.executed == [] and runner.cycles_run == 0
+    # The accepted boundary value still runs (and the default sleeper is
+    # what a stop event interrupts).
+    runner.request_stop()
+    assert runner.run_forever(interval_seconds=threading.TIMEOUT_MAX).cycles == ()

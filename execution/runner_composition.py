@@ -72,7 +72,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 
-from execution import execution_store, shadow_store
+from execution import execution_store
 from execution.live_runner import (
     BrokerContact,
     DEFAULT_MAX_ITEMS_PER_CYCLE,
@@ -287,12 +287,10 @@ class ShadowCycleExecutor:
     """The ``shadow`` mode executor: stored signals -> the production shadow
     cycle. NO broker exists anywhere on this path.
 
-    Work queue: executable stored signals (newest first) minus the ones a
-    COMPLETED shadow record already exists for. That filter is an
-    efficiency measure, never a safety mechanism: the shadow store's
-    claim-first idempotency is what actually guarantees one record per
-    payload, and a candidate that slips through the filter is reported as a
-    ``DUPLICATE`` without evaluating the gate or writing a decision.
+    Work queue: executable stored signals (newest first), handed to the
+    claim UNFILTERED -- the claim is the only component that may decide
+    what an already-seen signal means (payload-equal -> ``DUPLICATE``,
+    payload-different -> conflict). See :meth:`select`.
     """
 
     def __init__(
@@ -350,17 +348,28 @@ class ShadowCycleExecutor:
         return BrokerContact.NOT_SENT
 
     def select(self, *, limit: int) -> tuple[str, ...]:
-        candidates = self._signal_lister.list_executable_signal_ids(limit=limit)
-        pending = []
-        for signal_id in candidates:
-            # Read-only; a missing shadow DB yields None without creating it
-            # (dry-run safe). A read FAILURE propagates: the cycle then fails
-            # closed instead of re-processing signals blindly.
-            if shadow_store.get_shadow_result_by_signal_id(
-                signal_id, db_path=self._shadow_db_path
-            ) is None:
-                pending.append(signal_id)
-        return tuple(pending)
+        """The candidate signals for one cycle -- UNFILTERED (PR #135 Codex
+        review P1).
+
+        An earlier revision dropped candidates that already had a completed
+        shadow record. That was meant as an efficiency measure, but it
+        silently removed a documented fail-loud behaviour: when the shadow
+        CONFIGURATION changes (a different order quantity for the same
+        signal, say), the canonical payload no longer matches the recorded
+        one, and ``claim_shadow_cycle`` must raise
+        ``ShadowIdentityConflictError`` rather than let the divergence pass
+        (docs/architecture/shadow_execution.md). A signal-id-only filter
+        answered "nothing to do" for exactly that case.
+
+        Making the filter payload-aware would mean re-deriving the request,
+        the client order id and the canonical payload here -- i.e. copying
+        the store's identity rules into the runner, which is what this
+        module exists to avoid. So every candidate goes to the claim, which
+        is the one component allowed to classify it: payload-equal ->
+        ``duplicate`` (nothing evaluated, nothing written), payload-different
+        -> conflict, which surfaces as a failed item.
+        """
+        return tuple(self._signal_lister.list_executable_signal_ids(limit=limit))
 
     def execute(self, item_id: str) -> RunnerItemOutcome:
         outcome = self._cycle(item_id, dry_run=False)

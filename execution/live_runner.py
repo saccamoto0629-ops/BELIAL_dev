@@ -644,6 +644,19 @@ class ExecutionRunner:
             raise ValueError(f"interval_seconds must be a number, got {interval_seconds!r}")
         if not interval_seconds > 0:
             raise ValueError(f"interval_seconds must be > 0, got {interval_seconds!r}")
+        if interval_seconds > threading.TIMEOUT_MAX:
+            # PR #135 Codex review P2: the DEFAULT sleeper is
+            # ``threading.Event.wait``, which raises OverflowError for a
+            # timeout above the platform limit (``inf`` included). That
+            # exception would escape the loop -- which only translates
+            # KeyboardInterrupt -- and kill a resident runner after its
+            # first cycle. A misconfigured interval must be refused at the
+            # boundary instead, before any cycle runs (an interval beyond
+            # the limit is ~49 days: never a real pacing choice).
+            raise ValueError(
+                f"interval_seconds must not exceed the platform timeout limit "
+                f"({threading.TIMEOUT_MAX}), got {interval_seconds!r}"
+            )
         if max_cycles is not None and (
             isinstance(max_cycles, bool) or not isinstance(max_cycles, int) or max_cycles < 1
         ):
