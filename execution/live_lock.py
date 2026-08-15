@@ -51,7 +51,10 @@ no validation message echoes a configured VALUE, a configured KEY, or any
 document content the strict JSON loader would otherwise quote. An operator
 can paste a credential into any field, name a field with one, or duplicate
 such a key -- none of that reaches a log. Messages carry the schema field
-name (fixed vocabulary), the expected shape, and the file path only.
+name (fixed vocabulary), the expected shape, and the file path only. That
+validation body now lives in ``execution/safety_config.py`` (Issue #132) so
+the DEMO activation lock applies the identical checks instead of a second
+copy; nothing about the live locks changed with the move.
 """
 
 from __future__ import annotations
@@ -59,20 +62,12 @@ from __future__ import annotations
 import dataclasses
 import enum
 import os
-import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping
 
-from broker.broker_models import OrderSide, safe_account_reference
-from broker.oanda_demo_adapter import (
-    ENV_ACCOUNT_ID as DEMO_ENV_ACCOUNT_ID,
-    ENV_API_TOKEN as DEMO_ENV_API_TOKEN,
-    ENV_API_URL as DEMO_ENV_API_URL,
-    OANDA_DEMO_API_URL,
-)
+from broker.broker_models import safe_account_reference
 from broker.oanda_live_adapter import (
     ENABLE_LIVE_TRADING_TRUE,
     ENV_ENABLE_LIVE_TRADING,
@@ -85,31 +80,60 @@ from broker.oanda_live_adapter import (
     OandaLiveAdapter,
     OandaLiveConfig,
 )
-from broker.oanda_v20_adapter import OANDA_DEMO_HOST_MARKER, OANDA_LIVE_HOST_MARKER
+from execution.safety_config import (
+    ENDPOINT_KIND_DEMO,
+    ENDPOINT_KIND_LIVE,
+    ENDPOINT_KIND_NOT_CONFIGURED,
+    ENDPOINT_KIND_UNKNOWN,
+    KILL_SWITCH_DISABLED,
+    KILL_SWITCH_ENABLED,
+    KILL_SWITCH_UNVERIFIABLE,
+    SafetyConfigError,
+    classify_endpoint,
+    collect_credential_separation_rejections,
+    configured as _configured,
+    displayable_symbols as _displayable_symbols,
+    endpoint_host_family,
+    load_safety_document,
+    parse_safety_policy,
+    read_kill_switch,
+)
 from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
     SafetyPolicy,
     resolve_execution_mode,
 )
-from execution.strict_json import load_strict_json_file
 
-# Endpoint KIND labels (non-secret): what an endpoint value IS, never the
-# value itself. ``unknown`` covers every host that is neither allowlisted
-# endpoint -- including a typo'd one, which must never render as "live".
-ENDPOINT_KIND_LIVE = "live"
-ENDPOINT_KIND_DEMO = "demo"
-ENDPOINT_KIND_UNKNOWN = "unknown"
-ENDPOINT_KIND_NOT_CONFIGURED = "not-configured"
+#: Re-exported from ``execution/safety_config.py`` so this module keeps the
+#: public surface Issue #82 established (callers and tests import the
+#: endpoint / kill-switch labels from the lock they belong to).
+__all__ = [
+    "ENDPOINT_KIND_DEMO",
+    "ENDPOINT_KIND_LIVE",
+    "ENDPOINT_KIND_NOT_CONFIGURED",
+    "ENDPOINT_KIND_UNKNOWN",
+    "KILL_SWITCH_DISABLED",
+    "KILL_SWITCH_ENABLED",
+    "KILL_SWITCH_UNVERIFIABLE",
+    "LiveActivationDecision",
+    "LiveLockCode",
+    "LiveLockRejection",
+    "LiveSafetyConfigError",
+    "LiveSafetySummary",
+    "build_live_connection",
+    "classify_endpoint",
+    "endpoint_host_family",
+    "evaluate_live_activation",
+    "load_live_safety_policy",
+    "parse_live_safety_policy",
+]
 
-# Kill switch labels for the summary (three states, never two: "cannot be
-# read" is its own answer and is as blocking as "on").
-KILL_SWITCH_ENABLED = "enabled"
-KILL_SWITCH_DISABLED = "disabled"
-KILL_SWITCH_UNVERIFIABLE = "unverifiable"
+#: Human-readable name of this document in every validation message.
+_LIVE_CONFIG_DESCRIPTION = "live safety configuration"
 
 
-class LiveSafetyConfigError(ValueError):
+class LiveSafetyConfigError(SafetyConfigError):
     """The live safety configuration is missing, incomplete or invalid.
 
     Always fail-closed: a configuration that cannot be read produces NO
@@ -256,110 +280,13 @@ class LiveActivationDecision:
 # apply to real money. It holds NO credentials: tokens, account ids and
 # endpoints come from the process environment only and must never be written
 # into a repository file.
-
-_LIVE_POLICY_KEYS = frozenset(
-    {
-        "policy_id",
-        "allowed_symbols",
-        "allowed_sides",
-        "max_order_quantity",
-        "max_positions_per_symbol",
-        "max_positions_account",
-        "max_reference_age_seconds",
-        "max_spread_by_symbol",
-        "allowed_live_targets",
-        "require_stop_loss",
-    }
-)
-
-
-# Every message below names the FIELD and the EXPECTED SHAPE and NEVER the
-# value that was found (PR #128 Codex review P1). The CLI copies this text
-# into its stdout / JSON output, so an operator who accidentally pastes a
-# token, a full account id or an endpoint URL into any field must not see it
-# echoed back into a log. The field NAMES are the closed-world schema keys,
-# which are fixed vocabulary, not operator data.
 #
-# SYMBOLS ARE THE ONE EXCEPTION, so they are constrained instead of trusted
-# (PR #128 Codex review r5 P1). ``allowed_symbols`` is the only free-form
-# operator value the startup summary PRINTS, and "non-empty string" was weak
-# enough that a token pasted into it (with the matching
-# ``max_spread_by_symbol`` key) made a perfectly valid policy whose summary
-# then echoed the secret. Symbols must now look like an instrument -- upper
-# case alphanumerics either side of a single underscore, which covers the
-# OANDA vocabulary (``USD_JPY``, ``XAU_USD``, ``SPX500_USD``) while a v20
-# token (lowercase hex + hyphen), an account id (``101-004-...-001``) and a
-# URL (``:`` and ``/``) all fail the shape and are refused, unprinted.
-_SYMBOL_PATTERN = re.compile(r"[A-Z0-9]{2,8}_[A-Z0-9]{2,8}")
+# The validation body is shared with the DEMO activation lock
+# (``execution/safety_config.py``, Issue #132) so both documents are judged
+# by ONE implementation; ``allowed_live_targets`` is the only live-specific
+# field.
 
-# Defence in depth for a policy built somewhere other than the strict loader
-# above: the DISPLAY boundary refuses to print a symbol it cannot recognise.
-_UNPRINTABLE_SYMBOL = "<unprintable>"
-
-
-def _displayable_symbols(symbols) -> tuple[str, ...]:
-    return tuple(
-        symbol if _SYMBOL_PATTERN.fullmatch(symbol) else _UNPRINTABLE_SYMBOL
-        for symbol in symbols
-    )
-
-
-def _require_symbol_shape(symbols, key: str) -> list[str]:
-    for symbol in symbols:
-        if not _SYMBOL_PATTERN.fullmatch(symbol):
-            raise LiveSafetyConfigError(
-                f"{key} must each be an instrument symbol of the form BASE_QUOTE "
-                "(upper-case letters or digits, 2-8 characters each side of one "
-                "underscore); the configured value is not echoed"
-            )
-    return list(symbols)
-
-
-def _require_key(mapping: dict, key: str):
-    if key not in mapping:
-        raise LiveSafetyConfigError(
-            f"live safety configuration field {key!r} is required (there are no defaults)"
-        )
-    return mapping[key]
-
-
-def _positive_decimal(value, name: str) -> Decimal:
-    if not isinstance(value, str):
-        raise LiveSafetyConfigError(
-            f"{name} must be a decimal string (the configured value is not echoed)"
-        )
-    try:
-        parsed = Decimal(value)
-    except InvalidOperation:
-        raise LiveSafetyConfigError(
-            f"{name} is not a valid decimal string (the configured value is not echoed)"
-        ) from None
-    if not parsed.is_finite() or parsed < 0:
-        raise LiveSafetyConfigError(
-            f"{name} must be a non-negative finite decimal (the configured value is not echoed)"
-        )
-    return parsed
-
-
-def _non_empty_str_list(mapping: dict, key: str) -> list[str]:
-    value = _require_key(mapping, key)
-    if not isinstance(value, list) or not value:
-        raise LiveSafetyConfigError(f"{key} must be a non-empty list of strings")
-    for entry in value:
-        if not isinstance(entry, str) or not entry.strip():
-            raise LiveSafetyConfigError(
-                f"{key} entries must be non-empty strings (the configured values are not echoed)"
-            )
-    return list(value)
-
-
-def _config_int(mapping: dict, key: str, *, minimum: int) -> int:
-    value = _require_key(mapping, key)
-    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise LiveSafetyConfigError(
-            f"{key} must be an integer >= {minimum} (the configured value is not echoed)"
-        )
-    return value
+_LIVE_TARGETS_KEY = "allowed_live_targets"
 
 
 def parse_live_safety_policy(raw) -> SafetyPolicy:
@@ -367,177 +294,24 @@ def parse_live_safety_policy(raw) -> SafetyPolicy:
     :class:`SafetyPolicy` whose ``live`` connection targets are the
     configured ones (the mode/target check the Safety Gate already
     performs per submission)."""
-    if not isinstance(raw, dict):
-        # A TYPE name is not operator data.
-        raise LiveSafetyConfigError(
-            f"live safety configuration must be an object, got {type(raw).__name__}"
-        )
-    unknown = set(raw) - _LIVE_POLICY_KEYS
-    if unknown:
-        # The unknown key NAMES are not echoed either (PR #128 Codex review
-        # r2 P1): an operator can paste a token / account id / URL as a KEY
-        # just as easily as as a value, and this message reaches stdout and
-        # the JSON output. The count plus the allowed vocabulary is enough
-        # to fix the document.
-        raise LiveSafetyConfigError(
-            f"live safety configuration has {len(unknown)} unknown field(s) "
-            "(their names are not echoed); allowed fields: "
-            f"{sorted(_LIVE_POLICY_KEYS)}"
-        )
-    sides = []
-    for entry in _non_empty_str_list(raw, "allowed_sides"):
-        try:
-            sides.append(OrderSide(entry))
-        except ValueError:
-            raise LiveSafetyConfigError(
-                "allowed_sides entries must each be one of "
-                f"{sorted(item.value for item in OrderSide)} "
-                "(the configured value is not echoed)"
-            ) from None
-    spreads_raw = _require_key(raw, "max_spread_by_symbol")
-    if not isinstance(spreads_raw, dict) or not spreads_raw:
-        raise LiveSafetyConfigError("max_spread_by_symbol must be a non-empty object")
-    # The per-symbol key is NOT interpolated into the error text: it is
-    # operator-supplied data like any value (PR #128 Codex review P1), and it
-    # must satisfy the instrument shape for the same reason ``allowed_symbols``
-    # does -- the two key sets have to match, so a credential pasted into one
-    # would otherwise have to be pasted into the other (r5 P1).
-    _require_symbol_shape(spreads_raw.keys(), "max_spread_by_symbol entries")
-    spreads = {
-        symbol: _positive_decimal(spread, "max_spread_by_symbol entries")
-        for symbol, spread in spreads_raw.items()
-    }
-    policy_id = _require_key(raw, "policy_id")
-    if not isinstance(policy_id, str) or not policy_id.strip():
-        raise LiveSafetyConfigError(
-            "policy_id must be a non-empty string (the configured value is not echoed)"
-        )
-    require_stop_loss = _require_key(raw, "require_stop_loss")
-    if not isinstance(require_stop_loss, bool):
-        raise LiveSafetyConfigError(
-            "require_stop_loss must be a boolean (the configured value is not echoed)"
-        )
-    try:
-        return SafetyPolicy(
-            policy_id=policy_id,
-            allowed_symbols=frozenset(
-                _require_symbol_shape(
-                    _non_empty_str_list(raw, "allowed_symbols"), "allowed_symbols entries"
-                )
-            ),
-            allowed_sides=frozenset(sides),
-            max_order_quantity=_positive_decimal(
-                _require_key(raw, "max_order_quantity"), "max_order_quantity"
-            ),
-            max_positions_per_symbol=_config_int(raw, "max_positions_per_symbol", minimum=0),
-            max_positions_account=_config_int(raw, "max_positions_account", minimum=0),
-            max_reference_age=timedelta(
-                seconds=_config_int(raw, "max_reference_age_seconds", minimum=1)
-            ),
-            max_spread_by_symbol=spreads,
-            allowed_connection_targets={
-                ExecutionMode.LIVE: frozenset(_non_empty_str_list(raw, "allowed_live_targets"))
-            },
-            require_stop_loss=require_stop_loss,
-        )
-    except LiveSafetyConfigError:
-        raise
-    except ValueError as exc:
-        # SafetyPolicy's own cross-field messages quote symbols, targets and
-        # limits, so they are NOT forwarded (PR #128 Codex review P1): the
-        # operator gets the constraint list, and the original exception stays
-        # available as ``__cause__`` for an interactive debugger only -- the
-        # CLI prints ``str(error)``, never the chain.
-        raise LiveSafetyConfigError(
-            "live safety configuration violates the safety-policy invariants (values are "
-            "not echoed): max_spread_by_symbol keys must exactly cover allowed_symbols, "
-            "symbols and targets must carry no surrounding whitespace, "
-            "max_order_quantity and max_reference_age_seconds must be > 0, and one "
-            "connection target may belong to only one execution mode"
-        ) from exc
+    return parse_safety_policy(
+        raw,
+        mode=ExecutionMode.LIVE,
+        targets_key=_LIVE_TARGETS_KEY,
+        description=_LIVE_CONFIG_DESCRIPTION,
+        error_cls=LiveSafetyConfigError,
+    )
 
 
 def load_live_safety_policy(path: str | Path) -> SafetyPolicy:
     """Load the live safety configuration from a JSON file (strict loader:
     duplicate keys, invalid UTF-8, oversized inputs and non-finite numbers
     are explicit errors). Any failure raises :class:`LiveSafetyConfigError`
-    -- the caller then passes ``policy=None`` and the startup is refused.
-
-    The strict loader's own messages quote DOCUMENT CONTENT (the duplicate
-    key's name, the offending field name of a ``NaN``), and this text
-    reaches stdout and the JSON output through the CLI. That is the same
-    leak the value-free validation contract closes above, so the loader's
-    message is NOT forwarded: the failure classes are listed instead. The
-    PATH is kept -- it is the operator's own argument, printed by the CLI
-    anyway, and it is what makes the error actionable.
-    """
-    path = Path(path)
-    try:
-        raw = load_strict_json_file(
-            path,
-            description="live safety configuration",
-            error_cls=LiveSafetyConfigError,
-        )
-    except LiveSafetyConfigError as exc:
-        raise LiveSafetyConfigError(
-            f"live safety configuration {path} was rejected before parsing (the document "
-            "content is not echoed): it is unreadable, oversized, not plain UTF-8, not "
-            "valid JSON, has duplicate object keys, contains NaN / Infinity, or exceeds "
-            "the nesting / string / array / object limits"
-        ) from exc
+    -- the caller then passes ``policy=None`` and the startup is refused."""
+    raw = load_safety_document(
+        path, description=_LIVE_CONFIG_DESCRIPTION, error_cls=LiveSafetyConfigError
+    )
     return parse_live_safety_policy(raw)
-
-
-def classify_endpoint(value) -> str:
-    """Classify a configured endpoint into a NON-SECRET kind label.
-
-    The value itself is never returned or echoed, and ONLY the two exactly
-    allowlisted endpoints earn the ``live`` / ``demo`` labels (PR #128 Codex
-    review r2 P2). A lookalike such as ``https://api-fxtrade.oanda.com.evil
-    .example`` is ``unknown``: it is refused by the exact allowlist, so
-    telling the operator "endpoint kind: live" in a SAFETY summary would
-    describe a connection that will never be made -- misleading exactly
-    where the summary has to be trustworthy.
-
-    Suspicion is not lost by this: :func:`endpoint_host_family` keeps the
-    marker-based "looks like" detection that the demo/live MIXING checks
-    need, and every non-exact endpoint still fails the endpoint lock.
-    """
-    if not isinstance(value, str) or not value.strip():
-        return ENDPOINT_KIND_NOT_CONFIGURED
-    normalized = value.strip().rstrip("/")
-    if normalized == OANDA_LIVE_API_URL:
-        return ENDPOINT_KIND_LIVE
-    if normalized == OANDA_DEMO_API_URL:
-        return ENDPOINT_KIND_DEMO
-    return ENDPOINT_KIND_UNKNOWN
-
-
-def endpoint_host_family(value) -> str | None:
-    """"Looks like" detection for the demo/live MIXING checks only.
-
-    Returns ``live`` / ``demo`` when the host merely CONTAINS the
-    corresponding OANDA marker, and ``None`` otherwise. Deliberately looser
-    than :func:`classify_endpoint`: putting a live-looking host in the DEMO
-    endpoint variable is a configuration mistake worth refusing even when
-    the URL would be rejected by the allowlist anyway. It is NEVER used as a
-    summary label, because "looks live" is not "is live".
-    """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    lowered = value.strip().rstrip("/").lower()
-    if OANDA_LIVE_HOST_MARKER in lowered:
-        return ENDPOINT_KIND_LIVE
-    if OANDA_DEMO_HOST_MARKER in lowered:
-        return ENDPOINT_KIND_DEMO
-    return None
-
-
-def _configured(environ: Mapping[str, str], name: str) -> str | None:
-    value = environ.get(name)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return value.strip()
 
 
 def _collect_credential_separation_rejections(
@@ -545,48 +319,15 @@ def _collect_credential_separation_rejections(
     environ: Mapping[str, str],
     reject: Callable[[LiveLockCode, str], None],
 ) -> None:
-    """Refuse every way demo and live configuration can be mixed.
-
-    Both directions matter, because either one makes "which account did
-    this order hit?" unanswerable:
-
-    - a LIVE run whose live endpoint slot holds a demo endpoint (or whose
-      endpoint is unknown) -- refused as ``LIVE_ENDPOINT_INVALID`` by the
-      caller's endpoint check, and refused again here when the demo slot is
-      what carries the live host;
-    - a DEMO run whose demo endpoint slot holds a LIVE endpoint;
-    - the same token or the same account id configured for both.
-    """
-    if endpoint_host_family(environ.get(DEMO_ENV_API_URL)) == ENDPOINT_KIND_LIVE:
-        reject(
-            LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
-            f"{DEMO_ENV_API_URL} (the DEMO endpoint variable) is configured with a live "
-            "endpoint; demo and live endpoints must never be interchanged",
-        )
-    if endpoint_host_family(environ.get(ENV_LIVE_API_URL)) == ENDPOINT_KIND_DEMO:
-        reject(
-            LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
-            f"{ENV_LIVE_API_URL} (the LIVE endpoint variable) is configured with a demo "
-            "endpoint; demo and live endpoints must never be interchanged",
-        )
-    for live_name, demo_name in (
-        (ENV_LIVE_API_TOKEN, DEMO_ENV_API_TOKEN),
-        (ENV_LIVE_ACCOUNT_ID, DEMO_ENV_ACCOUNT_ID),
-    ):
-        live_value = _configured(environ, live_name)
-        demo_value = _configured(environ, demo_name)
-        if live_value is not None and live_value == demo_value:
-            reject(
-                LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
-                f"{live_name} and {demo_name} hold the same value; live and demo "
-                "credentials must be separate",
-            )
-    if mode is ExecutionMode.DEMO and _configured(environ, ENV_ENABLE_LIVE_TRADING) is not None:
-        reject(
-            LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
-            f"execution mode 'demo' must not be started with {ENV_ENABLE_LIVE_TRADING} set; "
-            "unset it in the demo process environment",
-        )
+    """Refuse every way demo and live configuration can be mixed (the shared
+    implementation in ``execution/safety_config.py``, tagged with this
+    module's own machine-readable code)."""
+    collect_credential_separation_rejections(
+        mode,
+        environ,
+        reject,
+        mixed_code=LiveLockCode.DEMO_LIVE_CONFIGURATION_MIXED,
+    )
 
 
 def evaluate_live_activation(
@@ -721,31 +462,13 @@ def evaluate_live_activation(
         )
 
     # --- kill switch (fail closed: unreadable is as blocking as ON) -------
-    kill_switch_label = KILL_SWITCH_UNVERIFIABLE
-    try:
-        kill_switch = state_provider.is_kill_switch_enabled()
-    except Exception as exc:
-        reject(
-            LiveLockCode.KILL_SWITCH_STATE_UNVERIFIABLE,
-            f"kill switch state could not be read ({type(exc).__name__}); an unverifiable "
-            "kill switch never reads as OFF",
-        )
-    else:
-        if not isinstance(kill_switch, bool):
-            reject(
-                LiveLockCode.KILL_SWITCH_STATE_UNVERIFIABLE,
-                "kill switch provider returned a non-boolean state; refusing to treat it "
-                "as OFF",
-            )
-        elif kill_switch:
-            kill_switch_label = KILL_SWITCH_ENABLED
-            reject(
-                LiveLockCode.KILL_SWITCH_ENABLED,
-                "the kill switch is enabled; no live connection is composed and no order "
-                "is submitted",
-            )
-        else:
-            kill_switch_label = KILL_SWITCH_DISABLED
+    kill_switch_label = read_kill_switch(
+        state_provider,
+        reject,
+        enabled_code=LiveLockCode.KILL_SWITCH_ENABLED,
+        unverifiable_code=LiveLockCode.KILL_SWITCH_STATE_UNVERIFIABLE,
+        subject="live connection",
+    ).label
 
     summary = _summary(
         mode=mode,

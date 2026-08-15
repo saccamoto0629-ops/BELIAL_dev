@@ -165,6 +165,41 @@ jobs:
           test "$status" -eq 1 || { echo "a preflight without --confirm-live must refuse, got $status"; exit 1; }
           python -c "import json; data=json.load(open('live-preflight-noconfirm.json', encoding='ascii')); assert 'live_confirmation_missing' in data['rejection_codes'], data"
 
+      # Issue #132: the DEMO preflight has the same CI contract as the live
+      # one -- CI carries no demo credentials and no kill switch DB, so the
+      # startup must REFUSE (exit 1) with machine-readable codes, create
+      # nothing and print no endpoint / credential material. It also proves
+      # the mode lock: --execution-mode live can never come back allowed from
+      # this command.
+      - name: Run demo startup preflight (must refuse, no credentials in CI)
+        run: |
+          set -e
+          set +e
+          python -m execution.demo_startup_cli \
+            --execution-mode demo \
+            --safety-config execution/examples/demo_safety_config_example.json \
+            --kill-switch-db "$RUNNER_TEMP/demo-ci/kill_switch.sqlite3" \
+            --json > demo-preflight.json
+          status=$?
+          set -e
+          test "$status" -eq 1 || { echo "the demo preflight must refuse (exit 1) in CI, got $status"; exit 1; }
+          python -c "import json; data=json.load(open('demo-preflight.json', encoding='ascii')); assert data['allowed'] is False, data; assert 'demo_credentials_missing' in data['rejection_codes'], data; assert 'kill_switch_state_unverifiable' in data['rejection_codes'], data"
+          test ! -e "$RUNNER_TEMP/demo-ci" || { echo "the preflight must not create the kill switch DB"; exit 1; }
+          if grep -qi "api-fxpractice\|api-fxtrade\|Bearer\|Authorization" demo-preflight.json; then
+            echo "the preflight output must not carry endpoint/credential material"; exit 1
+          fi
+          # the mode lock: this command never composes a live connection
+          set +e
+          python -m execution.demo_startup_cli \
+            --execution-mode live \
+            --safety-config execution/examples/demo_safety_config_example.json \
+            --kill-switch-db "$RUNNER_TEMP/demo-ci/kill_switch.sqlite3" \
+            --json > demo-preflight-live.json
+          status=$?
+          set -e
+          test "$status" -eq 1 || { echo "a demo preflight in live mode must refuse, got $status"; exit 1; }
+          python -c "import json; data=json.load(open('demo-preflight-live.json', encoding='ascii')); assert 'execution_mode_not_demo' in data['rejection_codes'], data"
+
       # PR #87: broker/ must import as a normal package from the repo root,
       # without any sys.path manipulation. Issue #74 adds execution/ under
       # the same rule; Issue #75 adds the Safety Gate modules; Issue #77 adds
@@ -199,6 +234,11 @@ jobs:
           python -c "from execution.broker_reconciliation import BrokerOrderReconciliationService"
           python -c "from execution.broker_reconciliation_repair import BrokerOrderReconciliationRepairService"
           python -c "from execution.reconciliation_runner import main"
+          python -c "from execution.safety_config import parse_safety_policy, classify_endpoint"
+          python -c "from execution.demo_lock import build_demo_connection, DemoRuntimeGrant"
+          python -c "from execution.demo_startup_cli import main"
+          python -c "from execution.live_runner import ExecutionRunner, RUNNER_SUPPORTED_MODES"
+          python -c "from execution.runner_composition import build_demo_execution_runner"
 
   # Issue #83: the Paper Execution notification outbox does dry-run schema
   # probing and reads via private snapshot copies, then deletes the snapshot

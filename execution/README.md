@@ -1,6 +1,6 @@
 # execution/
 
-**Live Execution** に向けた ExecutionRequest モデル、注文状態・状態履歴の SQLite 永続化基盤(Issue #74)、Broker 送信直前の fail-closed **Safety Gate**(Issue #75)、Broker へ送信せずに実判定経路を検証記録する **Shadow Mode**(Issue #78)、**Live 接続の二重以上のロック**(Issue #82)、および **Live Execution runner core**(Issue #131。**Fake / Shadow のみ**)。**このパッケージ自身は注文を出さない**: 送信は唯一の境界 `LiveOrderSubmissionService` からのみ行われ、Live 接続は全ロックが成立したときだけ `live_lock.py` が組み立てる。**runner core は Fake / Shadow まで**であり、**OANDA Demo の runner 統合・reconciliation の定期実行・systemd 等の運用導線は未実装**、**実口座での Live 運用は未解禁**(Live 運用開始の事前条件は [運用ドキュメント](../docs/operations/operations.md) を参照)。
+**Live Execution** に向けた ExecutionRequest モデル、注文状態・状態履歴の SQLite 永続化基盤(Issue #74)、Broker 送信直前の fail-closed **Safety Gate**(Issue #75)、Broker へ送信せずに実判定経路を検証記録する **Shadow Mode**(Issue #78)、**Live 接続の二重以上のロック**(Issue #82)、**Live Execution runner core**(Issue #131)、および **OANDA Demo mode の runner 統合**(Issue #132)。**このパッケージ自身は注文を出さない**: 送信は唯一の境界 `LiveOrderSubmissionService` からのみ行われ、Demo 接続は `demo_lock.py`、Live 接続は `live_lock.py` だけが全ロック成立時に組み立てる。runner が駆動できるのは **`fake` / `shadow` / `demo`** で、**`live` は runner から拒否**される。**reconciliation の定期実行・systemd 等の継続運転導線は未実装**、**実口座での Live 運用は未解禁**(Live 運用開始の事前条件は [運用ドキュメント](../docs/operations/operations.md) を参照)。
 
 明示的な Python package。リポジトリルートから import する:
 
@@ -20,12 +20,16 @@ from execution.live_runner import ExecutionRunner
 from execution.runner_composition import (
     build_fake_execution_runner,
     build_shadow_execution_runner,
+    build_demo_execution_runner,
 )
+from execution.demo_lock import build_demo_connection
 ```
 
 手動 reconciliation CLI(Issue #105): `python -m execution.reconciliation_runner --broker oanda-demo [--dry-run]`(reconcile-only。詳細は [docs/operations/operations.md](../docs/operations/operations.md) の CLI 節)
 
 Live 起動前 preflight(Issue #82): `python -m execution.live_startup_cli --execution-mode live --confirm-live --safety-config <path>`(全ロックの検証 + 起動時 safety summary。**発注も外部通信もしない**。詳細は [docs/operations/operations.md](../docs/operations/operations.md) の「Live 接続の有効化 / 無効化 / 緊急停止」節)
+
+Demo 起動前 preflight(Issue #132): `python -m execution.demo_startup_cli --execution-mode demo --safety-config <path>`(demo ロックの検証 + safety summary + **pin すべき account digest の表示**。**発注も外部通信もしない**。詳細は [docs/operations/operations.md](../docs/operations/operations.md) の「Demo mode の起動」節)
 
 | ファイル | 内容 |
 |---|---|
@@ -55,8 +59,11 @@ Live 起動前 preflight(Issue #82): `python -m execution.live_startup_cli --exe
 | `broker_reconciliation.py` | **検出専用**の照合サービス `BrokerOrderReconciliationService`(Issue #103): Broker state を持つ内部注文(pending / accepted / partially_filled / unknown / terminal)を Broker へ照会し、不一致を分類する(`created` は未送信なので除外)。**内部注文状態を変更しない・Broker へ送信/キャンセルしない**(Broker は `get_order` / `list_orders` のみ、execution store は読み取りのみ。いずれも AST 検査で固定)。`auto_repair_candidate` の判定は既存 validator と `record_order_result` の前提条件(遷移・intent 一致・broker_order_id の chain 規則(Issue #102: 監査された reissue chain append のみ ID 変更可)と **DB 全体 UNIQUE の所有者確認(superseded chain の ID を含む)**・snapshot 更新契約・時刻の非逆行)の**再利用**で行い、修復は行わない(Issue #104)。判定に必要な store 読み取りが失敗した場合は推測せず `manual_review`(fail-closed)。照会失敗は `query_failure` discrepancy(対象 ID + 理由 + 型付き code)、Broker 側注文の列挙失敗・列挙非対応は run の `broker_listing_error`(= 「Broker のみの注文なし」ではなく「未確認」)。`detect()` は DB 無副作用、`run()` は戻り値 + ログ + DB へ記録。**Issue #105**: `include_position_scope=True` で position / trade / SL・TP スコープを追加実行(既定 False = #103 挙動不変)。内部期待は filled 注文の符号付きネットのみから導出し、UNKNOWN / 読めない snapshot のシンボルは fail-safe に除外。対応付けは ID 証拠のみ(trade の client_order_id / fill id ↔ trade id。曖昧一致は `trade_match_ambiguous`)。検出は position 欠落 / broker-only position / broker-only trade / closed-trade 証拠による Broker 側 close / 内部 close × Broker open / SL・TP の欠落・価格不一致(Decimal 値等価)・参照不一致・意図なし protection。**全件 `manual_review`** で修復経路なし。列挙失敗・capability 非対応・重複 ID は summary の `*_listing_error` に「未確認」として記録(差分を捏造しない) |
 | `live_lock.py` | **Live 活性化ロック + 起動時 safety summary**(Issue #82): `evaluate_live_activation()` が 5 つのロック(`execution_mode=live` / `ENABLE_LIVE_TRADING=true` / Live credential / Live endpoint / `--confirm-live`)、Demo-Live 混在(endpoint 逆挿し・credential 共有・Demo mode への live flag)、safety policy の可用性と live target 許可、Kill Switch(**ON も「読めない」も同じく拒否**)を **すべて収集**して fail-closed に判定する。`build_live_connection()` は全ロック成立時だけ `OandaLiveAdapter` + `BrokerConnection` を組み立てる**唯一の production composer**(AST test で固定)で、**判断材料を注入できない**(PR #128 レビュー P1): policy は `--safety-config` の**パスから自分で読み**(object 注入不可・読めなければ `safety_policy_unavailable`)、Kill Switch は自分で `PersistentKillSwitchStateProvider` を構築し、環境は `os.environ` を直接読む。`LiveOrderSubmissionService` の audit store / journal と同じ封印規則(パスは設定可・object は注入不可)。`evaluate_live_activation()` は注入可能なままだが**接続を返さない**ので、注入された入力は何も認可できない。broker 側の `LiveActivation` / `OandaLiveConfig` も**発行制**(PR #128 レビュー r3)で、実プロセス環境を読む issuer 以外からは生成できない。`LiveSafetySummary` は execution mode / endpoint 種別ラベル / account の非可逆 digest / 許可銘柄 / 最大注文数量 / 最大ポジション数 / Kill Switch 状態 / 5 ロックのチェックリストを出し、**token・完全な account id・endpoint URL・Authorization は一切含まない**。`load_live_safety_policy()` は closed-world JSON(全項目必須・未知キー拒否・credential を持たない)を strict loader で読み、読めなければ policy なし = 起動拒否 |
 | `live_startup_cli.py` | **Live 起動前 preflight CLI**(Issue #82。`python -m execution.live_startup_cli`): `--execution-mode` / `--confirm-live` / `--safety-config` / `--kill-switch-db` / `--json`。ロックを検証して safety summary を表示し、成立時のみ接続を組み立てて即破棄する(**発注・取消・照会なし、外部通信なし**)。exit code: 0 = 全ロック成立 / 1 = 拒否(ロック・Kill Switch・safety config)/ 2 = usage。出力・stderr に secrets は出ない |
-| `live_runner.py` | **Live Execution runner core**(Issue #131。Fake / Shadow のみ): 1 cycle を明示する `ExecutionRunner.run_cycle()` と常駐ループ境界 `run_forever()`(注入 clock / 注入 sleeper / `threading.Event` による停止 = **ループ内にビジネスロジックを持たない**)。**Broker を import も保持もしない**(AST 検査で固定)。mode は `RUNNER_SUPPORTED_MODES` = `fake` / `shadow` のみで、`demo`(未実装)/ `live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知はすべて `RunnerModeError` で拒否。work 選択の失敗は cycle 全体を fail-closed(0 件処理)、item の失敗は cycle 内で局所化、cycle の失敗はループを止めない。`request_stop()` 後は**新規 item を開始しない**。結果は `RunnerItemOutcome`(`broker_contact` = `not_sent` / `sent` / **`unresolved`** = 送信境界から例外が抜けた場合。「不明」を「未送信」と報告できない不変条件を型で固定)/ `RunnerCycleReport` / `RunnerLoopReport` |
-| `runner_composition.py` | **runner の composition root + mode executor**(Issue #131): `build_fake_execution_runner()`(`fake` 以外の `BrokerConnection` を拒否。送信サービスは `reissue_composition.build_reissue_boundary()` 経由でのみ構築)と `build_shadow_execution_runner()`(broker 引数が存在しない)。`FakeSubmissionCycleExecutor` は `list_pending_execution_requests()` → `LiveOrderSubmissionService.submit()` だけを行い、`ShadowCycleExecutor` は実行可能な保存済み Signal → `run_production_shadow_cycle()` だけを行う(候補は**絞り込まない**。「既に記録がある」の意味を決めてよいのは claim だけであり、payload 一致 = `duplicate` / payload 差異 = conflict。PR #135 レビュー P1)。**runner 側の状態更新・再送判断・自動修復は存在しない**(execution store の write API 呼び出しゼロを AST 検査で固定)。dry-run は `plan()` のみを呼び、Broker 呼び出し・DB 作成・migration・書き込みを一切行わない(`fake` の dry-run は Gate 手前で止まる = 「FakeBroker だから呼んでよい」にしない) |
+| `safety_config.py` | **起動ロック共通の設定検証**(Issue #132): closed-world な safety configuration document の strict 解析(全項目必須・未知キー拒否・**値もキーも一切 echo しない**・銘柄は instrument 形状に制約)、endpoint の種別分類(allowlist 完全一致のみ `live` / `demo`、marker ベースの「らしさ」判定は混在検出専用)、Demo-Live 混在の検出、Kill Switch の fail-closed 読み取り。Live / Demo 双方のロックが**同一実装**を使う(Issue #82 の検証本体を移設したもので、内容は無変更) |
+| `demo_lock.py` | **Demo 活性化ロック + 起動時 safety summary**(Issue #132): `evaluate_demo_activation()` が 7 つのロック(`execution_mode=demo` / Demo credential / Demo endpoint allowlist / **live 設定が 1 つも存在しないこと** / **safety config に pin された account digest との一致** / safety policy の可用性と demo target 許可 / Kill Switch = **ON も「読めない」も同じく拒否**)を**すべて収集**して fail-closed に判定する。`build_demo_connection()` は全ロック成立時だけ `OandaDemoAdapter` + `BrokerConnection` + `DemoRuntimeGrant` を組み立てる**唯一の production composer**(AST test で固定。reconcile-only CLI だけは adapter を照会専用 facade 経由で構築してよく、`BrokerConnection` は作らない)で、live lock と同じ封印規則(policy は `--safety-config` の**パスから自分で読み**、Kill Switch は自分で `PersistentKillSwitchStateProvider` を構築、環境は `os.environ` を直接読む。transport 注入は public API に存在しない)。`DemoSafetySummary` は execution mode / endpoint 種別 / **設定 account の digest と pin された digest** / 許可銘柄 / 上限 / Kill Switch / 5 ロックのチェックリストを出し、**token・完全な account id・endpoint URL は一切含まない** |
+| `demo_startup_cli.py` | **Demo 起動前 preflight CLI**(Issue #132。`python -m execution.demo_startup_cli`): `--execution-mode` / `--safety-config` / `--kill-switch-db` / `--json`。ロックを検証して safety summary を表示し(**拒否時も account digest を表示する** = `expected_account_reference` の bootstrap 手段)、成立時のみ接続を組み立てて即破棄する(**発注・取消・照会なし、外部通信なし**)。exit code: 0 = 全ロック成立 / 1 = 拒否 / 2 = usage。runner は起動しない |
+| `live_runner.py` | **Live Execution runner core**(Issue #131 / #132。Fake / Shadow / Demo): 1 cycle を明示する `ExecutionRunner.run_cycle()` と常駐ループ境界 `run_forever()`(注入 clock / 注入 sleeper / `threading.Event` による停止 = **ループ内にビジネスロジックを持たない**)。**Broker を import も保持もしない**(AST 検査で固定)。mode は `RUNNER_SUPPORTED_MODES` = `fake` / `shadow` / `demo`(Issue #132)のみで、`live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知はすべて `RunnerModeError` で拒否。work 選択の失敗は cycle 全体を fail-closed(0 件処理)、item の失敗は cycle 内で局所化、cycle の失敗はループを止めない。`request_stop()` 後は**新規 item を開始しない**。結果は `RunnerItemOutcome`(`broker_contact` = `not_sent` / `sent` / **`unresolved`** = 送信境界から例外が抜けた場合。「不明」を「未送信」と報告できない不変条件を型で固定)/ `RunnerCycleReport` / `RunnerLoopReport` |
+| `runner_composition.py` | **runner の composition root + mode executor**(Issue #131 / #132): `build_fake_execution_runner()`(`fake` 以外の `BrokerConnection` を拒否。送信サービスは `reissue_composition.build_reissue_boundary()` 経由でのみ構築)、`build_demo_execution_runner()`(**`DemoRuntimeGrant` 以外を受け取らない** = connection / policy / kill switch provider を個別に注入できず、Gate の Kill Switch reader は grant の store path から**この関数が**永続 provider として構築する)、`build_shadow_execution_runner()`(broker 引数が存在しない)。送信 executor の本体は `SubmissionCycleExecutor` 1 つで、`FakeSubmissionCycleExecutor` / `DemoSubmissionCycleExecutor` は受理する境界 mode の宣言だけが異なる(**fake で検証した経路が demo でそのまま動くこと**が目的。demo 固有の分岐は存在しない)。両者は `list_pending_execution_requests()` → `LiveOrderSubmissionService.submit()` だけを行い、`ShadowCycleExecutor` は実行可能な保存済み Signal → `run_production_shadow_cycle()` だけを行う(候補は**絞り込まない**。「既に記録がある」の意味を決めてよいのは claim だけであり、payload 一致 = `duplicate` / payload 差異 = conflict。PR #135 レビュー P1)。**runner 側の状態更新・再送判断・自動修復は存在しない**(execution store の write API 呼び出しゼロを AST 検査で固定)。dry-run は `plan()` のみを呼び、Broker 呼び出し・DB 作成・migration・書き込みを一切行わない(`fake` の dry-run は Gate 手前で止まる = 「FakeBroker だから呼んでよい」にしない) |
 | `reconciliation_runner.py` | **手動 reconciliation CLI**(Issue #105。`python -m execution.reconciliation_runner`): `--broker oanda-demo`(Demo 以外の endpoint は Adapter 構築時 allowlist で exit 2 拒否・secrets 非出力)/ `--broker fake`(配線確認)。渡した Broker を `ReconcileOnlyBroker` facade(submit / cancel / get_account_state が無条件 raise。listing capability は `__getattr__` で inner の有無をそのまま反映)で包み、検出サービスのみを実行する。`--dry-run` は reconciliation DB を作成・migration・書き込みしない。exit 0 = 差分・部分失敗なし / 1 = 差分・部分失敗 / 2 = usage・設定エラー。`--json` は pure ASCII |
 | `sqlite_ro.py` | **true read-only SQLite 接続**(`mode=ro` + `PRAGMA query_only` + **authorizer**): missing DB / parent / WAL / SHM を作らず、mtime 不変、write は必ず失敗。`set_authorizer` が **`ATTACH` / `DETACH`**・DDL・状態変更 PRAGMA の値設定を対象ファイルを開く前に `SQLITE_DENY` で拒否するため、ATTACH による 0 バイトファイル生成も起きない(ファイルシステム完全不変)。全読み取り経路(safety store 含む)が使用  **`allow_immutable_wal=False`**(Issue #81 / PR #126 レビュー P1)で WAL フォールバックを opt-out でき、stale な point-in-time 読み取りが許されない呼び出し元(Kill Switch)は WAL ファイルを通常の `mode=ro` で開いて `PRAGMA journal_mode` を自トランザクション内で観測できる(既定は従来どおり immutable フォールバック)。**opt-out 時は WAL ファイルの open が `-wal` / `-shm` を再作成する**ため、無副作用が必要な呼び出し元は open 前に WAL を拒否すること |
 | `strict_json.py` | JSON 入力の strict loader: **重複キー拒否(ネスト含む)**・不正 UTF-8 / BOM・サイズ / 深さ / 文字列 / 配列 / object キー数上限・NaN / Infinity 拒否を安定エラーへ変換 |
@@ -83,8 +90,8 @@ mode の唯一の正は `execution.safety_gate.ExecutionMode`。設定文字列�
 
 - `dry-run`: 副作用ゼロ(Broker 呼び出し・DB 作成・migration・INSERT/UPDATE・state 更新・Discord いずれもなし。既存 DB は read-only probe のみ)。
 - `shadow`: 実 Signal・実設定・Safety Gate を通常経路で実行し、**Broker へは送信せず**検証記録を保存する(下記)。仮想約定・仮想 Position・仮想 PnL は計算しない(それは Paper Execution の責務)。
-- `fake`: FakeBroker へ送信(`LiveOrderSubmissionService` 経由。既存の注文状態機械・保存を使用)。Issue #131 の runner core が駆動できるのは**この mode と `shadow` だけ**。
-- `demo`: **mode 定義と validation のみ。Execution 層への組み込みは未実装**。OANDA Demo Adapter 自体は Issue #79 で `broker/oanda_demo_adapter.py` に実装済みだが、`BROKER_TYPE_BY_MODE` に Adapter 型が登録されるまで `BrokerConnection` を構築できず、runner は明示的に拒否する(登録は別 Issue)。
+- `fake`: FakeBroker へ送信(`LiveOrderSubmissionService` 経由。既存の注文状態機械・保存を使用)。**インメモリ = ネットワークも口座も存在しない**。
+- `demo`: **OANDA Practice(Demo)口座への実送信**(Issue #132)。`BROKER_TYPE_BY_MODE` に `OandaDemoAdapter` が**具象型完全一致**で登録されており、`BrokerConnection` を組み立ててよいのは `demo_lock.build_demo_connection()` だけである(repository-wide AST test が構築箇所を固定)。runner が駆動できるが、**demo だから緩い経路があるわけではない**: 送信は `LiveOrderSubmissionService` の単一境界のみ、Safety Gate・Journal・Order Store の契約は `fake` と同一で、送信境界は **`demo` にも永続 Kill Switch reader を要求する**(`REAL_BROKER_MODES`)。endpoint は Practice の 1 URL に allowlist 固定され、それ以外は Adapter 構築時と demo lock の両方で fail-closed。
 - `live`: **LOCKED**(Issue #82)。`BROKER_TYPE_BY_MODE` には `OandaLiveAdapter` が登録されているが、その instance は Live endpoint + Live credential + `ENABLE_LIVE_TRADING=true` + `--confirm-live` が揃わないと生成できず、`BrokerConnection` を組み立ててよいのは `live_lock.build_live_connection()` だけである(repository-wide AST test が構築箇所を 1 箇所に固定)。**mode 単独では Live 接続できない。** 他の runner(shadow runner 等)は `LOCKED_BROKER_MODES` として明示拒否する。
 
 ## Shadow Mode(Issue #78 / PR #100)
@@ -110,9 +117,9 @@ python -m execution.shadow_report --shadow-db ... --claims | --orphan-decisions 
 
 設計の詳細(provenance / claim / lease / duplicate と conflict / decision 1:1 / account snapshot / true read-only / JSON 入力制限)は [docs/architecture/shadow_execution.md](../docs/architecture/shadow_execution.md) を参照。
 
-## Live Execution runner core(Issue #131)
+## Live Execution runner core(Issue #131 / #132)
 
-既存の安全基盤を**継続実行**から駆動するためのライフサイクル。**対象は `fake` / `shadow` のみ**で、OANDA Demo の runner 統合は別 Issue、実口座 Live 運用は未解禁のままである。
+既存の安全基盤を**継続実行**から駆動するためのライフサイクル。**対象は `fake` / `shadow` / `demo`** で、`live` は runner から拒否され、**実口座 Live 運用は未解禁**のままである。
 
 ```python
 runner = build_fake_execution_runner(
@@ -123,18 +130,30 @@ runner = build_fake_execution_runner(
 )
 report = runner.run_cycle()                                  # 1 cycle(テスト単位)
 report = runner.run_forever(interval_seconds=60)             # 常駐ループ(停止は request_stop())
+
+# demo は「部品を渡す」経路が存在しない: ロックが発行した grant だけを受け取る
+decision, grant = build_demo_connection(
+    execution_mode="demo", safety_config_path=..., kill_switch_db_path=...)
+if grant is None:
+    raise SystemExit(decision.summary.render())              # fail-closed
+runner = build_demo_execution_runner(
+    grant=grant, market_provider=market_provider, clock=clock,
+    order_db_path=..., decision_db_path=..., journal_db_path=...,
+)
 ```
 
 - **経路(fake)**: `list_pending_execution_requests()`(phase `created`)→ `LiveOrderSubmissionService.submit()` → Safety Gate(**送信ごとに** Kill Switch を再評価)→ 判定の耐久保存 + read-back → Submission Journal → `created → submitting` → FakeBroker → Journal / Order Store。**Fake でも Gate と Journal を省略しない**。
+- **経路(demo)**: 上と**完全に同一**で、末端が OANDA Demo Adapter(Practice endpoint)になるだけである。差分は経路ではなく前提と失敗様式にある: 接続は `demo_lock` の 7 ロックを通ったものだけ、Kill Switch reader は**永続 store 必須**、timeout / 通信断は本物なので outcome が真に UNKNOWN になり得る(= reconciliation の対象。runner は再送しない)。
 - **経路(shadow)**: 実行可能な保存済み Signal → `run_production_shadow_cycle()` → shadow claim → `evaluate_shadow()` → intended order / shadow 記録。**Broker は存在しない**(runner / executor は broker 実装を import も保持もしない)。
 - **冪等性は runner が持たない**: 「送ってよいか」は Execution Store の phase 遷移 + Submission Journal(fake)と shadow claim(shadow)だけが決める。shadow の候補も**選択時に絞り込まない** — 設定変更後に payload が変わった Signal を「記録済みだから skip」と扱うと、shadow の契約が要求する `ShadowIdentityConflictError` を握り潰すため(PR #135 レビュー P1)。runner は cycle をまたぐメモリを持たず、毎 cycle 耐久ストアを読み直す。曖昧なら送らない(UNKNOWN・unresolved journal・superseded intent はすべて既存境界が拒否する)。
 - **送信境界から例外が抜けた場合は `unresolved`**(「未送信」とは報告しない)。該当注文は `list_unresolved_submissions()` / Journal に残り、**reconciliation が解決する**(runner は再送しない・reconciliation を定期実行しない)。
-- **fail-closed**: work 選択の失敗 = その cycle は 0 件処理、Kill Switch ON / 読み取り不能・Safety Store 異常・Journal 異常・Execution Store 異常・Gate 拒否・不正な work item・想定外例外はすべて Broker 送信ゼロ。`demo` / `live` / `dry-run` / 未知 mode は `RunnerModeError`。
+- **fail-closed**: work 選択の失敗 = その cycle は 0 件処理、Kill Switch ON / 読み取り不能・Safety Store 異常・Journal 異常・Execution Store 異常・Gate 拒否・不正な work item・想定外例外はすべて Broker 送信ゼロ。`live` / `dry-run` / 未知 mode は `RunnerModeError`。**Demo でも同一**: credential / account / mode identity の不整合は demo lock が接続構築前に、identity のドリフトは Gate が送信ごとに拒否する。
 - **dry-run は完全無副作用**: Broker 呼び出し・Order Store / Journal / Shadow Store への書き込み・DB 作成・migration が一切なく、既存 DB は read-only probe のみ(バイト列と mtime が不変であることを回帰テストが固定)。
 - **graceful shutdown**: `request_stop()`(signal handler や別スレッドから可)で現在の item だけを終え、**新規 item を開始しない**。ループの sleep も停止で即座に中断される。
 - **常駐ループの pacing**: `interval_seconds` は既定 sleeper(`threading.Event.wait`)の上限 `threading.TIMEOUT_MAX` を超える値を拒否する(超過値は `OverflowError` で常駐 runner を落とすため。PR #135 レビュー P2)。
 - **既知の制約**: 送信境界が常に拒否する intent(例: 恒常的な Gate 拒否・supersede 済みの親)は phase `created` のまま作業キューに残り続ける(runner が状態を書き換えて「諦める」経路は**意図的に存在しない**。解消は再発行 / キャンセルの運用経路)。キュー先頭がこれで埋まると後続が処理されないため、運用導線を作る Issue で扱う。
-- **未実装(別 Issue)**: OANDA Demo 統合、reconciliation の定期実行、CLI / systemd 等の運用導線、Strategy からの ExecutionRequest 自動生成、ロット / リスク管理。
+- **Fake / Shadow / Demo の責務**: `fake` = インメモリ Broker(ネットワークも口座もない。状態機械のリハーサル)、`shadow` = **Broker が経路上に存在しない**(専用 store `shadow_results.sqlite3` にのみ記録し、`execution_orders` / Journal / 注文状態機械には一切触れない)、`demo` = **実 Practice 口座への実送信**(`fake` と同じ store / 状態機械 / Journal を使うため、運用では data-dir を分けて namespace を分離する)。
+- **未実装(別 Issue)**: reconciliation の定期実行、systemd 等の継続運転導線、Strategy からの ExecutionRequest 自動生成、ロット / リスク管理。**実口座 Live 運用は未解禁**。
 
 ## Broker Reconciliation(Issue #103 / #104)
 

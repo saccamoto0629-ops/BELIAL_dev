@@ -39,14 +39,16 @@ every crash point (before evaluation, after decision, before completion)
 converges back to a completed record once the lease expires, and no claim
 can stay unprocessable forever.
 
-Mode dispatch (Issue #78 / #82): ``shadow`` runs through THIS service;
-``fake`` submission stays exclusively ``LiveOrderSubmissionService``;
-``demo`` remains unconstructible (``BROKER_TYPE_BY_MODE``); ``live`` is
+Mode dispatch (Issue #78 / #82 / #132): ``shadow`` runs through THIS
+service; ``fake`` and ``demo`` submission stay exclusively
+``LiveOrderSubmissionService`` (a ``demo`` connection is constructible only
+through the demo activation lock ``execution/demo_lock.py``); ``live`` is
 constructible ONLY through the live activation lock
-(``execution/live_lock.py``, every lock satisfied). Both must be refused
-explicitly by any runner that is not that composer -- shadow mode owns no
-broker connection at all. ``dry-run`` uses :meth:`dry_run_cycle`, which
-persists NOTHING and probes existing stores strictly read-only.
+(``execution/live_lock.py``, every lock satisfied). All three submitting
+modes must be refused explicitly by any runner that is not their composer --
+shadow mode owns no broker connection at all. ``dry-run`` uses
+:meth:`dry_run_cycle`, which persists NOTHING and probes existing stores
+strictly read-only.
 
 Idempotency namespaces: shadow writes only the shadow store; the execution
 order store is never touched, so a shadow run can never make a later fake /

@@ -1,9 +1,12 @@
 """LiveOrderSubmissionService -- THE single sanctioned submission boundary
 for the FUTURE Live Execution layer (Issue #75, review r1).
 
-*** NOTHING HERE CONNECTS TO A REAL BROKER. The only Broker implementation
-that can exist today is FakeBroker (see ``BrokerConnection``); no OANDA
-adapter, no live connection, no production runner exists. ***
+*** THIS SERVICE IS THE ONLY PLACE AN ORDER CROSSES INTO A BROKER. *** The
+broker behind it may be a FakeBroker, the OANDA DEMO adapter (Issue #132,
+composed only by ``execution/demo_lock.py``) or the OANDA LIVE adapter
+(Issue #82, composed only by ``execution/live_lock.py`` and NOT released for
+real-account operation); the contract below is identical for all three, and
+both real-broker modes additionally require the DURABLE Kill Switch reader.
 
 This service closes the official Live Execution submission path into ONE
 boundary. The raw broker adapter is wired INTO the service (via the typed
@@ -135,6 +138,7 @@ from execution.safety_gate import (
     BrokerConnection,
     ExecutionMode,
     MarketSafetySnapshot,
+    REAL_BROKER_MODES,
     SafetyDecision,
     SafetyGate,
     SafetyRejection,
@@ -303,23 +307,29 @@ class LiveOrderSubmissionService:
             raise ValueError(f"connection must be a BrokerConnection, got {connection!r}")
         if not isinstance(gate, SafetyGate):
             raise ValueError(f"gate must be a SafetyGate, got {gate!r}")
-        # A LIVE submission boundary must read a DURABLE kill switch (Issue
-        # #82; PR #128 Codex review r5 P1). Composition-time evidence cannot
-        # be made unforgeable inside one process -- anything that can reach a
-        # module-private signer can equally read the credentials out of the
-        # environment -- so the control that has to hold is here, where it is
-        # checkable: an in-memory provider (or any subclass free to override
-        # the query) would make "the kill switch is off" true by construction
-        # and turn an unreadable switch into a silent OFF, which Issue #82
-        # forbids. ``fake`` / shadow compositions keep their static providers.
-        if connection.execution_mode is ExecutionMode.LIVE and (
+        # A REAL-BROKER submission boundary must read a DURABLE kill switch
+        # (Issue #82; PR #128 Codex review r5 P1; extended to ``demo`` by
+        # Issue #132). Composition-time evidence cannot be made unforgeable
+        # inside one process -- anything that can reach a module-private
+        # signer can equally read the credentials out of the environment --
+        # so the control that has to hold is here, where it is checkable: an
+        # in-memory provider (or any subclass free to override the query)
+        # would make "the kill switch is off" true by construction and turn
+        # an unreadable switch into a silent OFF, which Issue #82 forbids.
+        # ``demo`` is included because an operator pressing the Kill Switch
+        # means "stop sending orders", not "stop sending orders unless the
+        # account is a practice one" -- a demo runner that could be composed
+        # with a static provider would keep submitting. ``fake`` / shadow
+        # compositions keep their static providers (no network, no account).
+        if connection.execution_mode in REAL_BROKER_MODES and (
             type(gate.state_provider) is not PersistentKillSwitchStateProvider
         ):
             raise ValueError(
-                "a live submission boundary requires the gate to read the persistent "
-                "kill switch (exactly a PersistentKillSwitchStateProvider, so the state "
-                "cannot be answered from memory and an unreadable switch cannot read as "
-                f"OFF), got {type(gate.state_provider).__name__}"
+                f"a {connection.execution_mode.value} submission boundary requires the "
+                "gate to read the persistent kill switch (exactly a "
+                "PersistentKillSwitchStateProvider, so the state cannot be answered from "
+                "memory and an unreadable switch cannot read as OFF), got "
+                f"{type(gate.state_provider).__name__}"
             )
         if not isinstance(decision_db_path, (str, Path)):
             # The audit trail is SEALED inside the service (Issue #75 review

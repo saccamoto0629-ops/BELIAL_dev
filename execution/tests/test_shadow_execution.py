@@ -566,18 +566,20 @@ def test_resolve_execution_mode_accepts_exactly_the_five_modes():
             resolve_execution_mode(bogus)
 
 
-def test_demo_stays_unimplemented_and_live_is_locked():
-    """Issue #82 changed exactly one thing here: ``live`` moved from
-    "unrepresentable" to "representable only behind the live activation
-    lock". ``demo`` is untouched, the non-submitting modes still own no
-    broker connection at all, and ``live`` maps to the live adapter -- never
-    to a FakeBroker."""
+def test_demo_is_registered_and_live_is_still_locked():
+    """Issue #132 changed exactly one thing here: ``demo`` moved from
+    "unrepresentable" to "representable only behind the demo activation
+    lock", mirroring what Issue #82 did for ``live``. The non-submitting
+    modes still own no broker connection at all, ``live`` still maps to the
+    live adapter and is still LOCKED, and neither maps to a FakeBroker."""
+    from broker.oanda_demo_adapter import OandaDemoAdapter
     from broker.oanda_live_adapter import OandaLiveAdapter
 
-    assert UNIMPLEMENTED_BROKER_MODES == {ExecutionMode.DEMO}
+    assert UNIMPLEMENTED_BROKER_MODES == frozenset()
     assert LOCKED_BROKER_MODES == {ExecutionMode.LIVE}
-    for mode in (ExecutionMode.DEMO, ExecutionMode.SHADOW, ExecutionMode.DRY_RUN):
+    for mode in (ExecutionMode.SHADOW, ExecutionMode.DRY_RUN):
         assert mode not in BROKER_TYPE_BY_MODE
+    assert BROKER_TYPE_BY_MODE[ExecutionMode.DEMO] is OandaDemoAdapter
     assert BROKER_TYPE_BY_MODE[ExecutionMode.LIVE] is OandaLiveAdapter
 
 

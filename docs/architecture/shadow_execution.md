@@ -10,7 +10,7 @@
 
 ## execution mode(統一語彙)
 
-mode の唯一の正は `execution.safety_gate.ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)。設定文字列は `resolve_execution_mode()` が設定ロード時に解決し、**未知の mode は起動時に明示拒否**する。`demo` は mode 定義と validation のみ(Adapter 型未登録のため `BrokerConnection` を構築できず、runner は明示拒否)。`live` は Issue #82 で `OandaLiveAdapter` が登録済みだが **LOCKED** であり、`live_lock.build_live_connection()` 以外は構築できず shadow runner は `LOCKED_BROKER_MODES` として明示拒否する。`fake` の送信経路は従来どおり `LiveOrderSubmissionService` ただ 1 つ。
+mode の唯一の正は `execution.safety_gate.ExecutionMode`(`dry-run` / `shadow` / `fake` / `demo` / `live`)。設定文字列は `resolve_execution_mode()` が設定ロード時に解決し、**未知の mode は起動時に明示拒否**する。`demo` は Issue #132 で `OandaDemoAdapter` が登録済みだが、`BrokerConnection` を構築してよいのは `demo_lock.build_demo_connection()` だけであり、**shadow runner は `demo` を明示拒否する**(shadow は一切送信しないため、demo 口座へ接触したと読める label で shadow cycle を走らせない)。`live` は Issue #82 で `OandaLiveAdapter` が登録済みだが **LOCKED** であり、`live_lock.build_live_connection()` 以外は構築できず shadow runner は `LOCKED_BROKER_MODES` として明示拒否する。`fake` の送信経路は従来どおり `LiveOrderSubmissionService` ただ 1 つ。
 
 ## Production Signal 入力経路(本 Issue の中核)
 

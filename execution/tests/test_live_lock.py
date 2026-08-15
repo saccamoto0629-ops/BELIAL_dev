@@ -492,7 +492,8 @@ def test_a_live_adapter_subclass_cannot_claim_the_live_mode():
 
     forged = ForgedLiveAdapter()
     assert isinstance(forged, OandaLiveAdapter)  # the hole isinstance would leave
-    assert EXACT_BROKER_TYPE_MODES == {ExecutionMode.LIVE}
+    # Issue #132 added ``demo`` to the exact-type set for the same reason.
+    assert EXACT_BROKER_TYPE_MODES == {ExecutionMode.DEMO, ExecutionMode.LIVE}
     assert BROKER_TYPE_BY_MODE[ExecutionMode.LIVE] is OandaLiveAdapter
     with pytest.raises(ValueError, match="requires exactly a OandaLiveAdapter"):
         BrokerConnection(broker=forged)

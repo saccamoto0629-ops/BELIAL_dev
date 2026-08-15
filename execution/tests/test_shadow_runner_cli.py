@@ -313,7 +313,12 @@ def test_dry_run_fails_explicitly_on_an_invalid_existing_db(tmp_path, capsys):
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        pytest.param("demo", "NOT implemented", id="demo-unimplemented"),
+        # Issue #132: demo is no longer "unimplemented" either -- it is a
+        # real submitting mode composed by the demo activation lock. The
+        # shadow runner must still refuse it EXPLICITLY (it never submits),
+        # and the refusal must not let a shadow cycle run under a label that
+        # implies a demo account was contacted.
+        pytest.param("demo", "demo_lock", id="demo-submits"),
         # Issue #82: live is no longer "unimplemented" -- it is LOCKED. The
         # shadow runner must still refuse it (it never submits), and the
         # refusal must point at the one command that may compose a live

@@ -523,6 +523,19 @@ def _run_cli(argv: list[str] | None) -> int:
             file=sys.stderr,
         )
         return EXIT_USAGE_ERROR
+    if mode is ExecutionMode.DEMO:
+        # Issue #132: ``demo`` became a real submitting mode. It is refused
+        # here for the same reason ``fake`` is -- the shadow runner never
+        # submits -- and refusing it EXPLICITLY matters more now that it no
+        # longer falls into UNIMPLEMENTED_BROKER_MODES: a shadow cycle must
+        # never run under a label that implies a demo account was contacted.
+        print(
+            "execution mode 'demo' submits to the OANDA practice account via "
+            "LiveOrderSubmissionService (composed by execution/demo_lock.py); the shadow "
+            "runner never submits",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE_ERROR
 
     if args.now is not None:
         try:
