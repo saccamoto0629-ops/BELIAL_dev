@@ -1,5 +1,6 @@
 """Live Execution runner core (Issue #131) -- the LIFECYCLE around the
-existing submission / shadow boundaries. Fake and Shadow only.
+existing submission / shadow boundaries. Fake and Shadow, plus OANDA Demo
+since Issue #132; ``live`` is refused here (see "Modes" below).
 
 *** THIS MODULE NEVER TALKS TO A BROKER. It holds no ``Broker`` /
 ``BrokerConnection``, imports neither, and calls neither ``submit_order``
