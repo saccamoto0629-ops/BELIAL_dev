@@ -111,6 +111,17 @@ STALE_CLAIMS = (
     StaleClaim(r"Fake (/|and) Shadow only"),
     StaleClaim(r"`fake` / `shadow` (のみ|だけ|限定)"),
     StaleClaim(r"`fake` と `shadow` だけ"),
+    # The reST enumeration form (PR #136 review r5). The old
+    # ``live_runner`` module docstring wrote the mode list as
+    # ``fake`` and ``shadow``, which none of the rules above matched --
+    # so re-introducing that exact sentence passed. The rule is exempted
+    # when the same clause also names demo, which is how the CORRECTED
+    # sentence (``fake``, ``shadow`` and ``demo``) and the "which Issue
+    # added what" note in ``runner_composition`` are written.
+    StaleClaim(
+        r"``fake`` and ``shadow``",
+        exempt_if_clause_contains=r"demo|Demo",
+    ),
     # --- demo's Execution-layer status ------------------------------------
     StaleClaim(r"`demo` は mode 定義のみ"),
     StaleClaim(r"`BROKER_TYPE_BY_MODE` への `demo` 登録は未実装"),
@@ -135,7 +146,24 @@ STALE_CLAIMS = (
 #: Clause separators. Japanese prose in this repository packs several
 #: independent statements into one line (markdown table cells especially),
 #: so an exemption earned by one clause must not cover the next.
-_CLAUSE_BOUNDARY = re.compile(r"[。|]")
+#:
+#: PR #136 review r5: ``。`` and ``|`` alone left a loophole -- in
+#: "常駐対応は後続 Issue とするが、runner は未実装" the qualifier belongs to a
+#: DIFFERENT assertion in the same sentence, yet it exempted the stale one.
+#: Writing 常駐 anywhere earlier was a free pass. Two more boundaries close
+#: it without cutting genuine qualification:
+#:
+#: - ``、`` -- the reading comma, which separates assertions;
+#: - a contrastive ``が`` followed by whitespace. Bare ``が`` is also the
+#:   subject marker ("継続運転が必要な runner"), where it must NOT split, and
+#:   there it is followed by a word rather than a space. In this repository
+#:   the space appears exactly when the clause switches to a Latin-script
+#:   term, which is the contrastive case we need to cut.
+#:
+#: Residual: a contrastive with neither comma nor space still slips. The
+#: adversarial fixtures below record what IS covered rather than claiming
+#: the split is complete.
+_CLAUSE_BOUNDARY = re.compile(r"[。|、]|が(?=\s)")
 
 
 def _clause_before(line: str, start: int) -> str:
@@ -270,6 +298,9 @@ REMOVED_BY_THIS_ISSUE = (
     '"""Issue #131: the Live Execution runner core (Fake / Shadow only).',
     # the spelling variant the pin originally missed (review r4)
     "existing submission / shadow boundaries. Fake and Shadow only.",
+    # the reST enumeration the pin still missed (review r5), copied from
+    # the pre-Issue-#132 execution/live_runner.py line 52 verbatim
+    "Only :data:`RUNNER_SUPPORTED_MODES` -- ``fake`` and ``shadow`` -- may be",
     "driven by this runner (OANDA Demo integration is a separate Issue, and",
     "**OANDA Demo / Live へは runner から接続できない**",
     "Live Execution(基盤実装済み・runner 未実装・運用未解禁)",
@@ -327,10 +358,26 @@ def test_the_pin_does_not_flag_a_correct_or_still_true_statement(sentence):
     assert matched == [], f"{sentence!r} is correct but matched {matched}"
 
 
-def test_an_exemption_does_not_leak_into_the_next_clause():
-    """A qualifier earned by one clause must not excuse a stale claim in the
-    next one on the same line -- markdown table rows pack many statements
-    into a single line."""
-    line = "継続運転する常駐プロセスは未実装。runner は未実装であり demo も動かない"
+#: Sentences where a continuous-operation qualifier appears, but belongs to
+#: a DIFFERENT assertion than the stale claim. Without these the exemption
+#: becomes "write 常駐 anywhere in the line and the stale claim passes"
+#: (PR #136 review r5).
+EXEMPTION_MUST_NOT_BE_EARNED_BY = (
+    # separate sentence
+    "継続運転する常駐プロセスは未実装。runner は未実装であり demo も動かない",
+    # separate assertion, reading comma
+    "常駐対応は後続 Issue とするが、runner は未実装",
+    # separate assertion, contrastive が before a Latin-script term
+    "常駐対応は後続 Issue とするが runner は未実装",
+    # markdown table cell: the qualifier is in the previous column
+    "| 常駐プロセスは未実装 | runner は未実装 |",
+)
+
+
+@pytest.mark.parametrize("line", EXEMPTION_MUST_NOT_BE_EARNED_BY)
+def test_an_exemption_does_not_leak_across_assertions(line):
+    """A qualifier earned by one assertion must not excuse a stale claim in
+    another one on the same line -- markdown table rows and Japanese
+    sentences both pack several statements together."""
     claim = next(c for c in STALE_CLAIMS if c.exempt_if_clause_contains == _CONTINUOUS_OPERATION)
-    assert matches(claim, line), "the second clause's stale claim must still be caught"
+    assert matches(claim, line), "the stale claim in the other assertion must still be caught"
