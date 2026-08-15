@@ -11,12 +11,12 @@ BELIAL は、ニュース、マーケットデータ、チャート指標を観�
 5. **検証(Backtest)**: 過去のローソク足上で Strategy(シグナル生成ルール)と Execution ルール(Exit Policy / 仮想約定モデル)を再生・評価する検証基盤
 6. **仮想執行(Paper Execution)**: Paper Signal を入力に、時間進行に沿って仮想Entry、仮想ポジション管理、SL / TP / 最大保有時間による Exit 判定、仮想損益の確定を行う
 
-Broker API による実注文・実約定(**Live Execution**)は、v1.5 で基盤(Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続の二重以上のロック)まで実装済みだが、**実発注を駆動する定期実行 runner・自動売買は未実装**であり、**実口座での Live 運用は未解禁**である(下記「非スコープ」)。
+Broker API による実注文・実約定(**Live Execution**)は、v1.5 で基盤(Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続の二重以上のロック)まで、v1.6 の Issue #131 で **runner core が Fake / Shadow に限って**実装済みだが、**実 Broker(OANDA Demo / Live)への runner 統合・自動売買は未実装**であり、**実口座での Live 運用は未解禁**である(下記「非スコープ」)。
 
 ## 基本方針
 
 - 観測、分類、Alert、仮説生成、執行、永続化の責務を層として分ける(下記「レイヤー分離」)。
-- 執行(Execution)は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定。**基盤実装済み・runner 未実装・運用未解禁** = `broker/` + `execution/`)に分ける。Paper Execution は仮想レコードのみを生成し、Broker API・Live Execution 基盤のコードを一切使わない。
+- 執行(Execution)は **Paper Execution**(仮想約定・仮想ポジション管理による損益評価。**実装済み** = `paper-execution/`)と **Live Execution**(Broker API による実注文・実約定。**基盤実装済み・runner core は Fake / Shadow のみ・運用未解禁** = `broker/` + `execution/`)に分ける。Paper Execution は仮想レコードのみを生成し、Broker API・Live Execution 基盤のコードを一切使わない。
 - 過去データでの検証は、リアルタイムの執行フローとは独立した **Backtest**(検証基盤)が担う。Backtest と Paper Execution は約定規則の語彙・保守的方針(同一足での SL 優先、不利方向コスト)を共有し、結果を突合可能に保つ。
 - Webhook、API key、token などの秘密情報は `.env` に置き、Git管理しない。
 - dry-run は Discord 送信、state 更新、DB作成・migration などの副作用を発生させない。
@@ -43,7 +43,7 @@ Broker API による実注文・実約定(**Live Execution**)は、v1.5 で基�
 以下は実売買(**Live Execution**)の運用に踏み込む領域であり、現行スコープ外である。
 
 - **実口座での Live 運用開始** — OANDA Live Adapter と Live 接続の二重以上のロック(Issue #82)が merge 済みであっても、それだけでは開始しない。[運用ドキュメント](../operations/operations.md) の「Live 運用開始の事前条件」(FakeBroker 固定シナリオ試験の安定 / Shadow Mode での想定注文確認 / Demo 口座での継続運転 / Broker reconciliation 稼働 / Kill Switch 動作確認 / 発注数量・許可銘柄・リスク上限の設定)をすべて満たしたうえで、別途運用判断する
-- **実発注を駆動する定期実行 runner・常駐プロセス** — Broker API Adapter(Demo: Issue #79 / Live: Issue #82。いずれも endpoint allowlist で 1 URL に固定)と実発注経路(`LiveOrderSubmissionService` の単一境界)はコードとして実装済みだが、これを定期的に駆動するプロセスは未実装
+- **実発注を駆動する定期実行 runner・常駐プロセス** — Broker API Adapter(Demo: Issue #79 / Live: Issue #82。いずれも endpoint allowlist で 1 URL に固定)と実発注経路(`LiveOrderSubmissionService` の単一境界)に加え、Issue #131 で runner core(1 cycle API・常駐ループ境界・graceful shutdown・fail-closed)も実装済みだが、**駆動できるのは `fake` / `shadow` のみ**で `demo` / `live` は明示拒否される。実 Broker へ実発注を駆動するプロセス(OANDA Demo 統合・reconciliation の定期実行・CLI / systemd 等の運用導線)は未実装
 - 自動売買(実口座での自動エントリー・自動Exit・損切り・利確)
 - ロット計算・レバレッジ計算・資金管理
 - 売買推奨文言の生成

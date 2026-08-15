@@ -120,6 +120,21 @@ class StoredSignalProvider(Protocol):
     def get_signal(self, signal_id: str) -> StoredSignal: ...
 
 
+class ExecutableSignalLister(Protocol):
+    """Where a runner's shadow WORK QUEUE comes from (Issue #131).
+
+    Deliberately separate from :class:`StoredSignalProvider`: resolving one
+    signal by id and enumerating candidates are different capabilities, and
+    keeping them apart means the existing provider Protocol (and everything
+    implementing it) is unchanged.
+    """
+
+    @property
+    def source_id(self) -> str: ...
+
+    def list_executable_signal_ids(self, *, limit: int) -> tuple[str, ...]: ...
+
+
 class MarketSnapshotProvider(Protocol):
     @property
     def source_id(self) -> str: ...
@@ -160,6 +175,62 @@ class PaperSignalDbSignalProvider:
     @property
     def source_id(self) -> str:
         return f"paper_signal_db:{self._db_path}"
+
+    def list_executable_signal_ids(self, *, limit: int) -> tuple[str, ...]:
+        """The ids of at most ``limit`` EXECUTABLE stored signals, NEWEST
+        first (Issue #131 -- the shadow runner's candidate queue).
+
+        Newest-first is deliberate: a shadow cycle records into the shadow
+        store, never into the signal store, so the candidate set never
+        drains. Scanning from the newest end keeps freshly stored signals
+        reachable no matter how many already-recorded ones exist, and the
+        shadow store's claim remains the ONLY thing that decides whether a
+        candidate is actually processed again.
+
+        Only :data:`EXECUTABLE_SIGNAL_STATUSES` are returned -- the same
+        exact, closed comparison :func:`require_executable_signal_status`
+        enforces (which every returned id passes again when it is resolved).
+        Strictly read-only: a missing / unreadable / schema-incomplete store
+        is an explicit :class:`ShadowInputError`, never an empty answer that
+        would silently look like "no work".
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ShadowInputError(f"limit must be an int between 1 and 1000, got {limit!r}")
+        try:
+            connection = connect_read_only(self._db_path)
+        except ReadOnlyDbMissingError as exc:
+            raise ShadowInputError(
+                f"paper signal DB {self._db_path} does not exist; cannot list executable "
+                "signals"
+            ) from exc
+        statuses = sorted(EXECUTABLE_SIGNAL_STATUSES)
+        placeholders = ", ".join("?" for _ in statuses)
+        with closing(connection):
+            try:
+                columns = {
+                    row[1]
+                    for row in connection.execute(f"PRAGMA table_info({_PAPER_SIGNALS_TABLE})")
+                }
+                missing = [name for name in _REQUIRED_SIGNAL_COLUMNS if name not in columns]
+                if missing:
+                    raise ShadowInputError(
+                        f"paper signal DB {self._db_path} does not provide the required "
+                        f"columns {missing} on {_PAPER_SIGNALS_TABLE!r}; refusing to guess"
+                    )
+                rows = connection.execute(
+                    f"SELECT signal_id FROM {_PAPER_SIGNALS_TABLE} "
+                    f"WHERE status IN ({placeholders}) "
+                    "ORDER BY created_at_utc DESC, signal_id DESC "
+                    f"LIMIT {limit}",
+                    tuple(statuses),
+                ).fetchall()
+            except ShadowInputError:
+                raise
+            except Exception as exc:
+                raise ShadowInputError(
+                    f"paper signal DB {self._db_path} could not be read: {exc}"
+                ) from exc
+        return tuple(row["signal_id"] for row in rows)
 
     def get_signal(self, signal_id: str) -> StoredSignal:
         if not isinstance(signal_id, str) or not signal_id.strip():

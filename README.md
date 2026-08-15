@@ -4,7 +4,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 
 1. **実装済み機能**: Broker 境界・Safety Gate・OANDA Demo / Live Adapter・reconciliation・Kill Switch・submission / cancellation journal・再発行(reissue)系の安全機構(下記「v1.5(現行 main)の収録範囲」)
 2. **Live 接続コードとして存在するもの**: Live 用の接続・発注経路(`LiveOrderSubmissionService`)と安全ロック(Issue #82)。全ロック成立時のみ構築できる
-3. **Live 運用開始**: **未解禁**。実口座での自動売買・定期実行する Live Execution runner は未実装であり、Live 運用は [Operations の「Live 運用開始の事前条件」](docs/operations/operations.md#live-運用開始の事前条件issue-82-の-merge-だけでは開始しない) をすべて満たしたうえで別途運用判断する(Issue #82 の merge だけでは開始しない)
+3. **Live 運用開始**: **未解禁**。実口座での自動売買と、実 Broker へ実発注を駆動する runner は未実装であり(Issue #131 の Live Execution runner core は `fake` / `shadow` のみを駆動し、`demo` / `live` は fail-closed で拒否する)、Live 運用は [Operations の「Live 運用開始の事前条件」](docs/operations/operations.md#live-運用開始の事前条件issue-82-の-merge-だけでは開始しない) をすべて満たしたうえで別途運用判断する(Issue #82 の merge だけでは開始しない)
 
 本ドキュメントは、**v1.5 完了時点の main 開発状態**を反映しています。`v1.4.1` までの収録機能と v1.5 の差分は [docs/product/roadmap.md](docs/product/roadmap.md) および [v1.5 リリースノート](docs/development/reports/v1.5_release_notes.md) を参照してください。
 
@@ -38,8 +38,8 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | `market-watch/` | ローソク足取得、指標計算、Chart Snapshot、イベントAlert | [market-watch/README.md](market-watch/README.md) |
 | `paper-signal/` | Market Bias + Chart Snapshot から `paper_only` 仮説を生成 | [paper-signal/README.md](paper-signal/README.md) |
 | `paper-execution/` | Paper Signal を入力に仮想ポジションを Open / Close し仮想損益を記録(仮想約定のみ。Broker API・実注文なし) | [Paper Execution 設計](docs/architecture/paper_execution.md) |
-| `broker/` | Live Execution に向けた Broker 境界(共通インターフェース・共通モデル)と外部通信しないテストダブル FakeBroker(Issue #73)、OANDA Demo Adapter(Issue #79。fxpractice endpoint のみ許可)、OANDA Live Adapter(Issue #82。fxtrade endpoint のみ許可・全ロック成立時のみ構築可能)。定期実行する Live Execution runner は未実装で、Live 運用は未解禁 | [broker/README.md](broker/README.md) / [設計](docs/architecture/broker_interface.md) |
-| `execution/` | Live Execution に向けた ExecutionRequest モデル・注文状態永続化(Issue #74。再発行チェーン込みの schema v5)、発注前の fail-closed Safety Gate + 判定監査保存(Issue #75)、唯一の送信・キャンセル境界 `LiveOrderSubmissionService`(Issue #75 / #99)、Shadow Mode(Issue #78)、Kill Switch(Issue #81)、Submission / Cancellation Journal(Issue #93 / #99)、Broker reconciliation(検出 #103 / 修復 #104 / position・SL・TP スコープ + 手動 CLI #105)、再発行系安全機構(#95 / #102 / #114〜#117)、Live 接続の二重以上のロック + 起動前 preflight CLI(Issue #82)。execution mode は `dry-run` / `shadow` / `fake` / `demo` / `live` の統一 validation(`demo` は mode 定義のみで Execution 層への組み込み未実装、`live` は全ロック成立時のみ)。定期実行する Live Execution runner は未実装 | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) / [Safety Gate](docs/architecture/safety_gate.md) / [Shadow Mode](docs/architecture/shadow_execution.md) / [Reconciliation](docs/architecture/broker_reconciliation.md) |
+| `broker/` | Live Execution に向けた Broker 境界(共通インターフェース・共通モデル)と外部通信しないテストダブル FakeBroker(Issue #73)、OANDA Demo Adapter(Issue #79。fxpractice endpoint のみ許可)、OANDA Live Adapter(Issue #82。fxtrade endpoint のみ許可・全ロック成立時のみ構築可能)。実 Broker へ実発注を駆動する runner は未実装で、Live 運用は未解禁 | [broker/README.md](broker/README.md) / [設計](docs/architecture/broker_interface.md) |
+| `execution/` | Live Execution に向けた ExecutionRequest モデル・注文状態永続化(Issue #74。再発行チェーン込みの schema v5)、発注前の fail-closed Safety Gate + 判定監査保存(Issue #75)、唯一の送信・キャンセル境界 `LiveOrderSubmissionService`(Issue #75 / #99)、Shadow Mode(Issue #78)、Kill Switch(Issue #81)、Submission / Cancellation Journal(Issue #93 / #99)、Broker reconciliation(検出 #103 / 修復 #104 / position・SL・TP スコープ + 手動 CLI #105)、再発行系安全機構(#95 / #102 / #114〜#117)、Live 接続の二重以上のロック + 起動前 preflight CLI(Issue #82)。Live Execution runner core(Issue #131。`fake` / `shadow` のみ)。execution mode は `dry-run` / `shadow` / `fake` / `demo` / `live` の統一 validation(`demo` は mode 定義のみで Execution 層への組み込み未実装、`live` は全ロック成立時のみ)。**実 Broker へ実発注を駆動する runner・CLI / systemd 等の運用導線は未実装** | [execution/README.md](execution/README.md) / [設計](docs/architecture/execution_request.md) / [Safety Gate](docs/architecture/safety_gate.md) / [Shadow Mode](docs/architecture/shadow_execution.md) / [Reconciliation](docs/architecture/broker_reconciliation.md) |
 
 各コンポーネントは独立した `.env` / `requirements.txt`(共通は repo ルートの `requirements.txt`)/ `tests/` を持ちます。
 
@@ -52,7 +52,7 @@ BELIAL は、ニュース・マーケットデータ・チャート指標を観�
 | Alert | 事実を検知して通知する(売買判断はしない) | `market-watch/macd_alert_bot.py` / `ma_alert_bot.py` / `bollinger_alert_bot.py` / `rsi_alert_bot.py` |
 | Strategy / Method | 観測・分類情報から候補を生成・評価するルール | `paper-signal/signal_generator.py`。外部YAML定義は現在Backtest経路のみ |
 | Hypothesis / Paper Signal | Strategy / Method の評価結果を `paper_only` 仮説レコードとして生成・保存する | `paper-signal/signal_generator.py`, `paper_signal_store.py` |
-| Execution | 執行層の総称。**Paper Execution**(仮想約定・仮想ポジション管理・仮想Exit・仮想損益)と **Live Execution**(実注文・約定確認・ポジション管理・Exit)に分かれる | **Paper Execution は実装済み**(`paper-execution/`。仮想約定のみ)。**Live Execution は基盤実装済み**(`broker/` + `execution/`: Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)だが、**定期実行する runner・自動売買は未実装で、実口座での Live 運用は未解禁** |
+| Execution | 執行層の総称。**Paper Execution**(仮想約定・仮想ポジション管理・仮想Exit・仮想損益)と **Live Execution**(実注文・約定確認・ポジション管理・Exit)に分かれる | **Paper Execution は実装済み**(`paper-execution/`。仮想約定のみ)。**Live Execution は基盤実装済み**(`broker/` + `execution/`: Broker 境界・Adapter・Safety Gate・送信境界・reconciliation・Kill Switch・Live 接続ロック)で、**runner core は Fake / Shadow のみ実装済み**(Issue #131)。**実 Broker へ実発注を駆動する runner・自動売買は未実装で、実口座での Live 運用は未解禁** |
 
 詳細は [Concept のレイヤー分離](docs/product/concept.md#レイヤー分離)、Alert層の記述粒度は [Architecture の責務分離](docs/architecture/architecture.md#alert--strategy--signal--execution-の責務分離) を参照してください。
 
@@ -117,11 +117,11 @@ v1.4系では、v1.3までに蓄積した Chart Snapshot / Market Bias の永続
 以下は実売買(Live Execution)の**運用**に踏み込む領域であり、行いません。
 
 - 実口座での Live 運用開始(Issue #82 の merge だけでは開始しない。[Operations の事前条件](docs/operations/operations.md#live-運用開始の事前条件issue-82-の-merge-だけでは開始しない)を満たしたうえで別途判断)
-- 自動売買(実口座での自動エントリー・自動Exit・損切り・利確)と、それを駆動する定期実行 runner
+- 自動売買(実口座での自動エントリー・自動Exit・損切り・利確)と、それを実 Broker へ駆動する定期実行 runner(Issue #131 の runner core は `fake` / `shadow` 限定)
 - ロット計算・レバレッジ計算・資金管理
 - 売買推奨文言の生成
 
-Broker API 連携(OANDA Demo / Live Adapter)と実発注経路(`LiveOrderSubmissionService`)は**コードとして実装済み**ですが、endpoint allowlist・Live 接続の二重以上のロック・Kill Switch により fail-closed で保護されており、これらを駆動する常駐プロセスは存在しません。Paper Execution が行う仮想 Entry / Exit / SL / TP 判定は仮想レコード上のシミュレーションであり、実売買には該当しません。詳細は [Concept の非スコープ](docs/product/concept.md#非スコープ) を参照してください。
+Broker API 連携(OANDA Demo / Live Adapter)と実発注経路(`LiveOrderSubmissionService`)は**コードとして実装済み**ですが、endpoint allowlist・Live 接続の二重以上のロック・Kill Switch により fail-closed で保護されており、これらを実 Broker へ駆動する常駐プロセスは存在しません(Issue #131 の runner core が駆動できるのは `fake` / `shadow` だけで、CLI / systemd 等の運用導線もありません)。Paper Execution が行う仮想 Entry / Exit / SL / TP 判定は仮想レコード上のシミュレーションであり、実売買には該当しません。詳細は [Concept の非スコープ](docs/product/concept.md#非スコープ) を参照してください。
 
 ## Setup
 

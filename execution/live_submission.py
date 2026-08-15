@@ -370,6 +370,36 @@ class LiveOrderSubmissionService:
         self._reissue_policy = reissue_policy
 
     @property
+    def order_db_path(self) -> Path:
+        """The execution order DB this boundary writes (Issue #131).
+
+        A driver has to read the SAME store to find the intents it may
+        drive; exposing the path (never a store object -- the audit store
+        and the journal stay sealed) removes the possibility of a driver
+        being pointed at a different file than the boundary writes. Mirrors
+        ``ShadowExecutionService.shadow_db_path``."""
+        return self._order_db_path
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """The composed connection's execution mode (Issue #131).
+
+        Read-only IDENTITY, not a handle: a driver (the Live Execution
+        runner) has to refuse an unsupported mode before it processes
+        anything, and it must be able to do so WITHOUT being handed the
+        broker or the connection. The authoritative check stays where it
+        always was -- the gate re-derives the identity from the broker
+        instance on every evaluation, so a drifting identity fails closed
+        there regardless of what this property reported."""
+        return self._connection.execution_mode
+
+    @property
+    def connection_target(self) -> str:
+        """The composed connection's target (audit / logging identity; see
+        :attr:`execution_mode`)."""
+        return self._connection.connection_target
+
+    @property
     def reissue_policy(self) -> ReissuePolicy:
         """The reissue policy this submission boundary enforces. Compose the
         registration service from THIS object so both boundaries provably

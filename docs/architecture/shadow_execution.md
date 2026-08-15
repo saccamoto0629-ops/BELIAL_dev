@@ -4,7 +4,7 @@
 
 > **重要な位置づけ**
 >
-> - Shadow Mode は **Live 発注ではない**。Live Execution の基盤(Broker API Adapter・送信境界・Live 接続ロック)は Issue #79 / #82 等で実装済みだが、**実発注を駆動する定期実行 runner は未実装・実口座での Live 運用は未解禁**であり、Shadow Mode はその**前段の検証機能**である(Live 運用開始の事前条件のひとつ「Shadow Mode で想定注文を確認済み」を担う)。
+> - Shadow Mode は **Live 発注ではない**。Live Execution の基盤(Broker API Adapter・送信境界・Live 接続ロック)は Issue #79 / #82 等で実装済みだが、**実 Broker へ実発注を駆動する runner は未実装・実口座での Live 運用は未解禁**であり(Issue #131 の runner core は `fake` / `shadow` のみを駆動する)、Shadow Mode はその**前段の検証機能**である(Live 運用開始の事前条件のひとつ「Shadow Mode で想定注文を確認済み」を担う)。
 > - **Paper Execution とは別物**。Shadow Mode は**仮想約定・仮想 Position・仮想 PnL を一切計算しない** — 記録するのは「送信予定だった注文内容」と「Gate を通過した / 拒否された」という監査事実だけである。
 > - Shadow 結果には Broker 応答を意味する値(`ACCEPTED` / `FILLED` / `PARTIALLY_FILLED` / `CANCELLED`、Broker reference id、fill price / quantity)が**構造的に存在しない**(schema にその列がない)。
 

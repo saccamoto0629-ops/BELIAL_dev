@@ -4,7 +4,7 @@ Broker 送信前後の送信試行を、Execution Order DB(Issue #74)とは**独
 
 > **重要な位置づけ**
 >
-> - Journal は**記録のみ**を行う。Broker 呼び出し・外部通信・実発注は一切行わない。OANDA Demo / Live Adapter(Issue #79 / #82)と reconciliation(Issue #103〜#105)は実装済みだが、**定期実行する Live Execution runner・reconciliation の定期実行は未実装**であり、実口座での Live 運用は未解禁である。
+> - Journal は**記録のみ**を行う。Broker 呼び出し・外部通信・実発注は一切行わない。OANDA Demo / Live Adapter(Issue #79 / #82)と reconciliation(Issue #103〜#105)は実装済みだが、**実 Broker へ実発注を駆動する runner・reconciliation の定期実行は未実装**であり、実口座での Live 運用は未解禁である(Issue #131 の runner core は `fake` / `shadow` のみを駆動し、`fake` では本 Journal を正規経路として通る)。
 > - Paper Execution / Paper Signal / Strategy とは無関係・独立である(これらは Broker 境界に触れない)。
 > - 注文状態の唯一の正は既存 `broker.OrderState` のまま。Journal は注文状態機械を新設しない — 記録するのは**送信試行のライフサイクル**(Broker 呼び出しの前後関係と Execution DB 保存の成否)である。
 

@@ -4771,6 +4771,57 @@ def list_client_order_ids(*, db_path: Path | None = None) -> list[str]:
         ]
 
 
+def list_pending_execution_requests(
+    *, limit: int | None = None, db_path: Path | None = None
+) -> list[dict]:
+    """Registered intents that have never been submitted -- exactly
+    ``submission_phase = 'created'`` (Issue #131).
+
+    This is the Live Execution runner's WORK QUEUE: the set of intents for
+    which a submit attempt may still be started. It says nothing about
+    whether any of them MAY be submitted -- that judgement belongs to
+    ``LiveOrderSubmissionService`` (Safety Gate, submission journal, the
+    one-shot ``created -> submitting`` transition) and is deliberately not
+    anticipated here. In particular an intent that was superseded by a
+    reissue child, or one the gate always refuses, still appears: the
+    boundary refuses it every time and no runner-side state update exists
+    to retire it (retiring an intent is an operator action through the
+    reissue / cancel paths, never a runner convenience).
+
+    Ordering is oldest ``created_at_utc`` first (FIFO, tie-broken by id) --
+    the same total, deterministic ordering the other read helpers use, so a
+    bounded ``limit`` returns a stable prefix rather than an arbitrary
+    sample. Read-only and additive: a missing DB returns an empty list
+    without creating the file, the schema is verified first, and every
+    returned row passed full bundle validation (an inconsistent store fails
+    the read instead of yielding "no work").
+    """
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000
+    ):
+        raise ExecutionStoreError(f"limit must be an int between 1 and 1000, got {limit!r}")
+    db_path = Path(db_path) if db_path is not None else execution_db_path()
+    if not db_path.exists():
+        return []
+    limit_sql = "" if limit is None else f" LIMIT {limit}"
+    rows = []
+    with _verified_read(db_path) as connection:
+        ids = [
+            row["execution_request_id"]
+            for row in connection.execute(
+                f"SELECT execution_request_id FROM {ORDERS_TABLE} "
+                "WHERE submission_phase = ? "
+                f"ORDER BY created_at_utc ASC, execution_request_id ASC{limit_sql}",
+                (PHASE_CREATED,),
+            ).fetchall()
+        ]
+        for request_id in ids:
+            bundle = _fetch_and_validate(connection, request_id)
+            if bundle is not None:
+                rows.append(bundle[0])
+    return rows
+
+
 def list_unresolved_submissions(*, db_path: Path | None = None) -> list[dict]:
     """Every submission whose broker-side outcome is not yet recorded as a
     confirmed observation (Issue #75 review r3) -- read-only, additive.
