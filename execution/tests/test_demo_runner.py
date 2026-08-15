@@ -528,7 +528,12 @@ def test_a_kill_switch_flipped_during_the_journal_start_write_stops_the_post(
 
     That transition is a SQLite write with a 30-second busy timeout, so it is
     a real window -- the read before it had already returned False. The last
-    read now sits after this write, leaving zero operations before the POST.
+    read sits at the broker call site, past this write.
+
+    What is pinned here is the CONTRACT, not atomicity: a submission that
+    reaches the final read after the switch was enabled is refused. The
+    interval between that read returning False and the outbound HTTP call is
+    a documented non-guarantee (see docs/operations/operations.md).
     """
     original = SubmissionJournal.mark_broker_call_started
     flipped = []

@@ -302,7 +302,26 @@ python -m execution.reconciliation_runner --broker fake --dry-run
 
 2 回目の拒否で Journal を終端化しないのは意図的である。`started` = **Broker が注文を保持している可能性がある**という不変条件は reconciliation が依拠するものであり、`started` からの「送っていないことが証明済み」遷移を作るとこの不変条件が弱まる。万一その遷移が実際には POST 済みの経路で発火すれば注文を静かに失う — reconciliation 案件 1 件よりはるかに悪い。緊急停止時に unresolved が 1 件残るのは、どのみち reconciliation を行う場面での妥当なコストと判断している。なお runner 側は制御フロー上の事実として `NOT_SENT` を報告する。
 
-**保証の範囲を正確に**: 2 回目の読み取りと Broker 呼び出しの間に**自プロセスの処理は 1 つも入らない**が、読み取りが返った直後の一瞬に switch が ON になる可能性は残る。これを消すには読み取りと呼び出し開始を**同一の同期プロトコル**へ束縛する必要があり、HTTP の Broker 呼び出しではそれを提供できない。したがって契約は「**評価中の enable が Broker 呼び出し前に効く**」であって「原子的」ではない。
+#### Kill Switch と Broker 送信の契約(Issue #132 時点)
+
+**保証すること**
+
+1. Broker 送信の**直前に**永続 Kill Switch を再取得する(`REAL_BROKER_MODES` = `demo` / `live`)。
+2. **その取得時点で** ON、または読み取り不能であれば**送信しない**(fail-closed)。読み取り不能を OFF とみなすことはない。
+
+**保証しないこと**
+
+3. **最終 read が `False` を返した時点から、外部 HTTP call が開始されるまでの原子的排他は保証しない。**
+   別プロセスがこの区間で Kill Switch を enable した場合、その 1 件が送信され得る。
+4. 厳密な atomic immediate-stop(read と call 開始を同一の同期プロトコルへ束縛する)は
+   **本 Issue のスコープ外**であり、**将来の別 Issue** とする。新しい inter-process synchronization
+   protocol の導入が必要になるため、Demo runner 統合(Issue #132)では扱わない。
+
+この区間の race は**既知の非保証領域**であり、契約違反ではない。上記 3 の性質上、
+「Kill Switch を enable すれば実行中の送信が必ず止まる」とは言えない — 言えるのは
+「**enable 後に最終 read へ到達した送信は止まる**」である。実用上の競合 window
+(Safety Gate 評価中・Broker 安全確認 GET 中・Journal start 書き込み中・OrderRequest 構築中)は
+すべて regression test で閉じている。
 
 停止された intent は phase `submitting` に留まり自動再送はされない(`SubmissionJournal.list_unresolved()` / `execution_store.list_unresolved_submissions()` で可視)。
 
@@ -415,7 +434,7 @@ exit code: **0** = 全ロック成立(Demo 接続を構築できた。発注は�
 | Kill Switch ON | `kill_switch_enabled` |
 | Kill Switch DB が読めない・schema 不正・状態不明 | `kill_switch_state_unverifiable` |
 
-**緊急停止は Live と同じ**: `python -m execution.kill_switch_cli enable` を入れれば、Demo の新規送信も Broker call 前に停止する(Gate が送信判定ごとに永続 store を読み直すため、実行中の runner にも即座に効く)。
+**緊急停止は Live と同じ**: `python -m execution.kill_switch_cli enable` を入れれば、Demo の新規送信も Broker call 前に停止する(Gate が送信判定ごとに永続 store を読み直し、送信境界が Broker 呼び出し直前にもう一度読むため、実行中の runner にも反映される)。**enable と送信が同時に走った場合の原子性は保証しない** — 上記「Kill Switch と Broker 送信の契約」を参照。
 
 **未整備(別 Issue)**: Demo の継続運転(systemd 常駐・定期 reconciliation)は本 Issue の範囲外である。`demo` runner はライブラリ API(`execution.runner_composition.build_demo_execution_runner`)として利用でき、この CLI は preflight のみで runner を起動しない。Demo と Fake は同じ store 形状(`execution_orders` / `submission_journal` / `safety_gate_decisions`)を使うため、**運用では data-dir を分けて namespace を分離する**。
 

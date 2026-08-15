@@ -484,12 +484,18 @@ class LiveOrderSubmissionService:
         # ``to_order_request``. The OrderRequest is now fully built BEFORE
         # this read, so the next statement is the broker call itself.
         #
-        # This is as tight as an unsynchronised read can be, and the claim
-        # is deliberately no stronger than that: the switch can still flip
-        # in the instant after the read returns. Nothing of OURS runs in
-        # between -- closing that last instant would require binding the
-        # read and the call into one synchronisation protocol with the
-        # switch, which no HTTP broker call can offer.
+        # WHAT THIS GUARANTEES (and what it does not), see
+        # docs/operations/operations.md "Kill Switch と Broker 送信の契約":
+        #   guaranteed -- the switch is re-read immediately before the call,
+        #     and an ON or unreadable answer AT THAT MOMENT refuses;
+        #   NOT guaranteed -- mutual exclusion between the read returning
+        #     False and the outbound HTTP call starting. Another process
+        #     enabling the switch in that interval may still see this one
+        #     order sent. That race is a KNOWN, DOCUMENTED non-guarantee,
+        #     not a contract violation.
+        # Closing it needs the read and the call bound into one
+        # inter-process synchronisation protocol, which is out of scope for
+        # Issue #132 and left to a future Issue.
         #
         # A refusal here leaves the journal entry ``started`` / ``open``,
         # i.e. unresolved, on purpose. ``started`` => THE BROKER MAY HOLD
@@ -1196,9 +1202,9 @@ class LiveOrderSubmissionService:
         # scope query, and before the journal / store writes above. On a real
         # account those steps are network round trips, so an operator who
         # pressed the switch during them would still have seen the order go
-        # out. "Enabling the kill switch stops orders before the broker call
-        # and takes effect immediately" is an operations contract, so the
-        # switch is read once more here.
+        # out. The operations contract is that a submission reaching this
+        # point after an enable is refused -- not that an in-flight send is
+        # stopped atomically -- so the switch is read once more here.
         #
         # This is the EARLY of two reads (see the second one below the
         # ``started`` mark). Refusing here leaves the journal entry
