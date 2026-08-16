@@ -115,7 +115,10 @@ def register_intent(data_dir, *, execution_request_id="exec-1", client_order_id=
 def run_json(capsys, args):
     code = main(args + ["--json"])
     out = capsys.readouterr().out
-    return code, json.loads(out.strip().splitlines()[-1])
+    # The WHOLE of stdout must be one machine-readable JSON document (PR
+    # #138 Codex review P2): a redirected verification artifact is loaded
+    # with json.load(), so nothing human-readable may precede or follow it.
+    return code, json.loads(out)
 
 
 # --- the resident demo path, end to end -----------------------------------------
@@ -197,6 +200,21 @@ def test_a_kill_switch_on_refuses_the_startup_with_zero_broker_calls(
     assert not (data_dir / JOURNAL_DB).exists()
     # The summary still printed (the operator's journal evidence).
     assert "demo" in captured.out
+
+
+def test_a_json_refusal_is_a_single_parseable_document(tmp_path, capsys, monkeypatch):
+    """--json keeps stdout machine-readable on the refusal path too: one
+    JSON document carrying the rejection codes and the secret-free summary
+    (the human rendering goes to stderr)."""
+    transport = DemoTransport()
+    patch_demo_lock(monkeypatch, transport=transport)
+    args, _ = service_args(tmp_path, "--max-cycles", "1", kill_switch_enabled=True)
+    code, payload = run_json(capsys, args)
+    assert code == EXIT_FAILURE
+    assert payload["allowed"] is False
+    assert "kill_switch_enabled" in payload["rejection_codes"]
+    assert "safety_summary" in payload
+    assert transport.calls == []
 
 
 def test_live_configuration_in_the_environment_refuses_the_startup(

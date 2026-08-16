@@ -253,8 +253,11 @@ def _run_cli(argv: list[str] | None) -> int:
         kill_switch_db_path=kill_switch_db,
     )
     # The startup summary is the operator's audit record in the journal --
-    # printed on refusal AND on success, secret-free by construction.
-    print(decision.summary.render())
+    # printed on refusal AND on success, secret-free by construction. Under
+    # --json it goes to stderr so stdout stays ONE machine-readable JSON
+    # document a redirected verification artifact can json.load() (PR #138
+    # Codex review P2); the journal captures both streams either way.
+    print(decision.summary.render(), file=sys.stderr if args.json else sys.stdout)
     if not decision.allowed:
         for entry in decision.rejections:
             print(f"  refused [{entry.code.value}]: {entry.message}", file=sys.stderr)
@@ -263,6 +266,20 @@ def _run_cli(argv: list[str] | None) -> int:
             "broker call was made",
             file=sys.stderr,
         )
+        if args.json:
+            # The refusal is a document too (the demo_startup_cli shape):
+            # exit 1 plus a parseable record of WHY, never a broken artifact.
+            print(
+                json.dumps(
+                    {
+                        "allowed": False,
+                        "rejection_codes": list(decision.rejection_codes),
+                        "safety_summary": decision.summary.to_dict(),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
         return EXIT_FAILURE
 
     try:

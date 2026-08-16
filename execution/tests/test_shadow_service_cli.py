@@ -123,7 +123,9 @@ def service_args(tmp_path, *extra, signal_ids=("sig-1",)):
 def run_json(capsys, args):
     code = main(args + ["--json"])
     out = capsys.readouterr().out
-    return code, json.loads(out[out.index("{"):])
+    # The WHOLE of stdout must be one machine-readable JSON document (PR
+    # #138 Codex review P2 on the demo CLI; same artifact contract here).
+    return code, json.loads(out)
 
 
 # --- the resident production path -----------------------------------------------
