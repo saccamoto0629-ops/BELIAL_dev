@@ -191,7 +191,9 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 
 **永続化された `blocked` intent は「可視化」であって「gate」ではない**(PR #137 レビュー r6): 一度 park された blocked intent は **active ではなくなる**ため、以降の cycle では recovery が何も返さず、pending 行も無い — gate の生きた信号が両方とも沈黙する。それでも人手対応が必要な事実は audit DB に残っている。
 
-そこで cycle は、**開始時点で audit DB にある `blocked` intent を毎回読み出して報告し、その cycle を clean と名乗らせない**(`blocked_intent_ids` / CLI の `unresolved_blocked_intents` / exit 1)。blocked な takeover が journal から流れて忘れられることを防ぐ。**これは `--repair` の有無に関わらず、dry-run 以外のすべての cycle で行う** — 同梱の systemd unit は `--repair` なしで動くため、そこを検出専用扱いで飛ばすと既定のデプロイが恒久的に clean を報告してしまう(PR #137 レビュー r7)。既存ファイルの読み取りのみで、Issue #104 の状態遷移は伴わない。
+そこで cycle は、**開始時点で audit DB にある `blocked` intent を毎回読み出して報告し、その cycle を clean と名乗らせない**(`blocked_intent_ids` / CLI の `unresolved_blocked_intents` / exit 1)。blocked な takeover が journal から流れて忘れられることを防ぐ。**これは `--repair` の有無に関わらず、dry-run 以外のすべての cycle で行う** — 同梱の systemd unit は `--repair` なしで動くため、そこを検出専用扱いで飛ばすと既定のデプロイが恒久的に clean を報告してしまう(PR #137 レビュー r7)。Issue #104 の状態遷移は伴わない。
+
+ただし、cycle が行う store 読み取りはすべて**現行 schema の厳密検証つき read** であり、v1 → v2 → v3 の migration を行うのは `init_reconciliation_db()` である。そのため **audit DB が既に存在する場合は、読み取りの前に `init_reconciliation_db()` を呼ぶ**(冪等)。これを怠ると、リリース済み旧 schema を持つデプロイが `run()` 自身の init に到達する前に read で失敗し、**毎回 exit 1 で migration も記録も一切行われない**状態になる(PR #137 レビュー r8)。存在チェックは維持しており、**初回の DB 作成は従来どおり記録経路に委ねる**(dry-run はこの経路に到達しない)。
 
 **gate にはしない**理由: `BLOCKED` は**終端 status** であり(`ALLOWED_INTENT_TRANSITIONS[BLOCKED]` は空)、intent は監査証跡として**永久に保持される**。したがって「解決されるまで止める」を実装する手段が存在せず、gate にすると「**歴史的な監査行 1 行で永久に止まる**」= 無関係な注文の修復まで無期限に停止し、戻す手段が無い、という状態になる。gate は生きた保護(pending claim・その cycle の `BLOCKED` 結果)だけが担う。
 

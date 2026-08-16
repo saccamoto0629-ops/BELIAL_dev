@@ -646,9 +646,20 @@ def _guarded_cycle(
     # whether or not repair is enabled (PR #137 review r7). The shipped systemd
     # unit runs WITHOUT --repair, so nesting this under ``repair_enabled``
     # would mean the default deployment reports clean forever while a
-    # human-intervention record sits in the DB. It is a read of an existing
-    # file: no Issue #104 state transition, and nothing is created.
+    # human-intervention record sits in the DB.
+    #
+    # An EXISTING audit DB is initialized first (PR #137 review r8). Every
+    # store read here is a strict CURRENT-schema verified read, while
+    # ``init_reconciliation_db`` is the idempotent entry point that performs
+    # the supported v1 -> v2 -> v3 migration. Without this, a deployment
+    # carrying a valid released-prior schema would fail on the read before
+    # ``run()`` ever reached its own init -- exiting 1 on every activation
+    # and never migrating or recording anything.
+    #
+    # The missing-file check stays: first-run CREATION remains deferred to
+    # the recording path, and dry run never gets here at all.
     if reconciliation_db_path.exists():
+        reconciliation_store.init_reconciliation_db(reconciliation_db_path)
         blocked_intent_ids = _persisted_blocked_intent_ids(reconciliation_db_path)
 
     service = None

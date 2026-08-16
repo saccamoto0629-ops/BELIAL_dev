@@ -1427,3 +1427,67 @@ def test_a_detection_only_cycle_still_reports_a_persisted_blocked_intent(
     assert detection_only.repair_enabled is False
     assert detection_only.blocked_intent_ids == (parked.takeover_id,)
     assert not detection_only.is_clean
+
+
+@pytest.mark.parametrize("downgrade_name", ["downgrade_to_v1", "downgrade_to_v2"])
+def test_a_cycle_migrates_a_released_prior_audit_schema_before_reading(
+    paths, downgrade_name
+):
+    """PR #137 Codex review r8.
+
+    Every store read this module makes is a strict CURRENT-schema verified
+    read, but ``init_reconciliation_db`` is what performs the supported
+    v1 -> v2 -> v3 migration. Reading before that would fail on a deployment
+    carrying a valid released-prior schema -- exiting 1 on every activation
+    and never migrating or recording anything.
+
+    Uses the store suite's own downgrade helpers so "a released v1/v2 file"
+    has exactly one definition.
+    """
+    # imported lazily: the helpers live with the schema they describe
+    from test_reconciliation_store import downgrade_to_v1, downgrade_to_v2
+
+    downgrade = {"downgrade_to_v1": downgrade_to_v1, "downgrade_to_v2": downgrade_to_v2}[
+        downgrade_name
+    ]
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-20")
+    broker.submit_order(broker_request("exec-20"))
+
+    run_cycle(paths, reconcile_only(broker), run_id="run-20-old")
+    downgrade(reconciliation_db)
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] < 3
+
+    # the DEFAULT unit's shape: detection only, no --repair
+    report = run_cycle(
+        paths, reconcile_only(broker), run_id="run-20-new", repair_enabled=False
+    )
+
+    assert report.recorded_to == reconciliation_db
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    # migrated in place: the pre-existing run is still there, the new one added
+    assert [
+        entry.run_id
+        for entry in reconciliation_store.list_reconciliation_runs(db_path=reconciliation_db)
+    ] == ["run-20-old", "run-20-new"]
+
+
+def test_the_migration_step_never_creates_a_missing_audit_db(paths, tmp_path):
+    """The missing-file guard stays: first-run CREATION belongs to the
+    recording path, and a dry run must still touch nothing at all."""
+    _, reconciliation_db = paths
+    assert not reconciliation_db.exists()
+
+    dry = run_cycle(
+        paths,
+        reconcile_only(FakeBroker()),
+        run_id="run-21-dry",
+        dry_run=True,
+        cycle_lock_path=None,
+    )
+
+    assert dry.blocked_intent_ids == ()
+    assert list(tmp_path.iterdir()) == []  # not even the audit DB or the lock
