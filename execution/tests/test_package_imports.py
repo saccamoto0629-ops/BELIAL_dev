@@ -98,6 +98,9 @@ def test_execution_package_only_depends_on_stdlib_and_broker():
         "datetime", "decimal", "enum", "errno", "hashlib", "json", "logging", "math",
         "os", "pathlib", "re", "sqlite3", "sys", "tempfile", "threading", "time",
         "traceback", "types", "typing", "uuid", "broker", "execution", "__future__",
+        # Issue #134: the resident-service boundary routes SIGTERM/SIGINT
+        # into the runner's graceful stop (stdlib).
+        "signal",
     }
     for path in (REPO_ROOT / "execution").glob("*.py"):
         names = _imported_top_level_names(path)

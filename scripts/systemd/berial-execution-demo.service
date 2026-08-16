@@ -1,0 +1,98 @@
+[Unit]
+# Berial OANDA Demo resident submission runner (Issue #134). Continuously
+# drains pending execution intents (phase 'created') through the ONE
+# sanctioned submission boundary into the OANDA PRACTICE account.
+#
+# DEMO IS NOT A LOOSER LIVE: Safety Gate (durable Kill Switch re-read on
+# EVERY submission and again at the broker-call point), Submission Journal,
+# and the order state machine all apply unchanged. The process starts ONLY
+# when every demo activation lock holds (mode, demo credentials, allowlisted
+# practice endpoint, no live configuration in the environment, pinned
+# account digest, policy, Kill Switch verifiably OFF) -- otherwise it exits
+# 1 fail-closed with the secret-free safety summary in the journal, and
+# systemd retries every RestartSec. That retry loop is intentional: while
+# the Kill Switch is ON a restart keeps refusing, and after an operator
+# disables the switch (explicit --confirm-resume) the service recovers on
+# its own. 'live' cannot be started from this unit or this CLI at all.
+#
+# This unit is INDEPENDENT of the reconciliation timer: it declares no
+# dependency on it and the timer declares none on this unit, so a stalled
+# runner never blocks the audit and a stalled audit never blocks
+# submissions. Both point at the SAME demo data directory on purpose --
+# reconciliation must audit the very order store this runner writes.
+#
+# Copy/adapt this template to /etc/systemd/system/berial-execution-demo.service,
+# then: systemctl daemon-reload && systemctl enable --now berial-execution-demo
+# See docs/operations/operations.md ("Demo / Shadow 継続運転") for the full
+# preflight/deploy/verify/stop steps -- run the Issue #132 preflight
+# (python -m execution.demo_startup_cli) FIRST and confirm the Kill Switch
+# state before enabling this unit.
+#
+# Exit codes: 0 = stopped by request (systemctl stop) -- per-cycle failures
+# are visible in journalctl -u berial-execution-demo, in the Submission
+# Journal and in the order store, and do not fail a clean stop; 1 =
+# fail-closed refusal (demo activation lock, resident-runner lock);
+# 2 = usage/configuration error.
+Description=Berial OANDA Demo resident submission runner (practice account only)
+Documentation=file:/opt/berial/docs/architecture/safety_gate.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/berial
+# "python -m execution.demo_service_cli" resolves the package from
+# WorkingDirectory (sys.path[0]); PYTHONPATH is set as well so a future
+# WorkingDirectory change cannot silently import a different tree.
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/berial
+# DEMO credentials only: OANDA_API_TOKEN / OANDA_ACCOUNT_ID (fxpractice).
+# This file must NOT carry ENABLE_LIVE_TRADING or any OANDA_LIVE_* variable
+# -- the demo activation lock refuses the startup if ANY live configuration
+# is present in this process environment. "-" keeps a missing file
+# non-fatal; the lock then refuses at startup with a secret-free message.
+EnvironmentFile=-/opt/berial/execution/.env
+# --data-dir is the DEMO namespace (execution_orders.sqlite3 +
+# safety_gate_decisions.sqlite3 + submission_journal.sqlite3 +
+# execution_runner.lock). It is deliberately the SAME directory the
+# reconciliation unit audits, and must NEVER be shared with fake
+# (docs/operations/operations.md). The Kill Switch DB stays at its global
+# default (execution/data/kill_switch.sqlite3): ONE switch stops everything.
+# --market-snapshot is refreshed in place by an upstream process; a stale
+# snapshot is rejected per-submission by the Safety Gate (fail-closed).
+ExecStart=/opt/berial/.venv/bin/python -m execution.demo_service_cli --execution-mode demo --safety-config /etc/berial/demo_safety.json --market-snapshot /opt/berial/execution/data/demo/market_snapshot.json --data-dir /opt/berial/execution/data/demo --interval-seconds 60
+Restart=always
+RestartSec=10
+# Graceful shutdown: systemd sends SIGTERM -> the runner finishes the current
+# item (including its broker call and journal writes), starts no new one,
+# and exits 0. SIGKILL only after TimeoutStopSec: a hard-killed in-flight
+# submission stays 'started'/unresolved in the Submission Journal and is
+# resolved by reconciliation -- never re-sent.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# stdout/stderr to the journal (journalctl -u berial-execution-demo). The
+# startup safety summary (secret-free: endpoint KIND + account digest only)
+# lands here on every start attempt.
+StandardOutput=journal
+StandardError=journal
+# Sandbox: read-only system, no home access, writes limited to the execution
+# data directory (order DB, decision DB, journal DB, runner lock).
+#
+# DEPLOYMENT PRECONDITION: /opt/berial/execution/data/demo must EXIST and be
+# writable by User=/Group= before the unit starts (execution/data/ is
+# git-ignored, so a fresh checkout has no such directory):
+#   sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data/demo
+# Deliberately NO "-" prefix on ReadWritePaths (same reasoning as the
+# reconciliation unit): a missing path must fail loudly at namespace setup
+# (status=226/NAMESPACE) instead of leaving the tree read-only and failing
+# obscurely on every cycle.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/berial/execution/data
+
+[Install]
+WantedBy=multi-user.target

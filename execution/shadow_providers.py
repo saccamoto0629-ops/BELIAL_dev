@@ -165,12 +165,33 @@ _REQUIRED_SIGNAL_COLUMNS = (
 
 class PaperSignalDbSignalProvider:
     """Read-only adapter over the Paper Signal SQLite store (see the module
-    docstring). Never creates, migrates or writes the DB."""
+    docstring). Never creates, migrates or writes the DB itself.
 
-    def __init__(self, db_path: str | Path):
+    ``allow_immutable_wal`` (default True, the historical behaviour) controls
+    what a WAL-mode signal DB means. ``immutable=1`` ignores WAL contents,
+    which is an acceptable point-in-time view for a ONE-SHOT read but silently
+    hides committed-yet-uncheckpointed signals -- schema included -- from a
+    RESIDENT reader that re-polls the store (Issue #134 / PR #138 Codex
+    review P2). The shadow service's resident (non-dry) loop therefore opts
+    out (``False``): the DB is then opened plain ``mode=ro``, every committed
+    row is visible, and SQLite itself may (re)create the ``-wal`` / ``-shm``
+    sidecars, so the DB directory needs sidecar access (the systemd note in
+    ``berial-execution-shadow.service``). A DRY RUN keeps the default: sidecar
+    recreation is a filesystem side effect a dry run must never have, and the
+    point-in-time view is acceptable for a plan-only pass."""
+
+    def __init__(self, db_path: str | Path, *, allow_immutable_wal: bool = True):
         if not isinstance(db_path, (str, Path)):
             raise ValueError(f"db_path must be a filesystem path, got {type(db_path).__name__}")
+        if not isinstance(allow_immutable_wal, bool):
+            raise ValueError(
+                f"allow_immutable_wal must be a bool, got {allow_immutable_wal!r}"
+            )
         self._db_path = Path(db_path)
+        self._allow_immutable_wal = allow_immutable_wal
+
+    def _connect(self):
+        return connect_read_only(self._db_path, allow_immutable_wal=self._allow_immutable_wal)
 
     @property
     def source_id(self) -> str:
@@ -197,7 +218,7 @@ class PaperSignalDbSignalProvider:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ShadowInputError(f"limit must be an int between 1 and 1000, got {limit!r}")
         try:
-            connection = connect_read_only(self._db_path)
+            connection = self._connect()
         except ReadOnlyDbMissingError as exc:
             raise ShadowInputError(
                 f"paper signal DB {self._db_path} does not exist; cannot list executable "
@@ -236,7 +257,7 @@ class PaperSignalDbSignalProvider:
         if not isinstance(signal_id, str) or not signal_id.strip():
             raise ShadowInputError(f"signal_id must be a non-empty string, got {signal_id!r}")
         try:
-            connection = connect_read_only(self._db_path)
+            connection = self._connect()
         except ReadOnlyDbMissingError as exc:
             raise ShadowInputError(
                 f"paper signal DB {self._db_path} does not exist; cannot resolve stored "

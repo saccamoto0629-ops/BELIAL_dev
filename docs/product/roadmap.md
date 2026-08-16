@@ -22,7 +22,7 @@ FedWatch / Economic Calendar は外部取得元が不安定なため、今後も
 - Chart Snapshotの定期投稿頻度調整
 - ATR / 出来高 / Fear & Greed / COT Report などの補助指標追加
 - デモ口座でのPaper Signal記録
-- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)の基盤も v1.5(Issue #73〜#82 ほか。下記「v1.5」節)で、runner core は v1.6(Issue #131 の `fake` / `shadow` と Issue #132 の `demo`)で実装済みだが、継続運転する常駐 runner は未実装で実口座での Live 運用は未解禁
+- ~~Pepperoniによる将来のエントリー執行レイヤー~~ → 仮想執行(Paper Execution)は Issue #49〜#51 で `paper-execution/` に実装済み。実発注(Live Execution)の基盤も v1.5(Issue #73〜#82 ほか。下記「v1.5」節)で、runner core は v1.6(Issue #131 の `fake` / `shadow` と Issue #132 の `demo`)、定期 reconciliation と Shadow / Demo 常駐運転の systemd 導線も v1.6(Issue #133 / #134)で実装済みだが、`live` を常駐駆動する導線は存在せず実口座での Live 運用は未解禁
 
 これらは v1.3.1 以降の検討事項であり、v1.3.0では実装しない。
 
@@ -133,7 +133,7 @@ v1.5 は、`v1.4.1` タグ後に追加された以下の系統をまとめたリ
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
-- Live Execution runner(Pepperoni の実発注担当分。基盤は v1.5、runner core(`fake` / `shadow`)は v1.6 の Issue #131、**OANDA Demo mode の統合は Issue #132** で実装済み。**実口座 Live の自動売買はまだ設計しない**。reconciliation の定期実行は Issue #133 で実装済み(送信 runner とは独立した実行単位)。**送信 runner** の systemd 等の継続運転導線は後続 Issue)
-- Demo 継続運転の統合検証(Issue #132 / #133 の後続。定期 reconciliation は Issue #133 で実装済みなので、残るのは Demo runner 継続運転との組み合わせ確認)
+- Live Execution runner(Pepperoni の実発注担当分。基盤は v1.5、runner core(`fake` / `shadow`)は v1.6 の Issue #131、**OANDA Demo mode の統合は Issue #132**、reconciliation の定期実行は Issue #133、**送信 runner / Shadow runner の systemd 継続運転導線は Issue #134** で実装済み。**実口座 Live の自動売買はまだ設計しない**)
+- Demo 継続運転の**実績の蓄積**(導線は Issue #132〜#134 で整備済み。Shadow → Demo の段階的検証手順([Operations](../operations/operations.md) の「Demo / Shadow 継続運転」節)に沿って実口座解禁前の運用実績を積む)
 - 外部Strategy定義をPaper Signalへ接続し、Live相当のSignal生成とBacktestを同一定義で駆動する共有化
 - Live 運用開始判断(上記事前条件の充足確認を含む。ドキュメント同期や実装完了をもって自動的に開始しない)

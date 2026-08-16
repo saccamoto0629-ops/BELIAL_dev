@@ -157,6 +157,7 @@ execution mode / 接続先は**呼び出し側が申告する文字列ではな�
 - **新規注文は +1 として数える**: 既存件数が上限に達していれば拒否(`既存件数 >= 上限` で拒否)。上限 0 は「新規ポジション全面禁止」。
 - ポジション情報は evaluate 内で同期照会する。エントリが `PositionInfo` でない・snapshot 時刻(`retrieved_at_utc`)が未来・`max_reference_age` より古い場合は、その回答全体を信頼せず `broker_query_failed` で拒否する(fail-closed)。
 - **AccountState も同じ鮮度基準**で検証する: 型不正・`retrieved_at_utc` が未来・stale は `broker_query_failed`。
+- **Broker 照会結果の鮮度基準時刻は「照会後に取り直した clock 読み値」**である(Issue #134): Broker は照会の実行**中**に snapshot へ時刻を刻むため、評価開始時に取得した `now` と比較すると、実クロック運用では正直な回答が常に数ミリ秒「未来」となり全送信が拒否される(凍結 clock のテストでは両読み値が一致するため顕在化しない)。評価開始時の `now` は判定記録(`checked_at_utc`)と market snapshot の鮮度に使い、照会後の読み値より先の時刻が刻まれた snapshot は従来どおり未来として拒否する。clock 自体の破損は従来どおり例外(拒否コードに化けない)。
 - **部分約定中(working)の注文は数えない**: Broker がポジションとして報告するものだけが対象(Issue #75 では非スコープと明記)。
 
 ### kill switch
