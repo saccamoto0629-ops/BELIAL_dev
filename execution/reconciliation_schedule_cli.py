@@ -318,6 +318,11 @@ def _print_human(payload: dict) -> None:
                     entry["failure_code"],
                 )
             )
+        # An ENABLED repair can still be skipped -- a blocked takeover stops
+        # the pass. Say so here, or the operator reads "attempts=0" as "there
+        # was nothing to do".
+        if payload["repair_skipped_reason"] is not None:
+            print(f"  repair pass skipped: {payload['repair_skipped_reason']}")
     else:
         print(f"repair: not run ({payload['repair_skipped_reason']})")
     if payload["repair_error"] is not None:

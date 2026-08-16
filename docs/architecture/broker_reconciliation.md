@@ -168,7 +168,7 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 1 cycle の構成(`execution/reconciliation_schedule.py` の `run_reconciliation_cycle()`):
 
 1. **排他入場** — cycle 全体を advisory lock で保護する(既定 `<reconciliation DB のディレクトリ>/reconciliation_cycle.lock`)。
-2. **takeover recovery**(`--repair` 時のみ)— crash した前回 cycle が残した pending attempt を、既存の `recover_pending_attempts()` で**新しい観測の前に**引き継ぐ。後に回すと、回収された更新が直前の観測を stale にするだけになるため。監査 DB がまだ存在しない初回 cycle では pending が存在し得ないので、DB を作ってまで問い合わせない。
+2. **takeover recovery**(`--repair` 時のみ)— crash した前回 cycle が残した pending attempt を、既存の `recover_pending_attempts()` で**新しい観測の前に**引き継ぐ。後に回すと、回収された更新が直前の観測を stale にするだけになるため。監査 DB がまだ存在しない初回 cycle では pending が存在し得ないので、DB を作ってまで問い合わせない。**recovery が reservation を拒否した場合、または `BLOCKED` attempt を 1 件でも返した場合は、この cycle の 4 を丸ごと skip する**(下記「blocked takeover は cycle の修復 pass を止める」)。
 3. **検出** — `BrokerOrderReconciliationService.run()`(既定で position スコープ込み)。run が監査 DB へ記録されることが restart をまたいだ追跡可能性の実体である。
 4. **修復**(`--repair` 時のみ)— 直前に記録した run に対する `repair(mode=APPLY)`。
 
@@ -176,6 +176,12 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 
 - cycle が受け取れる Broker は `ReconcileOnlyBroker` **だけ**である(型で拒否する。`get_order` / `get_positions` を持つだけの duck-typed オブジェクトも拒否される)。broker 実装を import せず、`BrokerConnection` を組み立てず、adapter を構築しない — 4 点とも `execution/tests/test_submission_boundary.py` の AST 検査で固定。OANDA Demo Adapter の構築サイトは `demo_lock.py` と `reconciliation_runner.py` のままで、**Issue #133 は新しい構築サイトを増やしていない**(cycle CLI は `reconciliation_runner.build_reconcile_only_broker()` を経由する)。
 - cycle 自身は分類も状態更新もしない。`auto_repair_candidate` / `manual_review` の判定は検出サービスの、修復可否は修復サービスの責務であり、claim / lease / generation / takeover / fencing 契約はそのまま使われる(緩めない・再実装しない)。execution store の書き込み API を cycle が直接呼ばないことも AST 検査で固定。
+
+**blocked takeover は cycle の修復 pass を止める**(PR #137 レビュー r2): recovery は自動収束できない fencing 状態(fence 先行・identity 不一致・複数 active intent 等)を intent 行へ `blocked` として永続化し、typed な `BLOCKED` attempt として返す。Issue #104 は「**blocked からの自動復旧**」を明示的に非スコープとしており、これは人手の判断を要求する境界である。
+
+同じ cycle で新しい修復 pass を走らせると、この境界を素通りしてしまう。新しい pass の attempt id は新規であり、`execution_store.register_repair_fence` は **別 attempt が保持する fence を設計上 REPLACE する**(本当に新しい attempt は注文を引き継いでよい、という契約)。結果として、誰も説明できない fencing 状態にあるまさにその注文が再観測され、generation 1 で再 claim され、commit され、blocked な claim は pending のまま残る。timer 運用ではこれが 1 回きりではなく**毎 tick 起きる**。
+
+そのため、`BLOCKED` を 1 件でも観測した cycle は検出を記録した時点で停止し、理由を `repair_skipped_reason` に載せる。検出自体は実行・記録される — block の原因を診断するために運用者が必要とするのは、まさにその read-only な観測だからである。
 
 **overlap / concurrent run**: timer 駆動の `Type=oneshot` unit は systemd 自身が二重起動しないが、**手動実行と timer 実行の重なり**はそれでは防げないため、cycle 全体を advisory lock で保護する。lock は「空の SQLite ファイルを `BEGIN IMMEDIATE` で保持する」形式で、POSIX / Windows で同一に動作し、プロセス消滅時に OS が解放する(crash 後に手で消す stale lock が残らない)。同一プロセス内の 2 つ目の取得も拒否されるため、排他そのものをテストで固定できる。busy な lock は**失敗ではなく抑止**(`CycleAlreadyRunningError` → CLI は WARNING と `outcome: "suppressed_locked"` を出して exit 0)。
 

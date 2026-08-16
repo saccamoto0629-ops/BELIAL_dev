@@ -13,6 +13,8 @@ file is listed in the submission-boundary allow-list.
 """
 
 import json
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -745,3 +747,116 @@ def test_an_unwritable_data_directory_is_a_typed_refusal_naming_the_errno(tmp_pa
     message = str(excinfo.value)
     assert "cannot create the directory for the cycle lock" in message
     assert "ENOTDIR" in message or "EEXIST" in message, message
+
+
+def force_fence(execution_db, request_id, *, attempt_id, generation, takeover, claim, owner="w"):
+    """Install a repair fence directly, BYPASSING the takeover protocol, to
+    build the corrupt cross-DB state recovery must refuse rather than
+    resolve (the same helper shape the Issue #104 suite uses)."""
+    with closing(sqlite3.connect(execution_db)) as connection:
+        connection.execute(
+            f"INSERT INTO {execution_store.FENCES_TABLE} (execution_request_id, "
+            "repair_attempt_id, generation, takeover_id, owner_id, claim_execution_id, "
+            "updated_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (execution_request_id) DO UPDATE SET repair_attempt_id = excluded."
+            "repair_attempt_id, generation = excluded.generation, takeover_id = excluded."
+            "takeover_id, owner_id = excluded.owner_id, claim_execution_id = excluded."
+            "claim_execution_id, updated_at_utc = excluded.updated_at_utc",
+            (request_id, attempt_id, generation, takeover, owner, claim, OBSERVED_AT.isoformat()),
+        )
+        connection.commit()
+
+
+def test_a_blocked_takeover_stops_this_cycles_fresh_repair_pass(paths, monkeypatch):
+    """PR #137 Codex review r2 P1.
+
+    A BLOCKED recovery is the human-intervention boundary. A fresh pass in
+    the same cycle would walk past it: its attempt id is new, and
+    ``register_repair_fence`` REPLACES a fence held by a different attempt by
+    design -- so the very order whose fencing state nobody could account for
+    would be re-claimed at generation 1 and committed, every timer tick,
+    while the blocked claim stayed pending.
+    """
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-11")
+    broker.submit_order(broker_request("exec-11"))
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")  # crash-equivalent
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        run_cycle(paths, reconcile_only(broker), run_id="run-11a", repair_enabled=True)
+    monkeypatch.undo()
+
+    (crashed,) = reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db)
+    # an unexplained generation-3 fence: no takeover intent accounts for it,
+    # so recovery must BLOCK instead of overwriting it
+    force_fence(
+        execution_db,
+        "exec-11",
+        attempt_id=crashed.attempt_id,
+        generation=3,
+        takeover="tk-unknown",
+        claim="claim-unknown",
+    )
+
+    report = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-11b",
+        repair_enabled=True,
+        clock=lambda: LATER_AT,
+    )
+
+    (blocked,) = report.recovered_attempts
+    assert blocked.outcome is RepairOutcome.BLOCKED
+    assert blocked.failure_code is RepairFailureCode.FENCE_AHEAD
+    # the boundary held: no fresh attempt, no state change, claim still pending
+    assert report.repair_attempts == ()
+    assert "BLOCKED" in report.repair_skipped_reason
+    assert crashed.attempt_id in report.repair_skipped_reason
+    assert execution_store.get_execution_order("exec-11", db_path=execution_db)[
+        "order_state"
+    ] == "unknown"
+    assert [
+        entry.attempt_id
+        for entry in reconciliation_store.list_pending_repair_attempts(
+            db_path=reconciliation_db
+        )
+    ] == [crashed.attempt_id]
+    # the fence nobody could account for is untouched
+    fence = execution_store.get_repair_fence("exec-11", db_path=execution_db)
+    assert (fence["generation"], fence["takeover_id"]) == (3, "tk-unknown")
+    # detection still ran and is durable -- that is what an operator diagnoses with
+    assert reconciliation_store.get_reconciliation_run(
+        "run-11b", db_path=reconciliation_db
+    ) is not None
+    assert not report.is_clean
+
+
+def test_the_cli_says_a_blocked_takeover_skipped_the_repair_pass(tmp_path, capsys):
+    """`attempts=0` must never read as "there was nothing to do"."""
+    report = schedule.ReconciliationCycleReport(
+        run_id="run-x",
+        run=schedule.run_reconciliation_cycle(
+            broker=reconcile_only(FakeBroker()),
+            execution_db_path=tmp_path / "execution_orders.sqlite3",
+            reconciliation_db_path=tmp_path / "broker_reconciliation.sqlite3",
+            run_id="run-x",
+            cycle_lock_path=None,
+            dry_run=True,
+            clock=lambda: OBSERVED_AT,
+        ).run,
+        dry_run=False,
+        include_position_scope=True,
+        repair_enabled=True,
+        recorded_to=tmp_path / "broker_reconciliation.sqlite3",
+        repair_skipped_reason="takeover recovery reported 1 BLOCKED attempt(s) (a-1)",
+    )
+
+    cli._print_human(cli._cycle_payload(report, broker_label="fake / fake"))
+
+    out = capsys.readouterr().out
+    assert "repair pass skipped: takeover recovery reported 1 BLOCKED attempt(s)" in out

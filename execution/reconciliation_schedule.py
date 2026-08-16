@@ -22,7 +22,11 @@ the Execution submission runner:
 2. *takeover / recovery* (repair-enabled cycles only) -- the existing
    ``recover_pending_attempts()`` resumes what a CRASHED earlier cycle left
    pending, under the ORIGINAL claim identity. This runs BEFORE the new
-   observation so a leftover attempt is settled before anything is compared;
+   observation so a leftover attempt is settled before anything is compared.
+   If it REFUSES a reservation, or reports any ``BLOCKED`` attempt, step 4 is
+   skipped for the whole cycle: both mean the state needs a human, and a
+   fresh attempt would simply take the fence over (see "Blocked takeovers"
+   below);
 3. *detection* -- ``BrokerOrderReconciliationService.run()``: the Issue #103
    order scope plus, by default, the Issue #105 position / trade /
    transaction / SL / TP scope. The run is recorded to the reconciliation
@@ -62,6 +66,29 @@ What this module deliberately CANNOT do
   refuses it and the position domain has no repair path at all.
 - It performs no state update of its own: it owns no execution-store write
   call.
+
+Blocked takeovers stop the cycle's repair pass
+-----------------------------------------------
+
+The Issue #104 recovery protocol parks a state it must NOT resolve --
+a fence ahead of the intent, a foreign identity, several active intents --
+durably on the intent row and returns it as a ``BLOCKED`` attempt.
+"Automatic recovery from blocked" is an explicit non-scope there: it needs
+a human.
+
+Running a fresh repair pass in the same cycle would walk straight past that
+boundary. The new pass mints a NEW attempt id, and
+``execution_store.register_repair_fence`` REPLACES a fence held by a
+DIFFERENT attempt by design (a genuinely new attempt is allowed to take an
+order over) -- so the very order whose fencing state nobody could account
+for would be re-observed, re-claimed at generation 1 and committed, while
+the blocked claim stayed pending. Under a timer that is not a one-off: it
+is every tick.
+
+So a cycle that sees ANY blocked attempt records its detection and stops
+there, reporting why on ``repair_skipped_reason``. Detection still runs --
+a read-only observation is exactly what the operator needs to diagnose the
+block.
 
 Overlap / concurrent runs
 -------------------------
@@ -502,6 +529,32 @@ def _guarded_cycle(
                     f"({type(exc).__name__}); no repair pass was run this cycle -- the "
                     "pending claim and its takeover intent stay in the audit DB for "
                     "manual review"
+                )
+            blocked = tuple(
+                attempt
+                for attempt in recovered
+                if attempt.outcome is RepairOutcome.BLOCKED
+            )
+            if blocked:
+                # A BLOCKED takeover is the SAME class of situation as a
+                # refused recovery, and it is the canonical one: the cross-DB
+                # fencing state cannot be accounted for, so the protocol parks
+                # it durably and asks for a human (Issue #104 non-scope:
+                # "blocked からの自動復旧" is deliberately absent).
+                #
+                # A fresh pass would walk straight past that boundary. Its
+                # attempt id is new, and ``register_repair_fence`` REPLACES a
+                # fence held by a DIFFERENT attempt by design -- so the same
+                # order would be re-observed, re-claimed at generation 1, and
+                # committed, while the blocked claim stays pending. Under a
+                # timer that would happen every tick, which is exactly the
+                # automatic recovery the boundary exists to prevent.
+                service = None
+                skipped_reason = (
+                    f"takeover recovery reported {len(blocked)} BLOCKED attempt(s) "
+                    f"({', '.join(sorted(entry.attempt_id for entry in blocked))}); no "
+                    "repair pass was run this cycle -- a blocked takeover needs a human, "
+                    "and a fresh attempt would take the fence over instead"
                 )
         else:
             _LOGGER.info(
