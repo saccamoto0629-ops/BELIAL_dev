@@ -95,8 +95,8 @@ def test_paper_and_observation_layers_never_import_the_execution_package():
 def test_execution_package_only_depends_on_stdlib_and_broker():
     allowed = {
         "annotations", "argparse", "ast", "collections", "contextlib", "dataclasses",
-        "datetime", "decimal", "enum", "hashlib", "json", "logging", "math", "os",
-        "pathlib", "re", "sqlite3", "sys", "tempfile", "threading", "time",
+        "datetime", "decimal", "enum", "errno", "hashlib", "json", "logging", "math",
+        "os", "pathlib", "re", "sqlite3", "sys", "tempfile", "threading", "time",
         "traceback", "types", "typing", "uuid", "broker", "execution", "__future__",
     }
     for path in (REPO_ROOT / "execution").glob("*.py"):

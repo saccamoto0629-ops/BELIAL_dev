@@ -69,13 +69,25 @@ TimeoutStartSec=600
 # Deliberately no Restart=: a failing oneshot must stay failed until the next
 # timer run instead of looping against a broker that is refusing queries.
 # Sandbox: read-only system, no home access, writes limited to the execution
-# data directory (audit DB, order DB, cycle lock). The "-" prefix keeps a
-# not-yet-created data directory from failing namespace setup.
+# data directory (audit DB, order DB, cycle lock).
+#
+# DEPLOYMENT PRECONDITION: /opt/berial/execution/data must EXIST and be
+# writable by User=/Group= before the timer is enabled. The repository does
+# not track it (execution/data/ is git-ignored), so a fresh checkout has no
+# such directory -- create it once:
+#   sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data/demo
+#
+# Deliberately NO "-" prefix on ReadWritePaths here (unlike
+# berial-png-cleanup.service, whose script never creates anything and treats a
+# missing target as a warning). "-" makes systemd SKIP a missing path instead
+# of failing: /opt/berial would then stay read-only under ProtectSystem=strict
+# and every activation would die creating the data directory. Failing loudly at
+# namespace setup (status=226/NAMESPACE) points at the real cause instead.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=-/opt/berial/execution/data
+ReadWritePaths=/opt/berial/execution/data
 
 # No [Install] section on purpose: this unit is started by its timer (or
 # manually) and is not enabled on its own.

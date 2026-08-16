@@ -728,3 +728,20 @@ def test_a_refused_takeover_recovery_still_records_detection_and_is_not_clean(
             db_path=reconciliation_db
         )
     ] != []
+
+
+def test_an_unwritable_data_directory_is_a_typed_refusal_naming_the_errno(tmp_path):
+    """PR #137 Codex review P1: under a sandbox that leaves the parent
+    read-only, the cycle must fail with a diagnosable reason -- the errno
+    NAME, not a bare 'OSError' -- because the fix is a deployment one
+    (ReadWritePaths / directory ownership), not a code one."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file where a directory should be", encoding="utf-8")
+
+    with pytest.raises(schedule.CycleLockError) as excinfo:
+        with schedule.cycle_lock(blocked / "data" / "reconciliation_cycle.lock"):
+            pass  # pragma: no cover - must never be entered
+
+    message = str(excinfo.value)
+    assert "cannot create the directory for the cycle lock" in message
+    assert "ENOTDIR" in message or "EEXIST" in message, message

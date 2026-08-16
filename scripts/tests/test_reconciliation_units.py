@@ -127,7 +127,22 @@ def test_service_may_write_the_execution_data_directory_only():
     assert _single(sections, "Service", "ProtectSystem") == "strict"
     writable = _single(sections, "Service", "ReadWritePaths")
     # The audit DB, the order DB and the cycle lock all live there.
-    assert writable.lstrip("-").startswith("/")
+    assert writable.startswith("/")
+    # NOT "-<path>" (PR #137 Codex review P1): under ProtectSystem=strict, a
+    # "-" prefix makes systemd SKIP a not-yet-created path instead of failing,
+    # leaving /opt/berial read-only -- every activation would then die creating
+    # the data directory, with nothing in the journal pointing at the unit.
+    assert not writable.startswith("-"), writable
+
+
+def test_the_data_dir_the_cli_writes_is_inside_the_writable_path():
+    """The one invariant that keeps the sandbox and the command in agreement:
+    a --data-dir moved outside ReadWritePaths would be read-only at runtime."""
+    sections = _parse_unit(SERVICE_FILE)
+    writable = pathlib.PurePosixPath(_single(sections, "Service", "ReadWritePaths"))
+    parts = _single(sections, "Service", "ExecStart").split()
+    data_dir = pathlib.PurePosixPath(parts[parts.index("--data-dir") + 1])
+    assert data_dir == writable or writable in data_dir.parents, (data_dir, writable)
 
 
 def test_timer_is_periodic_persistent_and_references_the_committed_service():

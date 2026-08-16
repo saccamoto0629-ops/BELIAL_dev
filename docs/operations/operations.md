@@ -321,6 +321,11 @@ python -m execution.reconciliation_schedule_cli --broker fake --data-dir /tmp/re
 テンプレートは `scripts/systemd/berial-execution-reconciliation.service` / `berial-execution-reconciliation.timer`(リポジトリにコミット済み)。**UTC の 15 分毎**(`*:0/15:00 UTC`)に oneshot service を起動する。`Persistent=true` により停止中に逃した発火は起動後 1 回だけ追い付き実行される(再起動直後は照合が最も必要な場面であるため意図的)。`RandomizedDelaySec=2m` は周期より十分短く、tick を飛ばさない。
 
 ```bash
+# 1) データディレクトリを先に作る(必須。下記「データディレクトリの事前作成」参照)
+sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data
+sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data/demo
+
+# 2) unit を配置して timer を enable する
 sudo cp /opt/berial/scripts/systemd/berial-execution-reconciliation.service /etc/systemd/system/
 sudo cp /opt/berial/scripts/systemd/berial-execution-reconciliation.timer /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -329,12 +334,14 @@ systemctl list-timers berial-execution-reconciliation.timer
 journalctl -u berial-execution-reconciliation -n 50
 ```
 
+**データディレクトリの事前作成(必須)**: `execution/data/` は Git 管理外(`.gitignore`)であり、リポジトリを配置しただけでは存在しない。unit は `ProtectSystem=strict` で `/opt/berial` を read-only にし、`ReadWritePaths=/opt/berial/execution/data` だけを書き込み可能にするため、**このディレクトリが存在しないと timer 発火のたびに失敗する**。unit の `ReadWritePaths` には意図的に `-`(存在しなければ無視)を付けていない: `-` を付けると systemd が黙って read-only のまま起動し、cycle がデータディレクトリを作れずに毎回 exit 2 で終わる — 原因が unit 設定にあることが journal から読み取れない。`-` なしなら namespace 設定の時点で `status=226/NAMESPACE` として明示的に失敗する。所有者は unit の `User=` / `Group=`(テンプレートでは `ubuntu`)に合わせること。`--data-dir` を変更する場合は `ReadWritePaths` も同じ親ディレクトリへ合わせる。
+
 - **service ではなく timer を enable する**。service を直接 start すると即座に 1 cycle 走る。
 - `EnvironmentFile=/opt/berial/execution/.env` には **Demo 資格情報のみ**を置く。`ENABLE_LIVE_TRADING` と `OANDA_LIVE_*` は置かない(Demo 起動チェックの分離契約と同じ方針。この unit 自体は送信経路を持たないが、環境の混在を残さない)。
 - `--data-dir` は **Demo 専用のデータディレクトリ**を指す。Fake と同じ store 形状を使うため、namespace を分けること。
 - 既定テンプレートは `--repair` を付けていない。有効化する場合は **既存の `ExecStart=` 行を差し替える**(oneshot service は複数の `ExecStart=` を順に実行するため、行を追加すると 1 tick で 2 cycle 走る)。
 - `TimeoutStartSec=600` で 1 cycle を打ち切る。hang した cycle が entry lock を握り続けて以降の tick を抑止し続けるのを防ぐため。打ち切られた repair claim は lease 満了後に次の cycle の recovery が引き継ぐ。
-- 実機のみで確認する項目(pytest には含めない): `systemd-analyze verify` の通過、`systemd-analyze calendar '*:0/15:00 UTC'`、timer 発火時刻、`Persistent=true` の追い付き実行、再起動後の enable 状態、`ReadWritePaths` 配下(データディレクトリ)への書き込み権限(WAL sidecar と lock file を含む)。
+- 実機のみで確認する項目(pytest には含めない): `systemd-analyze verify` の通過、`systemd-analyze calendar '*:0/15:00 UTC'`、timer 発火時刻、`Persistent=true` の追い付き実行、再起動後の enable 状態、`ReadWritePaths` 配下(データディレクトリ)への書き込み権限(WAL sidecar と lock file を含む)。**初回は `sudo systemctl start berial-execution-reconciliation.service` を手動で 1 回実行し、`journalctl -u berial-execution-reconciliation` に `recorded to:` 行(または `--json` の `recorded_to`)が出ることを確認する** — ディレクトリの作成漏れ・権限誤りはここで表面化する。
 - **reconciliation は Execution runner の unit と結合しない**(`Requires=` / `BindsTo=` / `PartOf=` を持たない)。片方の停止・失敗がもう片方へ波及しないことが設計上の要件である。
 
 ### Execution Kill Switch — 緊急発注停止・状態確認・解除(Issue #81)

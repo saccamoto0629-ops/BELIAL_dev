@@ -107,6 +107,7 @@ operator can follow any past cycle by ``run_id`` through
 
 from __future__ import annotations
 
+import errno
 import logging
 import sqlite3
 from contextlib import contextmanager
@@ -195,9 +196,13 @@ def cycle_lock(lock_path: Path | str, *, wait_seconds: float = 0.0):
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
+        # The errno NAME (never the OS message) so a sandboxed deployment is
+        # diagnosable from the journal: EROFS / EACCES here means the data
+        # directory is not writable by this unit -- see the ReadWritePaths
+        # precondition in scripts/systemd/berial-execution-reconciliation.service.
         raise CycleLockError(
             f"cannot create the directory for the cycle lock at {lock_path}: "
-            f"{type(exc).__name__}"
+            f"{type(exc).__name__} ({errno.errorcode.get(exc.errno, exc.errno)})"
         ) from exc
     try:
         connection = sqlite3.connect(str(lock_path), timeout=float(wait_seconds))
