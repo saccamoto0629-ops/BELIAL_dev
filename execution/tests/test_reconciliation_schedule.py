@@ -1392,3 +1392,38 @@ def test_the_cli_names_an_unresolved_blocked_intent_and_exits_one(paths, tmp_pat
     out = capsys.readouterr().out
     assert "UNRESOLVED blocked takeover intent(s)" in out
     assert "takeover-abc123" in out
+
+
+def test_a_detection_only_cycle_still_reports_a_persisted_blocked_intent(
+    paths, monkeypatch
+):
+    """PR #137 Codex review r7.
+
+    The shipped systemd unit runs WITHOUT ``--repair``. If the persisted
+    blocked-intent lookup only happens for repair-enabled cycles, the default
+    deployment reports clean forever while a human-intervention record sits
+    in the audit DB -- the exact opposite of what the r6 change promised.
+    """
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-19")
+    broker.submit_order(broker_request("exec-19"))
+    _park_a_blocked_intent(paths, monkeypatch, broker, "exec-19", "run-19-")
+
+    (parked,) = [
+        intent
+        for intent in reconciliation_store.list_takeover_intents(db_path=reconciliation_db)
+        if intent.status is TakeoverIntentStatus.BLOCKED
+    ]
+
+    detection_only = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-19-c",
+        repair_enabled=False,  # the shipped unit's default
+        clock=lambda: LATER_AT + timedelta(days=2),
+    )
+
+    assert detection_only.repair_enabled is False
+    assert detection_only.blocked_intent_ids == (parked.takeover_id,)
+    assert not detection_only.is_clean

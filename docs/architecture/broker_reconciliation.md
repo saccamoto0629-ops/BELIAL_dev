@@ -191,7 +191,7 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 
 **永続化された `blocked` intent は「可視化」であって「gate」ではない**(PR #137 レビュー r6): 一度 park された blocked intent は **active ではなくなる**ため、以降の cycle では recovery が何も返さず、pending 行も無い — gate の生きた信号が両方とも沈黙する。それでも人手対応が必要な事実は audit DB に残っている。
 
-そこで cycle は、**開始時点で audit DB にある `blocked` intent を毎回読み出して報告し、その cycle を clean と名乗らせない**(`blocked_intent_ids` / CLI の `unresolved_blocked_intents` / exit 1)。blocked な takeover が journal から流れて忘れられることを防ぐ。
+そこで cycle は、**開始時点で audit DB にある `blocked` intent を毎回読み出して報告し、その cycle を clean と名乗らせない**(`blocked_intent_ids` / CLI の `unresolved_blocked_intents` / exit 1)。blocked な takeover が journal から流れて忘れられることを防ぐ。**これは `--repair` の有無に関わらず、dry-run 以外のすべての cycle で行う** — 同梱の systemd unit は `--repair` なしで動くため、そこを検出専用扱いで飛ばすと既定のデプロイが恒久的に clean を報告してしまう(PR #137 レビュー r7)。既存ファイルの読み取りのみで、Issue #104 の状態遷移は伴わない。
 
 **gate にはしない**理由: `BLOCKED` は**終端 status** であり(`ALLOWED_INTENT_TRANSITIONS[BLOCKED]` は空)、intent は監査証跡として**永久に保持される**。したがって「解決されるまで止める」を実装する手段が存在せず、gate にすると「**歴史的な監査行 1 行で永久に止まる**」= 無関係な注文の修復まで無期限に停止し、戻す手段が無い、という状態になる。gate は生きた保護(pending claim・その cycle の `BLOCKED` 結果)だけが担う。
 

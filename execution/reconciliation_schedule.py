@@ -543,6 +543,10 @@ def _persisted_blocked_intent_ids(reconciliation_db_path: Path) -> tuple[str, ..
     them, so the state cannot quietly disappear from an operator's view once
     the cycle that found it has scrolled out of the journal.
 
+    Read by EVERY non-dry cycle, including detection-only ones -- the shipped
+    systemd unit runs without ``--repair``, and that is exactly the
+    deployment that must not report clean over a parked block.
+
     They deliberately do NOT gate the repair pass. ``BLOCKED`` is a TERMINAL
     intent status (``ALLOWED_INTENT_TRANSITIONS[BLOCKED]`` is empty) and
     intents are retained forever as the audit trail, so there is no in-band
@@ -638,6 +642,15 @@ def _guarded_cycle(
     attempts: tuple[OrderRepairAttempt, ...] = ()
     blocked_intent_ids: tuple[str, ...] = ()
 
+    # EVERY non-dry cycle reports the blocked intents already in the audit DB,
+    # whether or not repair is enabled (PR #137 review r7). The shipped systemd
+    # unit runs WITHOUT --repair, so nesting this under ``repair_enabled``
+    # would mean the default deployment reports clean forever while a
+    # human-intervention record sits in the DB. It is a read of an existing
+    # file: no Issue #104 state transition, and nothing is created.
+    if reconciliation_db_path.exists():
+        blocked_intent_ids = _persisted_blocked_intent_ids(reconciliation_db_path)
+
     service = None
     if repair_enabled:
         service = _repair_service(
@@ -671,7 +684,6 @@ def _guarded_cycle(
                     "pending claim and its takeover intent stay in the audit DB for "
                     "manual review"
                 )
-            blocked_intent_ids = _persisted_blocked_intent_ids(reconciliation_db_path)
         else:
             _LOGGER.info(
                 "no reconciliation audit DB at %s yet: no pending repair attempt can "
