@@ -1,0 +1,91 @@
+[Unit]
+# Berial Shadow Mode resident runner (Issue #134). Continuously runs the
+# PRODUCTION shadow decision path over stored Paper Signals: Safety Gate
+# evaluation, durable decision audit, shadow record of what WOULD have been
+# ordered -- and NOTHING else.
+#
+# NO BROKER EXISTS ON THIS PATH, and this unit carries NO credentials of any
+# kind: there is deliberately no environment file here and no broker variable
+# below. The shadow service reads the signal DB and two operator-maintained
+# snapshot JSON files, and writes only its own shadow/decision DBs. A shadow
+# record never blocks a later fake/demo submission (separate namespace).
+#
+# This unit is INDEPENDENT of the demo runner and of the reconciliation
+# timer: it declares no dependency on them and none of them declares one on
+# it. Shadow -> Demo staged verification is an OPERATOR sequence
+# (docs/operations/operations.md), not a unit dependency.
+#
+# Copy/adapt this template to /etc/systemd/system/berial-execution-shadow.service,
+# then: systemctl daemon-reload && systemctl enable --now berial-execution-shadow
+# See docs/operations/operations.md ("Demo / Shadow 継続運転") for the full
+# deploy/verify/stop steps.
+#
+# Exit codes: 0 = stopped by request (systemctl stop) -- per-cycle failures
+# are visible in journalctl -u berial-execution-shadow and in the shadow /
+# decision DBs, and do not fail a clean stop; 1 = fail-closed startup refusal
+# (another resident shadow runner holds the lock, unreadable inputs);
+# 2 = usage/configuration error.
+Description=Berial Shadow Mode resident runner (no broker, no credentials)
+Documentation=file:/opt/berial/docs/architecture/shadow_execution.md
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/berial
+# "python -m execution.shadow_service_cli" resolves the package from
+# WorkingDirectory (sys.path[0]); PYTHONPATH is set as well so a future
+# WorkingDirectory change cannot silently import a different tree.
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/berial
+# Deliberately NO EnvironmentFile= here: the shadow path needs no secret and
+# must not have one available. Loading the demo credential file into this
+# process would only blur the "shadow holds nothing" guarantee.
+#
+# Inputs (all REQUIRED, no permissive defaults -- a missing file is a loud
+# cycle failure, never a silent "no work"):
+#   --signal-db          the Paper Signal store, read-only
+#   --execution-config   strict shadow execution configuration JSON
+#   --market-snapshot    operator-maintained market snapshot JSON
+#   --account-snapshot   operator-maintained account snapshot JSON
+# --data-dir is the SHADOW namespace (shadow_results.sqlite3 +
+# safety_gate_decisions.sqlite3 + shadow_runner.lock). Keep it separate from
+# the demo data directory: the two services must not share stores.
+# --owner-id: stable, distinct per deployment (deterministic claim recovery).
+ExecStart=/opt/berial/.venv/bin/python -m execution.shadow_service_cli --signal-db /opt/berial/paper-signal/data/paper_signals.sqlite3 --execution-config /etc/berial/shadow_execution_config.json --market-snapshot /opt/berial/execution/data/shadow/market_snapshot.json --account-snapshot /opt/berial/execution/data/shadow/account_snapshot.json --data-dir /opt/berial/execution/data/shadow --interval-seconds 60 --owner-id shadow-service-1
+Restart=always
+RestartSec=10
+# Graceful shutdown: systemd sends SIGTERM -> the runner finishes the current
+# item, starts no new one, and exits 0; SIGKILL only after TimeoutStopSec.
+# A killed shadow cycle loses nothing that matters: the claim's lease expires
+# and the next run recovers it.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# stdout/stderr to the journal (journalctl -u berial-execution-shadow).
+StandardOutput=journal
+StandardError=journal
+# Sandbox: read-only system, no home access, writes limited to the execution
+# data directory (shadow DB, decision DB, runner lock, snapshot files that an
+# upstream process refreshes in place).
+#
+# DEPLOYMENT PRECONDITION: /opt/berial/execution/data/shadow must EXIST and
+# be writable by User=/Group= before the unit starts (execution/data/ is
+# git-ignored, so a fresh checkout has no such directory):
+#   sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data/shadow
+# Deliberately NO "-" prefix on ReadWritePaths (same reasoning as the
+# reconciliation unit): a missing path must fail loudly at namespace setup
+# (status=226/NAMESPACE) instead of leaving the tree read-only and failing
+# obscurely on every cycle.
+#
+# The signal DB is READ-ONLY for this unit. If that DB ever runs in SQLite
+# WAL mode, its directory needs to be writable for SQLite's own sidecar
+# bookkeeping -- add it to ReadWritePaths then (the shadow code itself never
+# writes it; sqlite_ro refuses every write).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/berial/execution/data
+
+[Install]
+WantedBy=multi-user.target
