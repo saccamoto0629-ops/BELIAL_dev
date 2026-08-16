@@ -20,6 +20,7 @@ What is pinned:
 """
 
 import json
+import pathlib
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -221,6 +222,28 @@ def test_wal_committed_signals_are_visible_to_the_resident_loop(tmp_path, capsys
     assert cycle["status_counts"] == {"recorded": 2}
     results = shadow_store.list_shadow_results(db_path=data_dir / "shadow_results.sqlite3")
     assert {r.request.signal_id for r in results} == {"sig-1", "sig-wal"}
+
+
+def test_dry_run_recreates_no_wal_sidecars(tmp_path, capsys):
+    """PR #138 Codex review P2 (second round): a dry run keeps the immutable
+    WAL fallback, so reading a cleanly closed WAL-mode signal DB (sidecars
+    absent) recreates neither -wal nor -shm -- the dry-run contract is zero
+    filesystem side effects, and the input directory may be read-only."""
+    args, data_dir = service_args(tmp_path, "--max-cycles", "1", "--dry-run")
+    signal_db = pathlib.Path(args[args.index("--signal-db") + 1])
+    writer = sqlite3.connect(signal_db)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.commit()
+    writer.close()  # clean close: rows checkpointed, sidecars removed
+    assert not signal_db.with_name(signal_db.name + "-wal").exists()
+    before = sorted(p.name for p in signal_db.parent.iterdir())
+
+    code, payload = run_json(capsys, args)
+    assert code == EXIT_OK
+    (cycle,) = payload["cycles"]
+    assert cycle["status_counts"] == {"planned": 1}
+    assert sorted(p.name for p in signal_db.parent.iterdir()) == before
+    assert not data_dir.exists()
 
 
 # --- exclusivity ----------------------------------------------------------------

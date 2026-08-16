@@ -172,11 +172,13 @@ class PaperSignalDbSignalProvider:
     which is an acceptable point-in-time view for a ONE-SHOT read but silently
     hides committed-yet-uncheckpointed signals -- schema included -- from a
     RESIDENT reader that re-polls the store (Issue #134 / PR #138 Codex
-    review P2). The shadow service therefore opts out (``False``): the DB is
-    then opened plain ``mode=ro``, every committed row is visible, and SQLite
-    itself may (re)create the ``-wal`` / ``-shm`` sidecars, so the DB
-    directory needs sidecar access (the systemd note in
-    ``berial-execution-shadow.service``)."""
+    review P2). The shadow service's resident (non-dry) loop therefore opts
+    out (``False``): the DB is then opened plain ``mode=ro``, every committed
+    row is visible, and SQLite itself may (re)create the ``-wal`` / ``-shm``
+    sidecars, so the DB directory needs sidecar access (the systemd note in
+    ``berial-execution-shadow.service``). A DRY RUN keeps the default: sidecar
+    recreation is a filesystem side effect a dry run must never have, and the
+    point-in-time view is acceptable for a plan-only pass."""
 
     def __init__(self, db_path: str | Path, *, allow_immutable_wal: bool = True):
         if not isinstance(db_path, (str, Path)):

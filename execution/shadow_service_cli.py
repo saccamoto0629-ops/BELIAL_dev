@@ -241,13 +241,20 @@ def _run_cli(argv: list[str] | None) -> int:
     except ShadowConfigError as exc:
         return _fail(args, EXIT_USAGE_ERROR, "configuration_error", f"configuration error: {exc}")
 
-    # allow_immutable_wal=False: a RESIDENT reader must see every committed
-    # signal. The default immutable-WAL fallback is a point-in-time view that
-    # silently hides committed-yet-uncheckpointed rows (schema included) from
-    # this loop forever (PR #138 Codex review P2). SQLite may then (re)create
-    # the signal DB's -wal/-shm sidecars, so the DB directory needs sidecar
-    # access (see the unit template's note).
-    signal_provider = PaperSignalDbSignalProvider(args.signal_db, allow_immutable_wal=False)
+    # The RESIDENT (non-dry) loop opts out of the immutable-WAL fallback: a
+    # point-in-time view silently hides committed-yet-uncheckpointed rows
+    # (schema included) from a loop that re-polls the store forever (PR #138
+    # Codex review P2). SQLite may then (re)create the signal DB's -wal/-shm
+    # sidecars, so the DB directory needs sidecar access (see the unit
+    # template's note). A DRY RUN keeps the immutable fallback instead: its
+    # contract is ZERO filesystem side effects (recreating a sidecar next to
+    # a cleanly closed WAL DB would break that, and must keep working when
+    # the input directory is deliberately read-only) -- the price is the
+    # point-in-time view, which is acceptable for a plan-only pass (PR #138
+    # Codex review P2, second round).
+    signal_provider = PaperSignalDbSignalProvider(
+        args.signal_db, allow_immutable_wal=args.dry_run
+    )
     try:
         runner = build_shadow_execution_runner(
             signal_provider=signal_provider,
