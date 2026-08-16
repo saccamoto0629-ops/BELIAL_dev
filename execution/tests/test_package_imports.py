@@ -44,6 +44,8 @@ ROOT_LEVEL_IMPORTS = (
     "from execution.demo_startup_cli import main as demo_startup_cli_main",
     "from execution.live_runner import ExecutionRunner, RUNNER_SUPPORTED_MODES",
     "from execution.runner_composition import build_demo_execution_runner",
+    "from execution.reconciliation_schedule import run_reconciliation_cycle, cycle_lock",
+    "from execution.reconciliation_schedule_cli import main as reconciliation_schedule_cli_main",
 )
 
 # Components that must NEVER depend on the execution layer: Paper Signal /
@@ -93,8 +95,8 @@ def test_paper_and_observation_layers_never_import_the_execution_package():
 def test_execution_package_only_depends_on_stdlib_and_broker():
     allowed = {
         "annotations", "argparse", "ast", "collections", "contextlib", "dataclasses",
-        "datetime", "decimal", "enum", "hashlib", "json", "logging", "math", "os",
-        "pathlib", "re", "sqlite3", "sys", "tempfile", "threading", "time",
+        "datetime", "decimal", "enum", "errno", "hashlib", "json", "logging", "math",
+        "os", "pathlib", "re", "sqlite3", "sys", "tempfile", "threading", "time",
         "traceback", "types", "typing", "uuid", "broker", "execution", "__future__",
     }
     for path in (REPO_ROOT / "execution").glob("*.py"):

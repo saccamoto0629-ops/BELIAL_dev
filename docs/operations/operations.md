@@ -36,11 +36,11 @@ dry-run は以下の副作用を一切発生させない確認モードとして
 | `CHART_DB_PATH` | `market-watch/data/chart_data.sqlite3` | Chart DBのパス上書き(`market-watch/chart_collector.py`) |
 | `MARKET_BIAS_DB_PATH` | `news-feed-bot/data/market_bias.sqlite3` | Market Bias DBのパス上書き。Backtestから別プロセスで参照する場合に使う(`news-feed-bot/market_bias_store.py`) |
 | `PAPER_POSITION_DB_PATH` | `paper-execution/data/paper_positions.sqlite3` | Paper Execution の仮想ポジションDBのパス上書き(`paper-execution/position_store.py`)。相対パスは `paper-execution/` 基準。本番は永続ボリューム上の絶対パス推奨(例 `/var/lib/berial/paper_positions.sqlite3`)。通常(非dry-run)起動時に legacy DB を現行スキーマへ自動 migration してからポジションを読む(v3 で通知 outbox テーブル `paper_execution_notifications` を追加、v4(Issue #85)で `cancelled` の terminal_reason へ `position_limit` を追加 — pre-v4 DB は positions テーブルの transactional rebuild で移行)。dry-run では作成・migration せず、本体+WAL/SHM の snapshot コピーに対する読み取り専用スキーマ確認のみ行う(実 DB へ接続しない) |
-| `EXECUTION_ORDER_DB_PATH` | `execution/data/execution_orders.sqlite3` | Live Execution 用 Execution Order DB のパス上書き(`execution/execution_store.py`、Issue #74。schema v5)。相対パスは `execution/` 基準。**この DB を定期的に作成・更新する常駐プロセスは存在しない**(Issue #131 / #132 の Live Execution runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、systemd 等の継続運転導線は未実装。**Demo 運用では Fake と data-dir を分ける**。テストは `tmp_path` を使用)。手動 reconciliation CLI(`python -m execution.reconciliation_runner`)は照合時にこの DB を**読み取り**、修復サービス(Issue #104。API 明示呼び出しのみ)は状態機械経由で更新する |
+| `EXECUTION_ORDER_DB_PATH` | `execution/data/execution_orders.sqlite3` | Live Execution 用 Execution Order DB のパス上書き(`execution/execution_store.py`、Issue #74。schema v5)。相対パスは `execution/` 基準。**この DB を定期的に作成・更新する常駐プロセスは存在しない**(Issue #131 / #132 の Live Execution runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、systemd 等の継続運転導線は未実装。**Demo 運用では Fake と data-dir を分ける**。テストは `tmp_path` を使用)。手動 reconciliation CLI(`python -m execution.reconciliation_runner`)と定期実行 cycle CLI(`python -m execution.reconciliation_schedule_cli`。Issue #133)は照合時にこの DB を**読み取り**、修復サービス(Issue #104)は状態機械経由で更新する(修復の起動経路は API の明示呼び出しと cycle CLI の `--repair` のみ) |
 | `SAFETY_GATE_DECISION_DB_PATH` | `execution/data/safety_gate_decisions.sqlite3` | Safety Gate 判定監査 DB のパス上書き(`execution/safety_store.py`、Issue #75)。相対パスは `execution/` 基準。**この DB へ書き込む運用導線は Shadow Mode CLI(`python -m execution.shadow_runner`。Gate 判定の監査保存)のみ**で、定期実行する送信プロセスは存在しない(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API のみ。`demo` runner を回すと Demo の Gate 判定もここへ耐久記録される。テストは `tmp_path` を使用) |
 | `SUBMISSION_JOURNAL_DB_PATH` | `execution/data/submission_journal.sqlite3` | Live Execution 用 Submission / Cancellation Journal DB のパス上書き(`execution/submission_journal.py`、Issue #93 / #99)。Broker 送信前後の送信試行を Execution Order DB と**独立に**耐久記録する(Journal 保存失敗時は fail-closed で送信されない)。相対パスは `execution/` 基準。**運用導線からこの DB を作成・更新する常駐プロセスは現時点で存在しない**(Issue #131 / #132 の runner core は `fake` / `demo` mode でこの Journal を通るが、systemd 等の継続運転導線は未実装。テストは `tmp_path` を使用) |
 | `KILL_SWITCH_DB_PATH` | `execution/data/kill_switch.sqlite3` | Execution 層の**永続 Kill Switch** 状態 DB のパス上書き(`execution/kill_switch_store.py`、Issue #81)。相対パスは `execution/` 基準。本番は永続ボリューム上の絶対パス推奨。状態は append-only の遷移履歴(有効/無効・UTC 時刻・operator・reason)で、Safety Gate は毎評価この DB を再読する。**DB が読めない(未初期化・schema 不一致・破損)あいだは fail-closed で全新規送信が拒否される**(「OFF 扱い」にはならない)。操作は `python -m execution.kill_switch_cli`(下記 CLI 節)。Live 送信境界(`LiveOrderSubmissionService`)と Live 起動前 preflight(`python -m execution.live_startup_cli`)がこの DB を fail-closed に評価する(Issue #82)。**定期的に評価する常駐 Live Execution runner は存在しない**(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、各送信判定ごとにこの Kill Switch を Safety Gate 経由で再評価する。systemd 等の継続運転導線は未実装。テストは `tmp_path` を使用)。**Demo / Live の送信境界はこの永続 store の reader を必須とする**(`REAL_BROKER_MODES`。in-memory provider では境界を構築できない。Issue #132)。Demo 起動前 preflight(`python -m execution.demo_startup_cli`)もこの DB を fail-closed に評価する |
-| `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。schema v3(Issue #105)は position / trade / SL・TP 検出記録テーブル(`manual_review` のみ許可)と run の position summary 列を additive に追加(migration は v1 → v2 → v3 の段階適用、`init_reconciliation_db()` のみ)。**この DB を作成・更新する運用導線は手動 reconciliation CLI(`python -m execution.reconciliation_runner`。Issue #105、下記 CLI 節)だけであり**、scheduler / 常駐 Bot への組み込みは未実装(テストは `tmp_path` を使用) |
+| `BROKER_RECONCILIATION_DB_PATH` | `execution/data/broker_reconciliation.sqlite3` | Broker reconciliation の照合結果 + 修復監査 DB のパス上書き(`execution/reconciliation_store.py`、Issue #103 / #104)。相対パスは `execution/` 基準。検出は**検出専用**で注文状態を変更せず、修復(Issue #104)は保存済み run を入力に execution store の状態機械 API 経由でのみ内部注文状態を確定する(この DB に注文テーブルは存在しない。schema v2 = repair 監査テーブル(pending claim → finalized の 2 段階)+ **takeover intents テーブル**(cross-DB takeover の durable な identity・状態・blocked 診断。人手対応が必要な `blocked` 行はここに残り、`blocked_reason` と観測値で原因を特定できる。同じ generation の takeover は自動で再試行されない)+ discrepancies の観測 revision 列追加。v1 → v2 は `init_reconciliation_db()` のみが additive に migration し、読み取り / dry-run は migration しない)。schema v3(Issue #105)は position / trade / SL・TP 検出記録テーブル(`manual_review` のみ許可)と run の position summary 列を additive に追加(migration は v1 → v2 → v3 の段階適用、`init_reconciliation_db()` のみ)。**この DB を作成・更新する運用導線は手動 reconciliation CLI(`python -m execution.reconciliation_runner`。Issue #105、下記 CLI 節)と定期実行 cycle CLI(`python -m execution.reconciliation_schedule_cli`。Issue #133。systemd timer + oneshot、Execution 送信 runner とは独立した実行単位)だけである**。常駐 Bot への組み込みは未実装(テストは `tmp_path` を使用) |
 | `ENABLE_LIVE_TRADING` | unset | Live 接続のマスタースイッチ(Issue #82)。**厳密に `true`(小文字)のときだけ有効**。`TRUE` / `1` / `yes` / 前後空白付きはすべて無効扱いで fail-closed。これ単独では Live 接続できない(下記「Live 有効化手順」の全条件が必要)。**Demo mode のプロセス環境には設定しない**(設定されていると Demo 起動チェックが fail-closed で拒否する) |
 | `OANDA_LIVE_API_TOKEN` | empty | OANDA **Live** Adapter(`broker/oanda_live_adapter.py`、Issue #82)の API token。Demo 用 `OANDA_API_TOKEN` とは**別変数**で、同一値を両方へ設定すると構築時に fail-closed で拒否。環境変数でのみ渡し、ログ・例外・docs・リポジトリへ実値を書かない |
 | `OANDA_LIVE_ACCOUNT_ID` | empty | OANDA Live Adapter の Live account id。Demo 用 `OANDA_ACCOUNT_ID` とは**別変数**で、同一値の共有は fail-closed。起動 summary には非可逆 digest(`account-<12桁>`)だけを表示し、実 ID は出力しない |
@@ -286,8 +286,71 @@ python -m execution.reconciliation_runner --broker fake --dry-run
 - exit code: **0** = 差分・部分失敗なし / **1** = 差分または部分失敗(照合できなかった列挙を含む)/ **2** = usage・設定エラー(Demo 以外の endpoint 拒否・credential 欠落を含む)。
 - 既定では run を reconciliation DB(`BROKER_RECONCILIATION_DB_PATH`)へ append する(`init_reconciliation_db()` は冪等)。`--run-id` 省略時は一意な ID を自動生成し、既存 run_id の再記録は拒否される。
 - **token / account id / endpoint は出力・ログへ一切出ない**(接続表示は定数ラベル `demo / oanda-demo` のみ。設定エラー文言は環境変数名のみを含み値を echo しない)。
-- 検出結果は要確認(`manual_review`)分類の記録であり、**この CLI から自動修復は起動しない**。order スコープの修復(Issue #104)はサービス API の明示呼び出しのみ。
+- 検出結果は要確認(`manual_review`)分類の記録であり、**この CLI から自動修復は起動しない**。order スコープの修復(Issue #104)はサービス API の明示呼び出し、または下記の定期実行 cycle CLI の `--repair` のみ。
 - 通常 CI・pytest から実 Demo API へは接続しない(CI は `--broker fake` 経路のみ実行)。
+
+### 定期実行 Broker reconciliation(systemd timer + oneshot, Issue #133)
+
+`python -m execution.reconciliation_schedule_cli` は、上記の照合を**定期実行するための oneshot 境界**。**Execution 送信 runner とは独立した実行単位**であり、独自の schedule・独自の lock・独自の失敗面を持つ(reconciliation の停止が送信を止めず、送信の停止が監査を止めない)。手動 CLI との違いは次の 3 点だけで、reconcile-only 契約は同一である(同じ facade を同じ composition 関数から受け取る)。
+
+1. **排他入場**: cycle 全体を advisory lock で保護する(既定 `<reconciliation DB と同じディレクトリ>/reconciliation_cycle.lock`)。
+2. **restart 継続**: crash した前回 cycle が残した pending repair attempt を、**新しい照合の前に** 既存の takeover / recovery 経路(`recover_pending_attempts()`)で引き継ぐ(`--repair` 時のみ)。
+3. **`--repair`(既定 OFF)**: 直前に記録した run に対して既存の Issue #104 修復 pass を実行する。
+
+```bash
+# 1 cycle(検出のみ。reconciliation DB へ run を記録)
+python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir /opt/berial/execution/data/demo --json
+
+# 1 cycle(検出 + 既存修復経路。owner id は deployment ごとに固定・一意にする)
+python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir /opt/berial/execution/data/demo --repair --repair-owner-id demo-recon-1 --json
+
+# 照合のみ(DB も lock file も作らない。--repair とは併用不可)
+python -m execution.reconciliation_schedule_cli --broker fake --data-dir /tmp/recon --dry-run
+```
+
+- exit code: **0** = 差分・部分失敗・blocked takeover・修復エラーなし、**または他 cycle が lock を保持していて抑止された** / **1** = 差分・部分失敗・blocked takeover・途中終了した修復 pass / **2** = usage・設定エラー(Demo 以外の endpoint 拒否・credential 欠落・`--dry-run` と `--repair` の併用・lease と Broker timeout の矛盾を含む)。
+- **overlap の扱い**: 抑止(suppression)であって失敗ではない。timer 運用では「前回 cycle がまだ動いている」は正常であり、unit を failed にすると unit 状態が信用されなくなるため。抑止は JSON の `outcome: "suppressed_locked"` と stderr の `WARNING` で可視化されるので、`journalctl -u berial-execution-reconciliation` に `run_id` を出さない run が続く場合は cycle の hang を疑う。systemd 自身も稼働中の oneshot unit を二重起動しないため、lock が実際に効くのは **手動実行と timer 実行が重なる**ケース。
+- **修復の境界は変わらない**: `--repair` で既存経路へ進むのは order スコープの `auto_repair_candidate` のみ。`manual_review`(broker 側にしか存在しない注文、確定済み結果と矛盾する観測、および **position / trade / transaction / SL・TP の全 discrepancy**)は自動修復されない。position ドメインには修復経路自体が存在せず、close / 再作成 / SL・TP 変更 / 再送は一切行われない。変更され得るのは BELIAL 内部の注文状態のみで、それも既存の状態機械(Issue #74)と claim / lease / generation / takeover / fencing 契約(Issue #104)を経由する。
+- **未解決の claim が残っていると修復 pass は走らない**: recovery の後に pending attempt が 1 件でも残っている、**または** recovery が `BLOCKED` を返した場合(および recovery が reservation を拒否した場合)、その cycle は**検出だけ行って修復 pass を skip する**。両方を見るのは、`BLOCKED` が必ず pending を伴うとは限らないため(finalize 済み attempt の orphaned intent は `BLOCKED` かつ pending 無し)。新しい attempt は他者の fence を引き継いでしまうため、放置すると claim / lease の境界を毎 tick 素通りする。理由は JSON の `repair_skipped_reason` と human 出力の `repair pass skipped:` 行に出る。残り方は 2 種類あり、出力で区別できる:
+  - **lease がまだ有効なだけ**(前回 cycle が `TimeoutStartSec` 等で kill され、claim の lease が生きたまま次の tick が来た場合を含む): **自己修復する**。lease 満了後の cycle が元の identity のまま takeover し、以降の pass は通常どおり走る。放置してよい。
+  - **`BLOCKED`**: 自動収束できない fencing 状態であり、**人手の判断が必要**。exit code は 1(clean にならない)。`broker_reconciliation_repair_takeover_intents` の `blocked` 行と `blocked_reason` を見て判断する(`docs/architecture/broker_reconciliation.md`)。
+
+  この判定は pass の直前に行われるが、**mutex ではない**。修復サービスを直接呼ぶ運用者は cycle lock を取らないため、判定直後に claim する可能性は残る。その場合の結果は従来どおり Issue #104 の fencing が決める(新しい attempt が勝ち、古い worker は `repair_fence_conflict` で typed に失敗する。誤った書き込みは起こらない)。**cycle と手動の repair API を意図的に同時実行する運用は避けること。**
+- **未解決の blocked takeover intent は毎 cycle 報告され、exit 1 を維持する**(`--repair` の有無に関わらず。同梱 unit の既定は `--repair` なしであり、そこで報告されないと既定デプロイが恒久的に clean になるため): 一度 park された blocked intent は active でなくなるため recovery も pending も沈黙するが、人手対応が必要な事実は残る。cycle は開始時点の blocked intent を毎回読み出し、JSON の `unresolved_blocked_intents` と human 出力の `UNRESOLVED blocked takeover intent(s)` 行で報告し、**その cycle を clean にしない**(exit 1)。ただし**修復 pass は止めない** — `BLOCKED` は終端 status で intent は永久保持されるため、gate にすると歴史的な監査行 1 行で無関係な注文の修復まで恒久停止してしまう。
+  - **既知の制約**: blocked intent を解消する in-band な手段は現状存在しない。したがって**一度発生すると unit は恒久的に failed になる**。中身は `broker_reconciliation_repair_takeover_intents` の `blocked` 行(`blocked_reason` と観測値)で特定し、根本原因を人手で解消すること。「解決済みとして確定する」操作は Issue #104 の intent 状態機械に属し、後続 Issue で扱う。
+- **既存 audit DB の migration**: cycle は既存の audit DB に対して読み取り前に `init_reconciliation_db()`(冪等)を呼ぶため、リリース済み旧 schema(v1 / v2)を持つデプロイでも初回の cycle が **v3 へ in-place migration してから**記録する。既存 run は保持される。DB が存在しない場合は作成せず、初回作成は記録経路に委ねる(dry-run は何も作らない)。
+- **監査の追跡**: run・discrepancy・repair attempt はすべて `BROKER_RECONCILIATION_DB_PATH` の DB に永続化される。プロセスが落ちても `run_id` から `get_reconciliation_run()` / `list_repair_attempts()` / `list_pending_repair_attempts()` で追跡でき、pending attempt は lease 満了後に次の cycle が引き継ぐ。
+- `--lease-seconds`(既定 600)は 1 attempt の作業時間を十分上回る値にする。Broker の HTTP timeout は adapter の設定値がそのまま修復サービスへ渡され、**timeout >= lease は構築時に拒否される**(exit 2)。
+- token / account id / endpoint は出力・ログへ一切出ない(手動 CLI と同じ契約)。
+- CI は `--broker fake` 経路のみ実行し、実 Demo API へは接続しない。
+
+#### systemd への導入
+
+テンプレートは `scripts/systemd/berial-execution-reconciliation.service` / `berial-execution-reconciliation.timer`(リポジトリにコミット済み)。**UTC の 15 分毎**(`*:0/15:00 UTC`)に oneshot service を起動する。`Persistent=true` により停止中に逃した発火は起動後 1 回だけ追い付き実行される(再起動直後は照合が最も必要な場面であるため意図的)。`RandomizedDelaySec=2m` は周期より十分短く、tick を飛ばさない。
+
+```bash
+# 1) データディレクトリを先に作る(必須。下記「データディレクトリの事前作成」参照)
+sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data
+sudo install -d -o ubuntu -g ubuntu -m 0750 /opt/berial/execution/data/demo
+
+# 2) unit を配置して timer を enable する
+sudo cp /opt/berial/scripts/systemd/berial-execution-reconciliation.service /etc/systemd/system/
+sudo cp /opt/berial/scripts/systemd/berial-execution-reconciliation.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now berial-execution-reconciliation.timer   # timer を enable する(service ではない)
+systemctl list-timers berial-execution-reconciliation.timer
+journalctl -u berial-execution-reconciliation -n 50
+```
+
+**データディレクトリの事前作成(必須)**: `execution/data/` は Git 管理外(`.gitignore`)であり、リポジトリを配置しただけでは存在しない。unit は `ProtectSystem=strict` で `/opt/berial` を read-only にし、`ReadWritePaths=/opt/berial/execution/data` だけを書き込み可能にするため、**このディレクトリが存在しないと timer 発火のたびに失敗する**。unit の `ReadWritePaths` には意図的に `-`(存在しなければ無視)を付けていない: `-` を付けると systemd が黙って read-only のまま起動し、cycle がデータディレクトリを作れずに毎回 exit 2 で終わる — 原因が unit 設定にあることが journal から読み取れない。`-` なしなら namespace 設定の時点で `status=226/NAMESPACE` として明示的に失敗する。所有者は unit の `User=` / `Group=`(テンプレートでは `ubuntu`)に合わせること。`--data-dir` を変更する場合は `ReadWritePaths` も同じ親ディレクトリへ合わせる。
+
+- **service ではなく timer を enable する**。service を直接 start すると即座に 1 cycle 走る。
+- `EnvironmentFile=/opt/berial/execution/.env` には **Demo 資格情報のみ**を置く。`ENABLE_LIVE_TRADING` と `OANDA_LIVE_*` は置かない(Demo 起動チェックの分離契約と同じ方針。この unit 自体は送信経路を持たないが、環境の混在を残さない)。
+- `--data-dir` は **Demo 専用のデータディレクトリ**を指す。Fake と同じ store 形状を使うため、namespace を分けること。
+- 既定テンプレートは `--repair` を付けていない。有効化する場合は **既存の `ExecStart=` 行を差し替える**(oneshot service は複数の `ExecStart=` を順に実行するため、行を追加すると 1 tick で 2 cycle 走る)。
+- `TimeoutStartSec=600` で 1 cycle を打ち切る。hang した cycle が entry lock を握り続けて以降の tick を抑止し続けるのを防ぐため。打ち切られた repair claim は lease 満了後に次の cycle の recovery が元の identity のまま引き継ぐ。**lease が切れるまでの間の tick は修復 pass を skip する**(上記「未解決の claim が残っていると修復 pass は走らない」)ので、kill された worker の claim を別の attempt が横取りすることはない。
+- 実機のみで確認する項目(pytest には含めない): `systemd-analyze verify` の通過、`systemd-analyze calendar '*:0/15:00 UTC'`、timer 発火時刻、`Persistent=true` の追い付き実行、再起動後の enable 状態、`ReadWritePaths` 配下(データディレクトリ)への書き込み権限(WAL sidecar と lock file を含む)。**初回は `sudo systemctl start berial-execution-reconciliation.service` を手動で 1 回実行し、`journalctl -u berial-execution-reconciliation` に `recorded to:` 行(または `--json` の `recorded_to`)が出ることを確認する** — ディレクトリの作成漏れ・権限誤りはここで表面化する。
+- **reconciliation は Execution runner の unit と結合しない**(`Requires=` / `BindsTo=` / `PartOf=` を持たない)。片方の停止・失敗がもう片方へ波及しないことが設計上の要件である。
 
 ### Execution Kill Switch — 緊急発注停止・状態確認・解除(Issue #81)
 
@@ -361,8 +424,8 @@ python -m execution.kill_switch_cli disable \
   - 変換の直後に読み取りが走ったタイミング次第では、拒否とあわせて `kill_switch.sqlite3-wal` / `-shm` が残ることがある(WAL 内容を正しく読むには WAL index が必要なため。安全側の割り切りで、停止判定は常に fail-closed)。`journal_mode=DELETE` へ戻せば解消する。
 - `enable` / `disable` が exit 1 でも、出力に `WAS RECORDED` があれば**その遷移は記録済み**である(履歴に破損行がある等で現在状態を確認できないだけ)。この場合 Gate は fail-closed のまま送信を止め続けるので、破損を解消してから `status` で再確認する。逆に `WAS RECORDED` がない exit 1 は、遷移が記録されていない(store 自体を開けない)ことを意味する。
 - 状態読み取りは**履歴全行の完全性を検証**してから状態を返す。帯域外編集で 1 行でも壊れていれば、その後に正常な `disable` を追記しても Gate・CLI とも fail-closed のまま(緊急停止のための `enable` は破損 DB でも記録できるが、状態が検証可能になるまで送信は止まったまま)。破損が疑われる場合は `status` の出力と `sqlite3 <db> 'SELECT * FROM kill_switch_transitions;'` で該当行を特定する。
-- 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(照合)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
-- 現時点で本番の**継続運転する常駐** Live Execution runner は存在しない(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、systemd 等の運用導線は未実装)。Kill Switch は Live 送信境界が `PersistentKillSwitchStateProvider` を読むことで効き、**この配線は契約ではなく強制**である(`LiveOrderSubmissionService` は execution mode が `demo` / `live`(= `REAL_BROKER_MODES`。Issue #132)の場合、gate が永続 Kill Switch reader を持たない composition を構築時に拒否する。in-memory provider では「OFF」を構造的に作れてしまい、読み取り不能を暗黙の OFF に変えるため)。加えて、`python -m execution.live_startup_cli` / `python -m execution.demo_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
+- 停止中も実行できる非送信系: `python -m execution.reconciliation_runner`(単発照合)、`python -m execution.reconciliation_schedule_cli`(定期 cycle。`--repair` を含め Broker への送信・取消を行わない)、shadow report、execution store の read-only 照会。これらは kill switch を参照しない。
+- 現時点で本番の**継続運転する常駐** Live Execution runner は存在しない(Issue #131 / #132 の runner core は `fake` / `shadow` / `demo` を駆動するライブラリ API で、**送信 runner の** systemd 等の運用導線は未実装。Issue #133 の systemd 導線は reconciliation 専用で、送信経路を持たない)。Kill Switch は Live 送信境界が `PersistentKillSwitchStateProvider` を読むことで効き、**この配線は契約ではなく強制**である(`LiveOrderSubmissionService` は execution mode が `demo` / `live`(= `REAL_BROKER_MODES`。Issue #132)の場合、gate が永続 Kill Switch reader を持たない composition を構築時に拒否する。in-memory provider では「OFF」を構造的に作れてしまい、読み取り不能を暗黙の OFF に変えるため)。加えて、`python -m execution.live_startup_cli` / `python -m execution.demo_startup_cli` は接続を組み立てる前にも同じ状態を読んで fail-closed に拒否する(`docs/architecture/safety_gate.md` の「永続 Kill Switch」参照)。
 
 ### Demo mode の起動(Issue #132)
 
@@ -436,7 +499,7 @@ exit code: **0** = 全ロック成立(Demo 接続を構築できた。発注は�
 
 **緊急停止は Live と同じ**: `python -m execution.kill_switch_cli enable` を入れれば、Demo の新規送信も Broker call 前に停止する(Gate が送信判定ごとに永続 store を読み直し、送信境界が Broker 呼び出し直前にもう一度読むため、実行中の runner にも反映される)。**enable と送信が同時に走った場合の原子性は保証しない** — 上記「Kill Switch と Broker 送信の契約」を参照。
 
-**未整備(別 Issue)**: Demo の継続運転(systemd 常駐・定期 reconciliation)は本 Issue の範囲外である。`demo` runner はライブラリ API(`execution.runner_composition.build_demo_execution_runner`)として利用でき、この CLI は preflight のみで runner を起動しない。Demo と Fake は同じ store 形状(`execution_orders` / `submission_journal` / `safety_gate_decisions`)を使うため、**運用では data-dir を分けて namespace を分離する**。
+**未整備(別 Issue)**: Demo の継続運転のうち **送信 runner の systemd 常駐**は本 Issue の範囲外である(**定期 reconciliation は Issue #133 で実装済み**。上記「定期実行 Broker reconciliation」節。reconciliation は送信 runner とは独立した実行単位であり、runner の常駐は解禁しない)。`demo` runner はライブラリ API(`execution.runner_composition.build_demo_execution_runner`)として利用でき、この CLI は preflight のみで runner を起動しない。Demo と Fake は同じ store 形状(`execution_orders` / `submission_journal` / `safety_gate_decisions`)を使うため、**運用では data-dir を分けて namespace を分離する**。
 
 ### Live 接続の有効化 / 無効化 / 緊急停止(Issue #82)
 
@@ -555,8 +618,8 @@ python -m execution.live_startup_cli \
 
 - FakeBroker 固定シナリオ試験が安定している(`python -m execution.scenario_runner`)
 - Shadow Mode で想定注文を確認済み(`python -m execution.shadow_runner` / shadow report)
-- Demo 口座で継続運転済み(Issue #132 で `demo` mode の runner 統合と起動ロックは実装済み。**継続運転そのもの**= 定期 reconciliation・systemd 常駐は別 Issue で、この項目は未達)
-- Broker reconciliation が稼働している(`python -m execution.reconciliation_runner`)
+- Demo 口座で継続運転済み(Issue #132 で `demo` mode の runner 統合と起動ロックは、Issue #133 で定期 reconciliation の systemd timer + oneshot 導線は実装済み。**送信 runner の継続運転そのもの**は別 Issue で、この項目は未達)
+- Broker reconciliation が稼働している(定期実行は `berial-execution-reconciliation.timer` / `python -m execution.reconciliation_schedule_cli`、単発照合は `python -m execution.reconciliation_runner`)
 - Kill Switch が動作確認済み(enable → 送信拒否 → disable)
 - 発注数量・許可銘柄・リスク上限が `--safety-config` に設定済み
 
@@ -569,9 +632,9 @@ Issue #131 で **runner core**(`execution/live_runner.py` + `execution/runner_co
 **運用上の現状**:
 
 - 駆動できる mode は **`fake` / `shadow` / `demo`**。`live`(live activation lock)/ `dry-run`(mode ではなく flag)/ 未知 mode は `RunnerModeError` で拒否される。**OANDA Live へは runner から接続できない**。`demo` は `demo_lock.build_demo_connection()` が発行した grant からのみ組み立てられる。
-- **systemd 等の継続運転導線は未実装**であり、現時点で runner を常駐させる運用手順は存在しない(ライブラリ API とテストからのみ駆動される。`python -m execution.demo_startup_cli` は preflight であって runner を起動しない)。この文書に runner の常駐起動コマンドが載るのは、継続運転の Issue が完了してからである。
+- **runner の systemd 等の継続運転導線は未実装**であり、現時点で runner を常駐させる運用手順は存在しない(ライブラリ API とテストからのみ駆動される。`python -m execution.demo_startup_cli` は preflight であって runner を起動しない)。この文書に runner の常駐起動コマンドが載るのは、継続運転の Issue が完了してからである。Issue #133 で追加された systemd 導線は **reconciliation 専用**であり、runner を起動しない。
 - Kill Switch は**送信判定ごとに** Safety Gate 経由で再評価される(`KILL_SWITCH_DB_PATH` の永続 provider を配線した場合、有効化はプロセス再起動をまたいで新規送信を止め続ける。読めない場合も fail-closed)。
-- **reconciliation の定期実行は runner に含まれない**(引き続き手動 CLI)。runner は送信結果が不明(`unresolved`)な注文を**再送しない**。解決は reconciliation の責務である。
+- **reconciliation の定期実行は runner に含まれない**(Issue #133 で別プロセス・別 systemd unit として実装した。runner から reconciliation を呼ぶ経路は追加していない)。runner は送信結果が不明(`unresolved`)な注文を**再送しない**。解決は reconciliation の責務である。
 - dry-run は完全無副作用(Broker 呼び出し・Order Store / Journal / Shadow Store 書き込み・DB 作成・migration のいずれも行わない)。
 
 ### Paper Signal 日次集計レポート(Issue #47)

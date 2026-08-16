@@ -123,7 +123,7 @@ v1.5 は、`v1.4.1` タグ後に追加された以下の系統をまとめたリ
 
 - **実発注を駆動する定期実行 runner・自動売買**(Live Execution 本体の常駐プロセス)。まだ設計しない
 - `demo` mode の Execution 層統合(v1.6 の Issue #132 で実装。v1.5 時点では `BROKER_TYPE_BY_MODE` へ `demo` は未登録)
-- reconciliation の scheduler / 常駐 Bot への組み込み(手動 CLI のみ)
+- reconciliation の scheduler / 常駐 Bot への組み込み(v1.5 時点は手動 CLI のみ。**定期実行 = systemd timer + oneshot は v1.6 の Issue #133 で実装**。常駐 Bot / 送信 runner への組み込みは引き続き行わない)
 - 外部 Strategy 定義の Paper Signal / Paper Execution との共有
 
 **v1.5 完了 = Live 実口座運用開始ではない。** Live 接続は Issue #82 の全ロック成立時のみ構築でき、実口座での Live 運用開始は [運用ドキュメント](../operations/operations.md) の「Live 運用開始の事前条件」(FakeBroker 固定シナリオ試験の安定 / Shadow Mode での想定注文確認 / Demo 口座での継続運転 / reconciliation 稼働 / Kill Switch 動作確認 / 発注数量・許可銘柄・リスク上限の設定)をすべて満たしたうえでの別途の運用判断である。
@@ -133,8 +133,7 @@ v1.5 は、`v1.4.1` タグ後に追加された以下の系統をまとめたリ
 - systemd timer + oneshot 化(上記「本番常駐化」の将来候補を実装する)
 - Paper Signalの結果検証(仮説が実際の値動きとどう対応したかの事後集計。発注は行わない)
 - 複数時間足・複数通貨ペアへの対応
-- Live Execution runner(Pepperoni の実発注担当分。基盤は v1.5、runner core(`fake` / `shadow`)は v1.6 の Issue #131、**OANDA Demo mode の統合は Issue #132** で実装済み。**実口座 Live の自動売買はまだ設計しない**。reconciliation の定期実行 / systemd 等の継続運転導線は後続 Issue)
-- Demo 継続運転の統合検証(定期 reconciliation + systemd。Issue #132 の後続)
-- reconciliation の定期実行化
+- Live Execution runner(Pepperoni の実発注担当分。基盤は v1.5、runner core(`fake` / `shadow`)は v1.6 の Issue #131、**OANDA Demo mode の統合は Issue #132** で実装済み。**実口座 Live の自動売買はまだ設計しない**。reconciliation の定期実行は Issue #133 で実装済み(送信 runner とは独立した実行単位)。**送信 runner** の systemd 等の継続運転導線は後続 Issue)
+- Demo 継続運転の統合検証(Issue #132 / #133 の後続。定期 reconciliation は Issue #133 で実装済みなので、残るのは Demo runner 継続運転との組み合わせ確認)
 - 外部Strategy定義をPaper Signalへ接続し、Live相当のSignal生成とBacktestを同一定義で駆動する共有化
 - Live 運用開始判断(上記事前条件の充足確認を含む。ドキュメント同期や実装完了をもって自動的に開始しない)
