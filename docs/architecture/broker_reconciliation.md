@@ -177,7 +177,9 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 - cycle が受け取れる Broker は `ReconcileOnlyBroker` **だけ**である(型で拒否する。`get_order` / `get_positions` を持つだけの duck-typed オブジェクトも拒否される)。broker 実装を import せず、`BrokerConnection` を組み立てず、adapter を構築しない — 4 点とも `execution/tests/test_submission_boundary.py` の AST 検査で固定。OANDA Demo Adapter の構築サイトは `demo_lock.py` と `reconciliation_runner.py` のままで、**Issue #133 は新しい構築サイトを増やしていない**(cycle CLI は `reconciliation_runner.build_reconcile_only_broker()` を経由する)。
 - cycle 自身は分類も状態更新もしない。`auto_repair_candidate` / `manual_review` の判定は検出サービスの、修復可否は修復サービスの責務であり、claim / lease / generation / takeover / fencing 契約はそのまま使われる(緩めない・再実装しない)。execution store の書き込み API を cycle が直接呼ばないことも AST 検査で固定。
 
-**未解決の claim が残っている cycle は修復 pass を走らせない**(PR #137 レビュー r2 / r3): recovery の後、cycle は「recovery が何を返したか」ではなく **audit DB に何がまだ pending か**を見て判断する。1 件でも pending が残っていれば、新しい修復 pass は走らせない。
+**未解決の claim が残っている cycle は修復 pass を走らせない**(PR #137 レビュー r2 / r3 / r5): recovery の後、cycle は **(1) audit DB に pending が残っているか**、**(2) recovery が `BLOCKED` を返したか** の**両方**を見て、どちらかが成立すれば新しい修復 pass を走らせない。
+
+**両方を見る理由**: 片方はもう片方を含意しない。recovery が何も返さなくても pending は残り得るし、逆に **`BLOCKED` が必ず pending を伴うとは限らない** — 既に finalize 済みの attempt に紐づく **orphaned な active intent** を protocol が park した場合(`_report_orphaned_active_intents`)、recovery は `BLOCKED` を返すのに pending 行は 1 件も無い。片方だけを見ると、もう片方のケースがそのまま通過する。
 
 **recovery が何も返さないことは「何も保護されていない」ことを意味しない**。recovery は (1) lease がまだ有効な reservation を意図的に放置し(誰かが今まさに駆動しているかもしれず、kill されたプロセスの claim も期限までは leased のまま残る)、(2) `BLOCKED` を意図的に pending のまま残す(Issue #104 は「**blocked からの自動復旧**」を明示的に非スコープとしており、人手の判断を要求する境界である)。
 

@@ -23,10 +23,11 @@ the Execution submission runner:
    ``recover_pending_attempts()`` resumes what a CRASHED earlier cycle left
    pending, under the ORIGINAL claim identity. This runs BEFORE the new
    observation so a leftover attempt is settled before anything is compared.
-   If it REFUSES a reservation, or leaves ANY attempt still pending
-   (blocked, or simply still under a valid lease), step 4 is skipped for the
-   whole cycle -- a fresh attempt would take their fence over (see "An
-   unresolved claim" below);
+   If it REFUSES a reservation, reports any ``BLOCKED`` attempt, or leaves
+   ANY attempt still pending (still under a valid lease), step 4 is skipped
+   for the whole cycle -- a fresh attempt would take an existing claim's
+   fence over, and a blocked takeover needs a human (see "An unresolved
+   claim" below);
 3. *detection* -- ``BrokerOrderReconciliationService.run()``: the Issue #103
    order scope plus, by default, the Issue #105 position / trade /
    transaction / SL / TP scope. The run is recorded to the reconciliation
@@ -70,8 +71,14 @@ What this module deliberately CANNOT do
 An unresolved claim stops the cycle's repair pass
 -------------------------------------------------
 
-After recovery, the cycle asks the audit DB what is STILL PENDING -- not
-what recovery returned. If anything is, no fresh repair pass runs.
+After recovery, the cycle skips the fresh pass if EITHER anything is still
+PENDING in the audit DB, or recovery reported any ``BLOCKED`` attempt.
+
+Both, because neither implies the other. Recovery returning nothing does not
+mean nothing is pending, and a BLOCKED attempt is not always still pending:
+when the protocol parks an ORPHANED active intent whose attempt was already
+finalized, it reports BLOCKED with no pending row behind it. Checking only
+one of the two leaves the other's case walking straight through.
 
 Recovery returning nothing does NOT mean nothing is protected. It
 deliberately leaves alone every reservation whose lease is still valid
@@ -515,30 +522,42 @@ def _detect_only_cycle(
     )
 
 
-def _unresolved_reason(unresolved, recovered) -> str:
+def _blocked_in(recovered) -> tuple[OrderRepairAttempt, ...]:
+    return tuple(
+        attempt for attempt in recovered if attempt.outcome is RepairOutcome.BLOCKED
+    )
+
+
+def _skip_reason(unresolved, blocked) -> str:
     """Why a repair pass was skipped, in the terms an operator must act on.
 
     A BLOCKED attempt needs a human; a still-leased one only needs time (the
     next cycle takes it over once the lease expires). Saying which is which
-    is the difference between "investigate now" and "it will clear itself".
+    is the difference between "investigate now" and "it will clear itself" --
+    and the two are reported independently because they do not imply each
+    other (see the gate).
     """
-    blocked = sorted(
-        attempt.attempt_id
-        for attempt in recovered
-        if attempt.outcome is RepairOutcome.BLOCKED
-    )
-    detail = (
-        f"{len(blocked)} of them BLOCKED by the takeover protocol "
-        f"({', '.join(blocked)}) and needing a human"
-        if blocked
-        else "none of them BLOCKED -- their claim leases are simply still valid, so a "
-        "later cycle takes them over once the leases expire"
-    )
+    parts = []
+    if blocked:
+        parts.append(
+            f"{len(blocked)} attempt(s) BLOCKED by the takeover protocol "
+            f"({', '.join(sorted(entry.attempt_id for entry in blocked))}) and needing "
+            "a human"
+        )
+    if unresolved:
+        tail = (
+            ""
+            if blocked
+            else " -- none of them BLOCKED, so their claim leases are simply still "
+            "valid and a later cycle takes them over once the leases expire"
+        )
+        parts.append(
+            f"{len(unresolved)} repair attempt(s) still pending after takeover recovery "
+            f"({', '.join(sorted(entry.attempt_id for entry in unresolved))}){tail}"
+        )
     return (
-        f"{len(unresolved)} repair attempt(s) are still pending after takeover recovery "
-        f"({', '.join(sorted(entry.attempt_id for entry in unresolved))}); {detail}. No "
-        "fresh repair pass was run this cycle -- a new attempt would take their fence "
-        "over instead of respecting the claim"
+        "; ".join(parts) + ". No fresh repair pass was run this cycle -- a new attempt "
+        "would take an existing claim's fence over, and a blocked takeover needs a human"
     )
 
 
@@ -655,17 +674,23 @@ def _guarded_cycle(
         # resolved -- as it always has been -- by the store's fencing, which
         # fails the loser typed (``repair_fence_conflict``) and never lets a
         # wrong write land. See "Concurrency" in the module docstring.
+        # BOTH conditions, because neither implies the other (PR #137 review
+        # r5). A BLOCKED attempt is USUALLY still pending -- but not when the
+        # protocol parked an ORPHANED active intent whose attempt was already
+        # finalized (``_report_orphaned_active_intents``): recovery reports
+        # BLOCKED and the audit DB has no pending row at all.
         unresolved = reconciliation_store.list_pending_repair_attempts(
             db_path=reconciliation_db_path
         )
-        if unresolved:
+        blocked = _blocked_in(recovered)
+        if unresolved or blocked:
             return _skipped_report(
                 run_id=run_id,
                 run=run,
                 include_position_scope=include_position_scope,
                 reconciliation_db_path=reconciliation_db_path,
                 recovered=recovered,
-                skipped_reason=_unresolved_reason(unresolved, recovered),
+                skipped_reason=_skip_reason(unresolved, blocked),
             )
         try:
             attempts = service.repair(run_id=run_id, mode=RepairMode.APPLY).attempts

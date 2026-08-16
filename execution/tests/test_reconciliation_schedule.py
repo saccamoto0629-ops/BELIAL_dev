@@ -30,7 +30,12 @@ from broker.broker_models import (
     OrderType,
 )
 from broker.fake_broker import FakeBroker
-from execution import broker_reconciliation, execution_store, reconciliation_store
+from execution import (
+    broker_reconciliation,
+    broker_reconciliation_repair,
+    execution_store,
+    reconciliation_store,
+)
 from execution import reconciliation_runner as runner
 from execution.broker_reconciliation import BrokerOrderReconciliationService
 from execution.broker_reconciliation_repair import BrokerOrderReconciliationRepairService
@@ -1168,3 +1173,88 @@ def test_a_direct_caller_claiming_inside_the_residual_window_loses_typed_never_w
     ] == "filled"
     # and nothing is orphaned: the loser is finalized, not left pending
     assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
+
+
+def test_an_orphaned_blocked_intent_stops_the_pass_even_with_nothing_pending(
+    paths, monkeypatch
+):
+    """PR #137 Codex review r5.
+
+    A BLOCKED attempt is USUALLY still pending -- but not when the protocol
+    parks an ORPHANED active intent whose attempt was already finalized. Then
+    recovery reports BLOCKED and the audit DB has NO pending row, so a
+    pending-only gate lets the pass straight through while protocol
+    corruption is outstanding.
+
+    The order under corruption is not the interesting one (recovery already
+    settled it): the test seeds a SECOND, independently repairable order and
+    pins that the cycle leaves it alone too.
+    """
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-16")
+    broker.submit_order(broker_request("exec-16"))
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        run_cycle(paths, reconcile_only(broker), run_id="run-16a", repair_enabled=True)
+    monkeypatch.undo()
+    (crashed,) = reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db)
+
+    # a recovery that dies at finalize leaves the intent CLAIM_PROMOTED
+    monkeypatch.setattr(broker_reconciliation_repair, "finalize_repair_attempt", crash)
+    with pytest.raises(KeyboardInterrupt):
+        BrokerOrderReconciliationRepairService(
+            broker=reconcile_only(broker),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            owner_id="recovery",
+            clock=lambda: LATER_AT,
+        ).recover_pending_attempts()
+    monkeypatch.undo()
+
+    # ... and finalizing the attempt out of band under a FOREIGN takeover id
+    # orphans that intent: BLOCKED, with nothing pending behind it
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE {reconciliation_store.REPAIRS_TABLE} SET status = 'finalized', "
+            "outcome = 'failed', failure_code = 'store_update_failed', "
+            "takeover_id = 'tk-foreign', finalized_at_utc = ?",
+            (LATER_AT.isoformat(),),
+        )
+        connection.commit()
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
+
+    # a SECOND order the cycle could otherwise repair
+    seed_internal_unknown(execution_db, "exec-17")
+    broker.submit_order(broker_request("exec-17"))
+
+    report = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-16b",
+        repair_enabled=True,
+        clock=lambda: LATER_AT + timedelta(days=1),
+    )
+
+    (blocked,) = report.recovered_attempts
+    assert blocked.outcome is RepairOutcome.BLOCKED
+    assert blocked.failure_code is RepairFailureCode.TAKEOVER_PROTOCOL_CORRUPT
+    assert blocked.attempt_id == crashed.attempt_id
+    # the gate held even though NOTHING was pending
+    assert report.repair_attempts == ()
+    assert "BLOCKED" in report.repair_skipped_reason
+    assert "needing a human" in report.repair_skipped_reason
+    # the unrelated order was NOT repaired while corruption is outstanding
+    assert execution_store.get_execution_order("exec-17", db_path=execution_db)[
+        "order_state"
+    ] == "unknown"
+    assert not report.is_clean
+    # detection still ran and is durable
+    assert reconciliation_store.get_reconciliation_run(
+        "run-16b", db_path=reconciliation_db
+    ) is not None
