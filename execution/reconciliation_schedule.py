@@ -23,10 +23,10 @@ the Execution submission runner:
    ``recover_pending_attempts()`` resumes what a CRASHED earlier cycle left
    pending, under the ORIGINAL claim identity. This runs BEFORE the new
    observation so a leftover attempt is settled before anything is compared.
-   If it REFUSES a reservation, or reports any ``BLOCKED`` attempt, step 4 is
-   skipped for the whole cycle: both mean the state needs a human, and a
-   fresh attempt would simply take the fence over (see "Blocked takeovers"
-   below);
+   If it REFUSES a reservation, or leaves ANY attempt still pending
+   (blocked, or simply still under a valid lease), step 4 is skipped for the
+   whole cycle -- a fresh attempt would take their fence over (see "An
+   unresolved claim" below);
 3. *detection* -- ``BrokerOrderReconciliationService.run()``: the Issue #103
    order scope plus, by default, the Issue #105 position / trade /
    transaction / SL / TP scope. The run is recorded to the reconciliation
@@ -67,28 +67,40 @@ What this module deliberately CANNOT do
 - It performs no state update of its own: it owns no execution-store write
   call.
 
-Blocked takeovers stop the cycle's repair pass
------------------------------------------------
+An unresolved claim stops the cycle's repair pass
+-------------------------------------------------
 
-The Issue #104 recovery protocol parks a state it must NOT resolve --
-a fence ahead of the intent, a foreign identity, several active intents --
-durably on the intent row and returns it as a ``BLOCKED`` attempt.
-"Automatic recovery from blocked" is an explicit non-scope there: it needs
-a human.
+After recovery, the cycle asks the audit DB what is STILL PENDING -- not
+what recovery returned. If anything is, no fresh repair pass runs.
 
-Running a fresh repair pass in the same cycle would walk straight past that
-boundary. The new pass mints a NEW attempt id, and
-``execution_store.register_repair_fence`` REPLACES a fence held by a
-DIFFERENT attempt by design (a genuinely new attempt is allowed to take an
-order over) -- so the very order whose fencing state nobody could account
-for would be re-observed, re-claimed at generation 1 and committed, while
-the blocked claim stayed pending. Under a timer that is not a one-off: it
-is every tick.
+Recovery returning nothing does NOT mean nothing is protected. It
+deliberately leaves alone every reservation whose lease is still valid
+(someone may be driving it right now, and a killed process's claim stays
+leased until it expires), and it leaves a ``BLOCKED`` one pending on
+purpose -- the Issue #104 protocol parks a state it must not resolve (a
+fence ahead of the intent, a foreign identity, several active intents) and
+asks for a human, "automatic recovery from blocked" being an explicit
+non-scope there.
 
-So a cycle that sees ANY blocked attempt records its detection and stops
-there, reporting why on ``repair_skipped_reason``. Detection still runs --
-a read-only observation is exactly what the operator needs to diagnose the
-block.
+A fresh pass would walk straight past both boundaries. It mints a NEW
+attempt id, and ``execution_store.register_repair_fence`` REPLACES a fence
+held by a DIFFERENT attempt by design (a genuinely new attempt is allowed
+to take an order over) -- so the very order somebody else has claimed would
+be re-observed, re-claimed at generation 1 and committed, while the original
+claim stayed pending. Under a timer that is not a one-off: it is every tick.
+
+The entry lock does not cover this. It excludes concurrent CYCLES; a claim
+outlives the cycle that made it, so a claim left by a killed cycle (or by a
+human calling the repair API) is still there when the next tick takes the
+lock.
+
+The deferral is self-healing and bounded: once the lease expires, the next
+cycle's recovery takes the attempt over under its ORIGINAL identity and the
+pass runs again. Only a BLOCKED attempt stays indefinitely -- which is the
+point, and which is why it also makes the cycle report not-clean.
+
+Detection always runs and is always recorded either way: a read-only
+observation is exactly what an operator diagnoses the situation with.
 
 Overlap / concurrent runs
 -------------------------
@@ -143,6 +155,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from execution import reconciliation_store
 from execution.broker_reconciliation import BrokerOrderReconciliationService
 from execution.broker_reconciliation_repair import (
     BrokerOrderReconciliationRepairService,
@@ -478,6 +491,33 @@ def _detect_only_cycle(
     )
 
 
+def _unresolved_reason(unresolved, recovered) -> str:
+    """Why a repair pass was skipped, in the terms an operator must act on.
+
+    A BLOCKED attempt needs a human; a still-leased one only needs time (the
+    next cycle takes it over once the lease expires). Saying which is which
+    is the difference between "investigate now" and "it will clear itself".
+    """
+    blocked = sorted(
+        attempt.attempt_id
+        for attempt in recovered
+        if attempt.outcome is RepairOutcome.BLOCKED
+    )
+    detail = (
+        f"{len(blocked)} of them BLOCKED by the takeover protocol "
+        f"({', '.join(blocked)}) and needing a human"
+        if blocked
+        else "none of them BLOCKED -- their claim leases are simply still valid, so a "
+        "later cycle takes them over once the leases expire"
+    )
+    return (
+        f"{len(unresolved)} repair attempt(s) are still pending after takeover recovery "
+        f"({', '.join(sorted(entry.attempt_id for entry in unresolved))}); {detail}. No "
+        "fresh repair pass was run this cycle -- a new attempt would take their fence "
+        "over instead of respecting the claim"
+    )
+
+
 def _guarded_cycle(
     *,
     broker: ReconcileOnlyBroker,
@@ -530,32 +570,27 @@ def _guarded_cycle(
                     "pending claim and its takeover intent stay in the audit DB for "
                     "manual review"
                 )
-            blocked = tuple(
-                attempt
-                for attempt in recovered
-                if attempt.outcome is RepairOutcome.BLOCKED
-            )
-            if blocked:
-                # A BLOCKED takeover is the SAME class of situation as a
-                # refused recovery, and it is the canonical one: the cross-DB
-                # fencing state cannot be accounted for, so the protocol parks
-                # it durably and asks for a human (Issue #104 non-scope:
-                # "blocked からの自動復旧" is deliberately absent).
+            if service is not None:
+                # RECOVERY RETURNING NOTHING DOES NOT MEAN NOTHING IS
+                # PROTECTED. It deliberately leaves alone every reservation
+                # whose lease is still valid (someone may be driving it right
+                # now), and it leaves a BLOCKED one pending on purpose. So the
+                # decision is made on what is STILL PENDING, not on what came
+                # back.
                 #
-                # A fresh pass would walk straight past that boundary. Its
+                # A fresh pass would walk straight past that boundary: its
                 # attempt id is new, and ``register_repair_fence`` REPLACES a
-                # fence held by a DIFFERENT attempt by design -- so the same
-                # order would be re-observed, re-claimed at generation 1, and
-                # committed, while the blocked claim stays pending. Under a
-                # timer that would happen every tick, which is exactly the
-                # automatic recovery the boundary exists to prevent.
-                service = None
-                skipped_reason = (
-                    f"takeover recovery reported {len(blocked)} BLOCKED attempt(s) "
-                    f"({', '.join(sorted(entry.attempt_id for entry in blocked))}); no "
-                    "repair pass was run this cycle -- a blocked takeover needs a human, "
-                    "and a fresh attempt would take the fence over instead"
+                # fence held by a DIFFERENT attempt by design -- so the very
+                # order somebody else has claimed would be re-observed,
+                # re-claimed at generation 1 and committed, while the original
+                # claim stayed pending. Under a timer that is not a one-off;
+                # it is every tick.
+                unresolved = reconciliation_store.list_pending_repair_attempts(
+                    db_path=reconciliation_db_path
                 )
+                if unresolved:
+                    service = None
+                    skipped_reason = _unresolved_reason(unresolved, recovered)
         else:
             _LOGGER.info(
                 "no reconciliation audit DB at %s yet: no pending repair attempt can "

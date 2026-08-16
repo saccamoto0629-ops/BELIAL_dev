@@ -816,6 +816,7 @@ def test_a_blocked_takeover_stops_this_cycles_fresh_repair_pass(paths, monkeypat
     # the boundary held: no fresh attempt, no state change, claim still pending
     assert report.repair_attempts == ()
     assert "BLOCKED" in report.repair_skipped_reason
+    assert "needing a human" in report.repair_skipped_reason
     assert crashed.attempt_id in report.repair_skipped_reason
     assert execution_store.get_execution_order("exec-11", db_path=execution_db)[
         "order_state"
@@ -860,3 +861,109 @@ def test_the_cli_says_a_blocked_takeover_skipped_the_repair_pass(tmp_path, capsy
 
     out = capsys.readouterr().out
     assert "repair pass skipped: takeover recovery reported 1 BLOCKED attempt(s)" in out
+
+
+def test_a_still_leased_claim_stops_this_cycles_fresh_repair_pass(paths, monkeypatch):
+    """PR #137 Codex review r3 P1.
+
+    Recovery returning NOTHING does not prove nothing is protected: it leaves
+    alone every reservation whose lease is still valid. A killed cycle's
+    claim stays leased after the process is gone, so the next tick can land
+    inside it -- and the entry lock does not help, because a claim outlives
+    the cycle that made it.
+    """
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-12")
+    broker.submit_order(broker_request("exec-12"))
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("SIGKILL-equivalent")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        run_cycle(paths, reconcile_only(broker), run_id="run-12a", repair_enabled=True)
+    monkeypatch.undo()
+
+    (leased,) = reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db)
+    inside_lease = OBSERVED_AT + timedelta(seconds=60)
+    assert inside_lease < leased.lease_expires_at_utc  # the lease really is still valid
+
+    report = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-12b",
+        repair_enabled=True,
+        clock=lambda: inside_lease,
+    )
+
+    # recovery correctly leaves it alone -- and the cycle must not step over it
+    assert report.recovered_attempts == ()
+    assert report.repair_attempts == ()
+    assert leased.attempt_id in report.repair_skipped_reason
+    assert "leases are simply still valid" in report.repair_skipped_reason
+    assert execution_store.get_execution_order("exec-12", db_path=execution_db)[
+        "order_state"
+    ] == "unknown"
+    # the claim and ITS fence are untouched
+    fence = execution_store.get_repair_fence("exec-12", db_path=execution_db)
+    assert fence["repair_attempt_id"] == leased.attempt_id
+    assert [
+        entry.attempt_id
+        for entry in reconciliation_store.list_pending_repair_attempts(
+            db_path=reconciliation_db
+        )
+    ] == [leased.attempt_id]
+    # detection still ran and is durable
+    assert reconciliation_store.get_reconciliation_run(
+        "run-12b", db_path=reconciliation_db
+    ) is not None
+
+
+def test_the_deferral_is_self_healing_once_the_lease_expires(paths, monkeypatch):
+    """Deferring must not mean abandoning: the NEXT cycle after the lease
+    expires takes the attempt over under its ORIGINAL identity and applies."""
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-13")
+    broker.submit_order(broker_request("exec-13"))
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("SIGKILL-equivalent")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        run_cycle(paths, reconcile_only(broker), run_id="run-13a", repair_enabled=True)
+    monkeypatch.undo()
+
+    (leased,) = reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db)
+    # a tick inside the lease defers ...
+    deferred = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-13b",
+        repair_enabled=True,
+        clock=lambda: OBSERVED_AT + timedelta(seconds=60),
+    )
+    assert deferred.repair_attempts == ()
+
+    # ... and a tick after it expires resolves the ORIGINAL attempt
+    healed = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-13c",
+        repair_enabled=True,
+        clock=lambda: LATER_AT,
+    )
+
+    (recovered,) = healed.recovered_attempts
+    assert (recovered.attempt_id, recovered.outcome, recovered.generation) == (
+        leased.attempt_id,
+        RepairOutcome.APPLIED,
+        2,
+    )
+    assert execution_store.get_execution_order("exec-13", db_path=execution_db)[
+        "order_state"
+    ] == "filled"
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
+    assert healed.repair_skipped_reason is None
