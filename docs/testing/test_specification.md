@@ -78,7 +78,7 @@ python -m execution.reconciliation_runner --broker fake --dry-run               
 python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir <dir> [--repair] [--orders-only] [--json]   # Issue #133 定期実行 cycle(oneshot)。0=clean または他 cycle が lock 保持で抑止 / 1=差分・部分失敗・blocked takeover・修復途中終了 / 2=usage・非Demo拒否
 python -m execution.reconciliation_schedule_cli --broker fake --data-dir <dir> --dry-run                            # 完全無副作用(DB も lock file も作らない。--repair とは併用不可)
 python -m execution.demo_startup_cli --execution-mode demo --safety-config <path> [--kill-switch-db ...] [--json]   # Demo 起動前 preflight(Issue #132。0=全ロック成立 / 1=拒否 / 2=usage。発注も外部通信もしない)
-python -m execution.shadow_service_cli --signal-db ... --execution-config ... --market-snapshot ... --account-snapshot ... [--data-dir ...] [--max-cycles N] [--dry-run] [--json]   # Issue #134 Shadow 常駐 service(broker 非到達。0=stop 要求で終了 or 有界で全 cycle ok / 1=fail-closed 拒否 or 有界で失敗 cycle / 2=usage)
+python -m execution.shadow_service_cli --signal-db ... --execution-config ... --market-snapshot ... --account-snapshot ... [--data-dir ...] [--max-cycles N] [--dry-run] [--json]   # Issue #134 Shadow 常駐 service(broker 非到達。0=stop 要求で終了 or 有界で N cycle 完走かつ全 ok / 1=fail-closed 拒否 or 有界で中断・失敗 cycle / 2=usage)
 python -m execution.demo_service_cli --execution-mode demo --safety-config <path> --market-snapshot ... [--data-dir ...] [--max-cycles N] [--dry-run] [--json]   # Issue #134 Demo 送信常駐 service(demo 活性化ロック成立時のみ。exit 契約は同上)
 ```
 

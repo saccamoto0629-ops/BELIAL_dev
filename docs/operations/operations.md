@@ -606,7 +606,7 @@ ps -aux | grep service_cli          # 手動プロセスとの二重起動確認
 - `systemctl stop` は SIGTERM = **graceful shutdown**: 処理中の 1 item(Demo では Broker call と Journal 書き込みを含む)を完走し、新規 item を開始せず、cycle 間 sleep を即中断して exit 0 で終了する。`TimeoutStopSec`(Shadow 30s / Demo 90s)を超えたら SIGKILL。
 - SIGKILL された場合も安全側: 送信中だった intent は Journal に `started` / unresolved で残り、**再送されず** reconciliation が解決する。Shadow の claim は lease 満了後に回収される。
 - 稼働確認の監査ポイント(journal): 起動時の composition ログと(Demo は)safety summary、cycle ごとの 1 行(`cycle ...: processed=N statuses={...} broker_sends=N unresolved=N failed=N`)、停止時の `service stopped: reason=stop_requested`。
-- exit code 契約: 常駐は「stop 要求で終了 = 0」(cycle 内の失敗は journal と store に残り、停止を failed にしない)。`--max-cycles` の有界検証だけは全 cycle ok のときのみ 0。
+- exit code 契約: 常駐は「stop 要求で終了 = 0」(cycle 内の失敗は journal と store に残り、停止を failed にしない)。`--max-cycles` の有界検証は **N cycle を完走し全て ok のときのみ 0**(途中で stop された有界検証は 1 = 中断を成功と記録しない)。
 - Kill Switch ON 中に Demo unit を(再)起動すると、起動拒否(exit 1)→ `RestartSec=10` での再試行を繰り返す(意図的: スイッチ解除後に自動復帰する)。journal に拒否 summary が残り続けるので、意図的な停止なら `systemctl stop` で unit 自体を止める。
 
 #### Kill Switch の確認・有効化・解除(常駐運転時)
@@ -658,7 +658,7 @@ CLI での照会: `execution_store.list_unresolved_submissions()` / `SubmissionJ
 #### Broker 側注文・position と内部状態の突合
 
 - **定期**: `berial-execution-reconciliation.timer`(15 分毎)が注文 + position / trade / SL・TP を照合し、`broker_reconciliation.sqlite3` へ run を残す。`journalctl -u berial-execution-reconciliation` で clean / attention を確認する。
-- **任意時点(restart 前後・異常時)**: `python -m execution.reconciliation_runner --broker oanda-demo --json`(reconcile-only。送信・取消は構造的に不可能)。runner の稼働と独立に、いつでも安全に実行できる。
+- **任意時点(restart 前後・異常時)**: `python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir /opt/berial/execution/data/demo --json`(reconcile-only。送信・取消は構造的に不可能)。**必ず demo の `--data-dir` を明示する**(省略すると環境変数 / パッケージ既定の別 store を照合してしまう)。この cycle CLI は timer 実行と同じ cycle lock を取るため、timer と重なった場合は安全に抑止される(`suppressed_locked` + exit 0。少し待って再実行)。手動 CLI(`python -m execution.reconciliation_runner`)を使う場合も同様に `--data-dir /opt/berial/execution/data/demo` を明示すること(こちらは **cycle lock を取らない**検出専用 pass であり、timer との重複自体は安全だが、監査 run の時系列を単純に保ちたい場合は cycle CLI を使う)。
 - reconciliation は submission runner と**独立に停止・再実行できる**: `sudo systemctl stop berial-execution-reconciliation.timer`(定期停止)/ `sudo systemctl start berial-execution-reconciliation.service`(単発実行)。runner 側は影響を受けない。
 
 #### duplicate / restart / partial failure の確認と復旧
@@ -671,7 +671,7 @@ CLI での照会: `execution_store.list_unresolved_submissions()` / `SubmissionJ
 
 1. **安全停止**: `python -m execution.kill_switch_cli enable --operator <you> --reason "<incident>"`(新規送信を全停止)→ 必要なら `sudo systemctl stop berial-execution-demo`(graceful)。Shadow / reconciliation は止めなくてよい(送信経路を持たない)。
 2. **状態確認**: 上記「監査」節の Journal / Order Store 照会で unresolved・UNKNOWN・直近送信を列挙。journal(`journalctl -u berial-execution-demo -n 200`)で最後の cycle と例外を確認。
-3. **reconciliation**: `python -m execution.reconciliation_runner --broker oanda-demo --json` で Broker 側と突合(timer 稼働中でも安全。cycle lock は手動 run と timer run の重複を抑止する)。
+3. **reconciliation**: `python -m execution.reconciliation_schedule_cli --broker oanda-demo --data-dir /opt/berial/execution/data/demo --json` で Broker 側と突合(**demo の `--data-dir` を必ず明示**。timer 稼働中でも安全 — この cycle CLI は timer と同じ cycle lock を取り、重なった場合は `suppressed_locked` + exit 0 で抑止されるので、少し待って再実行する)。
 4. **復旧**: 差分が `auto_repair_candidate` のみなら cycle の `--repair`(または repair API)で内部状態を確定させる。blocked takeover intent は `blocked_reason` を見て人手で根本原因を解消する。**DB の直接編集は行わない。**
 5. **再開**: Kill Switch status 確認 → preflight(`demo_startup_cli`)→ `--confirm-resume` 付き disable → `sudo systemctl start berial-execution-demo` → journal で最初の cycle を確認。
 

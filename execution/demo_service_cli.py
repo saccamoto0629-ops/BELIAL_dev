@@ -44,10 +44,10 @@ would "succeed" without credentials would rehearse a startup that cannot
 happen.
 
 Exit codes (shared execution-CLI contract): 0 = the loop ended by a
-requested stop, or a bounded ``--max-cycles`` run in which EVERY cycle was
-ok; 1 = the demo activation was REFUSED (fail-closed), another resident
-runner holds the lock, or a bounded run had a failed cycle; 2 = usage
-errors. ``--json`` prints one pure-ASCII machine-readable loop summary on
+requested stop, or a bounded ``--max-cycles`` run that RAN ALL N CYCLES
+with every cycle ok; 1 = the demo activation was REFUSED (fail-closed),
+another resident runner holds the lock, or a bounded run was interrupted
+or had a failed cycle; 2 = usage errors. ``--json`` prints one pure-ASCII machine-readable loop summary on
 stdout at the end of the run (the durable evidence of a bounded local
 verification run, Issue #134).
 

@@ -38,10 +38,10 @@ shadow runner, so it cannot be misconfigured into a submitting mode.
 created, no claim, no record, and no runner lock file either).
 
 Exit codes (shared execution-CLI contract): 0 = the loop ended by a
-requested stop, or a bounded ``--max-cycles`` run in which EVERY cycle was
-ok; 1 = a bounded run with a failed cycle, or a fail-closed startup refusal
-(another resident runner holds the lock, unreadable configuration); 2 =
-usage errors. ``--json`` prints one pure-ASCII machine-readable loop summary
+requested stop, or a bounded ``--max-cycles`` run that RAN ALL N CYCLES
+with every cycle ok; 1 = a bounded run that was interrupted or had a failed
+cycle, or a fail-closed startup refusal (another resident runner holds the
+lock, unreadable configuration); 2 = usage errors. ``--json`` prints one pure-ASCII machine-readable loop summary
 on stdout at the end of the run -- the durable evidence a bounded local
 verification run leaves behind (Issue #134).
 """

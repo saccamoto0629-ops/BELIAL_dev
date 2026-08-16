@@ -37,7 +37,8 @@ apart:
   durable stores, and must not turn a weeks-long service into "failed" at
   the moment of a clean operator stop (the same reasoning that makes a
   suppressed reconciliation cycle exit 0). A BOUNDED verification run
-  (``--max-cycles N``) is judged: it exits 1 unless every cycle was ok.
+  (``--max-cycles N``) is judged: it exits 1 unless it ran all N cycles
+  AND every cycle was ok -- an interrupted verification is not a passed one.
 
 Nothing in this module knows what a cycle does: modes, stores, brokers and
 gates are entirely the composed runner's affair. It imports no broker
@@ -238,14 +239,23 @@ def run_service_loop(
 def service_exit_code(report: RunnerLoopReport, *, bounded: bool) -> int:
     """The shared exit-code rule (see the module docstring).
 
-    - bounded verification run (``--max-cycles``): 0 only when EVERY cycle
-      was ok -- the whole point of a bounded run is a judged result;
+    - bounded verification run (``--max-cycles``): 0 only when the run RAN
+      TO COMPLETION (``run_forever`` reports ``MAX_CYCLES`` only after the
+      requested cycle count was reached) AND every cycle was ok. An
+      interrupted bounded run -- a stop request part-way, the zero-cycle
+      case included -- must not read as a successful verification (PR #138
+      Codex review P2);
     - resident run: 0 when the loop ended by a requested stop. Per-cycle
       failures were already localized, logged and durably recorded; a clean
       operator stop is not the moment to convert them into a failed unit.
     """
     if bounded:
-        return 0 if all(cycle.ok for cycle in report.cycles) else 1
+        return (
+            0
+            if report.stop_reason is RunnerStopReason.MAX_CYCLES
+            and all(cycle.ok for cycle in report.cycles)
+            else 1
+        )
     return 0 if report.stop_reason is RunnerStopReason.STOP_REQUESTED else 1
 
 

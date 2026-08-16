@@ -201,6 +201,18 @@ def test_a_bounded_run_with_a_failed_cycle_exits_nonzero():
     assert service_exit_code(report, bounded=True) == 1
 
 
+def test_an_interrupted_bounded_run_is_not_a_passed_verification():
+    """PR #138 Codex review P2: a SIGTERM part-way through --max-cycles N
+    leaves only successful cycles behind, but the verification did not run
+    to completion -- exit 1, the zero-cycle interruption included."""
+    interrupted = RunnerLoopReport(
+        cycles=(cycle_report(1),), stop_reason=RunnerStopReason.STOP_REQUESTED
+    )
+    assert service_exit_code(interrupted, bounded=True) == 1
+    nothing_ran = RunnerLoopReport(cycles=(), stop_reason=RunnerStopReason.STOP_REQUESTED)
+    assert service_exit_code(nothing_ran, bounded=True) == 1
+
+
 def test_a_resident_stop_stays_clean_even_after_a_localized_cycle_failure():
     """Per-cycle failures are localized by design (Issue #131), logged and
     durably recorded; a clean operator stop must not convert them into a

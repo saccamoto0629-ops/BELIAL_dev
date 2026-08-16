@@ -64,15 +64,17 @@ def test_the_shadow_unit_matches_the_shadow_cli_contract():
     assert args.data_dir is not None
     assert args.owner_id, "a stable owner id makes claim recovery deterministic"
     for path in (args.signal_db, args.execution_config, args.market_snapshot, args.account_snapshot):
-        assert str(path).startswith("/"), path
+        # .as_posix(): argparse type=Path yields WindowsPath on the Windows
+        # CI job, whose str() spells the POSIX unit path with backslashes.
+        assert path.as_posix().startswith("/"), path
 
 
 def test_the_demo_unit_matches_the_demo_cli_contract():
     args = parsed_unit_args("berial-execution-demo.service")
     assert args.execution_mode == "demo"
     assert args.data_dir is not None
-    assert str(args.safety_config).startswith("/")
-    assert str(args.market_snapshot).startswith("/")
+    assert args.safety_config.as_posix().startswith("/")
+    assert args.market_snapshot.as_posix().startswith("/")
     # The Kill Switch DB stays at its global default: ONE switch stops
     # everything, so the unit must not point the runner at a private copy.
     assert args.kill_switch_db is None
@@ -99,4 +101,5 @@ def test_the_demo_unit_and_the_reconciliation_unit_share_the_data_dir():
     demo_args = parsed_unit_args("berial-execution-demo.service")
     recon_argv = exec_start_argv("berial-execution-reconciliation.service")
     recon_data_dir = recon_argv[recon_argv.index("--data-dir") + 1]
-    assert str(demo_args.data_dir) == recon_data_dir
+    # .as_posix() for the Windows CI job (see above).
+    assert demo_args.data_dir.as_posix() == recon_data_dir
