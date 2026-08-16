@@ -194,6 +194,35 @@ def test_dry_run_creates_nothing_at_all(tmp_path, capsys):
     assert not data_dir.exists()
 
 
+def test_wal_committed_signals_are_visible_to_the_resident_loop(tmp_path, capsys):
+    """PR #138 Codex review P2: a WAL-mode signal DB with committed but not
+    yet checkpointed rows must be readable by the RESIDENT loop. The
+    provider's default immutable-WAL fallback is a point-in-time view that
+    ignores WAL contents; the service opts out, so a row living only in the
+    -wal sidecar (the writer connection is still open) is still selected."""
+    args, data_dir = service_args(tmp_path, "--max-cycles", "1")
+    signal_db = args[args.index("--signal-db") + 1]
+    writer = sqlite3.connect(signal_db)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute(
+            "INSERT INTO paper_signals VALUES ('sig-wal', ?, 'USD_JPY', 'H1', 'long', "
+            "'strategy-1', 'paper_only')",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+        writer.commit()
+        # The writer stays open, so SQLite does not checkpoint: 'sig-wal'
+        # exists only in the WAL when the service reads.
+        code, payload = run_json(capsys, args)
+    finally:
+        writer.close()
+    assert code == EXIT_OK
+    (cycle,) = payload["cycles"]
+    assert cycle["status_counts"] == {"recorded": 2}
+    results = shadow_store.list_shadow_results(db_path=data_dir / "shadow_results.sqlite3")
+    assert {r.request.signal_id for r in results} == {"sig-1", "sig-wal"}
+
+
 # --- exclusivity ----------------------------------------------------------------
 
 
@@ -208,6 +237,22 @@ def test_a_second_resident_runner_is_refused_fail_closed(tmp_path, capsys):
     assert not (data_dir / "shadow_results.sqlite3").exists()
     # After the holder releases, the service starts normally.
     assert main(args) == EXIT_OK
+
+
+def test_json_failures_still_emit_one_parseable_document(tmp_path, capsys):
+    """PR #138 Codex review P2: every post-parse outcome keeps stdout to one
+    JSON document -- the lock refusal and a configuration failure included."""
+    args, data_dir = service_args(tmp_path, "--max-cycles", "1")
+    with runner_service_lock(data_dir / SHADOW_RUNNER_LOCK_FILENAME):
+        code, payload = run_json(capsys, args)
+    assert code == EXIT_FAILURE
+    assert payload["error"] == "runner_already_running"
+
+    bad = list(args)
+    bad[bad.index("--interval-seconds") + 1] = "0"
+    code, payload = run_json(capsys, bad)
+    assert code == EXIT_USAGE_ERROR
+    assert payload["error"] == "invalid_runner_configuration"
 
 
 # --- graceful stop --------------------------------------------------------------

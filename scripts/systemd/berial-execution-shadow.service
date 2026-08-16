@@ -77,10 +77,13 @@ StandardError=journal
 # (status=226/NAMESPACE) instead of leaving the tree read-only and failing
 # obscurely on every cycle.
 #
-# The signal DB is READ-ONLY for this unit. If that DB ever runs in SQLite
-# WAL mode, its directory needs to be writable for SQLite's own sidecar
-# bookkeeping -- add it to ReadWritePaths then (the shadow code itself never
-# writes it; sqlite_ro refuses every write).
+# The signal DB is READ-ONLY for this unit, but the resident reader
+# deliberately opts OUT of the immutable-WAL fallback (a point-in-time view
+# would silently hide committed-yet-uncheckpointed signals from the loop
+# forever). If that DB ever runs in SQLite WAL mode, SQLite itself needs
+# sidecar (-wal/-shm) access in the DB's directory -- add that directory to
+# ReadWritePaths then (the shadow code still never writes the DB; sqlite_ro
+# refuses every write statement).
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

@@ -41,9 +41,11 @@ Exit codes (shared execution-CLI contract): 0 = the loop ended by a
 requested stop, or a bounded ``--max-cycles`` run that RAN ALL N CYCLES
 with every cycle ok; 1 = a bounded run that was interrupted or had a failed
 cycle, or a fail-closed startup refusal (another resident runner holds the
-lock, unreadable configuration); 2 = usage errors. ``--json`` prints one pure-ASCII machine-readable loop summary
-on stdout at the end of the run -- the durable evidence a bounded local
-verification run leaves behind (Issue #134).
+lock, unreadable configuration); 2 = usage errors. ``--json`` keeps stdout
+to exactly ONE pure-ASCII machine-readable document in every post-parse
+outcome: the loop summary on a completed run (the durable evidence a
+bounded local verification run leaves behind, Issue #134), or an
+``{"error", "message"}`` document on a refusal / configuration failure.
 """
 
 from __future__ import annotations
@@ -185,7 +187,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="print a machine-readable pure-ASCII loop summary on stdout at the end",
+        help="keep stdout to exactly one machine-readable pure-ASCII JSON document "
+        "(the loop summary on a completed run; an error document otherwise)",
     )
     return parser
 
@@ -207,12 +210,24 @@ def _resolve_db_paths(args) -> tuple[Path, Path]:
     return Path(shadow_db), Path(decision_db)
 
 
+def _fail(args, exit_code: int, error: str, message: str) -> int:
+    """One failure, both audiences: the message on stderr for the journal,
+    and -- under ``--json`` -- ONE machine-readable error document on stdout,
+    so a redirected artifact can always be json.load()ed regardless of the
+    outcome (PR #138 Codex review P2)."""
+    print(message, file=sys.stderr)
+    if args.json:
+        print(
+            json.dumps({"error": error, "message": message}, ensure_ascii=True, sort_keys=True)
+        )
+    return exit_code
+
+
 def _run_cli(argv: list[str] | None) -> int:
     args = _build_parser().parse_args(argv)
 
     if args.max_cycles is not None and args.max_cycles < 1:
-        print("--max-cycles must be >= 1", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(args, EXIT_USAGE_ERROR, "usage_error", "--max-cycles must be >= 1")
 
     shadow_db, decision_db = _resolve_db_paths(args)
     lock_path = (
@@ -224,10 +239,15 @@ def _run_cli(argv: list[str] | None) -> int:
     try:
         config = load_shadow_execution_config(args.execution_config)
     except ShadowConfigError as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(args, EXIT_USAGE_ERROR, "configuration_error", f"configuration error: {exc}")
 
-    signal_provider = PaperSignalDbSignalProvider(args.signal_db)
+    # allow_immutable_wal=False: a RESIDENT reader must see every committed
+    # signal. The default immutable-WAL fallback is a point-in-time view that
+    # silently hides committed-yet-uncheckpointed rows (schema included) from
+    # this loop forever (PR #138 Codex review P2). SQLite may then (re)create
+    # the signal DB's -wal/-shm sidecars, so the DB directory needs sidecar
+    # access (see the unit template's note).
+    signal_provider = PaperSignalDbSignalProvider(args.signal_db, allow_immutable_wal=False)
     try:
         runner = build_shadow_execution_runner(
             signal_provider=signal_provider,
@@ -244,8 +264,12 @@ def _run_cli(argv: list[str] | None) -> int:
             runner_id="shadow-execution-service",
         )
     except ValueError as exc:
-        print(f"invalid runner configuration: {exc}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(
+            args,
+            EXIT_USAGE_ERROR,
+            "invalid_runner_configuration",
+            f"invalid runner configuration: {exc}",
+        )
 
     _LOGGER.info(
         "shadow service starting: signal_db=%s config=%s shadow_db=%s decision_db=%s "
@@ -278,17 +302,19 @@ def _run_cli(argv: list[str] | None) -> int:
             with runner_service_lock(lock_path):
                 report = _loop()
     except RunnerAlreadyRunningError as exc:
-        print(f"refused: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, EXIT_FAILURE, "runner_already_running", f"refused: {exc}")
     except RunnerServiceLockError as exc:
-        print(f"runner lock unusable: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, EXIT_FAILURE, "runner_lock_unusable", f"runner lock unusable: {exc}")
     except ValueError as exc:
         # run_forever's own boundary validation (e.g. a non-positive or
         # over-limit interval) -- a configuration mistake, refused before any
         # cycle ran.
-        print(f"invalid runner configuration: {exc}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(
+            args,
+            EXIT_USAGE_ERROR,
+            "invalid_runner_configuration",
+            f"invalid runner configuration: {exc}",
+        )
 
     exit_code = service_exit_code(report, bounded=args.max_cycles is not None)
     _LOGGER.info(

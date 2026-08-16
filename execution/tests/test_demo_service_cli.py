@@ -211,6 +211,7 @@ def test_a_json_refusal_is_a_single_parseable_document(tmp_path, capsys, monkeyp
     args, _ = service_args(tmp_path, "--max-cycles", "1", kill_switch_enabled=True)
     code, payload = run_json(capsys, args)
     assert code == EXIT_FAILURE
+    assert payload["error"] == "demo_startup_refused"
     assert payload["allowed"] is False
     assert "kill_switch_enabled" in payload["rejection_codes"]
     assert "safety_summary" in payload
@@ -295,6 +296,26 @@ def test_a_second_resident_runner_is_refused_fail_closed(tmp_path, capsys, monke
     # After the holder releases, the service runs normally.
     assert main(args) == EXIT_OK
     assert len(transport.submit_calls) == 1
+
+
+def test_json_failures_still_emit_one_parseable_document(tmp_path, capsys, monkeypatch):
+    """PR #138 Codex review P2: every post-parse outcome keeps stdout to one
+    JSON document -- the resident-lock refusal and a configuration failure
+    included, not only the activation refusal."""
+    transport = DemoTransport()
+    patch_demo_lock(monkeypatch, transport=transport)
+    args, data_dir = service_args(tmp_path, "--max-cycles", "1")
+    with runner_service_lock(data_dir / EXECUTION_RUNNER_LOCK_FILENAME):
+        code, payload = run_json(capsys, args)
+    assert code == EXIT_FAILURE
+    assert payload["error"] == "runner_already_running"
+
+    bad = list(args)
+    bad[bad.index("--interval-seconds") + 1] = "0"
+    code, payload = run_json(capsys, bad)
+    assert code == EXIT_USAGE_ERROR
+    assert payload["error"] == "invalid_runner_configuration"
+    assert transport.submit_calls == []
 
 
 # --- graceful stop --------------------------------------------------------------

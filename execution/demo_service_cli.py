@@ -47,9 +47,13 @@ Exit codes (shared execution-CLI contract): 0 = the loop ended by a
 requested stop, or a bounded ``--max-cycles`` run that RAN ALL N CYCLES
 with every cycle ok; 1 = the demo activation was REFUSED (fail-closed),
 another resident runner holds the lock, or a bounded run was interrupted
-or had a failed cycle; 2 = usage errors. ``--json`` prints one pure-ASCII machine-readable loop summary on
-stdout at the end of the run (the durable evidence of a bounded local
-verification run, Issue #134).
+or had a failed cycle; 2 = usage errors. ``--json`` keeps stdout to exactly
+ONE pure-ASCII machine-readable document in every post-parse outcome: the
+loop summary on a completed run (the durable evidence of a bounded local
+verification run, Issue #134), a refusal document (``error`` / ``allowed``
+/ ``rejection_codes`` / ``safety_summary``) when the demo activation is
+refused, or an ``{"error", "message"}`` document on any other refusal /
+configuration failure.
 
 Secrets: the token, the account id and the endpoint URL are never printed
 -- the startup summary shows the endpoint KIND and the account as a
@@ -199,7 +203,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="print a machine-readable pure-ASCII loop summary on stdout at the end",
+        help="keep stdout to exactly one machine-readable pure-ASCII JSON document "
+        "(the loop summary on a completed run; an error document otherwise)",
     )
     return parser
 
@@ -227,12 +232,24 @@ def _resolve_db_paths(args) -> tuple[Path, Path, Path]:
     return Path(order_db), Path(decision_db), Path(journal_db)
 
 
+def _fail(args, exit_code: int, error: str, message: str) -> int:
+    """One failure, both audiences: the message on stderr for the journal,
+    and -- under ``--json`` -- ONE machine-readable error document on stdout,
+    so a redirected artifact can always be json.load()ed regardless of the
+    outcome (PR #138 Codex review P2)."""
+    print(message, file=sys.stderr)
+    if args.json:
+        print(
+            json.dumps({"error": error, "message": message}, ensure_ascii=True, sort_keys=True)
+        )
+    return exit_code
+
+
 def _run_cli(argv: list[str] | None) -> int:
     args = _build_parser().parse_args(argv)
 
     if args.max_cycles is not None and args.max_cycles < 1:
-        print("--max-cycles must be >= 1", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(args, EXIT_USAGE_ERROR, "usage_error", "--max-cycles must be >= 1")
 
     order_db, decision_db, journal_db = _resolve_db_paths(args)
     lock_path = (
@@ -267,11 +284,13 @@ def _run_cli(argv: list[str] | None) -> int:
             file=sys.stderr,
         )
         if args.json:
-            # The refusal is a document too (the demo_startup_cli shape):
-            # exit 1 plus a parseable record of WHY, never a broken artifact.
+            # The refusal is a document too (the demo_startup_cli shape plus
+            # the shared "error" discriminator): exit 1 with a parseable
+            # record of WHY, never a broken artifact.
             print(
                 json.dumps(
                     {
+                        "error": "demo_startup_refused",
                         "allowed": False,
                         "rejection_codes": list(decision.rejection_codes),
                         "safety_summary": decision.summary.to_dict(),
@@ -295,8 +314,12 @@ def _run_cli(argv: list[str] | None) -> int:
             runner_id="demo-execution-service",
         )
     except ValueError as exc:
-        print(f"invalid runner configuration: {exc}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(
+            args,
+            EXIT_USAGE_ERROR,
+            "invalid_runner_configuration",
+            f"invalid runner configuration: {exc}",
+        )
 
     _LOGGER.info(
         "demo service starting: order_db=%s journal_db=%s kill_switch_db=%s "
@@ -328,16 +351,18 @@ def _run_cli(argv: list[str] | None) -> int:
             with runner_service_lock(lock_path):
                 report = _loop()
     except RunnerAlreadyRunningError as exc:
-        print(f"refused: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, EXIT_FAILURE, "runner_already_running", f"refused: {exc}")
     except RunnerServiceLockError as exc:
-        print(f"runner lock unusable: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, EXIT_FAILURE, "runner_lock_unusable", f"runner lock unusable: {exc}")
     except ValueError as exc:
         # run_forever's own boundary validation (e.g. a non-positive or
         # over-limit interval) -- refused before any cycle ran.
-        print(f"invalid runner configuration: {exc}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        return _fail(
+            args,
+            EXIT_USAGE_ERROR,
+            "invalid_runner_configuration",
+            f"invalid runner configuration: {exc}",
+        )
 
     exit_code = service_exit_code(report, bounded=args.max_cycles is not None)
     _LOGGER.info(
