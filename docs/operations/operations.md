@@ -314,6 +314,8 @@ python -m execution.reconciliation_schedule_cli --broker fake --data-dir /tmp/re
 - **未解決の claim が残っていると修復 pass は走らない**: recovery の後に pending attempt が 1 件でも残っていれば(または recovery が reservation を拒否すれば)、その cycle は**検出だけ行って修復 pass を skip する**。新しい attempt は他者の fence を引き継いでしまうため、放置すると claim / lease の境界を毎 tick 素通りする。理由は JSON の `repair_skipped_reason` と human 出力の `repair pass skipped:` 行に出る。残り方は 2 種類あり、出力で区別できる:
   - **lease がまだ有効なだけ**(前回 cycle が `TimeoutStartSec` 等で kill され、claim の lease が生きたまま次の tick が来た場合を含む): **自己修復する**。lease 満了後の cycle が元の identity のまま takeover し、以降の pass は通常どおり走る。放置してよい。
   - **`BLOCKED`**: 自動収束できない fencing 状態であり、**人手の判断が必要**。exit code は 1(clean にならない)。`broker_reconciliation_repair_takeover_intents` の `blocked` 行と `blocked_reason` を見て判断する(`docs/architecture/broker_reconciliation.md`)。
+
+  この判定は pass の直前に行われるが、**mutex ではない**。修復サービスを直接呼ぶ運用者は cycle lock を取らないため、判定直後に claim する可能性は残る。その場合の結果は従来どおり Issue #104 の fencing が決める(新しい attempt が勝ち、古い worker は `repair_fence_conflict` で typed に失敗する。誤った書き込みは起こらない)。**cycle と手動の repair API を意図的に同時実行する運用は避けること。**
 - **監査の追跡**: run・discrepancy・repair attempt はすべて `BROKER_RECONCILIATION_DB_PATH` の DB に永続化される。プロセスが落ちても `run_id` から `get_reconciliation_run()` / `list_repair_attempts()` / `list_pending_repair_attempts()` で追跡でき、pending attempt は lease 満了後に次の cycle が引き継ぐ。
 - `--lease-seconds`(既定 600)は 1 attempt の作業時間を十分上回る値にする。Broker の HTTP timeout は adapter の設定値がそのまま修復サービスへ渡され、**timeout >= lease は構築時に拒否される**(exit 2)。
 - token / account id / endpoint は出力・ログへ一切出ない(手動 CLI と同じ契約)。

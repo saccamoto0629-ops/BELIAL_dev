@@ -187,6 +187,12 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 
 この延期は**自己修復的で有界**である: lease 満了後、次の cycle の recovery が **元の identity のまま** takeover し、以降の pass は通常どおり走る。無期限に残るのは `BLOCKED` だけであり、それは意図どおりで、cycle が clean を名乗らない理由でもある。検出はどちらの場合も実行・記録される — 状況を診断するために運用者が必要とするのは、まさにその read-only な観測だからである。
 
+**この gate は mutex ではない**(PR #137 レビュー r4)。判定は可能な限り**遅く** — 検出の後、pass の直前 — に行うため、「見る」と「動く」の間隔はこのモジュールが縮められる限り小さい(検出 pass 1 回分の窓は除去済み)。それでも、**修復サービスを直接呼ぶ運用者は cycle lock を取らない**ため、gate の読み取り直後に claim する可能性は残る。
+
+これは本モジュールが解くべき問題ではなく、かつ**すでに解かれている**: 「1 注文に 2 つの repair worker」という、Issue #104 の fencing 契約がまさに想定している状況である。`register_repair_fence` は新しい attempt に注文を引き継がせ、古い worker の commit / finalize は transaction 内で typed に失敗する(`repair_fence_conflict` → outcome `conflict`)。**誤った書き込みは起こらず、provenance 行が 2 本になることも、更新が失われることもない。** `execution/tests/test_reconciliation_schedule.py` が実際にスレッドを停止させてこれを固定している。
+
+呼び出し経路をまたいで check と claim を atomic にするには、修復サービス内部に**呼び出し側横断の admission プロトコル**を追加する必要がある。それは Issue #104 の claim / lease / generation / fencing 契約そのものの変更であり、Issue #133 が触れてはならない領域である — しかもその契約がすでに安全にしている結果を防ぐために、である。
+
 **overlap / concurrent run**: timer 駆動の `Type=oneshot` unit は systemd 自身が二重起動しないが、**手動実行と timer 実行の重なり**はそれでは防げないため、cycle 全体を advisory lock で保護する。lock は「空の SQLite ファイルを `BEGIN IMMEDIATE` で保持する」形式で、POSIX / Windows で同一に動作し、プロセス消滅時に OS が解放する(crash 後に手で消す stale lock が残らない)。同一プロセス内の 2 つ目の取得も拒否されるため、排他そのものをテストで固定できる。busy な lock は**失敗ではなく抑止**(`CycleAlreadyRunningError` → CLI は WARNING と `outcome: "suppressed_locked"` を出して exit 0)。
 
 この lock が保証するのは **入場の排他**だけである。「2 つの worker が同一 discrepancy / repair claim を掴まない」ことは、従来どおり修復サービスの durable な claim / lease / generation / fencing が保証する(lock の有無に依存しない)。

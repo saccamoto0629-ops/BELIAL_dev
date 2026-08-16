@@ -12,8 +12,10 @@ fixtures are seeded on the FakeBroker before a cycle starts, which is why this
 file is listed in the submission-boundary allow-list.
 """
 
+import itertools
 import json
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -28,8 +30,10 @@ from broker.broker_models import (
     OrderType,
 )
 from broker.fake_broker import FakeBroker
-from execution import execution_store, reconciliation_store
+from execution import broker_reconciliation, execution_store, reconciliation_store
 from execution import reconciliation_runner as runner
+from execution.broker_reconciliation import BrokerOrderReconciliationService
+from execution.broker_reconciliation_repair import BrokerOrderReconciliationRepairService
 from execution import reconciliation_schedule as schedule
 from execution import reconciliation_schedule_cli as cli
 from execution.execution_models import ExecutionRequest
@@ -37,12 +41,17 @@ from execution.reconciliation_models import (
     DiscrepancyType,
     ResolutionCategory,
 )
-from execution.reconciliation_repair_models import RepairFailureCode, RepairOutcome
+from execution.reconciliation_repair_models import (
+    RepairFailureCode,
+    RepairMode,
+    RepairOutcome,
+)
 
 INTERNAL_T = datetime(2025, 12, 31, 12, 0, 0, tzinfo=timezone.utc)
 OBSERVED_AT = datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
 LATER_AT = OBSERVED_AT + timedelta(days=1)  # every lease long expired
 NOW_ARG = "2026-02-01T00:00:00+00:00"
+GATE_TIMEOUT = 15  # generous: the threads coordinate on events, never on sleep
 FILL_PRICE = Decimal("2400")
 QUANTITY = Decimal("10")
 
@@ -967,3 +976,195 @@ def test_the_deferral_is_self_healing_once_the_lease_expires(paths, monkeypatch)
     ] == "filled"
     assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
     assert healed.repair_skipped_reason is None
+
+
+def _seed_contended_order(paths, request_id, direct_run_id):
+    """One AUTO_REPAIR_CANDIDATE plus a recorded run for a DIRECT caller."""
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, request_id)
+    broker.submit_order(broker_request(request_id))
+    BrokerOrderReconciliationService(
+        broker=reconcile_only(broker),
+        execution_db_path=execution_db,
+        reconciliation_db_path=reconciliation_db,
+        clock=lambda: OBSERVED_AT,
+    ).run(run_id=direct_run_id)
+    return broker
+
+
+def _direct_repair(paths, broker, run_id):
+    """A DIRECT Issue #104 caller -- it does NOT take the cycle lock."""
+    execution_db, reconciliation_db = paths
+    counter = itertools.count(1)
+    return BrokerOrderReconciliationRepairService(
+        broker=reconcile_only(broker),
+        execution_db_path=execution_db,
+        reconciliation_db_path=reconciliation_db,
+        owner_id="direct-operator",
+        clock=lambda: OBSERVED_AT,
+        attempt_id_factory=lambda: f"direct-{next(counter)}",
+    ).repair(run_id=run_id, mode=RepairMode.APPLY)
+
+
+def _commit_gate(monkeypatch, thread_name):
+    """Hold ``thread_name`` after its claim + fence, before its commit."""
+    fenced, release = threading.Event(), threading.Event()
+    real_commit = execution_store.record_order_result
+
+    def gated(*args, **kwargs):
+        if threading.current_thread().name == thread_name:
+            fenced.set()
+            assert release.wait(GATE_TIMEOUT)
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(execution_store, "record_order_result", gated)
+    return fenced, release
+
+
+def test_a_direct_caller_claiming_before_the_gate_is_seen_and_defers_the_cycle(
+    paths, monkeypatch
+):
+    """PR #137 Codex review r4: the gate is taken as LATE as possible.
+
+    Moving it to immediately before the pass -- instead of before detection
+    -- removes the whole detection pass from the window, so a direct caller
+    that claims during detection is now SEEN and the cycle defers to it
+    instead of taking its fence.
+    """
+    execution_db, reconciliation_db = paths
+    broker = _seed_contended_order(paths, "exec-14", "run-14-direct")
+
+    detected, resume_cycle = threading.Event(), threading.Event()
+    real_record_run = broker_reconciliation.record_reconciliation_run
+
+    def gated_record_run(*args, **kwargs):
+        outcome = real_record_run(*args, **kwargs)
+        if threading.current_thread().name == "cycle":
+            detected.set()  # detection done, the pending gate not taken yet
+            assert resume_cycle.wait(GATE_TIMEOUT)
+        return outcome
+
+    monkeypatch.setattr(broker_reconciliation, "record_reconciliation_run", gated_record_run)
+    fenced, release_direct = _commit_gate(monkeypatch, "direct")
+
+    results: dict = {}
+    cycle_thread = threading.Thread(
+        target=lambda: results.update(
+            cycle=run_cycle(
+                paths,
+                reconcile_only(broker),
+                run_id="run-14-cycle",
+                repair_enabled=True,
+                repair_owner_id="scheduled",
+            )
+        ),
+        name="cycle",
+    )
+    cycle_thread.start()
+    assert detected.wait(GATE_TIMEOUT)
+
+    direct_thread = threading.Thread(
+        target=lambda: results.update(direct=_direct_repair(paths, broker, "run-14-direct")),
+        name="direct",
+    )
+    direct_thread.start()
+    assert fenced.wait(GATE_TIMEOUT)  # a LIVE leased claim + fence exists now
+
+    resume_cycle.set()
+    cycle_thread.join(GATE_TIMEOUT)
+    release_direct.set()
+    direct_thread.join(GATE_TIMEOUT)
+
+    # the cycle SAW the live claim and stood down
+    assert results["cycle"].repair_attempts == ()
+    assert "still pending" in results["cycle"].repair_skipped_reason
+    # the direct caller kept its claim and finished its own work
+    (direct_attempt,) = results["direct"].attempts
+    assert direct_attempt.outcome is RepairOutcome.APPLIED
+    assert direct_attempt.owner_id == "direct-operator"
+    fence = execution_store.get_repair_fence("exec-14", db_path=execution_db)
+    assert fence["repair_attempt_id"] == direct_attempt.attempt_id
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()
+
+
+def test_a_direct_caller_claiming_inside_the_residual_window_loses_typed_never_wrongly(
+    paths, monkeypatch
+):
+    """PR #137 Codex review r4: what the gate does NOT promise.
+
+    The gate is a POLICY gate, not a mutex. A DIRECT repair-service caller
+    does not take the cycle lock, so it can still claim in the instant
+    between the gate's read and the pass. Making that atomic would mean a
+    cross-caller admission protocol inside the Issue #104 service -- changing
+    the claim / lease / fencing contract Issue #133 may not touch, to prevent
+    an outcome that contract already makes safe.
+
+    So what must hold is the CONTRACT's guarantee, pinned here with a real
+    paused thread: the loser fails typed, nothing wrong is written, there is
+    exactly one provenance row, and no claim is orphaned.
+    """
+    execution_db, reconciliation_db = paths
+    broker = _seed_contended_order(paths, "exec-15", "run-15-direct")
+
+    gate_read, resume_cycle = threading.Event(), threading.Event()
+    real_pending = reconciliation_store.list_pending_repair_attempts
+
+    def gated_pending(*args, **kwargs):
+        outcome = real_pending(*args, **kwargs)
+        # Only the schedule module reaches the store through this attribute:
+        # the repair service imported the function by name, so recovery's own
+        # lookup does not come through here. This IS the cycle's gate read.
+        if threading.current_thread().name == "cycle" and not gate_read.is_set():
+            assert outcome == ()  # the gate really did see an empty audit DB
+            gate_read.set()  # repair() not entered yet
+            assert resume_cycle.wait(GATE_TIMEOUT)
+        return outcome
+
+    monkeypatch.setattr(reconciliation_store, "list_pending_repair_attempts", gated_pending)
+    fenced, release_direct = _commit_gate(monkeypatch, "direct")
+
+    results: dict = {}
+    cycle_thread = threading.Thread(
+        target=lambda: results.update(
+            cycle=run_cycle(
+                paths,
+                reconcile_only(broker),
+                run_id="run-15-cycle",
+                repair_enabled=True,
+                repair_owner_id="scheduled",
+            )
+        ),
+        name="cycle",
+    )
+    cycle_thread.start()
+    assert gate_read.wait(GATE_TIMEOUT)
+
+    direct_thread = threading.Thread(
+        target=lambda: results.update(direct=_direct_repair(paths, broker, "run-15-direct")),
+        name="direct",
+    )
+    direct_thread.start()
+    assert fenced.wait(GATE_TIMEOUT)  # claimed AFTER the gate read: invisible to it
+
+    resume_cycle.set()
+    cycle_thread.join(GATE_TIMEOUT)
+    release_direct.set()
+    direct_thread.join(GATE_TIMEOUT)
+
+    (loser,) = results["direct"].attempts
+    assert loser.outcome is RepairOutcome.CONFLICT
+    assert loser.failure_code is RepairFailureCode.REPAIR_FENCE_CONFLICT
+    assert loser.internal_state_after is None  # it wrote nothing
+    # exactly ONE repair provenance row: no double write, no lost update
+    provenance = [
+        row["repair_attempt_id"]
+        for row in execution_store.get_state_history("exec-15", db_path=execution_db)
+        if row["repair_attempt_id"] is not None
+    ]
+    assert len(provenance) == 1
+    assert execution_store.get_execution_order("exec-15", db_path=execution_db)[
+        "order_state"
+    ] == "filled"
+    # and nothing is orphaned: the loser is finalized, not left pending
+    assert reconciliation_store.list_pending_repair_attempts(db_path=reconciliation_db) == ()

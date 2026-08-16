@@ -102,6 +102,30 @@ point, and which is why it also makes the cycle report not-clean.
 Detection always runs and is always recorded either way: a read-only
 observation is exactly what an operator diagnoses the situation with.
 
+Concurrency: what the gate is, and what it is not
+--------------------------------------------------
+
+The gate is taken as LATE as possible -- immediately before the pass, after
+detection -- so the window between "look" and "act" is as small as this
+module can make it. It is still a POLICY gate, not a mutex.
+
+A DIRECT caller of the repair service (an operator invoking the Issue #104
+API) does not take the cycle lock and can therefore claim in the remaining
+instant. That case is NOT this module's to solve, and it is already
+resolved: it is the ordinary "two repair workers, one order" situation the
+Issue #104 fencing contract is built for. ``register_repair_fence`` lets the
+newer attempt take the order over, and the older worker's commit and
+finalize then fail typed (``repair_fence_conflict`` -> outcome ``conflict``)
+inside the transaction -- never a wrong write, never two provenance rows,
+never a lost update. ``execution/tests/test_reconciliation_schedule.py``
+pins exactly that with a real paused thread.
+
+Making the check and the claim atomic ACROSS callers would mean adding a
+cross-process admission protocol inside the repair service -- changing the
+Issue #104 claim / lease / generation / fencing contract, which Issue #133
+is explicitly not allowed to do, to prevent an outcome that contract already
+makes safe.
+
 Overlap / concurrent runs
 -------------------------
 
@@ -518,6 +542,28 @@ def _unresolved_reason(unresolved, recovered) -> str:
     )
 
 
+def _skipped_report(
+    *,
+    run_id: str,
+    run: ReconciliationRun,
+    include_position_scope: bool,
+    reconciliation_db_path: Path,
+    recovered,
+    skipped_reason: str,
+) -> ReconciliationCycleReport:
+    """A repair-enabled cycle whose pass was skipped, detection recorded."""
+    return ReconciliationCycleReport(
+        run_id=run_id,
+        run=run,
+        dry_run=False,
+        include_position_scope=include_position_scope,
+        repair_enabled=True,
+        recorded_to=reconciliation_db_path,
+        recovered_attempts=recovered,
+        repair_skipped_reason=skipped_reason,
+    )
+
+
 def _guarded_cycle(
     *,
     broker: ReconcileOnlyBroker,
@@ -570,27 +616,6 @@ def _guarded_cycle(
                     "pending claim and its takeover intent stay in the audit DB for "
                     "manual review"
                 )
-            if service is not None:
-                # RECOVERY RETURNING NOTHING DOES NOT MEAN NOTHING IS
-                # PROTECTED. It deliberately leaves alone every reservation
-                # whose lease is still valid (someone may be driving it right
-                # now), and it leaves a BLOCKED one pending on purpose. So the
-                # decision is made on what is STILL PENDING, not on what came
-                # back.
-                #
-                # A fresh pass would walk straight past that boundary: its
-                # attempt id is new, and ``register_repair_fence`` REPLACES a
-                # fence held by a DIFFERENT attempt by design -- so the very
-                # order somebody else has claimed would be re-observed,
-                # re-claimed at generation 1 and committed, while the original
-                # claim stayed pending. Under a timer that is not a one-off;
-                # it is every tick.
-                unresolved = reconciliation_store.list_pending_repair_attempts(
-                    db_path=reconciliation_db_path
-                )
-                if unresolved:
-                    service = None
-                    skipped_reason = _unresolved_reason(unresolved, recovered)
         else:
             _LOGGER.info(
                 "no reconciliation audit DB at %s yet: no pending repair attempt can "
@@ -608,6 +633,40 @@ def _guarded_cycle(
     ).run(run_id=run_id, include_position_scope=include_position_scope)
 
     if service is not None:
+        # THE PENDING GATE, taken as LATE as possible -- immediately before
+        # the pass, not before detection (PR #137 review r4: the detection
+        # pass was a substantial window between the check and the pass).
+        #
+        # RECOVERY RETURNING NOTHING DOES NOT MEAN NOTHING IS PROTECTED. It
+        # deliberately leaves alone every reservation whose lease is still
+        # valid (someone may be driving it right now), and it leaves a
+        # BLOCKED one pending on purpose. So the decision is made on what is
+        # STILL PENDING, not on what came back.
+        #
+        # A fresh pass would otherwise walk straight past that boundary: its
+        # attempt id is new, and ``register_repair_fence`` REPLACES a fence
+        # held by a DIFFERENT attempt by design -- so the very order somebody
+        # else has claimed would be re-observed, re-claimed at generation 1
+        # and committed. Under a timer that is not a one-off; it is every
+        # tick.
+        #
+        # This is a POLICY gate, not a mutex: a direct repair-service caller
+        # that claims in the remaining instant is still possible, and is
+        # resolved -- as it always has been -- by the store's fencing, which
+        # fails the loser typed (``repair_fence_conflict``) and never lets a
+        # wrong write land. See "Concurrency" in the module docstring.
+        unresolved = reconciliation_store.list_pending_repair_attempts(
+            db_path=reconciliation_db_path
+        )
+        if unresolved:
+            return _skipped_report(
+                run_id=run_id,
+                run=run,
+                include_position_scope=include_position_scope,
+                reconciliation_db_path=reconciliation_db_path,
+                recovered=recovered,
+                skipped_reason=_unresolved_reason(unresolved, recovered),
+            )
         try:
             attempts = service.repair(run_id=run_id, mode=RepairMode.APPLY).attempts
         except ReconciliationRepairRunError as exc:
