@@ -277,6 +277,17 @@ def _run_cli(argv: list[str] | None) -> int:
             "invalid_runner_configuration",
             f"invalid runner configuration: {exc}",
         )
+    except Exception as exc:
+        # The shadow root initializes no store, but the same normalization
+        # applies (PR #138 Codex review P2 on the demo CLI): a composition
+        # failure must exit 1 with a journal message and -- under --json --
+        # one error document, never a traceback with empty stdout.
+        return _fail(
+            args,
+            EXIT_FAILURE,
+            "startup_failed",
+            f"startup failed: {type(exc).__name__}: {exc}",
+        )
 
     _LOGGER.info(
         "shadow service starting: signal_db=%s config=%s shadow_db=%s decision_db=%s "

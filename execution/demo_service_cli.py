@@ -320,6 +320,20 @@ def _run_cli(argv: list[str] | None) -> int:
             "invalid_runner_configuration",
             f"invalid runner configuration: {exc}",
         )
+    except Exception as exc:
+        # Composition also INITIALIZES the sealed audit stores (decision DB,
+        # submission journal) on a non-dry startup; an unwritable path, a
+        # directory where a DB file should be, or a corrupt store surfaces
+        # here as a store/sqlite error, not a ValueError. Normalize it as a
+        # fail-closed startup failure -- exit 1, journal message, one JSON
+        # error document -- never a traceback with empty stdout (PR #138
+        # Codex review P2).
+        return _fail(
+            args,
+            EXIT_FAILURE,
+            "startup_failed",
+            f"startup failed: {type(exc).__name__}: {exc}",
+        )
 
     _LOGGER.info(
         "demo service starting: order_db=%s journal_db=%s kill_switch_db=%s "

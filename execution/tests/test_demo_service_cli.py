@@ -318,6 +318,25 @@ def test_json_failures_still_emit_one_parseable_document(tmp_path, capsys, monke
     assert transport.submit_calls == []
 
 
+def test_a_store_initialization_failure_is_a_json_startup_failure(
+    tmp_path, capsys, monkeypatch
+):
+    """PR #138 Codex review P2: composition initializes the audit stores on
+    a non-dry startup; pointing a store path at a DIRECTORY raises a
+    store/sqlite error, not a ValueError. It must exit 1 with one JSON
+    error document -- never a traceback with empty stdout."""
+    transport = DemoTransport()
+    patch_demo_lock(monkeypatch, transport=transport)
+    args, data_dir = service_args(tmp_path, "--max-cycles", "1")
+    broken = data_dir / "decision-db-is-a-directory"
+    broken.mkdir()
+    args += ["--decision-db", str(broken)]
+    code, payload = run_json(capsys, args)
+    assert code == EXIT_FAILURE
+    assert payload["error"] == "startup_failed"
+    assert transport.submit_calls == []
+
+
 # --- graceful stop --------------------------------------------------------------
 
 
