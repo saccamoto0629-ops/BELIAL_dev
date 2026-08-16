@@ -199,6 +199,7 @@ from execution.reconciliation_repair_models import (
     OrderRepairAttempt,
     RepairMode,
     RepairOutcome,
+    TakeoverIntentStatus,
 )
 from execution.reconciliation_runner import ReconcileOnlyBroker
 
@@ -334,6 +335,11 @@ class ReconciliationCycleReport:
     repair_attempts: tuple[OrderRepairAttempt, ...] = field(default_factory=tuple)
     repair_skipped_reason: str | None = None
     repair_error: str | None = None
+    #: Takeover ids of BLOCKED intents that were ALREADY in the audit DB when
+    #: this cycle started -- durable "a human must look at this" records from
+    #: an earlier cycle. They keep every later cycle from reporting clean
+    #: until someone deals with them; see ``is_clean``.
+    blocked_intent_ids: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def discrepancy_count(self) -> int:
@@ -360,6 +366,7 @@ class ReconciliationCycleReport:
             and not self.run.has_partial_failures
             and self.repair_error is None
             and not self.blocked_attempts
+            and not self.blocked_intent_ids
         )
 
 
@@ -528,6 +535,32 @@ def _blocked_in(recovered) -> tuple[OrderRepairAttempt, ...]:
     )
 
 
+def _persisted_blocked_intent_ids(reconciliation_db_path: Path) -> tuple[str, ...]:
+    """Takeover ids of BLOCKED intents already durable in the audit DB.
+
+    These are the human-intervention records an EARLIER cycle produced. They
+    make every later cycle report not-clean (exit 1) until someone deals with
+    them, so the state cannot quietly disappear from an operator's view once
+    the cycle that found it has scrolled out of the journal.
+
+    They deliberately do NOT gate the repair pass. ``BLOCKED`` is a TERMINAL
+    intent status (``ALLOWED_INTENT_TRANSITIONS[BLOCKED]`` is empty) and
+    intents are retained forever as the audit trail, so there is no in-band
+    way for an operator to clear one. Gating on them would therefore not be
+    "stop until resolved" -- it would be "stop forever, on a historical audit
+    row", disabling reconciliation repair for every unrelated order with no
+    supported way back. Visibility is the part that belongs here; the live
+    protections (pending claims, this cycle's BLOCKED results) are what gate.
+    """
+    return tuple(
+        intent.takeover_id
+        for intent in reconciliation_store.list_takeover_intents(
+            db_path=reconciliation_db_path
+        )
+        if intent.status is TakeoverIntentStatus.BLOCKED
+    )
+
+
 def _skip_reason(unresolved, blocked) -> str:
     """Why a repair pass was skipped, in the terms an operator must act on.
 
@@ -569,6 +602,7 @@ def _skipped_report(
     reconciliation_db_path: Path,
     recovered,
     skipped_reason: str,
+    blocked_intent_ids: tuple[str, ...],
 ) -> ReconciliationCycleReport:
     """A repair-enabled cycle whose pass was skipped, detection recorded."""
     return ReconciliationCycleReport(
@@ -580,6 +614,7 @@ def _skipped_report(
         recorded_to=reconciliation_db_path,
         recovered_attempts=recovered,
         repair_skipped_reason=skipped_reason,
+        blocked_intent_ids=blocked_intent_ids,
     )
 
 
@@ -601,6 +636,7 @@ def _guarded_cycle(
     skipped_reason: str | None = None
     repair_error: str | None = None
     attempts: tuple[OrderRepairAttempt, ...] = ()
+    blocked_intent_ids: tuple[str, ...] = ()
 
     service = None
     if repair_enabled:
@@ -635,6 +671,7 @@ def _guarded_cycle(
                     "pending claim and its takeover intent stay in the audit DB for "
                     "manual review"
                 )
+            blocked_intent_ids = _persisted_blocked_intent_ids(reconciliation_db_path)
         else:
             _LOGGER.info(
                 "no reconciliation audit DB at %s yet: no pending repair attempt can "
@@ -691,6 +728,7 @@ def _guarded_cycle(
                 reconciliation_db_path=reconciliation_db_path,
                 recovered=recovered,
                 skipped_reason=_skip_reason(unresolved, blocked),
+                blocked_intent_ids=blocked_intent_ids,
             )
         try:
             attempts = service.repair(run_id=run_id, mode=RepairMode.APPLY).attempts
@@ -723,6 +761,7 @@ def _guarded_cycle(
         repair_attempts=attempts,
         repair_skipped_reason=skipped_reason,
         repair_error=repair_error,
+        blocked_intent_ids=blocked_intent_ids,
     )
 
 

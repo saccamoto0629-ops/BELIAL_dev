@@ -267,6 +267,10 @@ def _cycle_payload(report: ReconciliationCycleReport, *, broker_label: str) -> d
         ],
         "repair_attempts": [_attempt_payload(attempt) for attempt in report.repair_attempts],
         "blocked_attempt_count": len(report.blocked_attempts),
+        # Durable "a human must look" records from EARLIER cycles. They keep
+        # this cycle from reporting clean until someone deals with them, so a
+        # blocked takeover cannot scroll out of the journal and be forgotten.
+        "unresolved_blocked_intents": list(report.blocked_intent_ids),
         "reconciliation": reconciliation,
     }
 
@@ -325,6 +329,13 @@ def _print_human(payload: dict) -> None:
             print(f"  repair pass skipped: {payload['repair_skipped_reason']}")
     else:
         print(f"repair: not run ({payload['repair_skipped_reason']})")
+    if payload["unresolved_blocked_intents"]:
+        print(
+            "UNRESOLVED blocked takeover intent(s) from an earlier cycle -- a human "
+            "must resolve these: {0}".format(
+                ", ".join(payload["unresolved_blocked_intents"])
+            )
+        )
     if payload["repair_error"] is not None:
         print(f"repair error: {payload['repair_error']}")
     print(

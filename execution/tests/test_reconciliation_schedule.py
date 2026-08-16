@@ -12,6 +12,7 @@ fixtures are seeded on the FakeBroker before a cycle starts, which is why this
 file is listed in the submission-boundary allow-list.
 """
 
+import dataclasses
 import itertools
 import json
 import sqlite3
@@ -47,9 +48,11 @@ from execution.reconciliation_models import (
     ResolutionCategory,
 )
 from execution.reconciliation_repair_models import (
+    ALLOWED_INTENT_TRANSITIONS,
     RepairFailureCode,
     RepairMode,
     RepairOutcome,
+    TakeoverIntentStatus,
 )
 
 INTERNAL_T = datetime(2025, 12, 31, 12, 0, 0, tzinfo=timezone.utc)
@@ -1258,3 +1261,134 @@ def test_an_orphaned_blocked_intent_stops_the_pass_even_with_nothing_pending(
     assert reconciliation_store.get_reconciliation_run(
         "run-16b", db_path=reconciliation_db
     ) is not None
+
+
+def _park_a_blocked_intent(paths, monkeypatch, broker, request_id, run_prefix):
+    """Drive the cycle into the state that leaves a DURABLE blocked intent:
+    crash -> claim, recovery killed at finalize -> CLAIM_PROMOTED intent,
+    attempt finalized out of band under a foreign takeover id, then one cycle
+    that reports it BLOCKED and parks it."""
+    execution_db, reconciliation_db = paths
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process killed")
+
+    monkeypatch.setattr(execution_store, "record_order_result", crash)
+    with pytest.raises(KeyboardInterrupt):
+        run_cycle(paths, reconcile_only(broker), run_id=f"{run_prefix}a", repair_enabled=True)
+    monkeypatch.undo()
+
+    monkeypatch.setattr(broker_reconciliation_repair, "finalize_repair_attempt", crash)
+    with pytest.raises(KeyboardInterrupt):
+        BrokerOrderReconciliationRepairService(
+            broker=reconcile_only(broker),
+            execution_db_path=execution_db,
+            reconciliation_db_path=reconciliation_db,
+            owner_id="recovery",
+            clock=lambda: LATER_AT,
+        ).recover_pending_attempts()
+    monkeypatch.undo()
+
+    with closing(sqlite3.connect(reconciliation_db)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE {reconciliation_store.REPAIRS_TABLE} SET status = 'finalized', "
+            "outcome = 'failed', failure_code = 'store_update_failed', "
+            "takeover_id = 'tk-foreign', finalized_at_utc = ?",
+            (LATER_AT.isoformat(),),
+        )
+        connection.commit()
+
+    # the cycle that DETECTS it -- this is what parks the intent as blocked
+    parked = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id=f"{run_prefix}b",
+        repair_enabled=True,
+        clock=lambda: LATER_AT + timedelta(days=1),
+    )
+    assert parked.repair_attempts == ()
+    return parked
+
+
+def test_a_persisted_blocked_intent_keeps_later_cycles_from_reporting_clean(
+    paths, monkeypatch
+):
+    """PR #137 Codex review r6.
+
+    Once parked, a blocked intent is no longer ACTIVE, so a later recovery
+    returns nothing about it and nothing is pending -- the gate's live
+    signals both go quiet while the human-intervention record is still there.
+
+    It must not go quiet in the OUTPUT too. Every later cycle names it and
+    refuses to report clean, so a blocked takeover cannot scroll out of the
+    journal and be forgotten.
+
+    It deliberately does NOT gate the repair pass: ``BLOCKED`` is a terminal
+    intent status with no transition out and intents are retained forever, so
+    gating would mean "stop forever on a historical audit row", disabling
+    repair for every unrelated order with no supported way back.
+    """
+    execution_db, reconciliation_db = paths
+    broker = FakeBroker(default_fill_price=FILL_PRICE)
+    seed_internal_unknown(execution_db, "exec-18")
+    broker.submit_order(broker_request("exec-18"))
+    _park_a_blocked_intent(paths, monkeypatch, broker, "exec-18", "run-18-")
+
+    blocked_intents = [
+        intent
+        for intent in reconciliation_store.list_takeover_intents(db_path=reconciliation_db)
+        if intent.status is TakeoverIntentStatus.BLOCKED
+    ]
+    assert len(blocked_intents) == 1
+    # terminal by construction: this is WHY it cannot be a gate
+    assert ALLOWED_INTENT_TRANSITIONS[TakeoverIntentStatus.BLOCKED] == frozenset()
+
+    later = run_cycle(
+        paths,
+        reconcile_only(broker),
+        run_id="run-18-c",
+        repair_enabled=True,
+        clock=lambda: LATER_AT + timedelta(days=2),
+    )
+
+    # the live gate signals are quiet -- and the durable record is still loud
+    assert later.recovered_attempts == ()
+    assert later.blocked_attempts == ()
+    assert later.blocked_intent_ids == (blocked_intents[0].takeover_id,)
+    assert not later.is_clean  # ... so the cycle still refuses to look clean
+    # the repair pass was NOT gated on it (that would be a permanent wedge)
+    assert later.repair_skipped_reason is None
+    # that the intent ALONE is enough to withhold "clean" -- with nothing else
+    # wrong -- is pinned by test_the_cli_names_an_unresolved_blocked_intent_...
+    assert dataclasses.replace(
+        later, blocked_intent_ids=()
+    ).is_clean is not later.is_clean or later.discrepancy_count > 0
+
+
+def test_the_cli_names_an_unresolved_blocked_intent_and_exits_one(paths, tmp_path, capsys):
+    report = schedule.ReconciliationCycleReport(
+        run_id="run-x",
+        run=schedule.run_reconciliation_cycle(
+            broker=reconcile_only(FakeBroker()),
+            execution_db_path=tmp_path / "execution_orders.sqlite3",
+            reconciliation_db_path=tmp_path / "broker_reconciliation.sqlite3",
+            run_id="run-x",
+            cycle_lock_path=None,
+            dry_run=True,
+            clock=lambda: OBSERVED_AT,
+        ).run,
+        dry_run=False,
+        include_position_scope=True,
+        repair_enabled=True,
+        recorded_to=tmp_path / "broker_reconciliation.sqlite3",
+        blocked_intent_ids=("takeover-abc123",),
+    )
+    payload = cli._cycle_payload(report, broker_label="fake / fake")
+
+    assert payload["outcome"] == "attention"  # -> EXIT_ATTENTION
+    assert payload["unresolved_blocked_intents"] == ["takeover-abc123"]
+    cli._print_human(payload)
+    out = capsys.readouterr().out
+    assert "UNRESOLVED blocked takeover intent(s)" in out
+    assert "takeover-abc123" in out

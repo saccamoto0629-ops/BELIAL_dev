@@ -189,6 +189,14 @@ Issue #105 の手動照合経路。**reconcile-only**: 渡された Broker を `
 
 この延期は**自己修復的で有界**である: lease 満了後、次の cycle の recovery が **元の identity のまま** takeover し、以降の pass は通常どおり走る。無期限に残るのは `BLOCKED` だけであり、それは意図どおりで、cycle が clean を名乗らない理由でもある。検出はどちらの場合も実行・記録される — 状況を診断するために運用者が必要とするのは、まさにその read-only な観測だからである。
 
+**永続化された `blocked` intent は「可視化」であって「gate」ではない**(PR #137 レビュー r6): 一度 park された blocked intent は **active ではなくなる**ため、以降の cycle では recovery が何も返さず、pending 行も無い — gate の生きた信号が両方とも沈黙する。それでも人手対応が必要な事実は audit DB に残っている。
+
+そこで cycle は、**開始時点で audit DB にある `blocked` intent を毎回読み出して報告し、その cycle を clean と名乗らせない**(`blocked_intent_ids` / CLI の `unresolved_blocked_intents` / exit 1)。blocked な takeover が journal から流れて忘れられることを防ぐ。
+
+**gate にはしない**理由: `BLOCKED` は**終端 status** であり(`ALLOWED_INTENT_TRANSITIONS[BLOCKED]` は空)、intent は監査証跡として**永久に保持される**。したがって「解決されるまで止める」を実装する手段が存在せず、gate にすると「**歴史的な監査行 1 行で永久に止まる**」= 無関係な注文の修復まで無期限に停止し、戻す手段が無い、という状態になる。gate は生きた保護(pending claim・その cycle の `BLOCKED` 結果)だけが担う。
+
+> **既知の制約**: 上記のとおり blocked intent を解消する in-band な手段が現状存在しないため、**一度発生すると以降の cycle は恒久的に exit 1 になる**。「blocked takeover を運用者が解決済みとして確定する」操作は Issue #104 の intent 状態機械に属し、Issue #133 のスコープ外である(後続 Issue 候補)。
+
 **この gate は mutex ではない**(PR #137 レビュー r4)。判定は可能な限り**遅く** — 検出の後、pass の直前 — に行うため、「見る」と「動く」の間隔はこのモジュールが縮められる限り小さい(検出 pass 1 回分の窓は除去済み)。それでも、**修復サービスを直接呼ぶ運用者は cycle lock を取らない**ため、gate の読み取り直後に claim する可能性は残る。
 
 これは本モジュールが解くべき問題ではなく、かつ**すでに解かれている**: 「1 注文に 2 つの repair worker」という、Issue #104 の fencing 契約がまさに想定している状況である。`register_repair_fence` は新しい attempt に注文を引き継がせ、古い worker の commit / finalize は transaction 内で typed に失敗する(`repair_fence_conflict` → outcome `conflict`)。**誤った書き込みは起こらず、provenance 行が 2 本になることも、更新が失われることもない。** `execution/tests/test_reconciliation_schedule.py` が実際にスレッドを停止させてこれを固定している。
