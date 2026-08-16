@@ -640,3 +640,79 @@ def test_the_schedule_modules_never_run_a_repair_pass_outside_apply_or_recovery(
     }
     assert called & forbidden == set()
     assert allowed & called == allowed  # both entry points really are driven
+
+
+# Issue #134: the resident-service boundary (execution/runner_service.py) and
+# the two service CLIs are the CONTINUOUS-OPERATION conduits for the runner --
+# and only conduits. The structural stance mirrors the runner and schedule
+# module pins: they own no broker, mint no connection (with ONE audited
+# exception below) and write no execution state.
+SERVICE_MODULES = ("runner_service.py", "shadow_service_cli.py", "demo_service_cli.py")
+
+
+def test_the_service_modules_never_import_any_broker_module():
+    """Stronger than the runner-module pin: not even broker MODELS. The
+    service layer paces an already composed runner; a broker import of any
+    kind here would be the beginning of a second submission surface. The
+    demo CLI's connection arrives through the demo activation lock's grant,
+    never through a broker import of its own."""
+    offenders = []
+    for name in SERVICE_MODULES:
+        for lineno, module in _imported_modules(REPO_ROOT / "execution" / name):
+            if module == "broker" or module.startswith("broker."):
+                offenders.append(f"execution/{name}:{lineno} imports {module}")
+    assert offenders == []
+
+
+def test_only_the_demo_service_cli_calls_a_composer_and_only_the_public_one():
+    """``build_demo_connection`` is the ONE sanctioned composer call in the
+    service layer -- the same call the Issue #132 preflight makes, sealed so
+    the caller can only choose paths, never judgements. The private seams,
+    the live composer and every adapter constructor stay at zero across all
+    three modules; the shadow service and the shared plumbing call no
+    composer at all."""
+    for name in SERVICE_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for callee in (
+            "_compose_demo_connection",
+            "build_live_connection",
+            "_compose_live_connection",
+            "OandaDemoAdapter",
+            "OandaDemoConfig",
+            "OandaLiveAdapter",
+            "FakeBroker",
+        ):
+            sites = _method_call_sites(path, callee) + _name_call_sites(path, callee)
+            assert sites == [], f"execution/{name} calls {callee} at {sites}"
+        public_sites = _method_call_sites(path, "build_demo_connection") + _name_call_sites(
+            path, "build_demo_connection"
+        )
+        if name == "demo_service_cli.py":
+            assert len(public_sites) == 1, (
+                "demo_service_cli.py must call build_demo_connection exactly once "
+                f"(the startup lock evaluation), found {public_sites}"
+            )
+        else:
+            assert public_sites == [], f"execution/{name} calls build_demo_connection"
+
+
+def test_the_service_modules_never_write_execution_state_directly():
+    """Same rule as the runner modules: every state change belongs to the
+    sanctioned services. The service CLIs additionally must not initialize
+    stores themselves -- composition roots own that."""
+    offenders = []
+    for name in SERVICE_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for function in EXECUTION_STORE_WRITE_FUNCTIONS:
+            for lineno in _method_call_sites(path, function) + _name_call_sites(path, function):
+                offenders.append(f"execution/{name}:{lineno} calls {function}")
+    assert offenders == []
+
+
+def test_the_service_modules_never_call_submit_or_cancel():
+    """Belt-and-braces restatement of the repository-wide pin, scoped to the
+    new conduits: the loop drives executors, never a broker method."""
+    for name in SERVICE_MODULES:
+        path = REPO_ROOT / "execution" / name
+        for method in ("submit_order", "cancel_order"):
+            assert _method_call_sites(path, method) == [], f"execution/{name} calls {method}"

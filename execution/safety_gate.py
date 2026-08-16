@@ -728,11 +728,38 @@ class SafetyGate:
         # --- broker safety queries: positions / account ----------------------
         positions: tuple[PositionInfo, ...] | None = None
         account: AccountState | None = None
+        query_error: Exception | None = None
+        raw_positions = raw_account = None
         try:
-            positions = self._reliable_positions(connection.broker.get_positions(), now)
-            account = self._reliable_account(connection.broker.get_account_state(), now)
+            raw_positions = connection.broker.get_positions()
+            raw_account = connection.broker.get_account_state()
         except Exception as exc:
-            reject(SafetyRejectionCode.BROKER_QUERY_FAILED, f"broker safety query failed: {exc}")
+            query_error = exc
+        if query_error is None:
+            # Reliability (stale / future-dated) is judged against a clock
+            # reading taken AFTER the queries (Issue #134): the broker stamps
+            # ``retrieved_at_utc`` while the query runs, i.e. after ``now``
+            # was captured above, so with real clocks every honest answer
+            # would land microseconds "in the future" of the evaluation
+            # start and be rejected -- a skew artifact, not a data problem.
+            # Frozen-clock verification runs are unchanged (both readings
+            # are identical), and a genuinely future-dated stamp -- one that
+            # is ahead of a clock read after the answer arrived -- is still
+            # rejected. A broken clock still raises (never a rejection).
+            observed_now = self._clock()
+            _require_utc(observed_now, "SafetyGate clock value")
+            try:
+                positions = self._reliable_positions(raw_positions, observed_now)
+                account = self._reliable_account(raw_account, observed_now)
+            except Exception as exc:
+                positions = None
+                account = None
+                query_error = exc
+        if query_error is not None:
+            reject(
+                SafetyRejectionCode.BROKER_QUERY_FAILED,
+                f"broker safety query failed: {query_error}",
+            )
 
         if positions is not None:
             self._collect_position_limit_rejections(request, positions, reject)

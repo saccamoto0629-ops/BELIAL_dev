@@ -890,6 +890,31 @@ def test_unreliable_account_snapshots_are_fail_closed(tmp_path, retrieved_at):
     assert broker.submitted_requests == []
 
 
+def test_a_ticking_clock_accepts_a_snapshot_stamped_during_the_query(tmp_path):
+    """Issue #134 (real-clock integration): the broker stamps its answer
+    WHILE the query runs -- i.e. after the evaluation captured ``now`` -- so
+    reliability is judged against a clock reading taken after the queries.
+    Otherwise every honest answer under real clocks would be 'from the
+    future' by microseconds and no submission could ever pass. A stamp
+    ahead of even the post-query reading stays rejected (the parametrized
+    future-account case above, where the frozen clock never advances)."""
+    readings = {"count": 0}
+
+    def ticking_clock():
+        readings["count"] += 1
+        return NOW + timedelta(milliseconds=5) * (readings["count"] - 1)
+
+    # Stamped 2ms after the evaluation start -- exactly what a real broker
+    # round-trip produces.
+    broker = make_broker(account_retrieved_at=NOW + timedelta(milliseconds=2))
+    decision, result, broker, _, _ = run(
+        tmp_path, conn=connection(broker), the_gate=gate(clock=ticking_clock)
+    )
+    assert decision.allowed is True, decision.rejections
+    assert result is not None
+    assert len(broker.submitted_requests) == 1
+
+
 # --- unexpected internal failure --------------------------------------------
 
 
